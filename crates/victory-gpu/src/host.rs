@@ -836,13 +836,7 @@ impl Host {
         };
         batch.flush();
         #[cfg(feature = "diagnostics")]
-        let hdr_frame = crate::draw::hdr_trace::active_frame();
-        #[cfg(feature = "diagnostics")]
-        if let Some(frame) = hdr_frame {
-            for (i, list) in runs.iter().enumerate() {
-                crate::draw::hdr_trace::submit(list, frame, *submitted + 1, i);
-            }
-        }
+        let hdr_armed = crate::draw::hdr_trace::enabled();
         let prepared = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::FaultsPrep, crate::copystat::page_faults().saturating_sub(faults));
@@ -945,7 +939,8 @@ impl Host {
             ));
         }
         #[cfg(feature = "diagnostics")]
-        if let Some(frame) = hdr_frame {
+        if hdr_armed {
+            let frame = crate::queue::presented() + 1;
             for (i, list) in runs.iter().enumerate() {
                 crate::draw::hdr_trace::complete(list, frame, *submitted, i);
             }
@@ -2544,11 +2539,15 @@ impl Host {
             }
             let result = p.swap_chain.Present(0, DXGI_PRESENT(0));
             #[cfg(feature = "diagnostics")]
-            if hdr_fence != 0 {
-                tracing::info!(target: "victory_gpu::hdr_trace", frame, fence = hdr_fence,
-                    source = ?texture.as_raw(), swap_buffer = ?back.as_raw(), index, shown,
-                    present_hr = format_args!("{:#x}", result.0),
-                    samples = ?hdr.map(|s| s.words()), "actual DXGI Present");
+            {
+                crate::draw::hdr_trace::flush(frame);
+                if hdr_fence != 0 {
+                    tracing::info!(target: "victory_gpu::hdr_trace", frame, fence = hdr_fence,
+                        source_host_texture = ?texture.as_raw(),
+                        swap_buffer = ?back.as_raw(), index, shown,
+                        present_hr = format_args!("{:#x}", result.0),
+                        samples = ?hdr.map(|s| s.words()), "actual DXGI Present");
+                }
             }
             #[cfg(not(feature = "diagnostics"))]
             let _ = result;

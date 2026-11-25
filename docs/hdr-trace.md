@@ -4,9 +4,11 @@
 `victory-gpu`. It is compiled only with the `diagnostics` feature, reads its
 switches once at first use, and records nothing unless all of the following
 hold: `VICTORY_HDR_TRACE=1`, `VICTORY_CAPTURE_WORLD` is set, and
-`VICTORY_CAPTURE_LISTED_ONLY=1`. It is active only in the listed world frame
-(`VICTORY_CAPTURE_WORLD` offsets). Disabled, it costs one cached boolean and
-allocates nothing.
+`VICTORY_CAPTURE_LISTED_ONLY=1`. Recording is armed for the run (the title
+records a frame's commands before presenting it, so filtering by the
+presented number misses them); the kept lines are emitted only at the
+selected world frame's Present and are discarded at every other Present.
+Disabled, it costs one cached boolean and allocates nothing.
 
 ## What is recorded, once per frame
 
@@ -51,8 +53,8 @@ $env:VICTORY_LOG              = 'info,victory_gpu::hdr_trace=info'
 Do not set `VICTORY_DUMP_TARGETS`, `VICTORY_DUMP_WRITERS`, `VICTORY_SHOW_TARGET`,
 `VICTORY_GPU_TIMING`, `VICTORY_D3D12_DRED` or `VICTORY_D3D12_DEBUG` for this
 run. The trace is tied to `VICTORY_CAPTURE_WORLD`, not to
-`VICTORY_CAPTURE_FRAMES`. The selected frame must be one the host records
-(commands recorded ahead of the frame are not replayed).
+`VICTORY_CAPTURE_FRAMES`; the trace is flushed at the selected world frame's
+Present, so commands the title recorded ahead are included.
 
 ## Not covered
 

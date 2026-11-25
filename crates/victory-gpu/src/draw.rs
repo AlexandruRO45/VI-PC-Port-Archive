@@ -554,7 +554,7 @@ impl State {
             let t = stage.translated();
             let made = self.tables(list, &t.used, title_compute);
             #[cfg(feature = "diagnostics")]
-            if hdr_trace::active_frame().is_some()
+            if hdr_trace::enabled()
                 && let Some(program) = hdr_trace::Program::from_hash(&stage.shader.hash)
                 && let Some(made) = &made
             {
@@ -2029,10 +2029,12 @@ pub(crate) mod hdr_trace {
         enabled() && crate::capture::listed(frame)
     }
 
+    /// Recording is armed for the whole run: the title records a frame's
+    /// commands before that frame is presented, so filtering by the
+    /// presented number here misses them. Kept lines are flushed only in
+    /// the selected frame's Present.
     pub(crate) fn active_frame() -> Option<u64> {
-        if !enabled() { return None; }
-        let frame = crate::queue::presented() + 1;
-        crate::capture::listed(frame).then_some(frame)
+        enabled().then_some(0)
     }
 
     #[derive(Clone, Copy, Debug)]
@@ -2159,29 +2161,28 @@ pub(crate) mod hdr_trace {
         targets: Vec<Target>,
         samples: Vec<(String, Sample)>,
         args: Option<(Readback, u32, u32, bool, u32)>,
-        issued: bool,
+        submission: u64,
     }
 
     // COM objects here are only D3D12 resources, documented free-threaded.
     // SAFETY: mappings are read only after the submission fence under its lock.
     unsafe impl Send for Event {}
 
-    struct Quota { frame: u64, seen: [u8; 7] }
-    static QUOTA: Mutex<Quota> = Mutex::new(Quota { frame: 0, seen: [0; 7] });
+    struct Quota { seen: [u8; 7] }
+    static QUOTA: Mutex<Quota> = Mutex::new(Quota { seen: [0; 7] });
 
     pub(super) fn before(list: &HostList, program: Program, command: std::fmt::Arguments<'_>,
         bindings: &[Binding], targets: &[Target]) -> Option<Event>
     {
-        let frame = active_frame()?;
+        active_frame()?;
         let mut q = QUOTA.lock().unwrap_or_else(|e| e.into_inner());
-        if q.frame != frame { *q = Quota { frame, seen: [0; 7] }; }
         let seen = &mut q.seen[program as usize];
         if *seen != 0 { return None; }
         *seen = 1;
         drop(q);
-        let mut event = Event { frame, program, command: command.to_string(), bindings: bindings.to_vec(),
+        let mut event = Event { frame: crate::queue::presented() + 1, program, command: command.to_string(), bindings: bindings.to_vec(),
             targets: if program.graphics() { targets.to_vec() } else { Vec::new() },
-            samples: Vec::new(), args: None, issued: false };
+            samples: Vec::new(), args: None, submission: 0 };
         event.record(list, false);
         Some(event)
     }
@@ -2244,46 +2245,51 @@ pub(crate) mod hdr_trace {
         }
     }
 
-    pub(crate) fn submit(list: &HostList, frame: u64, submission: u64, ordinal: usize) {
+    static PENDING: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+    /// Lines kept for the frame now presenting; emitted only if it is the
+    /// selected frame, and dropped either way.
+    pub(crate) fn flush(frame: u64) {
+        let selected = frame_is_selected(frame);
+        let mut pending = PENDING.lock().unwrap_or_else(|e| e.into_inner());
+        if selected {
+            for line in pending.iter() {
+                tracing::info!(target: "victory_gpu::hdr_trace", frame, "{line}");
+            }
+        }
+        pending.clear();
+        *QUOTA.lock().unwrap_or_else(|e| e.into_inner()) = Quota { seen: [0; 7] };
+    }
+
+    pub(crate) fn complete(list: &HostList, _frame: u64, submission: u64, ordinal: usize) {
         let mut events = list.hdr.lock().unwrap_or_else(|e| e.into_inner());
-        for (op, e) in events.iter_mut().enumerate().filter(|(_, e)| e.frame == frame) {
-            e.issued = true;
-            let id = list.list.as_raw();
-            tracing::info!(target: "victory_gpu::hdr_trace", frame, submission, ordinal, list = ?id, op,
-                program = ?e.program, command = %e.command, "recorded host operation");
+        if events.is_empty() { return; }
+        let id = list.list.as_raw();
+        let mut lines = PENDING.lock().unwrap_or_else(|e| e.into_inner());
+        for (op, e) in events.drain(..).enumerate() {
+            let stable = e.bindings.iter().all(|b| b.info.is_none() || b.stable());
+            lines.push(format!("op={op} submission={submission} fence={submission} ordinal={ordinal} list={id:?} program={:?} command={:?}", e.program, e.command));
             for b in &e.bindings {
-                let stable = b.stable();
-                let observed = stable.then_some(b.info).flatten();
+                let observed = b.stable().then_some(b.info).flatten();
                 let effective = observed.and_then(|i| i.effective);
                 let expected_f32 = matches!(e.program, Program::Temporal | Program::Diffusion)
                     && e.program.takes_sample(b.slot, b.offset).is_some();
                 let integer = effective.is_some_and(|f| matches!(f, 3|4|7|8|12|14|17|18|25|30|32|36|38|42|43|50|52|57|59|62|64));
-                tracing::info!(target: "victory_gpu::hdr_trace", frame, submission, ordinal, list = ?id, op,
-                    slot = b.slot, dwords = b.offset, kind = ?b.kind, b.host_slot, cpu = format_args!("{:#x}", b.cpu),
-                    object = format_args!("{:#x}", b.object), ?b.memory, requested = ?b.requested,
-                    effective = ?effective, generation_at_bind = ?b.info.map(|i| i.generation),
-                    generation_now = ?hdr_current(b.cpu).map(|i| i.generation), stable,
-                    backing = ?b.backing.as_ref().map(Interface::as_raw), twin = b.twin,
-                    null_or_unretained = b.backing.is_none(), sub = ?observed.and_then(|i| i.sub),
-                    expected_f32, class_mismatch = expected_f32 && integer, "table view (None = not observed)");
+                lines.push(format!(
+                    "view slot={} dwords={} kind={:?} host_slot={} cpu={:#x} object={:#x} memory={:?} requested={:?} effective={:?} generation_at_bind={:?} generation_now={:?} stable={} backing={:?} twin={} null_or_unretained={} sub={:?} expected_f32={} class_mismatch={}",
+                    b.slot, b.offset, b.kind, b.host_slot, b.cpu, b.object, b.memory, b.requested,
+                    effective, b.info.map(|i| i.generation), hdr_current(b.cpu).map(|i| i.generation),
+                    b.stable(), b.backing.as_ref().map(Interface::as_raw), b.twin,
+                    b.backing.is_none(), observed.and_then(|i| i.sub), expected_f32,
+                    expected_f32 && integer));
             }
             for (mrt, t) in e.targets.iter().enumerate() {
-                tracing::info!(target: "victory_gpu::hdr_trace", frame, submission, ordinal, list = ?id, op, mrt,
-                    object = format_args!("{:#x}", t.object), backing = ?t.backing.as_raw(),
-                    effective = ?t.format, sub = ?t.sub, "bound render target");
+                lines.push(format!("render_target mrt={mrt} object={:#x} backing={:?} effective={:?} sub={:?}",
+                    t.object, t.backing.as_raw(), t.format, t.sub));
             }
-        }
-    }
-
-    pub(crate) fn complete(list: &HostList, frame: u64, fence: u64, ordinal: usize) {
-        let events = list.hdr.lock().unwrap_or_else(|e| e.into_inner());
-        for (op, e) in events.iter().enumerate().filter(|(_, e)| e.frame == frame && e.issued) {
-            let id = list.list.as_raw();
-            let stable = e.bindings.iter().all(|b| b.info.is_none() || b.stable());
             for (name, s) in &e.samples {
-                tracing::info!(target: "victory_gpu::hdr_trace", frame, fence, ordinal, list = ?id, op,
-                    %name, stable, coordinates = ?s.points, footprint_format = s.format, words = ?s.words(),
-                    "raw texels (not shader return values)");
+                lines.push(format!("sample name={name} stable={stable} coordinates={:?} footprint_format={} words={:?}",
+                    s.points, s.format, s.words()));
             }
             if let Some((args, n, stride, counted, kind)) = &e.args {
                 let len = (*n * *stride) as usize;
@@ -2293,8 +2299,7 @@ pub(crate) mod hdr_trace {
                 let found = words.as_ref().zip(live).and_then(|(b, live)| b[..len].chunks_exact(*stride as usize)
                     .take(live).position(|r| r.chunks_exact(4).take(if *kind == 2 { 3 } else { 2 })
                         .all(|w| word(w).is_some_and(|w| w > 0))));
-                tracing::info!(target: "victory_gpu::hdr_trace", frame, fence, ordinal, list = ?id, op,
-                    count, captured_records = n, first_nonempty_record = ?found, "indirect argument prefix");
+                lines.push(format!("indirect count={count:?} captured_records={n} first_nonempty_record={found:?}"));
             }
         }
     }
