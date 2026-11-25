@@ -3630,6 +3630,8 @@ void main(uint3 id : SV_DispatchThreadID) {
         assert!(shown.upgrade().is_some_and(|s| std::sync::Arc::ptr_eq(&s, &found)), "the slot's copy");
         drop(found);
         slots.make_null(0);
+        // Held until the submission that may still use it has run.
+        crate::host::release_retired();
         assert!(shown.upgrade().is_none(), "released with the slot");
     }
 
