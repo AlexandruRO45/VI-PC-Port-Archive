@@ -34,20 +34,30 @@ mod indirect;
 #[cfg(windows)]
 mod inplace;
 pub mod list;
+#[cfg(windows)]
+mod memcopy;
+#[cfg(windows)]
+mod memory;
 pub mod object;
+#[cfg(windows)]
+mod over;
 pub mod pipeline;
+#[cfg(windows)]
+pub mod precompile;
 #[cfg(windows)]
 mod primitive;
 pub mod query;
 pub mod queue;
+#[cfg(windows)]
+mod readback;
+#[cfg(windows)]
+mod rebar;
 pub mod resource;
 pub mod root;
 #[cfg(windows)]
 mod sampler;
 #[cfg(windows)]
 pub mod shader_cache;
-#[cfg(windows)]
-mod memory;
 #[cfg(windows)]
 mod shadow;
 pub mod signature;
@@ -62,5 +72,6 @@ pub use host::on_failure;
 pub use inplace::{title_memory_freeing, title_memory_section, title_memory_view};
 #[cfg(windows)]
 pub use watch::{
-    title_memory_reading, title_memory_remapped, title_memory_remapping, writing as kernel_will_write,
+    title_memory_reading, title_memory_remapped, title_memory_remapping,
+    writing as kernel_will_write,
 };

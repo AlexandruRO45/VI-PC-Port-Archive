@@ -1,3 +1,66 @@
+# VIctory performance & lighting fork (`vitutu1/victory-fork`)
+
+A fork of [fxceless/victory-fork](https://github.com/fxceless/victory-fork) (itself a fork of [VIctory](https://github.com/Marvisak/VIctory)), focused on eliminating CPU/GPU synchronization bottlenecks, fixing pitch-black shadowed interiors, and getting playable framerates on PC.
+
+**This repository contains no game files, code or assets.** You need your own copy of the game. It is not affiliated with or endorsed by the game's developer or publisher.
+
+## Test Hardware & Results
+
+Tested on:
+- **CPU**: AMD Ryzen 7 9800X3D (8 cores / 16 threads)
+- **GPU**: NVIDIA GeForce RTX 4070 SUPER 12 GB (Resizable BAR enabled)
+- **RAM**: 64 GB
+- **OS**: Windows 11 Pro x64
+
+Measured results (up from the previous 2.5–4 fps baseline):
+- **10–14+ fps** in several prologue/interior gameplay zones (e.g., **14 fps / 71 ms** in the prison corridor, **11 fps / 95 ms** in the heist interior, **9 fps / 115 ms** in the cell; **4.5–6.5 fps** in heavier scenes up to ~10,000 draws/frame) using `--console series-s` with `VICTORY_OWN_UPSCALER=1` and `VICTORY_RENDER_SCALE=0.5`.
+- **Shadowed interiors lit**: dark/black shadow areas are now visible via ambient/shadowmask stand-ins (`VICTORY_AMBIENT_STUB=1`, `VICTORY_SHADOWMASK_STUB=1`).
+- **Stability**: `--console series-s` runs stably without the AMD FFX FSR4 `DXGI_ERROR_INVALID_CALL` crash thanks to `VICTORY_OWN_UPSCALER=1`, and without screen flicker.
+
+## What this fork adds on top of `fxceless/victory-fork`
+
+GPU & Synchronization:
+- **Coalesced `CARD_COMPARE` + 128 MiB inline L0 readback ring**: rewrote card-side diffing to 64 coalesced threads per 64 KiB piece with LDS hash reduction and inline readback slots, cutting relay fetch waits from ~200 ms/frame to ~0 ms.
+- **Scoped indirect clamp barriers (`VICTORY_CLAMP_SCOPED`, on by default)**: replaces global full-GPU UAV drains around `ExecuteIndirect` clamps with resource-scoped UAV barriers on dedicated argument/count buffers and drops the redundant post-clamp global barrier.
+- **Per-list UAV barrier deduplication (`VICTORY_BARRIER_MERGE`, on by default)**: tracks `uav_pending` (including image stores) per `HostList` and skips redundant global UAV barriers in `barrier_groups` and clamp passes.
+- **Larger indirect clamp windows & light PSO restore**: `VICTORY_INDIRECT_WINDOW` enabled by default, `VICTORY_INDIRECT_WINDOW_MOST` raised from `64` to `4096`, and `VICTORY_CLAMP_LIGHT_RESTORE` enabled by default so graphics root bindings survive clamp passes.
+
+CPU, Memory & Cache:
+- **Overlapped texture refreshes & fast hashing** (`VICTORY_TEXTURE_OVERLAP`, `VICTORY_FAST_HASH`, `VICTORY_KNOWN_WRITES`, all on by default).
+- **Eliminated CPU stalls & frame spikes**: removed O(N²) loops in `host.rs`, switched `heap_buffers` pruning/refresh to 1/16th incremental per frame (eliminating ~142 ms spikes), relaxed VRAM texture eviction (`EVICT_IDLE_FRAMES=120`), enabled parallel refresh flushes, and added ahead-of-time shader cache precompilation (`precompile`).
+
+Visuals, Loader & Input:
+- **Lighting stand-ins & shader fixes**: `VICTORY_AMBIENT_STUB=1`, `VICTORY_SHADOWMASK_STUB=1`, `VICTORY_EXPOSURE_STUB=1`, and merged GS/HS lowering.
+- **Series S overlay compositing** (`over.rs`) and **loader resolution/upscaler hooks** (`VICTORY_OWN_UPSCALER=1`, `VICTORY_RENDER_SCALE=<0.2..=1.0>`, `VICTORY_NO_WATCHDOG=1`).
+- **Keyboard & mouse input** (`kbm.rs` / `controls.rs`) with mouse capture toggle (`Alt` frees cursor).
+
+## Recommended Launch Command (Series S, 10+ fps profile)
+
+```powershell
+$env:VICTORY_CARD_BUFFERS_MIN_MB = "1"
+$env:VICTORY_CARD_BUFFERS_MB = "2048"
+$env:VICTORY_RELAY = "2"
+$env:VICTORY_LATE_WAIT = "3"
+$env:VICTORY_WIDE_BACK = "1"
+$env:VICTORY_LIBRARY_TRIM = "0"
+$env:VICTORY_REBAR = "0"
+$env:VICTORY_COPY_BACK_ONLY_READBACK = "0"
+$env:VICTORY_AMBIENT_STUB = "1"
+$env:VICTORY_SHADOWMASK_STUB = "1"
+$env:VICTORY_OWN_UPSCALER = "1"
+$env:VICTORY_RENDER_SCALE = "0.5"
+.\target\release\victory.exe run --console series-s --execute "<path-to-game-exe>"
+```
+
+## Inspiration & Credits
+
+- **[VIctory](https://github.com/Marvisak/VIctory)** by Marvisak and contributors (GPL-3.0-or-later) — the foundational compatibility layer, loader, D3D12 backend, and GFX10 → DXIL shader recompiler.
+- **[fxceless/victory-fork](https://github.com/fxceless/victory-fork)** (GPL-3.0-or-later) — the direct parent fork bringing world rendering, shader optimizations, card buffers, relay threading, and in-place memory experiments.
+- **[ZigZagBoi1/ScarlettPort](https://github.com/ZigZagBoi1/ScarlettPort)** (`runtime/victory`, GPL-3.0-or-later) — source of inspiration and ported GPL-3.0-or-later modules/ideas including lighting stand-ins (`stand_in.rs`, `exposure.rs`), merged shaders, Series S present plane compositing (`over.rs`), keyboard & mouse input (`kbm.rs`, `controls.rs`), `memcopy` / `rebar` / `readback` work, scoped indirect barriers, UAV barrier merging, and loader upscaler/render-scale hooks.
+- **[XCL](https://github.com/ivall/xcl)** by ivall and contributors (GPL-2.0-only) — referenced purely for behavioral comparison; no GPL-2.0-only code is included here.
+
+---
+
 # VIctory fork (work in progress)
 
 A work-in-progress fork of [VIctory](https://github.com/Marvisak/VIctory), a

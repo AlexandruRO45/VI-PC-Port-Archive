@@ -1385,12 +1385,11 @@ pub(crate) fn room() -> bool {
 }
 
 /// The share of the card's budget, in percent, up to which host copies of
-/// textures picked by index are made ([`room`]): 90 unless
-/// `VICTORY_TEXTURE_ROOM_PERCENT` says another (50 to 97). At 90 about a
-/// tenth of the budget, 1,020 MB of 10,200, stays unused while thousands of
-/// textures wait (runs 170-174); the card copies of title buffers from
-/// 1 MiB up take 449 MB more of the card than before (941 against 492),
-/// and 94 gives the textures about that much back.
+/// textures picked by index are made ([`room`]): 75 unless
+/// `VICTORY_TEXTURE_ROOM_PERCENT` says another (50 to 97). Leaving ~25%
+/// headroom keeps hot compute/skinning card buffers (which may use up to
+/// `VICTORY_CARD_VRAM_PERCENT`, default 92%) in local VRAM instead of
+/// spilling onto PCIe shared memory.
 #[cfg(windows)]
 fn room_percent() -> u64 {
     static PERCENT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
@@ -1398,7 +1397,7 @@ fn room_percent() -> u64 {
         std::env::var("VICTORY_TEXTURE_ROOM_PERCENT")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
-            .map_or(90, |percent| percent.clamp(50, 97))
+            .map_or(82, |percent| percent.clamp(50, 97))
     })
 }
 
@@ -1606,6 +1605,14 @@ pub(crate) fn card_accounting(room: bool, due: [u64; 5], never: Vec<(u64, u64)>,
     }
 }
 
+/// Whether LRU texture eviction from descriptor heaps under VRAM pressure is
+/// enabled (on by default; `VICTORY_TEXTURE_EVICT=0` disables it).
+#[cfg(windows)]
+fn evict_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_EVICT").is_none_or(|v| v != "0"))
+}
+
 /// Lets go of the host copies of textures the title fills that nothing
 /// names any more: placed textures were never released (one host texture
 /// per address and description ever viewed: 18,639 of them, 2.5 GB, after
@@ -1632,7 +1639,7 @@ pub(crate) fn card_accounting(room: bool, due: [u64; 5], never: Vec<(u64, u64)>,
 #[cfg(windows)]
 pub(crate) fn let_go_idle() {
     use std::sync::atomic::Ordering::Relaxed;
-    const IDLE_FRAMES: u64 = 4;
+    const IDLE_FRAMES: u64 = 30;
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if !*ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_SWEEP").is_none_or(|v| v != "0")) {
         return;
@@ -1677,6 +1684,7 @@ pub(crate) fn let_go_idle() {
             crate::host::retire(host);
         }
     }
+    drop(all);
     if went > 0 {
         crate::host::trail(|| {
             format!(
@@ -1685,6 +1693,128 @@ pub(crate) fn let_go_idle() {
                 first.unwrap_or(0)
             )
         });
+    }
+    evict_under_vram_pressure(idle_ms);
+}
+
+/// When VRAM usage exceeds [`room_percent`], unpins the least-recently-used
+/// idle title-filled textures from shader-visible descriptor heaps (replacing
+/// their slots with valid null SRVs) and frees their host copies so hot
+/// compute buffers and newly streamed textures have VRAM headroom.
+/// Called only from [`let_go_idle`] inside `sweep()` when no GPU submission is
+/// in flight.
+#[cfg(windows)]
+fn evict_under_vram_pressure(idle_ms: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    const EVICT_IDLE_FRAMES: u64 = 120;
+    const MIN_FREE: u64 = 128 << 20;
+    const MAX_FREE: u64 = 512 << 20;
+
+    if !evict_enabled() {
+        return;
+    }
+    let Some([budget, used, ..]) = crate::host::host().and_then(|h| h.video_memory()) else {
+        return;
+    };
+    let cap = budget / 100 * room_percent().max(90);
+    if budget == 0 || used < cap {
+        return;
+    }
+    let goal = budget / 100 * room_percent().max(90).saturating_sub(6);
+    let target = used.saturating_sub(goal).clamp(MIN_FREE, MAX_FREE);
+
+    // Pass 1: gather LRU candidates under `TEXTURES` lock, then drop it before
+    // touching descriptor heaps so lock ordering stays strictly acyclic.
+    let mut candidates: Vec<(u64, usize, usize, u64)> = {
+        let all = textures();
+        let mut out = Vec::new();
+        for &at in all.iter() {
+            // SAFETY: every entry in `TEXTURES` is live under its lock.
+            let r = unsafe { &*(at as *const Resource) };
+            if !fills(&r.desc) || crate::texture::host_wrote(at) {
+                continue;
+            }
+            let last_used = r.host.used.load(Relaxed);
+            if !crate::host::long_ago(last_used, idle_ms, EVICT_IDLE_FRAMES) {
+                continue;
+            }
+            let made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some((host, _)) = made.as_ref()
+                && std::sync::Arc::strong_count(host) == 1
+                && crate::host::references(&host.texture) > 1
+            {
+                let raw = windows::core::Interface::as_raw(&host.texture) as usize;
+                out.push((last_used, at, raw, host.bytes));
+            }
+        }
+        out
+    };
+    if candidates.is_empty() {
+        return;
+    }
+    // Oldest `moment()` first (frame in high 32 bits, tenths in low 32 bits).
+    candidates.sort_unstable_by_key(|&(last_used, _, _, _)| last_used);
+
+    let mut victim_ptrs = std::collections::HashSet::new();
+    let mut victim_resources = Vec::new();
+    let mut selected = 0u64;
+    for (_, at, raw, bytes) in candidates {
+        victim_ptrs.insert(raw);
+        victim_resources.push(at);
+        selected += bytes;
+        if selected >= target {
+            break;
+        }
+    }
+
+    let slots_cleared = crate::descriptor::evict_kept_resources(&victim_ptrs);
+    if slots_cleared == 0 {
+        return;
+    }
+
+    // Pass 2: now that descriptor heaps released their COM references (and no
+    // submission is in flight), free every victim whose refcount dropped to 1.
+    let (mut freed, mut freed_bytes) = (0u64, 0u64);
+    {
+        let all = textures();
+        for at in victim_resources {
+            if !all.contains(&at) {
+                continue;
+            }
+            // SAFETY: `at` is still live in `TEXTURES` under the lock.
+            let r = unsafe { &*(at as *const Resource) };
+            let gone = {
+                let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+                let ready = made.as_ref().is_some_and(|(host, _)| {
+                    std::sync::Arc::strong_count(host) == 1
+                        && crate::host::references(&host.texture) == 1
+                });
+                if ready {
+                    crate::texture::unstage(at as This);
+                    made.take()
+                } else {
+                    None
+                }
+            };
+            if let Some((host, _)) = gone {
+                r.host.gone.store(true, Relaxed);
+                KINDS[2].fetch_add(1, Relaxed);
+                KINDS[3].fetch_add(host.bytes, Relaxed);
+                freed += 1;
+                freed_bytes += host.bytes;
+                crate::host::retire(host);
+            }
+        }
+    }
+    if freed > 0 {
+        tracing::info!(
+            textures = freed,
+            mb = freed_bytes >> 20,
+            slots_cleared,
+            vram_used_mb = used >> 20,
+            vram_budget_mb = budget >> 20,
+            "VRAM pressure: evicted LRU idle textures from descriptor heaps"
+        );
     }
 }
 
@@ -2016,6 +2146,9 @@ fn hand_out_resource(
     if desc.dimension == BUFFER {
         let at = std::ptr::from_ref::<Resource>(&resource) as usize;
         crate::shadow::register(at, resource.data() as u64, desc.width);
+        if crate::readback::creating_readback() {
+            crate::readback::tag(resource.data() as u64, desc.width);
+        }
     }
     object::hand_out(RESOURCE, resource, iid, &RESOURCE_IIDS, out)
 }
@@ -2034,6 +2167,8 @@ impl Drop for Resource {
                     targets.remove(&at);
                 }
             }
+        } else {
+            crate::readback::untag(self.data() as u64);
         }
         let made = self
             .host
