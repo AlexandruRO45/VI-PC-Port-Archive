@@ -3883,13 +3883,20 @@ impl<'a> Lower<'a> {
         let kind = self.used_kind(src);
         let c = self.cur;
         let (base, extra) = self.built_offset(src)?;
-        let offset = &((*offset as u32).wrapping_add(base) as i32);
-        let mut addr = self.s.m.i32(*offset as u32);
+        // RDNA ISA guide §8 (Scalar Memory Operations): address components are
+        // in bytes but the two LSBs of the immediate offset and of soffset are
+        // ignored independently before they are summed. Descriptor `base` /
+        // dynamic `extra` are not instruction operands and stay unmasked.
+        let imm = (*offset as u32) & !3;
+        let total = imm.wrapping_add(base);
+        let mut addr = self.s.m.i32(total);
         if let Some(x) = extra {
             addr = self.s.m.bin(c, Bin::Add, addr, x);
         }
         if !matches!(soffset, Operand::Scalar { code: NULL, .. }) {
             let so = self.operand(inst, soffset)?;
+            let mask = self.s.m.i32(!3u32);
+            let so = self.s.m.bin(c, Bin::And, so, mask);
             addr = self.s.m.bin(c, Bin::Add, addr, so);
         }
         if matches!(src, Source::Built { address, .. } if address.param == CODE) {
@@ -3945,7 +3952,7 @@ impl<'a> Lower<'a> {
             V::Const(_)
                 if matches!(soffset, Operand::Scalar { code: NULL, .. }) && extra.is_none() =>
             {
-                Some(*offset as u32)
+                Some(total)
             }
             _ => None,
         };
@@ -10724,5 +10731,50 @@ mod tests {
         for a in [1, 3, 4] {
             assert_eq!(param(a), "- - - - - - - -");
         }
+    }
+
+    /// RDNA ISA §8: `s_buffer_load_dword*` ignores the two LSBs of `soffset`
+    /// and of the immediate offset independently. The distinguishing case
+    /// `soffset = 3, offset:3` must lower (non-constant path); a GPU test in
+    /// `valu_tests` checks it reads dword 0, not dword 1.
+    #[test]
+    fn s_buffer_load_with_unaligned_soffset_and_offset_lowers() {
+        // Hardware rule: independent truncation, not sum-then-shift.
+        assert_eq!((3u32 & !3) + (3u32 & !3), 0);
+        assert_eq!((3u32 + 3) >> 2, 1);
+        let words = [
+            0xBE85_0380u32, // s_mov_b32 s5, 0
+            0xF408_0202,    // s_load_dwordx4 s[8:11], s[4:5], 0 (CBV)
+            0xFA00_0000,
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            // s_buffer_load_dword s16, s[8:11], s0 offset:3
+            0xF420_0404,
+            0x0000_0003,
+            0xBF8C_C07F,
+            0x7E00_0210, // v_mov_b32 v0, s16
+            0xD834_0000, // ds_write_b32 v0, v0
+            0x0000_0000,
+            S_ENDPGM,
+        ];
+        let constants = RootParam {
+            sgprs: 1,
+            ..root(RootType::Constants, 0, 0)
+        };
+        let cbv = UsedResource {
+            kind: ResourceType::Cbv,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 4,
+            slot: 1,
+        };
+        lower_with(
+            &words,
+            vec![constants, root(RootType::Table, 4, 1)],
+            vec![cbv],
+        )
+        .expect("s_buffer_load with soffset=s0 offset:3");
     }
 }
