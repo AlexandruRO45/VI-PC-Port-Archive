@@ -112,7 +112,6 @@ pub(crate) struct CardCopy {
     pub(crate) shadow: Arc<Shadow>,
     pub(crate) offset: u64,
     pub(crate) len: u64,
-    pages: std::ops::Range<usize>,
 }
 
 /// Live two-sided shadows, including exact view slices that `all()` omits.
@@ -234,7 +233,6 @@ impl Shadow {
             shadow: self.clone(),
             offset: self.base + (from - start) as u64,
             len: (to - from) as u64,
-            pages,
         })
     }
 
@@ -812,21 +810,6 @@ impl Shadow {
     }
 }
 
-impl CardCopy {
-    /// The staging pages copied by an accepted copy-up are current on the
-    /// GPU side now.
-    pub(crate) fn clear_stale(&self) {
-        let Some(stale) = &self.shadow.stale else {
-            return;
-        };
-        let mut stale = stale.lock().unwrap_or_else(|e| e.into_inner());
-        for page in self.pages.clone() {
-            if let Some(value) = stale.get_mut(page) {
-                *value = false;
-            }
-        }
-    }
-}
 
 fn live_cards() -> Vec<Arc<Shadow>> {
     let mut cards = cards();
@@ -854,7 +837,9 @@ pub(crate) fn card_uploads() -> Vec<CardCopy> {
         let Some(stale) = &shadow.stale else {
             continue;
         };
-        let stale = stale.lock().unwrap_or_else(|e| e.into_inner());
+        // Taken and cleared under one lock: a page marked after this is copied
+        // up by the next submission, never dropped between the copy and the clear.
+        let mut stale = stale.lock().unwrap_or_else(|e| e.into_inner());
         let mut page = 0;
         while page < stale.len() {
             if !stale[page] {
@@ -866,6 +851,7 @@ pub(crate) fn card_uploads() -> Vec<CardCopy> {
             while page < stale.len() && stale[page] {
                 page += 1;
             }
+            stale[first..page].fill(false);
             if let Some(copy) = shadow.card_copy(first..page) {
                 copies.push(copy);
             }

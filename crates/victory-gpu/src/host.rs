@@ -1217,9 +1217,6 @@ impl Host {
         // SAFETY: a closed list; later title lists run on this same queue.
         unsafe { self.queue.ExecuteCommandLists(&[Some(list)]) };
         let bytes: u64 = copies.iter().map(|copy| copy.len).sum();
-        for copy in copies {
-            copy.clear_stale();
-        }
         CARD_COPY_BYTES[0].fetch_add(bytes, Ordering::Relaxed);
         Ok(bytes)
     }
