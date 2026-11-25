@@ -693,6 +693,7 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             }
             ensure_state(list, dst, COPY_DEST);
             ensure_state(list, src, COPY_SOURCE);
+            list.note_other_gpu_work();
             crate::texture::host_writes(list, dst);
             #[cfg(feature = "diagnostics")]
             list.note_op(|| format!("copy resource {src:?} to {dst:?}"));
@@ -749,6 +750,7 @@ extern "system" fn copy_texture_region(
         else {
             return;
         };
+        list.note_other_gpu_work();
         let Some(to) = crate::resource::host_resource(dst.resource) else {
             if dst.kind == FOOTPRINT && src.kind != FOOTPRINT {
                 read_back(list, &dst, [x, y, z], &src, source_box);
@@ -983,6 +985,7 @@ extern "system" fn resolve(
         };
         use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
         use windows::core::Interface;
+        list.note_other_gpu_work();
         const RESOLVE_DEST: u32 = 0x1000;
         const RESOLVE_SOURCE: u32 = 0x2000;
         ensure_state(list, dst, RESOLVE_DEST);
@@ -1044,6 +1047,7 @@ extern "system" fn clear_rtv(
         else {
             return;
         };
+        list.note_other_gpu_work();
         let (Some(texture), Some(host)) = (
             crate::resource::host_resource(record.resource),
             crate::host::host(),
@@ -1095,6 +1099,7 @@ extern "system" fn clear_dsv(
         else {
             return;
         };
+        list.note_other_gpu_work();
         let (Some(texture), Some(host)) = (
             crate::resource::host_resource(record.resource),
             crate::host::host(),

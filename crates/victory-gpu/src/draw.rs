@@ -209,6 +209,9 @@ fn root_view(list: &HostList, address: u64, srv: bool, uav: bool) -> Option<u64>
     if srv || uav || gpu % 256 == 0 {
         shadow.refresh(list, address, len);
         if uav {
+            if len < shadow.left(address) {
+                list.note_other_gpu_work();
+            }
             // A host root descriptor: no heap view, so its writes are not
             // marked.
             shadow.gpu_writes(list, address, len, false);
@@ -216,7 +219,7 @@ fn root_view(list: &HostList, address: u64, srv: bool, uav: bool) -> Option<u64>
         return Some(gpu);
     }
     let (gpu, to) = list.scratch(len)?;
-    list.defer_fill(to, address as *const u8, len as usize);
+    list.defer_root_fill(to, address as usize, len as usize, shadow);
     Some(gpu)
 }
 
@@ -864,6 +867,9 @@ impl State {
                 for (address, shadow) in &roots {
                     if let (Some(shadow), Some((_, map))) = (shadow, &self.memory) {
                         let len = shadow.left(*address).min(1 << 20);
+                        if len < shadow.left(*address) {
+                            list.note_other_gpu_work();
+                        }
                         shadow.refresh(list, *address, len);
                         shadow.gpu_writes(list, *address, len, false);
                         map.precise(*address, len);
@@ -919,6 +925,10 @@ impl State {
         };
         shadow.refresh(list, address, shadow.left(address));
         if uav {
+            if !shadow.marked() {
+                // A view with no marks can reach past its fallback snapshot.
+                list.note_other_gpu_work();
+            }
             // Writes through the view are marked wherever they land in the
             // copy; else declared for 1 MiB.
             let len = if shadow.marked() { shadow.left(address) } else { shadow.left(address).min(1 << 20) };
@@ -998,6 +1008,7 @@ impl State {
         float: bool,
         rects: &[RECT],
     ) {
+        list.note_other_gpu_work();
         let Some(view) = crate::descriptor::view(cpu) else {
             once!("an unordered access clear of a slot without a view");
             return;
@@ -1068,6 +1079,20 @@ impl State {
             once!("a dispatch with a graphics pipeline");
             return;
         }
+        self.dispatch_bound(list, p, x, y, z);
+    }
+
+    fn dispatch_bound(&mut self, list: &HostList, p: &HostPipeline, x: u32, y: u32, z: u32) {
+        let bounded = p.stages.iter().all(|stage| {
+            let t = stage.translated();
+            !t.host.heap && t.used.iter().all(|r| r.root == RootType::Descriptor)
+                && (t.host.view_marks || !t.host.user_data.iter().any(|u| {
+                    is_root_view(u) && u.dword == victory_shader::emit::ROOT_UAV_VIEW
+                }))
+        });
+        if !bounded {
+            list.note_other_gpu_work();
+        }
         if !self.bind(list, p, true) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
@@ -1080,6 +1105,9 @@ impl State {
         self.probe_small(list, true);
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
+        if bounded {
+            list.note_buffer_dispatch(p.stages.iter().any(|s| s.memory.is_some()));
+        }
         #[cfg(feature = "diagnostics")]
         self.probe_written(list);
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
@@ -1153,6 +1181,7 @@ impl State {
     /// Runs a mesh dispatch of `x` groups on the host (the title's mesh
     /// programs are one-dimensional).
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
+        list.note_other_gpu_work();
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
         let ran = self.prepare_for(list, false, true)
@@ -1514,6 +1543,7 @@ impl State {
         first: u32,
         first_instance: u32,
     ) {
+        list.note_other_gpu_work();
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
         // Rectangles: completed by the pipeline's geometry shader, else
@@ -1618,6 +1648,7 @@ impl State {
         base: i32,
         first_instance: u32,
     ) {
+        list.note_other_gpu_work();
         #[cfg(feature = "diagnostics")]
         self.trace("indexed", indices, first);
         let rects = self.topology == RECTANGLES && !self.completes_rectangles();
@@ -1658,6 +1689,7 @@ impl State {
         arguments: u64,
         count: Option<u64>,
     ) -> bool {
+        list.note_other_gpu_work();
         // Skip before the argument clamp can mutate the indirect buffer.
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
@@ -1977,6 +2009,10 @@ const QUAD_STRIP: u32 = 20;
 
 #[cfg(test)]
 mod tests {
+    mod interleaved {
+        include!("draw/interleaved_tests.rs");
+    }
+
     use super::*;
     use crate::object::{HRESULT, S_OK};
     use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;

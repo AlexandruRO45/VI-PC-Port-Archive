@@ -467,8 +467,13 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
     let precise: Arc<Mutex<Vec<(u64, u64)>>> = Arc::default();
     let byte_for_byte = precise.clone();
     let data = data as usize;
+    let retained: Arc<Mutex<Option<Arc<Layout>>>> = Arc::default();
+    let for_missed = retained.clone();
+    let for_pages = retained.clone();
+    let retain = retained.clone();
     list.defer_missed(move || {
-        let l = layout(key);
+        let l = for_missed.lock().unwrap_or_else(|e| e.into_inner())
+            .clone().unwrap_or_else(|| layout(key));
         // SAFETY: the bitmap is mapped and the list's run is over.
         let marks = unsafe { std::slice::from_raw_parts(data as *const u32, words) };
         marks.iter().enumerate().any(|(w, &mark)| {
@@ -479,7 +484,9 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
         })
     });
     list.defer_memory_pages(move |held| {
-        let Layout { copies, blocks, owner, .. } = &*layout(key);
+        let l = for_pages.lock().unwrap_or_else(|e| e.into_inner())
+            .clone().unwrap_or_else(|| layout(key));
+        let Layout { copies, blocks, owner, .. } = &*l;
         // SAFETY: the prefix fence finished the GPU's use of this bitmap.
         let marks = unsafe { std::slice::from_raw_parts(data as *const u32, words) };
         for (w, &word) in marks.iter().enumerate() {
@@ -496,8 +503,12 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
             }
         }
     });
-    list.defer_after(move || {
-        let Layout { copies, blocks, owner, .. } = &*layout(key);
+    list.defer_memory_completion(move || {
+        *retain.lock().unwrap_or_else(|e| e.into_inner()) = Some(layout(key));
+    }, move || {
+        let l = retained.lock().unwrap_or_else(|e| e.into_inner())
+            .take().unwrap_or_else(|| layout(key));
+        let Layout { copies, blocks, owner, .. } = &*l;
         let precise = byte_for_byte.lock().unwrap_or_else(|e| e.into_inner());
         // SAFETY: the bitmap is mapped and the list's run is over.
         let marks = unsafe { std::slice::from_raw_parts_mut(data as *mut u32, words) };

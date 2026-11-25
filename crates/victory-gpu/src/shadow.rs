@@ -248,6 +248,15 @@ impl Shadow {
         self.marks.is_some()
     }
 
+    /// A private root constant upload after the producer fence.
+    pub(crate) fn stage_private(&self, address: usize, len: usize, dst: *mut u8) {
+        let offset = address - self.start as usize;
+        assert!(offset + len <= self.len as usize);
+        // SAFETY: the source is inside the fenced shadow. The caller is
+        // preparing the recorded consumer's nonoverlapping upload span.
+        unsafe { self.data.add(offset).copy_to_nonoverlapping(dst, len) };
+    }
+
     /// Refresh only bytes delivered by an ordered title copy. A whole
     /// page refresh at a native fence would replace GPU data on that page.
     /// Keep the snapshot in sync so these bytes are not copied back as GPU
