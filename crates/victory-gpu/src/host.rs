@@ -1083,6 +1083,7 @@ impl Host {
         }
     }
 
+    /// With `VICTORY_D3D12_DRED`: the faulting address and the allocations
     /// it lies in (by the names we give them) or the title memory copy just
     /// below it; for each list that did not finish, the command it stopped
     /// at and what the draws and dispatches in flight there run (or, in
