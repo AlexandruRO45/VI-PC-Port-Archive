@@ -52,10 +52,11 @@ Requirements: Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with
 shader model 6.6 (and mesh shaders for the world), Rust (pinned in
 `rust-toolchain.toml`).
 
-On Windows 10 the in-box Direct3D 12 runtime stops at shader model 6.5: a GPU
-that supports 6.6 still reports `the device supports SM 0x65 only` until the
-process loads a Direct3D 12 Agility SDK runtime (see #84). Windows 11's in-box
-runtime already offers 6.6 on capable GPUs.
+The standard build requires Windows 11 and a GPU that supports shader model
+6.6. On Windows 10, VIctory requires a build that opts into the Direct3D 12
+Agility SDK: downloading the SDK or placing `D3D12Core.dll` beside a standard
+`victory.exe` alone will not make that build report SM 6.6. See #84 for
+current status.
 
 To install Rust, use rustup (`winget install --id Rustlang.Rustup -e`, or
 the installer from https://rustup.rs). The first `cargo` command in this
