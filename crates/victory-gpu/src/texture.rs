@@ -69,9 +69,10 @@ struct Last {
 }
 
 impl Last {
-    /// Throttle polling, not a refresh prompted by a known new write.
-    fn partial_due(&self, frame: u64, written: bool) -> bool {
-        written || self.partial.is_none_or(|at| frame.saturating_sub(at) >= 30)
+    /// Sparse view blocks can be reported as written on every guard query
+    /// even when unchanged. Keep their expensive reads bounded regardless.
+    fn partial_due(&self, frame: u64) -> bool {
+        self.partial.is_none_or(|at| frame.saturating_sub(at) >= 30)
     }
 
     /// All-zero reads from partially mapped memory are not uploaded.
@@ -668,13 +669,11 @@ impl Staging {
         // texture's address, so the textures take turns.
         // `VICTORY_TEXTURE_GUARD=0` hashes at every check, as before.
         static GUARD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let mut guard_written = false;
         if *GUARD.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_GUARD").is_none_or(|v| v != "0"))
             && let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, true))
         {
             const HASH_EVERY: u64 = 8;
             let unwritten = last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked);
-            guard_written = last.asked != 0 && !unwritten;
             last.asked = now;
             let turn = crate::frame::current().wrapping_add((start >> 16) as u64).is_multiple_of(HASH_EVERY);
             if unwritten && !turn {
@@ -703,11 +702,10 @@ impl Staging {
             // there, the usual state while it streams in. Read through the
             // copy, which stands unmapped pages (zeros), and upload what
             // is there; nothing at all mapped changes nothing.
-            // Poll at most every 30 frames when no new write is known
-            // (reading around unmapped pages is slow). An observed write
-            // or remap must not be swallowed by that polling throttle.
+            // Poll at most every 30 frames: the guard conservatively reports
+            // unprotectable sparse blocks even without an actual write.
             let frame = crate::frame::current();
-            if !last.partial_due(frame, guard_written) {
+            if !last.partial_due(frame) {
                 return 0;
             }
             last.partial = Some(frame);
@@ -1080,18 +1078,23 @@ mod title_memory_tests {
     use super::{Last, with_title};
 
     #[test]
-    fn partial_poll_throttle_does_not_hide_new_writes() {
+    fn repeated_sparse_guard_reports_do_not_bypass_partial_throttle() {
         let mut last = Last::default();
-        assert!(last.partial_due(100, false));
-        last.partial = Some(100);
-        for frame in 100..130 {
-            assert!(!last.partial_due(frame, false));
-            assert!(last.partial_due(frame, true));
+        let mut reads = Vec::new();
+        // Simulate every submission reaching the sparse read path due to
+        // a conservative guard report (including repeated queries per frame).
+        for frame in 100..191 {
+            for _ in 0..32 {
+                if last.partial_due(frame) {
+                    reads.push(frame);
+                    last.partial = Some(frame);
+                }
+            }
         }
-        assert!(last.partial_due(130, false));
-        assert!(last.partial_due(130, true));
+        assert_eq!(reads, [100, 130, 160, 190]);
+        // A fully mapped path clears the partial polling state.
         last.partial = None;
-        assert!(last.partial_due(131, false));
+        assert!(last.partial_due(191));
     }
 
     #[test]
