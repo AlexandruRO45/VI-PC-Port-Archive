@@ -36,12 +36,95 @@ impl PreciseRanges {
     }
 }
 
+/// Avoid sorting/allocating for small or lightly queried range lists.
+/// The measured crossover depends on query count and hit position. Start
+/// linearly and build the index only after the equivalent of 32 full scans.
+pub(super) struct AdaptiveRanges<'a> {
+    ranges: &'a [(u64, u64)],
+    comparisons: usize,
+    index: Option<PreciseRanges>,
+}
+
+impl<'a> AdaptiveRanges<'a> {
+    pub(super) fn new(ranges: &'a [(u64, u64)]) -> Self {
+        Self { ranges, comparisons: 0, index: None }
+    }
+
+    pub(super) fn overlaps(&mut self, from: u64, to: u64) -> bool {
+        if from >= to {
+            return false;
+        }
+        if let Some(index) = &self.index {
+            return index.overlaps(from, to);
+        }
+        let n = self.ranges.len();
+        if n >= 8 && self.comparisons >= n.saturating_mul(32) {
+            let index = self.index.insert(PreciseRanges::new(self.ranges));
+            return index.overlaps(from, to);
+        }
+        let hit = self.ranges.iter().position(|&(a, len)| {
+            a < to && from < a.saturating_add(len)
+        });
+        if n >= 8 {
+            self.comparisons = self.comparisons.saturating_add(hit.map_or(n, |i| i + 1));
+        }
+        hit.is_some()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn reference(ranges: &[(u64, u64)], from: u64, to: u64) -> bool {
         ranges.iter().any(|&(a, n)| a < to && from < a.saturating_add(n))
+    }
+
+
+    #[test]
+    fn adaptive_index_waits_for_work_and_keeps_small_inputs_linear() {
+        let ranges = vec![(0, 1); 64];
+        let mut lookup = AdaptiveRanges::new(&ranges);
+        assert!(lookup.index.is_none());
+        // Hits at the first range should not pay for an index.
+        for _ in 0..1024 {
+            assert!(lookup.overlaps(0, 1));
+        }
+        assert!(lookup.index.is_none());
+
+        // Repeated misses pay for the index; no result changes.
+        for _ in 0..64 {
+            assert!(!lookup.overlaps(2, 3));
+        }
+        assert!(lookup.index.is_some());
+        assert!(lookup.overlaps(0, 1));
+
+        let mut small = AdaptiveRanges::new(&ranges[..4]);
+        for _ in 0..4096 {
+            assert!(!small.overlaps(2, 3));
+        }
+        assert!(small.index.is_none());
+    }
+
+    #[test]
+    fn adaptive_lookup_matches_reference_before_and_after_indexing() {
+        let ranges: Vec<_> = (0..128u64)
+            .rev()
+            .map(|i| (i * 65536 + 7, i % 3 * 65536))
+            .chain([(u64::MAX - 2, 8), (1, 65536 * 20)])
+            .collect();
+        let mut lookup = AdaptiveRanges::new(&ranges);
+        assert!(!lookup.overlaps(1, 1));
+        assert!(!lookup.overlaps(2, 1));
+        for i in 0..4096u64 {
+            let from = (i * 37 % 257) * 65536;
+            assert_eq!(
+                lookup.overlaps(from, from + 65536),
+                reference(&ranges, from, from + 65536)
+            );
+        }
+        assert!(lookup.index.is_some());
+        assert!(lookup.overlaps(u64::MAX - 1, u64::MAX));
     }
 
     #[test]

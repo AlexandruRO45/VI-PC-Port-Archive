@@ -42,7 +42,7 @@ use crate::host::HostList;
 use crate::shadow::Shadow;
 
 mod precise_ranges;
-use precise_ranges::PreciseRanges;
+use precise_ranges::AdaptiveRanges;
 
 /// Pages per level-2 block: 4096 pages of 64 KiB, 256 MiB.
 const BLOCK: usize = 4096;
@@ -485,7 +485,7 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
         let Layout { copies, blocks, owner, .. } = &*layout(key);
         // Freeze the declared ranges for this readback.
         let declared = byte_for_byte.lock().unwrap_or_else(|e| e.into_inner());
-        let precise = PreciseRanges::new(&declared);
+        let mut precise = AdaptiveRanges::new(&declared);
         // SAFETY: the bitmap is mapped and the list's run is over.
         let marks = unsafe { std::slice::from_raw_parts_mut(data as *mut u32, words) };
         let (mut pages, mut regions, mut missed) = (0, 0, Vec::new());
@@ -513,6 +513,9 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
                 }
             }
         }
+        // No more range queries: release the registry before copying pages.
+        drop(precise);
+        drop(declared);
         // What shaders computed from memory with no copy (read as zeros) is
         // not the console's: it does not go into title memory, where it broke
         // the title's own data (garbage pointers in title threads, run c1),
