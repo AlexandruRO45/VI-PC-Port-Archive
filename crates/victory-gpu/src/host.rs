@@ -3577,6 +3577,14 @@ fn late_line(frames: f64) {
         let [pages, runs, bytes] = crate::shadow::merged_stats().map(|n| n as f64 / frames);
         let why = crate::shadow::merge_why_stats().map(|n| n as f64 / frames);
         let [masked_pages, masked_runs] = crate::shadow::masked_stats().map(|n| n as f64 / frames);
+        let [landed, landed_mb, differ, span_mb, differ_mb] = crate::shadow::card_landed_stats().map(|n| n as f64 / frames);
+        tracing::info!(
+            "card pieces merged by the copy-back per frame: {landed:.0} pieces, {:.1} MB; {differ:.0} of them with a byte that \
+             differs, {:.2} MB from first to last difference, {:.3} MB that differ",
+            landed_mb / (1 << 20) as f64,
+            span_mb / (1 << 20) as f64,
+            differ_mb / (1 << 20) as f64
+        );
         tracing::info!(
             "title bytes put in under flights' shader writes per frame (VICTORY_LATE_WAIT=2): {pages:.0} pages looked at, \
              {runs:.0} changed runs, {:.2} MB; of them through a mask on the card (VICTORY_CARD_MASK): {masked_pages:.1} pages, \

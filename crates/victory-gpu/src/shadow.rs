@@ -187,6 +187,18 @@ pub(crate) fn card_mask_on() -> bool {
 /// mask ([`card_mask_on`]), and their changed runs.
 static MASKED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
+/// Since the last frame-rate line, of the relay's merges of fetched card
+/// pieces ([`Shadow::card_merge_relay`]): pieces landed and their bytes;
+/// of them, pieces with a byte that differs from the CPU's side, the bytes
+/// from their first to their last difference, and the bytes that differ.
+/// Whether smaller pieces would fetch much less.
+static CARD_LANDED: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+
+/// [`CARD_LANDED`], taken.
+pub(crate) fn card_landed_stats() -> [u64; 5] {
+    [0, 1, 2, 3, 4].map(|i| CARD_LANDED[i].swap(0, Ordering::Relaxed))
+}
+
 /// [`MASKED`], taken.
 pub(crate) fn masked_stats() -> [u64; 2] {
     [0, 1].map(|i| MASKED[i].swap(0, Ordering::Relaxed))
@@ -3516,10 +3528,15 @@ impl Shadow {
         // does write it (the title's bytes put in under shader writes)
         // holds the lock held here.
         let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), gpu.len()) };
+        CARD_LANDED[0].fetch_add(1, Ordering::Relaxed);
+        CARD_LANDED[1].fetch_add(gpu.len() as u64, Ordering::Relaxed);
         let Some(first) = first_difference(gpu, held) else {
             return 0;
         };
         let last = last_difference(gpu, held).unwrap_or(first);
+        CARD_LANDED[2].fetch_add(1, Ordering::Relaxed);
+        CARD_LANDED[3].fetch_add((last + 1 - first) as u64, Ordering::Relaxed);
+        CARD_LANDED[4].fetch_add(changed_runs(gpu, held).iter().map(|r| r.1 as u64).sum(), Ordering::Relaxed);
         let (at, n) = (at + first, last + 1 - first);
         let (gpu, held) = (&gpu[first..=last], &mut held[first..=last]);
         let skip: Vec<(usize, usize)> = {
