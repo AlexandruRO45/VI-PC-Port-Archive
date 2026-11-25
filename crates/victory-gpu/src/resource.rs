@@ -2370,9 +2370,10 @@ mod tests {
             "the stand-in keeps the element size, so no ladder step or copy changes"
         );
         // And the formats that answer for themselves still do.
-        assert_eq!(pc_format(28), 28);
-        assert_eq!(pc_format(118), 45);
+        assert_eq!(pc_format(28), 28, "R8G8B8A8_UNORM is a PC format already");
+        assert_eq!(pc_format(118), 20, "D32_FLOAT stands in as D32_FLOAT_S8X24");
     }
+
     fn texture(width: u64, height: u32, format: u32, mips: u16) -> ResourceDesc {
         ResourceDesc {
             dimension: 3,
