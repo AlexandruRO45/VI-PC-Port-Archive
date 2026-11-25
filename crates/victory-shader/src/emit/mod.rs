@@ -229,11 +229,9 @@ pub fn loop_limit() -> u32 {
 }
 
 /// `VICTORY_SHADER_LOOP_LIMIT`'s value; the default when it is unset,
-/// unreadable or 0. The constant and the counter are `i32` in the emitted
-/// code, so the value is clamped to [`i32::MAX`] to stay inside it. The
-/// compare itself is unsigned (`IULT`/`IUGE`), so a value from 2^31 up is a
-/// large count rather than a negative one; the clamp only keeps the
-/// constant representable. Pure, for testing.
+/// unreadable or 0. Values above [`i32::MAX`] are clamped to it. That is only
+/// a cap: the emitted constant takes any `u32`, and the compare is unsigned
+/// (`IULT`/`IUGE`). Pure, for testing.
 fn parse_loop_limit(value: Option<&str>) -> u32 {
     let parsed = value.map(str::trim).and_then(|v| {
         let hex = v.strip_prefix("0x").or_else(|| v.strip_prefix("0X"));
