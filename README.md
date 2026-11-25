@@ -119,6 +119,13 @@ cargo test --workspace                   # needs no game data
 cargo run -p victory -- config           # check your paths
 ```
 
+To check title-window shutdown on Windows, run
+`cargo test -p victory-hle --lib --locked direct_close_suspends_and_exits`.
+The test checks that closing the title window runs the suspend routine
+and exits cleanly. It waits for the child process with a separate test timeout.
+The DirectStorage test `a_page_list_filled_after_its_request_starts` checks
+that a page list populated after the first read is picked up on retry.
+
 Run the title:
 
 ```powershell

@@ -785,16 +785,33 @@ mod tests {
     fn direct_close_suspends_and_exits() {
         const CHILD: &str = "VICTORY_TEST_DIRECT_CLOSE_CHILD";
         if std::env::var_os(CHILD).is_none() {
-            let output = std::process::Command::new(std::env::current_exe().unwrap())
+            use std::os::windows::io::AsRawHandle;
+            use std::process::{Command, Stdio};
+            use windows_sys::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
+            use windows_sys::Win32::System::Threading::WaitForSingleObject;
+
+            let mut child = Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
                     "modules::lifecycle::tests::direct_close_suspends_and_exits",
                     "--nocapture",
                 ])
                 .env(CHILD, "1")
-                .output()
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .spawn()
                 .unwrap();
+            // Bound the test from outside the child so a slow runner cannot
+            // make the test thread panic while the close worker is ending it.
+            // SAFETY: the child owns the process handle throughout the wait.
+            let wait = unsafe { WaitForSingleObject(child.as_raw_handle(), 15_000) };
+            if wait != WAIT_OBJECT_0 {
+                let _ = child.kill();
+            }
+            let output = child.wait_with_output().unwrap();
             let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_ne!(wait, WAIT_TIMEOUT, "direct close did not exit: {stderr}");
+            assert_eq!(wait, WAIT_OBJECT_0, "could not wait for close: {stderr}");
             assert!(output.status.success(), "close test child failed: {stderr}");
             assert!(stderr.contains("suspend routine ran"), "{stderr}");
             return;
@@ -839,8 +856,9 @@ mod tests {
         );
         // SAFETY: this thread owns the title window.
         unsafe { wm::SendMessageW(title, wm::WM_CLOSE, 0, 0) };
-        std::thread::sleep(SUSPEND_DEADLINE + Duration::from_secs(1));
-        panic!("direct close did not exit the title process");
+        loop {
+            std::thread::park();
+        }
     }
 
     /// Whether `hwnd`'s thread answers a message within `ms`.
