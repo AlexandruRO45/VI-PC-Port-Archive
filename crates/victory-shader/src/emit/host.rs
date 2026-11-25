@@ -2,6 +2,7 @@
 //! tests, drawing a full-screen triangle and reading the target back.
 
 use std::ffi::CString;
+use std::sync::Mutex;
 
 use windows::Win32::Graphics::Direct3D::*;
 use windows::Win32::Graphics::Direct3D12::*;
@@ -62,6 +63,49 @@ fn err(e: windows::core::Error) -> String {
     e.message().to_string()
 }
 
+/// Whether `VICTORY_D3D12_DEBUG` asks for the debug layer (diagnostics builds
+/// only, as for the title's own host device: `0` is off, any other value on).
+fn debug_requested() -> bool {
+    cfg!(feature = "diagnostics")
+        && std::env::var_os("VICTORY_D3D12_DEBUG").is_some_and(|v| v != "0")
+}
+
+/// Devices of one adapter are one device: `D3D12CreateDevice` returns the same
+/// object, so every [`Host`] of a process shares one `ID3D12InfoQueue`. Object
+/// creation and the read of what it reported go through this lock in debug
+/// mode, or a worker's reads and clears take another worker's messages.
+static CREATION: Mutex<()> = Mutex::new(());
+
+/// What the debug layer reported (errors and warnings, as `id N: text`), and
+/// the queue emptied.
+fn drain_messages(queue: &ID3D12InfoQueue) -> Vec<String> {
+    let mut found = Vec::new();
+    // SAFETY: each message is read into a buffer of the size the queue
+    // reports, then the queue is emptied.
+    unsafe {
+        for i in 0..queue.GetNumStoredMessages() {
+            let mut size = 0;
+            if queue.GetMessage(i, None, &mut size).is_err() || size == 0 {
+                continue;
+            }
+            let mut buffer = vec![0u64; size.div_ceil(8)];
+            let message = buffer.as_mut_ptr().cast::<D3D12_MESSAGE>();
+            if queue.GetMessage(i, Some(message), &mut size).is_err() {
+                continue;
+            }
+            let m = &*message;
+            if m.Severity.0 > D3D12_MESSAGE_SEVERITY_WARNING.0 {
+                continue;
+            }
+            let text = std::slice::from_raw_parts(m.pDescription, m.DescriptionByteLength);
+            let text = String::from_utf8_lossy(text);
+            found.push(format!("id {}: {}", m.ID.0, text.trim_end_matches('\0')));
+        }
+        queue.ClearStoredMessages();
+    }
+    found
+}
+
 /// The first adapter that is a GPU: not flagged software, and with video
 /// memory of its own. A machine without one (GitHub's Windows runner has only
 /// `Microsoft Basic Render Driver`) has nothing to run the hardware-only
@@ -99,6 +143,14 @@ impl Host {
         let warp = warp || std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1");
         // SAFETY: plain D3D12/DXGI calls with valid out pointers.
         unsafe {
+            // Before the first device exists: the layer cannot be added to a
+            // device, and without it the device has no info queue.
+            if debug_requested() {
+                let mut layer: Option<ID3D12Debug> = None;
+                if D3D12GetDebugInterface(&mut layer).is_ok() {
+                    layer.iter().for_each(|l| l.EnableDebugLayer());
+                }
+            }
             let mut device: Option<ID3D12Device> = None;
             let factory: IDXGIFactory4 =
                 CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(err)?;
@@ -127,6 +179,28 @@ impl Host {
             }
             Ok(Host { device })
         }
+    }
+
+    /// Makes an object, naming the debug layer's reasons if it is refused:
+    /// with the layer on (`VICTORY_D3D12_DEBUG=1` in a diagnostics build) the
+    /// error carries what the layer said, not only the bare code. Creations
+    /// are then one at a time (the queue is shared, see [`CREATION`]); without
+    /// the layer they run in parallel.
+    fn made<T>(&self, make: impl FnOnce() -> windows::core::Result<T>) -> Result<T, String> {
+        let Ok(queue) = self.device.cast::<ID3D12InfoQueue>() else {
+            return make().map_err(err);
+        };
+        let _one_at_a_time = CREATION.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: a plain call; the lock keeps others' messages out of ours.
+        unsafe { queue.ClearStoredMessages() };
+        make().map_err(|e| {
+            let reasons = drain_messages(&queue);
+            if reasons.is_empty() {
+                err(e)
+            } else {
+                format!("{}; debug layer: {}", err(e), reasons.join("; "))
+            }
+        })
     }
 
     /// The root signature translated shaders expect: user data per stage
@@ -268,7 +342,7 @@ impl Host {
                 blob.GetBufferPointer().cast::<u8>(),
                 blob.GetBufferSize(),
             );
-            self.device.CreateRootSignature(0, bytes).map_err(err)
+            self.made(|| self.device.CreateRootSignature(0, bytes))
         }
     }
 
@@ -297,7 +371,7 @@ impl Host {
             ..Default::default()
         };
         // SAFETY: the description points at live data.
-        unsafe { self.device.CreateComputePipelineState(&desc) }.map_err(err)
+        self.made(|| unsafe { self.device.CreateComputePipelineState(&desc) })
     }
 
     /// A graphics pipeline from a vertex and a pixel shader, with float or
@@ -403,8 +477,7 @@ impl Host {
             desc.DepthStencilState.StencilEnable = true.into();
         }
         // SAFETY: the description points at live data.
-        let pso = unsafe { self.device.CreateGraphicsPipelineState(&desc) };
-        pso.map_err(err)
+        self.made(|| unsafe { self.device.CreateGraphicsPipelineState(&desc) })
     }
 
     /// A mesh pipeline from a mesh and a pixel shader (user data of the mesh
@@ -514,7 +587,7 @@ impl Host {
         };
         let device: ID3D12Device2 = self.device.cast().map_err(err)?;
         // SAFETY: the stream points at live data and outlives the call.
-        unsafe { device.CreatePipelineState(&desc) }.map_err(err)
+        self.made(|| unsafe { device.CreatePipelineState(&desc) })
     }
 
     /// Whether this device fuses DXIL `FMad`, which the lowering emits for
