@@ -5032,11 +5032,11 @@ impl Host {
                             // of them; the copy into it has run, and it is not
                             // given out again before this landing is done.
                             let gpu = unsafe { std::slice::from_raw_parts((data + *at as usize) as *const u8, hi - lo) };
-                            let merged = if crate::lazyback::kept(shadow, *lo, *hi, gpu) {
+                            let merged = if crate::lazyback::kept(shadow, *lo, *hi, gpu, after) {
                 0
             } else {
                 let merged = crate::lazyback::merging(|| shadow.card_merge_relay(*lo, gpu, after, &mut title));
-                crate::lazyback::merged(shadow, *lo, *hi, gpu);
+                crate::lazyback::merged(shadow, *lo, *hi, gpu, after);
                 merged
             };
                             shadow.walls_merged(gpu.len(), merged);
@@ -5055,11 +5055,11 @@ impl Host {
                 // SAFETY: the mapping of the fetched bytes, `total` of them;
                 // the copy into it has run.
                 let gpu = unsafe { std::slice::from_raw_parts((data + *at as usize) as *const u8, hi - lo) };
-                let merged = if crate::lazyback::kept(shadow, *lo, *hi, gpu) {
+                let merged = if crate::lazyback::kept(shadow, *lo, *hi, gpu, after) {
                 0
             } else {
                 let merged = crate::lazyback::merging(|| shadow.card_merge_relay(*lo, gpu, after, &mut title));
-                crate::lazyback::merged(shadow, *lo, *hi, gpu);
+                crate::lazyback::merged(shadow, *lo, *hi, gpu, after);
                 merged
             };
                 shadow.walls_merged(gpu.len(), merged);

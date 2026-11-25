@@ -114,6 +114,34 @@ struct Card {
     size: u64,
 }
 
+impl Card {
+    /// The offsets of `[at, at + n)` where the CPU's side holds title bytes
+    /// the card had not received when a fetch sent after send
+    /// `fetched_after` ran: those still to go up, and those that went up
+    /// with a later send. There the card's side is the older one.
+    fn skip(&self, at: usize, n: usize, fetched_after: u64) -> Vec<(usize, usize)> {
+        let dirty = self.dirty.lock().unwrap_or_else(|e| e.into_inner());
+        let sent = self.sent.lock().unwrap_or_else(|e| e.into_inner());
+        let masked = self.masked.lock().unwrap_or_else(|e| e.into_inner());
+        let masked_sent = self.masked_sent.lock().unwrap_or_else(|e| e.into_inner());
+        // Of a page that goes up through a mask, only its masked bytes
+        // are the title's: the card's other bytes there are newer, and
+        // what shaders wrote in them is taken as usual.
+        let masks = masked
+            .iter()
+            .chain(masked_sent.iter().filter(|s| s.1 > fetched_after).map(|s| &s.0))
+            .filter(|m| m.from < at + n && m.to > at)
+            .flat_map(|m| m.runs_in(at, at + n));
+        dirty
+            .iter()
+            .copied()
+            .chain(sent.iter().filter(|s| s.2 > fetched_after).map(|s| (s.0, s.1)))
+            .filter(|&(a, b)| a < at + n && b > at)
+            .chain(masks)
+            .collect()
+    }
+}
+
 /// Title bytes of a copy in the card's memory that go to its card side
 /// through a mask: the copy's offsets `[from, to)` (both multiples of 4),
 /// and one bit per byte (`bits[i / 32] >> (i % 32)`, `i` from `from`) set
@@ -3847,37 +3875,52 @@ impl Shadow {
 
     /// The lazy copy-back gives a card-only page back (`crate::lazyback`):
     /// `gpu` is the card side's bytes at offset `at` of this copy in the
-    /// card's memory, as last fetched. The title could not touch the page
-    /// while it was card-only, so the CPU's side and title memory still
-    /// hold what the merge before left: the card's bytes are the page's
-    /// bytes. They go into the CPU's side and into title memory through our
-    /// own view, which the title views' protection does not stop. False
-    /// (nothing written to title memory) if there is no own view for it.
-    pub(crate) fn card_materialize(&self, at: usize, gpu: &[u8]) -> bool {
-        if self.card.is_none() || at + gpu.len() > self.len as usize || gpu.is_empty() {
-            return false;
+    /// card's memory, as fetched by a fetch sent after send `fetched_after`.
+    /// The title could not touch the page while it was card-only, so the
+    /// CPU's side holds what title memory holds; the page's bytes are the
+    /// CPU's side with what shaders wrote put in, as the copy-back's merge
+    /// puts it ([`Shadow::card_merge_relay`]): the card's byte where it
+    /// differs from the CPU's side, except where the CPU's side holds title
+    /// bytes the card had not received ([`Card::skip`]). They go into the
+    /// CPU's side, and into title memory through our own view (which the
+    /// title views' protection does not stop) if `own`. Returns them, and
+    /// whether our own view took them.
+    pub(crate) fn card_materialize(&self, at: usize, gpu: &[u8], fetched_after: u64, own: bool) -> Option<(Vec<u8>, bool)> {
+        let card = self.card.as_ref()?;
+        if at + gpu.len() > self.len as usize || gpu.is_empty() {
+            return None;
         }
         let start = self.start as usize;
+        let n = gpu.len();
         // No block locks: a thread that holds them (a merge under flights)
         // may come here through a read, and a card-only page is merged by
         // no one else meanwhile (the copy-back keeps its bytes instead).
         // SAFETY: inside the mapping (checked above).
-        let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), gpu.len()) };
-        held.copy_from_slice(gpu);
-        crate::host::shaders_write(start + at, gpu);
-        self.put_back_own(start + at, gpu)
+        let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
+        let mut page = held.to_vec();
+        for (a, b) in outside(at, at + n, card.skip(at, n, fetched_after)) {
+            for i in a - at..b - at {
+                if gpu[i] != held[i] {
+                    page[i] = gpu[i];
+                }
+            }
+        }
+        held.copy_from_slice(&page);
+        crate::host::shaders_write(start + at, &page);
+        let taken = own && self.put_back_own(start + at, &page);
+        Some((page, taken))
     }
 
     /// As [`Shadow::card_materialize`] where our own view could not take
     /// the bytes: through the kernel, after the title views were given
     /// their protection back.
-    pub(crate) fn card_materialize_kernel(&self, at: usize, gpu: &[u8]) {
-        if at + gpu.len() > self.len as usize || gpu.is_empty() {
+    pub(crate) fn card_materialize_kernel(&self, at: usize, page: &[u8]) {
+        if at + page.len() > self.len as usize || page.is_empty() {
             return;
         }
         let start = self.start as usize;
-        crate::watch::writing(start + at, gpu.len());
-        crate::host::write_mapped((start + at) as *mut u8, gpu.as_ptr(), gpu.len());
+        crate::watch::writing(start + at, page.len());
+        crate::host::write_mapped((start + at) as *mut u8, page.as_ptr(), page.len());
     }
 
     /// [`relay`], for a copy in the card's memory: `gpu` is what the
@@ -3922,27 +3965,7 @@ impl Shadow {
         CARD_LANDED[3].fetch_add((last + 1 - first) as u64, Ordering::Relaxed);
         let (at, n) = (at + first, last + 1 - first);
         let (gpu, held) = (&gpu[first..=last], &mut held[first..=last]);
-        let skip: Vec<(usize, usize)> = {
-            let dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
-            let sent = card.sent.lock().unwrap_or_else(|e| e.into_inner());
-            let masked = card.masked.lock().unwrap_or_else(|e| e.into_inner());
-            let masked_sent = card.masked_sent.lock().unwrap_or_else(|e| e.into_inner());
-            // Of a page that goes up through a mask, only its masked bytes
-            // are the title's: the card's other bytes there are newer, and
-            // what shaders wrote in them is taken as usual.
-            let masks = masked
-                .iter()
-                .chain(masked_sent.iter().filter(|s| s.1 > fetched_after).map(|s| &s.0))
-                .filter(|m| m.from < at + n && m.to > at)
-                .flat_map(|m| m.runs_in(at, at + n));
-            dirty
-                .iter()
-                .copied()
-                .chain(sent.iter().filter(|s| s.2 > fetched_after).map(|s| (s.0, s.1)))
-                .filter(|&(a, b)| a < at + n && b > at)
-                .chain(masks)
-                .collect()
-        };
+        let skip = card.skip(at, n, fetched_after);
         title.clear();
         title.resize(n, 0);
         let mapped = crate::host::read_into((start + at) as *const u8, title);

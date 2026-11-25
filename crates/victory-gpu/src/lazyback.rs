@@ -50,6 +50,8 @@ pub(crate) fn step() -> u8 {
 
 #[derive(Clone, Copy, Default)]
 struct Page {
+    /// The frame a fetch first brought it; 0: never.
+    first: u64,
     /// The frame a fetch last brought it; 0: never.
     fetched: u64,
     /// The frame something on the CPU's side last touched it; 0: never.
@@ -57,8 +59,15 @@ struct Page {
 }
 
 impl Page {
+    /// Fetched for [`QUIET_FRAMES`] frames at least, and nothing on the
+    /// CPU's side touched it in the last [`QUIET_FRAMES`]. (Counted from the
+    /// first fetch: the fetch being merged is noted before its merge, and a
+    /// page made card-only at its first fetch was the first world frame's
+    /// pages, all at once.)
     fn candidate(&self, frame: u64) -> bool {
-        self.touched == 0 || frame >= self.touched + QUIET_FRAMES
+        self.first != 0
+            && frame >= self.first + QUIET_FRAMES
+            && (self.touched == 0 || frame >= self.touched + QUIET_FRAMES)
     }
 }
 
@@ -100,7 +109,10 @@ pub(crate) fn fetched(from: usize, to: usize) {
     let mut all = true;
     for page in from / PAGE..to.div_ceil(PAGE) {
         let p = pages.entry(page).or_default();
-        all &= p.fetched != 0 && p.candidate(frame);
+        all &= p.candidate(frame);
+        if p.first == 0 {
+            p.first = frame;
+        }
         p.fetched = frame;
     }
     COUNT[0].fetch_add(1, Relaxed);
@@ -164,6 +176,8 @@ struct CardOnly {
     shadow: std::sync::Arc<crate::shadow::Shadow>,
     lo: usize,
     bytes: Vec<u8>,
+    /// The send the fetch of `bytes` was after (as the merge is told).
+    after: u64,
     shown: Vec<(usize, u32)>,
 }
 
@@ -211,7 +225,7 @@ static REFUSED: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
 /// Step 2, at a landing, before merging a fetched piece of `shadow` at
 /// offsets `[lo, hi)`: if its page is card-only, its bytes are kept for
 /// when it is given back and the merge is skipped (true).
-pub(crate) fn kept(shadow: &crate::shadow::Shadow, lo: usize, hi: usize, gpu: &[u8]) -> bool {
+pub(crate) fn kept(shadow: &crate::shadow::Shadow, lo: usize, hi: usize, gpu: &[u8], after: u64) -> bool {
     if step() < 2 || !any_card_only() {
         return false;
     }
@@ -223,6 +237,7 @@ pub(crate) fn kept(shadow: &crate::shadow::Shadow, lo: usize, hi: usize, gpu: &[
         return false;
     }
     page.bytes.copy_from_slice(gpu);
+    page.after = after;
     CARD_COUNT[1].fetch_add(1, Relaxed);
     CARD_COUNT[2].fetch_add(gpu.len() as u64, Relaxed);
     true
@@ -231,7 +246,7 @@ pub(crate) fn kept(shadow: &crate::shadow::Shadow, lo: usize, hi: usize, gpu: &[
 /// Step 2, right after a landing merged a fetched piece of `shadow` at
 /// offsets `[lo, hi)` (`gpu` its bytes): if its page is a candidate, it
 /// becomes card-only.
-pub(crate) fn merged(shadow: &std::sync::Arc<crate::shadow::Shadow>, lo: usize, hi: usize, gpu: &[u8]) {
+pub(crate) fn merged(shadow: &std::sync::Arc<crate::shadow::Shadow>, lo: usize, hi: usize, gpu: &[u8], after: u64) {
     use windows_sys::Win32::System::Memory::{PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE, VirtualProtect};
     if step() < 2 || hi <= lo {
         return;
@@ -254,7 +269,7 @@ pub(crate) fn merged(shadow: &std::sync::Arc<crate::shadow::Shadow>, lo: usize, 
         .unwrap_or_else(|e| e.into_inner())
         .as_ref()
         .and_then(|p| p.get(&(page / PAGE)).copied())
-        .is_some_and(|p| p.fetched != 0 && p.candidate(frame));
+        .is_some_and(|p| p.candidate(frame));
     if !candidate {
         return no(1);
     }
@@ -338,6 +353,7 @@ pub(crate) fn merged(shadow: &std::sync::Arc<crate::shadow::Shadow>, lo: usize, 
             shadow: shadow.clone(),
             lo,
             bytes: gpu.to_vec(),
+            after,
             shown,
         },
     );
@@ -369,16 +385,17 @@ fn materialize(key: usize, why: Why) {
         }
     }
     let was = GIVING.with(|g| g.replace(true));
-    // Through our own view while the title's are still kept from the CPU:
-    // no title thread sees the page half given back.
-    let own = page.shadow.card_materialize(page.lo, &page.bytes);
+    // Merged as the copy-back merges, and through our own view while the
+    // title's are still kept from the CPU: no title thread sees the page
+    // half given back.
+    let merged = page.shadow.card_materialize(page.lo, &page.bytes, page.after, true);
     for &(view, back) in &page.shown {
         let mut old = 0;
         // SAFETY: a page we kept from the CPU, given its protection back.
         unsafe { windows_sys::Win32::System::Memory::VirtualProtect(view as *const _, PAGE, back, &mut old) };
     }
-    if !own {
-        page.shadow.card_materialize_kernel(page.lo, &page.bytes);
+    if let Some((bytes, false)) = &merged {
+        page.shadow.card_materialize_kernel(page.lo, bytes);
     }
     GIVING.with(|g| g.set(was));
     drop(card);
@@ -455,7 +472,7 @@ pub(crate) fn line(frames: f64) {
     let (noted, now) = {
         let frame = crate::frame::current().max(1);
         let pages = PAGES.lock().unwrap_or_else(|e| e.into_inner());
-        pages.as_ref().map_or((0, 0), |p| (p.len(), p.values().filter(|p| p.fetched != 0 && p.candidate(frame)).count()))
+        pages.as_ref().map_or((0, 0), |p| (p.len(), p.values().filter(|p| p.candidate(frame)).count()))
     };
     tracing::info!(
         "lazy copy-back, noting only (VICTORY_LAZY_BACK=1), per frame: {pieces:.0} pieces fetched, {skipped:.0} of them all on \
@@ -494,9 +511,13 @@ mod tests {
     /// is a candidate; a touch of ours (not the merge's) takes it out.
     #[test]
     fn untouched_fetched_pages_are_candidates_and_a_touch_is_not_the_merges() {
-        let page = Page::default();
-        assert!(page.candidate(1), "never touched");
-        let touched = Page { fetched: 10, touched: 10 };
+        assert!(!Page::default().candidate(1000), "never fetched");
+        // Counted from the first fetch, not the last one.
+        let fresh = Page { first: 10, fetched: 10, touched: 0 };
+        assert!(!fresh.candidate(10), "not at its first fetch");
+        assert!(!fresh.candidate(10 + QUIET_FRAMES - 1));
+        assert!(fresh.candidate(10 + QUIET_FRAMES));
+        let touched = Page { first: 1, fetched: 10, touched: 10 };
         assert!(!touched.candidate(10 + QUIET_FRAMES - 1));
         assert!(touched.candidate(10 + QUIET_FRAMES));
         // The merge's own accesses are not touches.
