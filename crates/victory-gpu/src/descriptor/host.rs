@@ -505,14 +505,33 @@ impl TextureQueue {
     /// backlog of unmapped or partial textures cannot use the whole pass.
     /// Among first looks, take the newest and oldest writes in turns.
     fn due(&self, frame: u64, max: usize) -> Vec<(u32, u64)> {
+        if max == 0 {
+            return Vec::new();
+        }
         let mut again = Vec::new();
         let mut fresh = Vec::new();
         for (&index, w) in self.slots.iter().filter(|(_, w)| w.due <= frame) {
             let class = if w.looks > 0 || w.mapped > 0 { &mut again } else { &mut fresh };
             class.push((index, w.write));
         }
-        again.sort_unstable_by_key(|&(_, write)| write);
-        fresh.sort_unstable_by_key(|&(_, write)| write);
+        let older_first = |a: &(u32, u64), b: &(u32, u64)| a.1.cmp(&b.1);
+        // Preserve the rotating retry/new/old policy with only the candidates
+        // that can be visited in a pass. Retain both ends of fresh writes.
+        if again.len() > max {
+            let keep = again.len() - max;
+            again.select_nth_unstable_by(keep, older_first);
+            again.drain(..keep);
+        }
+        let fresh_limit = max.saturating_mul(2);
+        if fresh.len() > fresh_limit {
+            fresh.select_nth_unstable_by(max, older_first);
+            let (_, rest) = fresh.split_at_mut(max);
+            let keep = rest.len() - max;
+            rest.select_nth_unstable_by(keep, older_first);
+            fresh.drain(max..max + keep);
+        }
+        again.sort_unstable_by(older_first);
+        fresh.sort_unstable_by(older_first);
         let count = max.min(again.len() + fresh.len());
         let mut fresh = fresh.into_iter();
         // A time-limited pass may stop after one slot. Rotate its first
