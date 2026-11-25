@@ -764,11 +764,20 @@ fn skipped_region(p: &Program, branch: usize, first: usize, target: usize) -> Op
 ///
 /// EXEC may open where the compiler takes the whole wave for a moment (a wave
 /// sum behind a bounds test: `s_or_saveexec_b64 s[4:5], -1` ... `s_mov_b64
-/// exec, s[4:5]`), if it is clear again before its block ends and nothing in
-/// between writes more than registers: the registers written there are ones
-/// the compiler takes as overwritten in every lane, as it must whenever that
-/// code runs. A restore of a mask from before the branch leaves EXEC open, and
-/// keeps the branch.
+/// exec, s[4:5]`), if the mask that opening saved puts it back before its
+/// block ends and nothing in between writes more than registers: the registers
+/// written there are ones the compiler takes as overwritten in every lane, as
+/// it must whenever that code runs. Only that opening is taken
+/// ([`whole_wave`]), narrowed inside by constants alone ([`fixed_mask`]: a
+/// prefix sum's `s_mov_b32 exec_lo, 0xffff0000`). A restore of a mask from
+/// before the branch runs the lanes of that mask, and what they write to
+/// registers is read after the join where the console, which skipped the
+/// region, still has what was there (v1 = 7 before the branch, 9 written under
+/// the restored mask, the join's store of v1), so it keeps the branch.
+///
+/// The walk also has to end: a host lane decides a branch on a mask by its own
+/// bit, so one outside EXEC never leaves a loop that goes on "while no running
+/// lane wants out" ([`spins_with_empty_exec`]).
 fn walks_with_empty_exec(p: &Program, branch: usize, inside: &[bool]) -> bool {
     let lanes = 1 + u8::from(p.wave64);
     let Some(test) = p.blocks[branch].insts.last() else {
@@ -823,22 +832,212 @@ fn walks_with_empty_exec(p: &Program, branch: usize, inside: &[bool]) -> bool {
     // Each block starts with EXEC clear: the region does, and every block of it
     // ends so.
     for &b in &order {
-        let mut open = [false; 2];
+        // The register a whole-wave opening saved the clear EXEC in, and the
+        // values it holds, while that window is open.
+        let mut window: Option<(u8, [Option<Value>; 2])> = None;
         for inst in &p.blocks[b].insts {
-            if open.contains(&true) && leaves_registers(inst) {
+            if window.is_some() && leaves_registers(inst) {
                 return false;
             }
-            for k in 0..lanes {
-                if let Some(v) = inst.write(Reg::S(EXEC + k)) {
-                    open[usize::from(k)] = !zero.contains(&v);
-                }
+            let written: Vec<Value> = (0..lanes)
+                .filter_map(|k| inst.write(Reg::S(EXEC + k)))
+                .collect();
+            if written.is_empty() {
+                continue;
             }
+            let clear = written.iter().all(|v| zero.contains(v));
+            window = match window {
+                None if clear => None,
+                // EXEC opens for the whole wave only ...
+                None => match whole_wave(inst, lanes) {
+                    Some(saved) => Some(saved),
+                    None => return false,
+                },
+                // ... and until the mask that opening saved puts it back, only
+                // fixed masks narrow it.
+                Some((code, saved)) => {
+                    let back = (0..lanes).all(|k| {
+                        let held = saved[usize::from(k)];
+                        held.is_some() && inst.read(Reg::S(code + k)) == held
+                    });
+                    match (clear && back, fixed_mask(inst)) {
+                        (true, _) => None,
+                        (false, true) => Some((code, saved)),
+                        (false, false) => return false,
+                    }
+                }
+            };
         }
-        if open.contains(&true) {
+        if window.is_some() {
             return false;
         }
     }
-    true
+    let Exit::Branch { not_taken: first, .. } = p.blocks[branch].exit else {
+        return false;
+    };
+    !spins_with_empty_exec(p, first, inside, &zero)
+}
+
+/// The register in which `inst` saves EXEC while it opens it to the whole wave
+/// (`s_or_saveexec sD, -1` or `s_nand_saveexec sD, 0`, the openings
+/// `emit::wave` takes its sections from), and the values saved there by dword.
+fn whole_wave(inst: &Inst, lanes: u8) -> Option<(u8, [Option<Value>; 2])> {
+    let all = match inst.name() {
+        "s_or_saveexec_b64" | "s_or_saveexec_b32" => Operand::Const(193),
+        "s_nand_saveexec_b64" | "s_nand_saveexec_b32" => Operand::Const(128),
+        _ => return None,
+    };
+    let Fields::Sop {
+        dst: Some(Operand::Scalar { code, dwords }),
+        src,
+        ..
+    } = &inst.fields
+    else {
+        return None;
+    };
+    if src.first() != Some(&all) || *dwords != lanes {
+        return None;
+    }
+    let mut saved = [None; 2];
+    for k in 0..lanes {
+        saved[usize::from(k)] = Some(inst.write(Reg::S(code + k))?);
+    }
+    Some((*code, saved))
+}
+
+/// Whether `inst` sets EXEC, or one dword of it, to a constant (`s_mov_b32
+/// exec_lo, 0xffff0000`, as the steps of a prefix sum over the wave do).
+fn fixed_mask(inst: &Inst) -> bool {
+    matches!(inst.name(), "s_mov_b32" | "s_mov_b64")
+        && matches!(
+            &inst.fields,
+            Fields::Sop { dst: Some(Operand::Scalar { code, .. }), src, .. }
+                if (EXEC..EXEC + 2).contains(code)
+                    && matches!(src.first(), Some(Operand::Const(128..=208) | Operand::Literal(_)))
+        )
+}
+
+/// Where the branch that ends block `b` goes for a lane outside EXEC, if the
+/// values in `zero` decide that: a branch on EXEC, on a VCC that is clear, or
+/// on the SCC of a mask operation whose result is clear (`scc`: the
+/// instruction that writes each SCC value). `None` if it turns on anything
+/// else, which may let the lane out.
+fn decided(
+    p: &Program,
+    b: usize,
+    zero: &std::collections::HashSet<Value>,
+    scc: &std::collections::HashMap<Value, &Inst>,
+) -> Option<usize> {
+    let block = &p.blocks[b];
+    let Exit::Branch { taken, not_taken } = block.exit else {
+        return None;
+    };
+    let inst = block.insts.last()?;
+    let lanes = 1 + u8::from(p.wave64);
+    let clear = |inst: &Inst, code: u8| {
+        (0..lanes).all(|k| inst.read(Reg::S(code + k)).is_some_and(|v| zero.contains(&v)))
+    };
+    match inst.name() {
+        "s_cbranch_execz" if clear(inst, EXEC) => Some(taken),
+        "s_cbranch_execnz" if clear(inst, EXEC) => Some(not_taken),
+        "s_cbranch_vccz" if clear(inst, VCC) => Some(taken),
+        "s_cbranch_vccnz" if clear(inst, VCC) => Some(not_taken),
+        name @ ("s_cbranch_scc0" | "s_cbranch_scc1") => {
+            // SCC of a mask operation: whether its result (EXEC, for the forms
+            // that write EXEC) is not zero.
+            let def = scc.get(&inst.read(Reg::Scc)?)?;
+            let op = def.name();
+            let mask = matches!(def.fields, Fields::Sop { .. })
+                && ["s_and_", "s_or_", "s_xor_", "s_andn2_", "s_andn1_"]
+                    .iter()
+                    .any(|prefix| op.starts_with(prefix))
+                && (op.ends_with("_b64") || op.ends_with("_b32"));
+            if !mask {
+                return None;
+            }
+            let zeroed = if op.contains("saveexec") || op.contains("wrexec") {
+                (0..lanes).all(|k| def.write(Reg::S(EXEC + k)).is_some_and(|v| zero.contains(&v)))
+            } else {
+                let mut results = def.writes.iter().filter(|w| matches!(w.0, Reg::S(_)));
+                let mut any = false;
+                let all = results.all(|w| {
+                    any = true;
+                    zero.contains(&w.1)
+                });
+                any && all
+            };
+            zeroed.then_some(if name == "s_cbranch_scc0" { taken } else { not_taken })
+        }
+        _ => None,
+    }
+}
+
+/// Whether a lane that walks the region (`inside`) from `first` with EXEC
+/// clear can come to a loop it never leaves: blocks that jumps and branches
+/// decided by the clear masks ([`decided`]) lead round. The console's wave
+/// leaves such a loop with its last running lane; a host lane outside EXEC
+/// decides by its own bit and goes round until the lowering's limit, and past
+/// it runs what follows the loop with no guard (c4183d3c,
+/// CS_ProjDecalResolve_Vectorized: `s_andn2_b64 vcc, exec, vcc`, `s_cbranch_vccz`
+/// back). A branch on a scalar counts as a way out.
+fn spins_with_empty_exec(
+    p: &Program,
+    first: usize,
+    inside: &[bool],
+    zero: &std::collections::HashSet<Value>,
+) -> bool {
+    let n = p.blocks.len();
+    let mut scc = std::collections::HashMap::new();
+    for inst in p.blocks.iter().flat_map(|block| &block.insts) {
+        if let Some(value) = inst.write(Reg::Scc) {
+            scc.insert(value, inst);
+        }
+    }
+    // The one way on from a block of the region, where there is only one.
+    let only: Vec<Option<usize>> = (0..n)
+        .map(|b| match p.blocks[b].exit {
+            _ if !inside[b] => None,
+            Exit::Jump(to) => Some(to),
+            Exit::Branch { .. } => decided(p, b, zero, &scc),
+            _ => None,
+        })
+        .collect();
+    // The blocks the walk may come to.
+    let mut reached = vec![false; n];
+    let mut pending = vec![first];
+    while let Some(b) = pending.pop() {
+        if b >= n || !inside[b] || reached[b] {
+            continue;
+        }
+        reached[b] = true;
+        match only[b] {
+            Some(to) => pending.push(to),
+            None => pending.extend(p.blocks[b].exit.successors()),
+        }
+    }
+    // A way round among them (0: not looked at, 1: on this path, 2: leads out).
+    let mut state = vec![0u8; n];
+    for start in (0..n).filter(|&b| reached[b]) {
+        let mut path = Vec::new();
+        let mut b = start;
+        loop {
+            match state[b] {
+                1 => return true,
+                2 => break,
+                _ => {}
+            }
+            state[b] = 1;
+            path.push(b);
+            match only[b] {
+                Some(to) if to < n && inside[to] => b = to,
+                _ => break,
+            }
+        }
+        for b in path {
+            state[b] = 2;
+        }
+    }
+    false
 }
 
 /// Whether the `i`th register `inst` writes is zero where the values in `zero`
@@ -2134,6 +2333,135 @@ mod tests {
         assert_eq!(skips(&without_early_outs(&into_exec).expect("left out")), 0);
         let in_window = early_out(&[OPEN, CMPX, STORE[0], STORE[1], CLOSE]);
         assert!(without_early_outs(&in_window).is_none());
+    }
+
+    /// A window that is not the whole wave keeps the branch. Inside
+    /// `if (t < s0)` the region puts back the mask from before the branch,
+    /// writes v1 and clears EXEC again with the mask it saved while EXEC was
+    /// clear; the join stores v1. With no thread below s0 the console skips
+    /// the region and stores 7, and lanes walking it would store 9.
+    #[test]
+    fn a_window_of_a_mask_from_before_the_branch_keeps_the_branch() {
+        let window = |open: u32, close: u32| {
+            build_words(
+                &[
+                    0x7E02_0287, // v_mov_b32 v1, 7
+                    0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+                    0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+                    0xBF88_0004, // s_cbranch_execz -> join
+                    0xBE8E_047E, // s_mov_b64 s[14:15], exec (clear when skipped)
+                    open,
+                    0x7E02_0289, // v_mov_b32 v1, 9
+                    close,
+                    0xBEFE_040C, // join: s_mov_b64 exec, s[12:13]
+                    0x3408_0082, // v_lshlrev_b32 v4, 2, v0
+                    0xE070_1000,
+                    0x8002_0104, // buffer_store_dword v1, v4, s[8:11], 0 offen
+                    S_ENDPGM,
+                ],
+                true,
+            )
+        };
+        // s_mov_b64 exec, s[12:13] (the lanes from before the branch) ...
+        // s_mov_b64 exec, s[14:15]
+        let before = window(0xBEFE_040C, 0xBEFE_040E);
+        assert_eq!(skips(&before), 1);
+        assert!(without_skips(&before, false).is_none());
+        assert!(without_skips(&before, true).is_none());
+        // A whole-wave opening put back by a mask it did not save: s_or_saveexec_b64
+        // s[16:17], -1 ... s_mov_b64 exec, s[14:15] (clear too, but not that window's).
+        let other = window(0xBE90_25C1, 0xBEFE_040E);
+        assert!(without_skips(&other, true).is_none());
+    }
+
+    /// A prefix sum over the wave narrows its whole-wave window with constants
+    /// (bad01f53, CS_MaterialTilesInitial: rows 1 and 3, then every lane
+    /// again). That still writes registers only, so the early-out can go. A
+    /// mask from a register or from SCC there keeps it.
+    #[test]
+    fn a_whole_wave_window_may_narrow_to_fixed_masks() {
+        const OPEN: u32 = 0xBE84_25C1; // s_or_saveexec_b64 s[4:5], -1
+        const CLOSE: u32 = 0xBEFE_0404; // s_mov_b64 exec, s[4:5]
+        const STORE: [u32; 2] = [0xD834_0000, 0x0000_0C00]; // ds_write_b32 v0, v12
+        let window = |narrow: &[u32]| {
+            early_out(
+                &[
+                    &[OPEN, 0xD501_0001, 0x0012_0E80][..], // v_cndmask_b32 v1, 0, v7, s[4:5]
+                    narrow,
+                    &[0x7E04_0301, CLOSE][..], // v_mov_b32 v2, v1
+                    &STORE[..],
+                ]
+                .concat(),
+            )
+        };
+        let rows = window(&[
+            0xBEFE_03FF,
+            0xFFFF_0000, // s_mov_b32 exec_lo, 0xffff0000
+            0xBEFF_03FF,
+            0xFFFF_0000, // s_mov_b32 exec_hi, 0xffff0000
+            0x7E04_0301, // v_mov_b32 v2, v1
+            0xBEFE_03C1, // s_mov_b32 exec_lo, -1
+            0xBEFF_03C1, // s_mov_b32 exec_hi, -1
+        ]);
+        assert_eq!(skips(&without_early_outs(&rows).expect("left out")), 0);
+        assert_eq!(skips(&without_skips(&rows, true).expect("left out")), 0);
+        // s_mov_b64 exec, s[2:3]; s_mov_b32 exec_lo, scc
+        for narrow in [0xBEFE_0402, 0xBEFE_03FD] {
+            let p = window(&[narrow]);
+            assert!(without_early_outs(&p).is_none(), "{narrow:#x}");
+            assert!(without_skips(&p, true).is_none(), "{narrow:#x}");
+        }
+    }
+
+    /// A loop that goes on "while no running lane wants out" behind an
+    /// early-out (c4183d3c, CS_ProjDecalResolve_Vectorized). EXEC stays clear
+    /// in it, but a host lane decides `s_cbranch_vccz` by its own bit: outside
+    /// EXEC it never leaves, counts to the lowering's limit and runs the store
+    /// after the loop. The early-out stays; with a way out on a scalar the
+    /// lane leaves with its wave and the early-out can go.
+    #[test]
+    fn a_loop_no_lane_outside_exec_leaves_keeps_the_early_out() {
+        const TAIL: [u32; 4] = [
+            0x7E06_0214, // v_mov_b32 v3, s20
+            0x3408_0082, // v_lshlrev_b32 v4, 2, v0
+            0xE070_1000,
+            0x8002_0304, // buffer_store_dword v3, v4, s[8:11], 0 offen
+        ];
+        let behind = |lp: &[u32]| {
+            let mut words = vec![
+                0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+                0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+                0xBF88_0000 | (1 + lp.len() + TAIL.len()) as u32, // s_cbranch_execz -> s_endpgm
+                0xBE94_0380, // s_mov_b32 s20, 0
+            ];
+            words.extend_from_slice(lp);
+            words.extend_from_slice(&TAIL);
+            words.push(S_ENDPGM);
+            build_words(&words, true)
+        };
+        let spins = behind(&[
+            0x8114_8114, // loop: s_add_i32 s20, s20, 1
+            0x7E04_0214, // v_mov_b32 v2, s20
+            0x7D88_0401, // v_cmp_gt_u32 vcc, s1, v2 (go on while s1 > count)
+            0x8AEA_6A7E, // s_andn2_b64 vcc, exec, vcc (running lanes that want out)
+            0xBF86_FFFB, // s_cbranch_vccz -> loop
+        ]);
+        assert!(without_early_outs(&spins).is_none());
+        assert!(without_skips(&spins, true).is_none());
+        let counted = behind(&[
+            0x8114_8114, // loop: s_add_i32 s20, s20, 1
+            0xBF0A_0114, // s_cmp_lt_u32 s20, s1
+            0xBF85_FFFD, // s_cbranch_scc1 -> loop
+        ]);
+        assert_eq!(skips(&without_early_outs(&counted).expect("left out")), 0);
+        // The SCC of a mask operation on the clear EXEC is as decided as the
+        // mask: s_andn2_b64 s[6:7], exec, vcc; s_cbranch_scc0 -> loop.
+        let on_scc = behind(&[
+            0x8114_8114, // loop: s_add_i32 s20, s20, 1
+            0x8A86_6A7E, // s_andn2_b64 s[6:7], exec, vcc
+            0xBF84_FFFD, // s_cbranch_scc0 -> loop
+        ]);
+        assert!(without_early_outs(&on_scc).is_none());
     }
 
     #[test]
