@@ -1953,7 +1953,11 @@ impl HostHeap {
                 None
             } else {
                 MIRROR_MADE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                make(&view, self.cpu(index))
+                if self.sampler {
+                    make(&view, self.cpu(index))
+                } else {
+                    copy_or_make(key, &view, self.cpu(index))
+                }
             };
             if kept.is_none() && !self.sampler {
                 null_for(&view, self.cpu(index));
@@ -2669,6 +2673,93 @@ fn twin_uav(
 
 /// Makes the host descriptor for `view` at `at`: the host resource it
 /// views, or `None` if it cannot.
+/// `VICTORY_VIEW_CACHE=0` makes every view as before (see [`copy_or_make`]).
+fn view_cache() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_VIEW_CACHE").is_none_or(|v| v != "0"))
+}
+
+/// Since the last frame line: slots made by copying a view made before.
+pub(crate) static VIEW_COPIED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Views already made, each once, in a heap of our own that nothing rewrites:
+/// the record key it was made from, where it is, and the resource it keeps
+/// alive. 40,000 to 113,000 views are made a frame and the same records come
+/// back (draws read the same slots every frame), so a slot that shows one
+/// again is a 32-byte descriptor copy instead of a call into the driver.
+struct Models {
+    heap: ID3D12DescriptorHeap,
+    cpu: usize,
+    step: u32,
+    next: u32,
+    made: std::collections::HashMap<u64, (u32, Kept)>,
+}
+
+/// The most views kept (a heap of that many descriptors, 8 MB at 32 bytes);
+/// past it every view is made as before.
+static MOST_MODELS: u32 = 262_144;
+
+static MODELS: Mutex<Option<Models>> = Mutex::new(None);
+
+/// Makes `view` for slot `key` by copying a view of the same record made
+/// before, or makes it and keeps it for the next slot that shows it.
+fn copy_or_make(key: u64, view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
+    if !view_cache() {
+        return make(view, at);
+    }
+    let Some(host) = host() else {
+        return make(view, at);
+    };
+    let device = &host.device;
+    let mut models = MODELS.lock().unwrap_or_else(|e| e.into_inner());
+    if models.is_none() {
+        let desc = D3D12_DESCRIPTOR_HEAP_DESC {
+            Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+            NumDescriptors: MOST_MODELS,
+            Flags: D3D12_DESCRIPTOR_HEAP_FLAG_NONE,
+            NodeMask: 0,
+        };
+        // SAFETY: a plain call on our device.
+        match unsafe { device.CreateDescriptorHeap::<ID3D12DescriptorHeap>(&desc) } {
+            Ok(heap) => {
+                let step = unsafe { device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) };
+                let cpu = unsafe { heap.GetCPUDescriptorHandleForHeapStart() }.ptr;
+                *models = Some(Models { heap, cpu, step, next: 0, made: Default::default() });
+            }
+            Err(_) => return make(view, at),
+        }
+    }
+    let Some(models) = models.as_mut() else {
+        return make(view, at);
+    };
+    if let Some((at_model, kept)) = models.made.get(&key) {
+        let from = D3D12_CPU_DESCRIPTOR_HANDLE {
+            ptr: models.cpu + *at_model as usize * models.step as usize,
+        };
+        // SAFETY: both are CBV_SRV_UAV slots of heaps of ours, the source
+        // holding a descriptor made from this very record.
+        unsafe { device.CopyDescriptorsSimple(1, at, from, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) };
+        VIEW_COPIED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return Some(kept.clone());
+    }
+    if models.next >= MOST_MODELS {
+        return make(view, at);
+    }
+    let at_model = models.next;
+    models.next += 1;
+    let slot = D3D12_CPU_DESCRIPTOR_HANDLE {
+        ptr: models.cpu + at_model as usize * models.step as usize,
+    };
+    // Made at the model's slot first: the slot itself may be rewritten by a
+    // later record, the model never is.
+    let kept = make(view, slot)?;
+    models.made.insert(key, (at_model, kept.clone()));
+    let _ = &models.heap;
+    // SAFETY: as above; the model slot is written.
+    unsafe { device.CopyDescriptorsSimple(1, at, slot, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) };
+    Some(kept)
+}
+
 fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
     let host = host()?;
     let device = &host.device;

@@ -6594,9 +6594,11 @@ impl Meter {
             {
                 let made = crate::descriptor::host::MIRROR_MADE.swap(0, Ordering::Relaxed) as f64 / frames;
                 let later = crate::descriptor::host::MIRROR_DEFERRED.swap(0, Ordering::Relaxed) as f64 / frames;
+                let copied = crate::descriptor::host::VIEW_COPIED.swap(0, Ordering::Relaxed) as f64 / frames;
                 if made + later > 0.0 {
                     tracing::info!(
-                        "descriptor views per frame: {made:.0} made, {later:.0} left to the draws that read them"
+                        "descriptor views per frame: {made:.0} slots made, {copied:.0} copied from a view made before, \
+                         {later:.0} left to the draws that read them"
                     );
                 }
             }
