@@ -14,14 +14,19 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_COMMITMENT_LIMIT, HANDLE, INVALID_HANDLE_VALUE,
+    CloseHandle, ERROR_COMMITMENT_LIMIT, EXCEPTION_ACCESS_VIOLATION, HANDLE, INVALID_HANDLE_VALUE,
+};
+use windows_sys::Win32::System::Diagnostics::Debug::{
+    AddVectoredExceptionHandler, EXCEPTION_CONTINUE_EXECUTION, EXCEPTION_CONTINUE_SEARCH,
+    EXCEPTION_POINTERS,
 };
 use windows_sys::Win32::System::Memory::{
     CreateFileMappingW, MEM_ADDRESS_REQUIREMENTS, MEM_COMMIT, MEM_EXTENDED_PARAMETER,
     MEM_PRESERVE_PLACEHOLDER, MEM_RELEASE, MEM_REPLACE_PLACEHOLDER, MEM_RESERVE,
     MEM_RESERVE_PLACEHOLDER, MEMORY_BASIC_INFORMATION, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile3,
-    MemExtendedParameterAddressRequirements, PAGE_NOACCESS, PAGE_READWRITE, SEC_COMMIT,
-    SEC_RESERVE, UnmapViewOfFile2, VirtualAlloc, VirtualAlloc2, VirtualFree, VirtualQueryEx,
+    MemExtendedParameterAddressRequirements, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE,
+    PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE, SEC_COMMIT, SEC_RESERVE, UnmapViewOfFile2,
+    VirtualAlloc, VirtualAlloc2, VirtualFree, VirtualQuery, VirtualQueryEx,
 };
 use windows_sys::Win32::System::ProcessStatus::{
     K32GetPerformanceInfo, K32GetProcessMemoryInfo, PERFORMANCE_INFORMATION,
@@ -1028,6 +1033,113 @@ fn commit_limit_message(
     message
 }
 
+/// Active split-and-remap window `[ACTIVE_SPLIT_LO, ACTIVE_SPLIT_HI)` while
+/// `unmap()` temporarily unmaps a coalesced multi-page view to remap its
+/// surviving head and/or tail.
+static ACTIVE_SPLIT_LO: AtomicUsize = AtomicUsize::new(0);
+static ACTIVE_SPLIT_HI: AtomicUsize = AtomicUsize::new(0);
+
+/// Lock-free ring of recently split view ranges so a thread whose access
+/// violation arrived microseconds after `unmap()` finished remapping the
+/// surviving head/tail still retries cleanly once `VirtualQuery` confirms
+/// the page is committed and accessible again.
+const SPLIT_RING_LEN: usize = 16;
+static RECENT_SPLITS: [(AtomicUsize, AtomicUsize); SPLIT_RING_LEN] =
+    [const { (AtomicUsize::new(0), AtomicUsize::new(0)) }; SPLIT_RING_LEN];
+static RECENT_SPLIT_NEXT: AtomicUsize = AtomicUsize::new(0);
+static SPLIT_VEH_INSTALLED: std::sync::Once = std::sync::Once::new();
+
+fn install_split_veh() {
+    SPLIT_VEH_INSTALLED.call_once(|| {
+        // SAFETY: installs a lock-free, allocation-free first-chance VEH.
+        unsafe {
+            AddVectoredExceptionHandler(1, Some(on_split_fault));
+        }
+    });
+}
+
+fn begin_split_window(lo: usize, hi: usize) {
+    install_split_veh();
+    let slot = RECENT_SPLIT_NEXT.fetch_add(1, Ordering::Relaxed) % SPLIT_RING_LEN;
+    RECENT_SPLITS[slot].0.store(lo, Ordering::Release);
+    RECENT_SPLITS[slot].1.store(hi, Ordering::Release);
+    ACTIVE_SPLIT_LO.store(lo, Ordering::Release);
+    ACTIVE_SPLIT_HI.store(hi, Ordering::Release);
+}
+
+fn end_split_window() {
+    ACTIVE_SPLIT_HI.store(0, Ordering::Release);
+    ACTIVE_SPLIT_LO.store(0, Ordering::Release);
+}
+
+fn in_recent_split(addr: usize) -> bool {
+    for (lo, hi) in &RECENT_SPLITS {
+        let l = lo.load(Ordering::Acquire);
+        let h = hi.load(Ordering::Acquire);
+        if l < h && addr >= l && addr < h {
+            return true;
+        }
+    }
+    false
+}
+
+unsafe extern "system" fn on_split_fault(info: *mut EXCEPTION_POINTERS) -> i32 {
+    if info.is_null() {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    // SAFETY: Windows passes valid EXCEPTION_POINTERS and ExceptionRecord.
+    let rec = unsafe { &*(*info).ExceptionRecord };
+    if rec.ExceptionCode != EXCEPTION_ACCESS_VIOLATION || rec.NumberParameters < 2 {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    let access = rec.ExceptionInformation[0]; // 0 = read, 1 = write, 8 = DEP
+    let addr = rec.ExceptionInformation[1];
+    if access != 0 && access != 1 {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    let mut waited = false;
+    loop {
+        let lo = ACTIVE_SPLIT_LO.load(Ordering::Acquire);
+        let hi = ACTIVE_SPLIT_HI.load(Ordering::Acquire);
+        if lo < hi && addr >= lo && addr < hi {
+            waited = true;
+            std::hint::spin_loop();
+        } else {
+            break;
+        }
+    }
+    if !waited && !in_recent_split(addr) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    // Confirm the surviving page is actually committed and permits this access
+    // before resuming; a genuinely unmapped address still propagates normally.
+    let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    let queried = unsafe {
+        VirtualQuery(
+            addr as *const c_void,
+            &mut mbi,
+            size_of::<MEMORY_BASIC_INFORMATION>(),
+        )
+    };
+    if queried == 0 || mbi.State != MEM_COMMIT {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    let prot = mbi.Protect & 0xff;
+    let allowed = if access == 0 {
+        prot == PAGE_READONLY
+            || prot == PAGE_READWRITE
+            || prot == PAGE_EXECUTE_READ
+            || prot == PAGE_EXECUTE_READWRITE
+    } else {
+        prot == PAGE_READWRITE || prot == PAGE_EXECUTE_READWRITE
+    };
+    if allowed {
+        EXCEPTION_CONTINUE_EXECUTION
+    } else {
+        EXCEPTION_CONTINUE_SEARCH
+    }
+}
+
 /// Returns `[base, base + len)` to placeholders; views reaching past it
 /// are mapped again outside it.
 fn unmap(physical: &mut Physical, base: usize, len: usize) {
@@ -1064,6 +1176,10 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
                 }
             }
         }
+        let splitting = at < base || at + size > end;
+        if splitting {
+            begin_split_window(at, at + size);
+        }
         victory_gpu::title_memory_remapped(at, size);
         // SAFETY: a view we mapped; it becomes a placeholder again.
         unsafe {
@@ -1081,6 +1197,9 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
         if at + size > end {
             let index = slice.index + (end - at) / PAGE;
             map(physical, end, at + size - end, Slice { index, ..slice });
+        }
+        if splitting {
+            end_split_window();
         }
     }
     if !hit_empty && len > PAGE {
@@ -1595,6 +1714,56 @@ mod tests {
         assert!(map_alias(dst as u64, 0, (N * PAGE) as u64));
         assert_eq!(XMemMapPhysicalPages(src, N, std::ptr::null()), src);
         assert_eq!(XMemFreePhysicalPages(N, pages.as_ptr()), 1);
+    }
+
+    #[test]
+    fn concurrent_reads_survive_coalesced_view_split() {
+        use std::sync::atomic::AtomicBool;
+        let pages = 8usize;
+        let size = pages * PAGE;
+        let base = XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            size,
+            MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
+            0,
+            PAGE_NOACCESS,
+        );
+        assert!(!base.is_null());
+        let mut phys = [0usize; 8];
+        let mut count = pages;
+        assert_ne!(XMemAllocatePhysicalPages(0, &mut count, phys.as_mut_ptr()), 0);
+        assert_eq!(count, pages);
+        assert_eq!(XMemMapPhysicalPages(base, pages, phys.as_ptr()), base);
+        let tail_ptr = (base as usize + 4 * PAGE + 0x40) as *mut u64;
+        // SAFETY: tail page is mapped and writable.
+        unsafe { tail_ptr.write_volatile(0x1122_3344_5566_7788) };
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_r = stop.clone();
+        let addr = tail_ptr as usize;
+        let reader = std::thread::spawn(move || {
+            let mut reads = 0u64;
+            while !stop_r.load(Ordering::Relaxed) {
+                // SAFETY: tail page stays logically mapped throughout head splits/remaps.
+                let v = unsafe { (addr as *const u64).read_volatile() };
+                assert_eq!(v, 0x1122_3344_5566_7788);
+                reads += 1;
+            }
+            reads
+        });
+
+        // Repeatedly split the head (pages 0..2) and remap it while reader hammers page 4.
+        for _ in 0..40 {
+            assert_eq!(XMemMapPhysicalPages(base, 2, std::ptr::null()), base);
+            assert_eq!(XMemMapPhysicalPages(base, 2, phys.as_ptr()), base);
+        }
+        stop.store(true, Ordering::Relaxed);
+        let reads = reader.join().expect("reader thread must not crash during split");
+        assert!(reads > 0);
+
+        XMemMapPhysicalPages(base, pages, std::ptr::null());
+        XMemFreePhysicalPages(pages, phys.as_ptr());
+        unsafe { VirtualFree(base, 0, MEM_RELEASE) };
     }
 
     #[test]
