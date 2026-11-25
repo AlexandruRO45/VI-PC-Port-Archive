@@ -32,6 +32,12 @@ pub(crate) fn texture_state(state: u32) -> u32 {
     pc_state(state) & !BUFFER_ONLY
 }
 
+/// A DXGI description (nul-padded UTF-16) as text.
+fn adapter_name(description: &[u16]) -> String {
+    let end = description.iter().position(|&c| c == 0).unwrap_or(description.len());
+    String::from_utf16_lossy(&description[..end])
+}
+
 /// Render target views live only until their command is recorded, so a
 /// ring of host descriptors is enough.
 const RTV_RING: u32 = 1024;
@@ -545,7 +551,15 @@ fn create() -> windows::core::Result<Host> {
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
             tracing::info!("host device on the software adapter (WARP)");
         } else {
-            D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+            // A laptop with switchable graphics reports its integrated GPU
+            // first, and `D3D12CreateDevice(None, ..)` takes that one, whose
+            // wave width and feature set are not the ones the translator is
+            // tuned for. Ask DXGI for the high-performance adapter instead,
+            // and fall back to the default when there is nothing to pick.
+            match discrete_adapter() {
+                Some(adapter) => D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?,
+                None => D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?,
+            }
         }
         let device = device.ok_or_else(windows::core::Error::empty)?;
         // `VICTORY_D3D12_BACKGROUND=0`: the runtime's background work (the
@@ -603,6 +617,20 @@ fn create() -> windows::core::Result<Host> {
         let adapter = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
             .and_then(|factory| factory.EnumAdapterByLuid::<IDXGIAdapter3>(device.GetAdapterLuid()))
             .ok();
+        // Which card the device landed on. `D3D12CreateDevice(None, ..)` takes
+        // the system's default adapter; on a laptop with switchable graphics
+        // that can be the integrated one, whose wave width and feature set
+        // are not the ones the translator is tuned for.
+        if let Some(adapter) = adapter.as_ref()
+            && let Ok(desc) = adapter.GetDesc1()
+        {
+            tracing::info!(
+                name = adapter_name(&desc.Description),
+                vendor = format_args!("{:#x}", desc.VendorId),
+                vram_mb = desc.DedicatedVideoMemory >> 20,
+                "host adapter"
+            );
+        }
         tracing::info!("host D3D12 device ready");
         Ok(Host {
             device,
@@ -620,6 +648,28 @@ fn create() -> windows::core::Result<Host> {
             presenter: Mutex::new(None),
             adapter,
         })
+    }
+}
+
+/// The adapter DXGI calls high-performance: on a laptop with switchable
+/// graphics the discrete card, not the integrated one. `None` when DXGI is
+/// too old to be asked, has nothing to offer, or offers software.
+fn discrete_adapter() -> Option<IDXGIAdapter1> {
+    // SAFETY: plain DXGI adapter queries.
+    unsafe {
+        let factory: IDXGIFactory6 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
+        let adapter: IDXGIAdapter1 = factory
+            .EnumAdapterByGpuPreference(0, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE)
+            .ok()?;
+        let desc = adapter.GetDesc1().ok()?;
+        if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0 {
+            tracing::warn!(
+                vendor = format_args!("{:#x}", desc.VendorId),
+                "DXGI offers software as the high-performance adapter; taking the default instead"
+            );
+            return None;
+        }
+        Some(adapter)
     }
 }
 
@@ -683,6 +733,55 @@ mod tests {
     }
 
     use super::*;
+
+    /// Every adapter DXGI reports on this machine, and the one the host
+    /// device landed on. Run with `cargo test --release -p victory-gpu --
+    /// --ignored --nocapture adapters_on_this_machine`.
+    #[test]
+    #[ignore = "reports the machine's adapters"]
+    fn adapters_on_this_machine() {
+        // SAFETY: plain DXGI adapter queries.
+        unsafe {
+            let factory = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
+                .expect("a DXGI factory");
+            let mut index = 0;
+            while let Ok(adapter) = factory.EnumAdapters1(index) {
+                let desc = adapter.GetDesc1().expect("an adapter description");
+                println!(
+                    "adapter {index}: {} (vendor {:#x}, {} MiB dedicated, flags {:#x})",
+                    adapter_name(&desc.Description),
+                    desc.VendorId,
+                    desc.DedicatedVideoMemory >> 20,
+                    desc.Flags
+                );
+                index += 1;
+            }
+            match host().and_then(|host| host.adapter.as_ref()) {
+                Some(adapter) => {
+                    let desc = adapter.GetDesc1().expect("an adapter description");
+                    println!("the host device is on {}", adapter_name(&desc.Description));
+                }
+                None => println!("no host device was made on this machine"),
+            }
+        }
+    }
+
+    /// Whichever card DXGI calls high-performance, it is never the software
+    /// one: the translator's output is for a real card. Runs on any machine.
+    #[test]
+    fn the_high_performance_adapter_is_never_software() {
+        let Some(adapter) = discrete_adapter() else {
+            return; // DXGI has nothing to prefer here
+        };
+        // SAFETY: a plain DXGI adapter query.
+        let desc = unsafe { adapter.GetDesc1() }.expect("an adapter description");
+        assert_eq!(
+            desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32,
+            0,
+            "{} was offered as the high-performance adapter",
+            adapter_name(&desc.Description)
+        );
+    }
 
     #[test]
     fn warp_adapter_accepts_only_software() {
