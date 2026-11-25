@@ -1538,6 +1538,7 @@ impl State {
             return false;
         };
         let rects = u64::from(count / 3);
+        let mut streams = Vec::new();
         for slot in 0..32 {
             let elements: Vec<(u32, u32)> = p
                 .inputs
@@ -1563,18 +1564,7 @@ impl State {
                 return false;
             };
             let (from, to, stride) = (from as usize, to as usize, stride as usize);
-            let n = rects as usize;
-            list.defer_host(move || {
-                // SAFETY: the vertices lie in a title buffer (checked when
-                // recorded) and the scratch memory is the list's.
-                let (src, dst) = unsafe {
-                    (
-                        std::slice::from_raw_parts(from as *const u8, n * 3 * stride),
-                        std::slice::from_raw_parts_mut(to as *mut u8, n * 6 * stride),
-                    )
-                };
-                crate::primitive::expand_rects(src, dst, stride, &elements);
-            });
+            streams.push((from, to, stride, elements));
             let view = D3D12_VERTEX_BUFFER_VIEW {
                 BufferLocation: gpu,
                 SizeInBytes: (rects * 6 * stride as u64) as u32,
@@ -1582,6 +1572,28 @@ impl State {
             };
             // SAFETY: an open list; the view names live scratch memory.
             unsafe { list.list.IASetVertexBuffers(slot, Some(&[view])) };
+        }
+        if !streams.is_empty() {
+            let n = rects as usize;
+            list.defer_host(move || {
+                let corners = streams.iter().find_map(|(from, _, stride, elements)| {
+                    // SAFETY: the source range was checked when recording.
+                    let src = unsafe { std::slice::from_raw_parts(*from as *const u8, n * 3 * stride) };
+                    crate::primitive::rectangle_corners(src, *stride, elements)
+                });
+                let corners = corners.as_deref().unwrap_or_default();
+                for (from, to, stride, elements) in &streams {
+                    // SAFETY: the source is in its checked vertex buffer; the
+                    // destination is a distinct slice of list-owned scratch.
+                    let (src, dst) = unsafe {
+                        (
+                            std::slice::from_raw_parts(*from as *const u8, n * 3 * stride),
+                            std::slice::from_raw_parts_mut(*to as *mut u8, n * 6 * stride),
+                        )
+                    };
+                    crate::primitive::expand_rects_with_corners(src, dst, *stride, elements, corners);
+                }
+            });
         }
         true
     }
