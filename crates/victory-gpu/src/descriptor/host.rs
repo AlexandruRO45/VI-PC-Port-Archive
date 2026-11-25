@@ -1050,6 +1050,21 @@ fn fits(texture: &ID3D12Resource, castable: &[u32], mut format: Option<&mut DXGI
         once!(view, own, "an unordered view in a format the host cannot store");
         return false;
     }
+    // The format the view takes; a format the host cannot store typed
+    // unordered access in is an invalid call, which removes the device
+    // (B5G5R5A1_UNORM, the menu's, 2026-11-25).
+    // shortcut: such views are null and their writes dropped; map the
+    // format to one the host can store (of the same bit width) when the
+    // world needs them.
+    let effective = if typeless || cast { view } else { own };
+    if unordered && !typed_store(effective) {
+        once!(
+            view = effective,
+            own,
+            "an unordered view in a format the host cannot store typed"
+        );
+        return false;
+    }
     if let Some(format) = format
         && !typeless
         && !cast
