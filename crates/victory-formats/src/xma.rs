@@ -1482,28 +1482,6 @@ mod tests {
     }
 
     #[test]
-    fn first_frame_follows_stream_skips_past_continuation_packets() {
-        let mut data = vec![0; 3 * PACKET_BYTES];
-        // No starts in packet 0. Packet 1 belongs to another stream.
-        put_bits(&mut data, 0, 32, 1);
-        put_bits(&mut data, PACKET_BITS, 32, 1 << 26);
-        put_bits(&mut data, 2 * PACKET_BITS, 32, (1 << 26) | (9 << 11));
-        let start = 2 * PACKET_BITS + HEADER_BITS + 9;
-        put_bits(&mut data, start, 15, 31);
-        assert_eq!(first_frame(&data), Some(start));
-        assert_eq!(read_frame(&data, start).unwrap().bits, 31);
-        assert_eq!(first_frame(&data[..2 * PACKET_BYTES]), None);
-    }
-
-    #[test]
-    fn first_frame_rejects_an_offset_outside_the_announcing_payload() {
-        let mut data = vec![0; 2 * PACKET_BYTES];
-        let payload = (PACKET_BITS - HEADER_BITS) as u32;
-        put_bits(&mut data, 0, 32, (1 << 26) | (payload << 11));
-        assert_eq!(first_frame(&data), None);
-    }
-
-    #[test]
     fn packet_headers_and_frame_walk() {
         // Two packets: frame A (100 bits) and B (16300 bits, crossing into
         // packet 1 by 48 bits), then C (60 bits) in packet 1; the rest is
@@ -1622,6 +1600,28 @@ mod tests {
     /// and decoding each, mono and stereo, gives a frame of samples per
     /// frame and ends within the frames the buffer can hold (each is over
     /// 15 bits and the walk only moves on).
+    #[test]
+    fn first_frame_follows_stream_skips_past_continuation_packets() {
+        let mut data = vec![0; 3 * PACKET_BYTES];
+        // No starts in packet 0. Packet 1 belongs to another stream.
+        put_bits(&mut data, 0, 32, 1);
+        put_bits(&mut data, PACKET_BITS, 32, 1 << 26);
+        put_bits(&mut data, 2 * PACKET_BITS, 32, (1 << 26) | (9 << 11));
+        let start = 2 * PACKET_BITS + HEADER_BITS + 9;
+        put_bits(&mut data, start, 15, 31);
+        assert_eq!(first_frame(&data), Some(start));
+        assert_eq!(read_frame(&data, start).unwrap().bits, 31);
+        assert_eq!(first_frame(&data[..2 * PACKET_BYTES]), None);
+    }
+
+    #[test]
+    fn first_frame_rejects_an_offset_outside_the_announcing_payload() {
+        let mut data = vec![0; 2 * PACKET_BYTES];
+        let payload = (PACKET_BITS - HEADER_BITS) as u32;
+        put_bits(&mut data, 0, 32, (1 << 26) | (payload << 11));
+        assert_eq!(first_frame(&data), None);
+    }
+
     #[test]
     fn noise_packets_walk_and_decode() {
         let mut noise = Noise(0x2545_f491_4f6c_dd1d);
