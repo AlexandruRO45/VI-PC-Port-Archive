@@ -2,6 +2,7 @@
 mod import;
 mod virtual_place;
 mod pages;
+mod section_probe;
 use import::trace_import_failure;
 pub(super) use import::import_buffer_with_heap;
 use import::import_with_commit;
@@ -575,18 +576,22 @@ pub(super) unsafe extern "system" fn committed_layout(
     unsafe { wrap_pageable(Ok(native), &RESOURCE, device, super::ResourceState::from(backing), out) }
 }
 
-fn validate_shared_range(start: u64, end: u64) -> windows::core::Result<()> {
-    use windows::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_READWRITE, VirtualQuery};
+/// Every page must be committed read-write. Returns whether any of them is a
+/// section view, which some host drivers cannot import (see `section_probe`).
+fn validate_shared_range(start: u64, end: u64) -> windows::core::Result<bool> {
+    use windows::Win32::System::Memory::{MEM_COMMIT, MEM_MAPPED, MEMORY_BASIC_INFORMATION, PAGE_READWRITE, VirtualQuery};
     let mut cursor = start;
+    let mut section_backed = false;
     while cursor < end {
         let mut region = MEMORY_BASIC_INFORMATION::default();
         if unsafe { VirtualQuery(Some(cursor as _), &mut region, size_of_val(&region)) } == 0
             || region.State != MEM_COMMIT || region.Protect != PAGE_READWRITE {
             return Err(E_INVALIDARG.into());
         }
+        section_backed |= region.Type == MEM_MAPPED;
         cursor = (region.BaseAddress as u64).checked_add(region.RegionSize as u64).ok_or(E_INVALIDARG)?;
     }
-    Ok(())
+    Ok(section_backed)
 }
 
 pub(super) extern "system" fn unregister_pages(device: &Device, token: usize) {

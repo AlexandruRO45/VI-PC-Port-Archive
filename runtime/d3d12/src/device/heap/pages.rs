@@ -33,9 +33,14 @@ pub(in super::super) struct PagePools {
     // 1.2 MiB about five times a frame each, and its recording allocators
     // keep every import for 216 frames: about 4,500 live buffers.
     pub(super) loose: std::sync::Mutex<PageCache<ImportedHeap>>,
+    section_imports: std::sync::OnceLock<bool>,
 }
 
 impl PagePools {
+    pub(super) fn section_imports_alias(&self, device: &ID3D12Device) -> bool {
+        *self.section_imports.get_or_init(|| super::section_probe::section_imports_alias(device))
+    }
+
     pub(super) fn register(&self, start: u64, end: u64) -> usize {
         let pool = Box::new(PagePool { start, end, pages: PageCache::default() });
         let token = core::ptr::from_ref(pool.as_ref()).addr();

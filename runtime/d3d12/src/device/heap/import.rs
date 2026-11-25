@@ -59,7 +59,11 @@ pub(in super::super) fn import_buffer_with_heap(
     crate::diagnostics::watch("imported buffer", address, info.SizeInBytes, || format!(
         "width={:#x} flags={:#x} state={:#x}", desc.Width, desc.Flags.0, state.0));
     let pin = GPU_APERTURE.pin(base, size)?;
-    validate_shared_range(base, base.checked_add(size).ok_or(E_INVALIDARG)?)?;
+    let section_backed = validate_shared_range(base, base.checked_add(size).ok_or(E_INVALIDARG)?)?;
+    if section_backed && !device.state.page_pools.section_imports_alias(&device.native) {
+        trace_import_failure(source, "section", size, E_NOTIMPL);
+        return Err(E_NOTIMPL.into());
+    }
     // A guest can place thousands of tiny resources in one multi-GiB XMem
     // reservation. Pin only the pages needed by this resource on the adapter.
     let heap = if let Ok(sized) = device.native.cast::<ID3D12Device13>() {
