@@ -207,7 +207,13 @@ impl HostHeap {
             // index leaves the heap.
             // shortcut: title slots past the room left are left out (read
             // null); a title that reaches them needs remapping.
-            let room = views.saturating_sub(MIN_DYNAMIC + NULL_ROOM);
+            // The dynamic slots keep their full count where the heap has
+            // room for it: with `MIN_DYNAMIC`, Grand Theft Auto VI's world
+            // ran out of them on the RTX 5060's 1,000,000-slot heap (draws
+            // dropped, then the title waited for their work for good),
+            // where fewer title slots only leave more of its views null.
+            let dynamic = if views > 2 * DYNAMIC { DYNAMIC } else { MIN_DYNAMIC };
+            let room = views.saturating_sub(dynamic + NULL_ROOM);
             match make(views) {
                 Ok(heap) => {
                     if count > room {
@@ -218,7 +224,7 @@ impl HostHeap {
                             "host view heap capped: title slots past the room left read null"
                         );
                     }
-                    (heap, count.min(room), MIN_DYNAMIC)
+                    (heap, count.min(room), dynamic)
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, count, views, sampler, "no host descriptor heap");
