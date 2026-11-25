@@ -47,6 +47,13 @@ pub(crate) struct Shadow {
 /// Snapshot segments (offset, bytes) and the pieces compared.
 type Snapshot = (Vec<(usize, Vec<u8>)>, std::collections::HashSet<usize>);
 
+/// Where a copy-back piece's snapshot bytes are: inside one segment (its
+/// address), or reassembled from several.
+enum Old {
+    At(usize),
+    Gathered(usize),
+}
+
 /// Snapshot memory kept for reuse (already touched, so no page faults).
 static POOL: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
 
@@ -79,6 +86,77 @@ fn give_back(v: Vec<u8>) {
 
 const POOL_BYTES: usize = 256 << 20;
 const SNAPSHOT_CHUNK: usize = 4 << 20;
+
+/// Threads snapshots and copy-back use (`VICTORY_COPY_THREADS`, 1 = all
+/// on the submitting thread as before; default up to 6). Hundreds of MB
+/// a world frame were copied and compared on the submitting thread alone
+/// (Belobug a0a4591 did the same for its tiles). `VICTORY_SERIAL_COPIES=1`
+/// is the opt-out for A/B runs of one build: one thread, as before.
+fn copy_threads() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        let cpus = std::thread::available_parallelism().map_or(1, |n| n.get());
+        let serial = std::env::var("VICTORY_SERIAL_COPIES").ok();
+        let n = threads_from(serial.as_deref(), std::env::var("VICTORY_COPY_THREADS").ok().as_deref(), cpus);
+        tracing::info!(threads = n, "snapshots and copy-back threads (VICTORY_SERIAL_COPIES=1 for one)");
+        n
+    })
+}
+
+/// [`copy_threads`] from `VICTORY_SERIAL_COPIES`, `VICTORY_COPY_THREADS`
+/// and the processors there are.
+fn threads_from(serial: Option<&str>, threads: Option<&str>, cpus: usize) -> usize {
+    if serial.is_some_and(|v| v.trim() == "1") {
+        return 1;
+    }
+    threads
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .map_or(cpus.clamp(1, 6), |n| n.clamp(1, 16))
+}
+
+/// Work smaller than this stays on the calling thread (starting threads
+/// costs tens of microseconds).
+const PARALLEL_LEAST: usize = 2 << 20;
+/// Pieces memory copies are split into between threads.
+const COPY_PIECE: usize = 1 << 20;
+
+/// Calls `f` on pieces of `list` from up to `threads` threads (the caller's
+/// one of them), small pieces taken in turn: they are not equally long.
+/// Every item is handed to exactly one call.
+fn in_parallel<T: Sync>(list: &[T], threads: usize, f: impl Fn(&[T]) + Sync) {
+    if threads <= 1 || list.len() <= 1 {
+        return f(list);
+    }
+    let piece = (list.len() / (threads * 8)).max(1);
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let work = || {
+        loop {
+            let from = next.fetch_add(piece, std::sync::atomic::Ordering::Relaxed);
+            if from >= list.len() {
+                break;
+            }
+            f(&list[from..(from + piece).min(list.len())]);
+        }
+    };
+    let threads = threads.min(list.len().div_ceil(piece));
+    #[cfg(test)]
+    SPREAD.fetch_add(usize::from(threads > 1), std::sync::atomic::Ordering::Relaxed);
+    std::thread::scope(|s| {
+        for _ in 1..threads {
+            s.spawn(work);
+        }
+        work();
+    });
+}
+
+/// Calls of [`in_parallel`] that started threads (tests).
+#[cfg(test)]
+static SPREAD: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Declared ranges whose snapshot was skipped because a range already
+/// declared in the submission covers them (diagnostics).
+#[cfg(feature = "diagnostics")]
+static COVERED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
 // SAFETY: D3D12 resources are free-threaded; `data` is a persistent mapping
 // written only on the submitting thread.
@@ -233,24 +311,44 @@ impl Shadow {
     /// heap), in reused memory (fresh snapshots cost ~2.3 million page
     /// faults per world frame).
     pub(crate) fn writing(&self, address: usize, len: usize) {
-        self.pending
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert((address, address + len));
+        self.writing_on(address, len, copy_threads());
+    }
+
+    /// [`Shadow::writing`] with the snapshot copied on up to `threads`
+    /// threads. A range inside one already declared in this submission has
+    /// its snapshot already (Belobug a0a4591): nothing to look at.
+    fn writing_on(&self, address: usize, len: usize, threads: usize) {
+        let end = address + len;
+        {
+            let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+            // Every pending range had its holes snapshotted when declared, and
+            // the snapshot lives until the last pending range goes.
+            let covered = pending.iter().any(|&(a, b)| a <= address && end <= b);
+            pending.insert((address, end));
+            if covered {
+                #[cfg(feature = "diagnostics")]
+                {
+                    use std::sync::atomic::Ordering::Relaxed;
+                    COVERED[0].fetch_add(1, Relaxed);
+                    COVERED[1].fetch_add(len as u64, Relaxed);
+                }
+                return;
+            }
+        }
         let (from, to) = self.inside(address, len);
         if from >= to {
             return;
         }
-        // SAFETY: inside the mapping.
-        let host = |a: usize, b: usize| unsafe { std::slice::from_raw_parts(self.data.add(a), b - a) };
         let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let segments = &mut before.0;
-        let mut i = segments.partition_point(|(at, bytes)| at + bytes.len() <= from);
-        let mut at = from;
-        #[cfg(feature = "diagnostics")]
-        let mut captured = 0;
         #[cfg(feature = "diagnostics")]
         let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::SnapshotUs);
+        // The holes of `[from, to)` not snapshotted yet, in order: preserve
+        // the first baseline of each byte; extending a range only snapshots
+        // its holes. Chunk edges aligned to title pages.
+        let mut holes: Vec<(usize, usize)> = Vec::new();
+        let mut i = segments.partition_point(|(at, bytes)| at + bytes.len() <= from);
+        let mut at = from;
         while at < to {
             if let Some((start, bytes)) = segments.get(i)
                 && *start <= at
@@ -259,21 +357,60 @@ impl Shadow {
                 i += 1;
                 continue;
             }
-            // Preserve the first baseline of each byte; extending a range
-            // only snapshots its holes. Align chunk edges to title pages.
             let absolute = self.start as usize + at;
             let next = ((absolute / SNAPSHOT_CHUNK + 1) * SNAPSHOT_CHUNK) - self.start as usize;
             let end = to.min(next).min(segments.get(i).map_or(to, |s| s.0));
-            let mut bytes = pooled(end - at);
-            bytes.extend_from_slice(host(at, end));
-            segments.insert(i, (at, bytes));
-            #[cfg(feature = "diagnostics")]
-            { captured += end - at; }
-            i += 1;
+            holes.push((at, end));
             at = end;
         }
+        if holes.is_empty() {
+            return;
+        }
+        let captured: usize = holes.iter().map(|&(a, b)| b - a).sum();
+        let mut bufs: Vec<Vec<u8>> = holes.iter().map(|&(a, b)| pooled(b - a)).collect();
+        // (copy offset, snapshot buffer, bytes) in pieces of at most
+        // COPY_PIECE; each piece is one thread's alone.
+        let mut copies: Vec<(usize, usize, usize)> = Vec::new();
+        for (&(a, b), buf) in holes.iter().zip(&mut bufs) {
+            let dst = buf.as_mut_ptr() as usize;
+            let mut at = a;
+            while at < b {
+                let n = (b - at).min(COPY_PIECE);
+                copies.push((at, dst + (at - a), n));
+                at += n;
+            }
+        }
+        let data = self.data as usize;
+        let threads = if captured >= PARALLEL_LEAST { threads } else { 1 };
+        in_parallel(&copies, threads, |chunk| {
+            for &(at, dst, n) in chunk {
+                // SAFETY: inside the mapping (`at + n <= to`); a pooled buffer
+                // with room for its hole, each piece written by one thread.
+                unsafe { std::ptr::copy_nonoverlapping((data + at) as *const u8, dst as *mut u8, n) };
+            }
+        });
+        let mut new = holes
+            .iter()
+            .zip(bufs)
+            .map(|(&(a, b), mut buf)| {
+                // SAFETY: every byte of `[0, b - a)` was written above,
+                // within the capacity `pooled` gave.
+                unsafe { buf.set_len(b - a) };
+                (a, buf)
+            })
+            .peekable();
+        // Holes lie between existing segments: merge both sorted lists.
+        let old = std::mem::take(segments);
+        segments.reserve(old.len() + holes.len());
+        for segment in old {
+            while new.peek().is_some_and(|(a, _)| *a < segment.0) {
+                segments.push(new.next().expect("peeked"));
+            }
+            segments.push(segment);
+        }
+        segments.extend(new);
         #[cfg(feature = "diagnostics")]
-        if captured > 0 {
+        {
             crate::copystat::add(crate::copystat::C::SnapshotBytes, captured as u64);
             crate::copystat::snapshot(self.start, self.len, captured as u64);
         }
@@ -298,6 +435,14 @@ impl Shadow {
     }
 
     fn copy_back_or_not(&self, address: usize, len: usize, back: bool) -> usize {
+        self.copy_back_on(address, len, back, copy_threads())
+    }
+
+    /// [`Shadow::copy_back_or_not`] with the pieces compared and written
+    /// back on up to `threads` threads. Which pieces are compared, and with
+    /// which snapshot bytes, is decided in order on this thread first; the
+    /// pieces are disjoint, so the threads touch disjoint memory.
+    fn copy_back_on(&self, address: usize, len: usize, back: bool, threads: usize) -> usize {
         let mut snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let (segments, compared) = &mut *snapshot;
         let mut written = 0;
@@ -309,37 +454,35 @@ impl Shadow {
             // By 64 KiB piece: the copy compared with its bytes before the
             // submission, title memory read only where the GPU wrote.
             const PIECE: usize = 64 << 10;
-            let mut title = vec![0u8; PIECE];
-            let mut synced = Vec::new();
+            // (copy offset, bytes, the snapshot's bytes: a pointer into a
+            // segment, or an index into `gathered`).
+            let mut work: Vec<(usize, usize, Old)> = Vec::new();
+            let mut gathered: Vec<Vec<u8>> = Vec::new();
             let mut i = segments.partition_point(|(at, bytes)| at + bytes.len() <= from);
-            let mut gathered = Vec::new();
             let mut at = from;
             while at < to {
                 let n = (PIECE - (start + at) % PIECE).min(to - at);
                 let end = at + n;
                 let Some((taken, before)) = segments.get(i).filter(|(s, _)| *s <= at) else { break };
                 let old = if end <= taken + before.len() {
-                    &before[at - taken..end - taken]
+                    Old::At(before.as_ptr() as usize + (at - taken))
                 } else {
                     // A range extension may have split a page into several
                     // captures. Reassemble just this page, not the snapshot.
-                    gathered.clear();
+                    let mut piece = Vec::with_capacity(n);
                     let mut cursor = at;
                     for (s, bytes) in &segments[i..] {
                         if *s > cursor { break; }
                         let limit = end.min(*s + bytes.len());
-                        gathered.extend_from_slice(&bytes[cursor - s..limit - s]);
+                        piece.extend_from_slice(&bytes[cursor - s..limit - s]);
                         cursor = limit;
                         if cursor == end { break; }
                     }
-                    if gathered.len() != n { break; }
-                    &gathered
+                    if piece.len() != n { break; }
+                    gathered.push(piece);
+                    Old::Gathered(gathered.len() - 1)
                 };
                 while segments.get(i).is_some_and(|(s, b)| s + b.len() <= end) { i += 1; }
-                // SAFETY: inside the mapping; only the submitting thread
-                // writes it.
-                let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
-                let title = &mut title[..n];
                 // A whole piece is compared once per submission, whichever
                 // declared ranges overlap it: then what the GPU wrote there
                 // went back.
@@ -347,27 +490,62 @@ impl Shadow {
                     at += n;
                     continue;
                 }
-                #[cfg(feature = "diagnostics")]
-                crate::copystat::add(crate::copystat::C::CompareBytes, n as u64);
-                if host != old && crate::host::read_into((start + at) as *const u8, title) {
-                    // Title memory with the GPU's bytes put in; the copy
-                    // takes the title's bytes in turn.
-                    let mut changed = false;
-                    for ((t, h), o) in title.iter_mut().zip(host.iter_mut()).zip(old) {
-                        if *h != *o && *t != *h {
-                            *t = *h;
-                            changed = true;
-                        }
-                        *h = *t;
-                    }
-                    if changed {
-                        let _writing = crate::watch::writing(start + at, n);
-                        crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
-                        written += n;
-                    }
-                    synced.push((start + at) / PAGE);
-                }
+                work.push((at, n, old));
                 at += n;
+            }
+            // Per piece: 0 equal to title memory or unread, 1 synced, 2
+            // synced and written back.
+            let outcome: Vec<std::sync::atomic::AtomicU8> =
+                work.iter().map(|_| std::sync::atomic::AtomicU8::new(0)).collect();
+            let total: usize = work.iter().map(|w| w.1).sum();
+            let threads = if total >= PARALLEL_LEAST { threads } else { 1 };
+            let data = self.data as usize;
+            let indexed: Vec<usize> = (0..work.len()).collect();
+            in_parallel(&indexed, threads, |chunk| {
+                let mut title = vec![0u8; PIECE];
+                for &k in chunk {
+                    let (at, n, ref old) = work[k];
+                    // SAFETY: inside the mapping; the GPU is done with it and
+                    // this piece is this thread's alone.
+                    let host = unsafe { std::slice::from_raw_parts_mut((data + at) as *mut u8, n) };
+                    let old: &[u8] = match *old {
+                        // SAFETY: inside a segment (checked above), which
+                        // the lock held keeps alive and unchanged.
+                        Old::At(p) => unsafe { std::slice::from_raw_parts(p as *const u8, n) },
+                        Old::Gathered(g) => &gathered[g],
+                    };
+                    let title = &mut title[..n];
+                    #[cfg(feature = "diagnostics")]
+                    crate::copystat::add(crate::copystat::C::CompareBytes, n as u64);
+                    if host != old && crate::host::read_into((start + at) as *const u8, title) {
+                        // Title memory with the GPU's bytes put in; the copy
+                        // takes the title's bytes in turn.
+                        let mut changed = false;
+                        for ((t, h), o) in title.iter_mut().zip(host.iter_mut()).zip(old) {
+                            if *h != *o && *t != *h {
+                                *t = *h;
+                                changed = true;
+                            }
+                            *h = *t;
+                        }
+                        if changed {
+                            let _writing = crate::watch::writing(start + at, n);
+                            crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+                        }
+                        outcome[k].store(1 + u8::from(changed), std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+            });
+            let mut synced = Vec::new();
+            for (&(at, n, _), o) in work.iter().zip(&outcome) {
+                match o.load(std::sync::atomic::Ordering::Relaxed) {
+                    2 => {
+                        written += n;
+                        synced.push((start + at) / PAGE);
+                    }
+                    1 => synced.push((start + at) / PAGE),
+                    _ => {}
+                }
             }
             // Pages made equal to title memory are current in the copy, so
             // our own write is not taken for the title's; others keep what
@@ -618,6 +796,12 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
         *used = now;
         return Some(shadow.clone());
     }
+    // A new window: first give back those over memory the title freed
+    // (`VICTORY_SWEEP_TILES=2`), so that the cap below does not throw out
+    // windows still in use instead.
+    drop(map);
+    sweep_loose_now();
+    let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
     let total: u64 = map.entries.keys().map(|&(_, n)| n).sum();
     let released = if map.entries.len() >= LOOSE_MAX_COUNT || total.saturating_add(len) > LOOSE_MAX_BYTES {
         map.trim(48, (192u64 << 20).min(LOOSE_MAX_BYTES.saturating_sub(len)))
@@ -643,6 +827,111 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     map.entries.insert((start, len), (now, shadow.clone()));
     changed();
     Some(shadow)
+}
+
+/// Which copies of memory outside buffer objects are given back before
+/// the cap asks (`VICTORY_SWEEP_TILES`): 0 none (default); 2 windows no
+/// list, heap slot or submission holds whose title memory is all freed
+/// (`MEM_FREE`), at most once a second. Port of Belobug 0a32e89/e11fb06,
+/// whose sparse tiles this tree does not have: its loose windows are what
+/// grows with title memory here. Mode 1 there (by age alone) stopped the
+/// host GPU and is not ported. Reserved memory never counts as freed: a
+/// lazily committed reservation (`crate::watch::lazy_covers`) is still the
+/// title's and its copy may hold GPU-only results (the zero-fill of
+/// 7a91fe8).
+fn sweep_mode() -> u8 {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| {
+        let mode = std::env::var("VICTORY_SWEEP_TILES").ok().and_then(|v| v.trim().parse::<u8>().ok()).unwrap_or(0);
+        match mode {
+            0 => 0,
+            2 => {
+                tracing::info!("VICTORY_SWEEP_TILES=2: copies of freed title memory are given back");
+                2
+            }
+            other => {
+                tracing::warn!(mode = other, "VICTORY_SWEEP_TILES: only 0 and 2 are known; off");
+                0
+            }
+        }
+    })
+}
+
+/// [`sweep_loose`] if `VICTORY_SWEEP_TILES=2`, at most once a second,
+/// whoever asks.
+fn sweep_loose_now() {
+    if sweep_mode() != 2 {
+        return;
+    }
+    static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+    {
+        let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+        if last.is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(1)) {
+            return;
+        }
+        *last = Some(std::time::Instant::now());
+    }
+    let started = std::time::Instant::now();
+    let (windows, bytes) = sweep_loose(freed);
+    let took = started.elapsed();
+    if windows > 0 || took > std::time::Duration::from_millis(20) {
+        tracing::info!(windows, megabytes = bytes >> 20, ms = took.as_millis() as u64, "copies of freed title memory given back");
+    }
+}
+
+/// Whether all of `[start, start + len)` is free address space: nothing of
+/// the title's is there any more (reserved or committed memory is not).
+fn freed(start: u64, len: u64) -> bool {
+    use windows_sys::Win32::System::Memory::{MEM_FREE, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    let end = start.saturating_add(len) as usize;
+    let mut at = start as usize;
+    while at < end {
+        let mut info = MEMORY_BASIC_INFORMATION::default();
+        // SAFETY: only querying address metadata; `info` is writable.
+        let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+        if n == 0 || info.State != MEM_FREE || info.RegionSize == 0 {
+            return false;
+        }
+        at = (info.BaseAddress as usize).saturating_add(info.RegionSize);
+    }
+    true
+}
+
+/// Gives back the loose windows only the cache holds whose title memory
+/// `gone` says is no longer there. Which ones is decided under the cache's
+/// lock, `gone` asked outside it (it asks the system, e11fb06), and a
+/// window looked up or taken meanwhile is kept. Returns the windows and
+/// bytes given back.
+fn sweep_loose(gone: impl Fn(u64, u64) -> bool) -> (usize, u64) {
+    let candidates: Vec<((u64, u64), u64)> = LOOSE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entries
+        .iter()
+        .filter(|(_, (_, s))| Arc::strong_count(s) == 1)
+        .map(|(&key, &(used, _))| (key, used))
+        .collect();
+    let gone: Vec<((u64, u64), u64)> = candidates.into_iter().filter(|&((a, n), _)| gone(a, n)).collect();
+    if gone.is_empty() {
+        return (0, 0);
+    }
+    let mut released = Vec::new();
+    {
+        let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+        for (key, used) in gone {
+            if map.entries.get(&key).is_some_and(|(u, s)| *u == used && Arc::strong_count(s) == 1)
+                && let Some((_, copy)) = map.entries.remove(&key)
+            {
+                released.push((key.1, copy));
+            }
+        }
+        if !released.is_empty() {
+            changed();
+        }
+    }
+    let bytes = released.iter().map(|(n, _)| n).sum();
+    // Dropped outside the cache's lock: their trackers take the journal's.
+    (released.len(), bytes)
 }
 
 /// The copy a buffer view of `len` bytes at `address`, whose elements are
@@ -675,6 +964,15 @@ static VIEWS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::At
 pub(crate) fn log_views(frames: f64) {
     use std::sync::atomic::Ordering::Relaxed;
     let [asks, made, bytes, largest] = [0, 1, 2, 3].map(|i| VIEWS[i].swap(0, Relaxed));
+    let [covered, covered_bytes] = [0, 1].map(|i| COVERED[i].swap(0, Relaxed));
+    if covered > 0 {
+        tracing::info!(
+            "shader-written ranges inside one already declared: {:.0}/frame ({:.1} MB) not looked at again; copy threads {}",
+            covered as f64 / frames,
+            covered_bytes as f64 / frames / 1e6,
+            copy_threads()
+        );
+    }
     let live = EXACT
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -890,5 +1188,286 @@ mod tests {
         assert_eq!([title(p + 20), title(p + 21), title(p + 22), title(p + PAGE + 5)], [1, 2, 3, 9]);
         assert_eq!(bytes(&copy), 0, "the snapshot goes with the last range");
         unregister(p, p as u64);
+    }
+
+    /// Title byte `i` of the fixtures: never zero, so a zero anywhere is a
+    /// zero-fill.
+    fn pattern(i: usize) -> u8 {
+        (i % 251) as u8 + 1
+    }
+
+    /// One run of the parallel-snapshot fixture on `threads` threads: a
+    /// 10 MiB write-watched buffer (three snapshot chunks), declared ranges
+    /// that overlap and nest, shader writes across chunk and piece edges,
+    /// a title write meanwhile. Returns (title bytes, copy bytes, snapshot
+    /// bytes after each declaration, bytes written back).
+    fn parallel_fixture(threads: usize) -> (Vec<u8>, Vec<u8>, Vec<usize>, usize) {
+        let host = host().expect("D3D12 host");
+        let pages = 160;
+        let len = pages * PAGE;
+        let p = crate::watch::tests::pool(pages);
+        // SAFETY: our pool, not guarded yet.
+        unsafe { (0..len).for_each(|i| ((p + i) as *mut u8).write(pattern(i))) };
+        let (buffer, data) = host.shared_buffer(len as u64).unwrap();
+        let copy = Shadow::new(buffer, data, 0, p as u64, len as u64);
+        assert_eq!(copy.update(p, len), len);
+        let snap = |s: &Shadow| s.before.lock().unwrap().0.iter().map(|(_, b)| b.len()).sum::<usize>();
+        let segments_ok = |s: &Shadow| {
+            let b = s.before.lock().unwrap();
+            // Disjoint, in order, and each the title's bytes before the run.
+            b.0.windows(2).all(|w| w[0].0 + w[0].1.len() <= w[1].0)
+                && b.0.iter().all(|(at, bytes)| bytes.iter().enumerate().all(|(k, &v)| v == pattern(at + k)))
+        };
+        let mib = 1 << 20;
+        let a = (p + 100, 9 * mib - 100);
+        let nested = (p + 3 * PAGE + 7, 2 * PAGE);
+        let tail = (p + 9 * mib - 100, len - 9 * mib + 100);
+        let early = (p + 10, 200);
+        let mut sizes = Vec::new();
+        for (at, n) in [a, nested, a, tail, early] {
+            copy.writing_on(at, n, threads);
+            sizes.push(snap(&copy));
+            assert!(segments_ok(&copy), "snapshot holds the title's bytes before the submission");
+        }
+        // The GPU writes: across the 4 MiB chunk edge, a 64 KiB piece edge,
+        // inside the nested range, at the very ends.
+        let writes: [(usize, &[u8]); 6] = [
+            (4 * mib - 3, &[0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6]),
+            (17 * PAGE - 1, &[0xb1, 0xb2]),
+            (3 * PAGE + 9, &[0xc1; 300]),
+            (100, &[0xd1]),
+            (len - 1, &[0xe1]),
+            (8 * mib + 12345, &[0xf1; 70000]),
+        ];
+        for (at, bytes) in writes {
+            copy.write_host((p + at) as u64, bytes);
+        }
+        // The title writes a byte of a written page meanwhile (guard fault),
+        // one the GPU left alone: the title's byte stays.
+        // SAFETY: our pool; the guard handler takes the write.
+        unsafe { ((p + 17 * PAGE + 40) as *mut u8).write_volatile(0x77) };
+        let mut written = 0;
+        for (at, n) in [early, tail, a, nested, a] {
+            written += copy.copy_back_on(at, n, true, threads);
+        }
+        assert!(copy.before.lock().unwrap().0.is_empty(), "the snapshot goes with the last range");
+        // SAFETY: our pool and the copy's mapping, both `len` bytes.
+        let title = unsafe { std::slice::from_raw_parts(p as *const u8, len) }.to_vec();
+        // SAFETY: as above.
+        let host_bytes = unsafe { std::slice::from_raw_parts(data, len) }.to_vec();
+        let mut expected: Vec<u8> = (0..len).map(pattern).collect();
+        for (at, bytes) in writes {
+            expected[at..at + bytes.len()].copy_from_slice(bytes);
+        }
+        expected[17 * PAGE + 40] = 0x77;
+        assert!(title == expected, "title memory: the shaders' bytes went back, the title's stayed, nothing else changed");
+        assert!(!title.contains(&0) && !host_bytes.contains(&0), "no zero-fill of title memory or of the copy");
+        // Byte for byte, the copy is title memory again (the shaders' bytes,
+        // the title's write, the rest as it was): nothing zeroed or stale.
+        let differ = host_bytes.iter().zip(&expected).filter(|(h, e)| h != e).count();
+        assert_eq!(differ, 0, "copy bytes differing from title memory");
+        drop(copy);
+        crate::watch::tests::free(p);
+        (title, host_bytes, sizes, written)
+    }
+
+    /// (b): snapshots and copy-back on several threads keep the bytes the
+    /// shaders wrote, keep the title's own, zero nothing, snapshot each byte
+    /// once (a range inside one already declared adds nothing), and give
+    /// the same result as one thread, the behaviour before (a).
+    #[test]
+    fn parallel_snapshots_keep_shader_bytes_and_match_one_thread() {
+        if host().is_none() {
+            return;
+        }
+        let spread = SPREAD.load(std::sync::atomic::Ordering::Relaxed);
+        let many = parallel_fixture(6);
+        assert!(SPREAD.load(std::sync::atomic::Ordering::Relaxed) > spread, "threads were started");
+        let one = parallel_fixture(1);
+        let len = 160 * PAGE;
+        let a = 9 * (1 << 20) - 100;
+        // a, then nested inside a (nothing), a again (nothing), the tail's
+        // part past a, then `early`'s 90 bytes before a.
+        assert_eq!(many.2, vec![a, a, a, len - 100, len - 10]);
+        assert_eq!(many.0, one.0, "title memory identical");
+        assert_eq!(many.1, one.1, "copies identical");
+        assert_eq!(many.2, one.2, "snapshot bytes identical");
+        assert_eq!(many.3, one.3, "bytes written back identical");
+        eprintln!(
+            "parallel snapshot fixture: {} snapshot bytes for {} declared, {} written back",
+            many.2[4],
+            2 * a + 2 * PAGE + (len - a) + 200,
+            many.3
+        );
+    }
+
+    /// A committed allocation holding one whole loose window: (window
+    /// start, allocation base).
+    fn window_alloc() -> (usize, usize) {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE};
+        window_alloc_as(MEM_RESERVE | MEM_COMMIT)
+    }
+
+    fn window_alloc_as(kind: u32) -> (usize, usize) {
+        use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualAlloc};
+        let n = 3 * WINDOW as usize;
+        // SAFETY: a fresh allocation, freed by the test.
+        let base = unsafe { VirtualAlloc(std::ptr::null(), n, kind, PAGE_READWRITE) } as usize;
+        assert_ne!(base, 0);
+        let at = base.next_multiple_of(WINDOW as usize);
+        // A window left by an earlier user of these addresses is not ours.
+        evict_loose(at, WINDOW as usize);
+        (at, base)
+    }
+
+    /// The sweep tests share the loose cache: one at a time.
+    static SWEEP_TESTS: Mutex<()> = Mutex::new(());
+
+    fn free_alloc(base: usize) {
+        use windows_sys::Win32::System::Memory::{MEM_RELEASE, VirtualFree};
+        // SAFETY: an allocation of ours.
+        assert_ne!(unsafe { VirtualFree(base as _, 0, MEM_RELEASE) }, 0);
+    }
+
+    /// The shader value at a loose window's third page, if the cache still
+    /// has the window.
+    fn loose_value(at: usize) -> Option<u32> {
+        LOOSE
+            .lock()
+            .unwrap()
+            .entries
+            .get(&(at as u64, WINDOW))
+            .map(|(_, s)| s.read_host((at + 2 * PAGE) as u64, 1)[0])
+    }
+
+    /// (a): the sweep is off unless asked for, and off it leaves every
+    /// copy, even one over freed memory.
+    #[test]
+    fn sweep_is_off_by_default() {
+        let _one = SWEEP_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        if std::env::var_os("VICTORY_SWEEP_TILES").is_some() || host().is_none() {
+            return;
+        }
+        assert_eq!(sweep_mode(), 0);
+        let (at, base) = window_alloc();
+        let copy = find(at as u64, 16).expect("loose copy");
+        copy.write_host((at + 2 * PAGE) as u64, &0x1234_5678u32.to_le_bytes());
+        drop(copy);
+        free_alloc(base);
+        sweep_loose_now();
+        assert_eq!(loose_value(at), Some(0x1234_5678), "nothing given back with the sweep off");
+        evict_loose(at, WINDOW as usize);
+    }
+
+    /// (c): the sweep gives back a copy of freed title memory nothing
+    /// holds, and keeps, bytes and all: a copy of live memory, of reserved
+    /// (lazily committed) memory, of freed memory a list still holds, and
+    /// one looked up while the system was asked.
+    #[test]
+    fn sweep_gives_back_only_freed_unheld_copies_and_keeps_shadow_bytes() {
+        let _one = SWEEP_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        use windows_sys::Win32::System::Memory::MEM_RESERVE;
+        if host().is_none() {
+            return;
+        }
+        let gpu = 0x1234_5678u32;
+        let made = |at: usize| {
+            let copy = find(at as u64, 16).expect("loose copy");
+            copy.write_host((at + 2 * PAGE) as u64, &gpu.to_le_bytes());
+            copy
+        };
+        let (gone, gone_base) = window_alloc();
+        let (live, live_base) = window_alloc();
+        let (reserved, reserved_base) = window_alloc_as(MEM_RESERVE);
+        let (held, held_base) = window_alloc();
+        let (asked, asked_base) = window_alloc();
+        drop(made(gone));
+        drop(made(live));
+        drop(made(reserved));
+        let held_copy = made(held);
+        drop(made(asked));
+        for base in [gone_base, held_base, asked_base] {
+            free_alloc(base);
+        }
+        assert!(freed(gone as u64, WINDOW), "released memory is free");
+        assert!(!freed(live as u64, WINDOW), "committed memory is not");
+        assert!(!freed(reserved as u64, WINDOW), "reserved memory is not");
+        let ours = [gone, live, reserved, held, asked].map(|a| a as u64);
+        let (windows, bytes) = sweep_loose(|a, n| {
+            if a == asked as u64 {
+                // Looked up while the system is asked: kept.
+                drop(find(a, 16));
+            }
+            ours.contains(&a) && freed(a, n)
+        });
+        assert_eq!(loose_value(gone), None, "the copy of freed memory is given back");
+        assert_eq!((windows, bytes), (1, WINDOW));
+        for at in [live, reserved, held, asked] {
+            assert_eq!(loose_value(at), Some(gpu), "kept with the shader's bytes at {at:#x}");
+        }
+        assert_eq!(held_copy.read_host((held + 2 * PAGE) as u64, 1), [gpu]);
+        drop(held_copy);
+        // Freed and held by nothing now: the next sweep takes it.
+        let (windows, _) = sweep_loose(|a, n| a == held as u64 && freed(a, n));
+        assert_eq!((windows, loose_value(held)), (1, None));
+        for at in [live, reserved, asked] {
+            evict_loose(at, WINDOW as usize);
+        }
+        free_alloc(live_base);
+        free_alloc(reserved_base);
+    }
+
+    /// The A/B opt-out: `VICTORY_SERIAL_COPIES=1` wins, one thread as
+    /// before; otherwise up to 6 by default.
+    #[test]
+    fn serial_copies_opt_out() {
+        assert_eq!(threads_from(Some("1"), Some("8"), 16), 1);
+        assert_eq!(threads_from(Some(" 1 "), None, 16), 1);
+        assert_eq!(threads_from(Some("0"), None, 16), 6);
+        assert_eq!(threads_from(None, None, 4), 4);
+        assert_eq!(threads_from(None, Some("1"), 16), 1);
+        assert_eq!(threads_from(None, Some("0"), 16), 1);
+        assert_eq!(threads_from(None, Some("x"), 2), 2);
+    }
+
+    /// The memory peak of several threads against one: snapshot buffers
+    /// are the same either way; the threads add their stacks and a 64 KiB
+    /// buffer each. Run alone (`--ignored --test-threads=1`): the process
+    /// peak is shared with other tests.
+    #[test]
+    #[ignore]
+    fn parallel_copies_peak_commit() {
+        use windows_sys::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS_EX};
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        if host().is_none() {
+            return;
+        }
+        let peak = || {
+            // SAFETY: plain data, all zeros valid.
+            let mut c: PROCESS_MEMORY_COUNTERS_EX = unsafe { std::mem::zeroed() };
+            c.cb = size_of_val(&c) as u32;
+            // SAFETY: our own process, a counters structure of its size.
+            assert_ne!(unsafe { GetProcessMemoryInfo(GetCurrentProcess(), (&raw mut c).cast(), c.cb) }, 0);
+            (c.PeakPagefileUsage, c.PeakWorkingSetSize)
+        };
+        // Twice on one thread first: the pool and the D3D12 heaps reach
+        // their size, so the peak after that is what threads add.
+        parallel_fixture(1);
+        parallel_fixture(1);
+        let (commit, ws) = peak();
+        for _ in 0..4 {
+            parallel_fixture(6);
+        }
+        let (commit2, ws2) = peak();
+        let extra = commit2.saturating_sub(commit);
+        eprintln!(
+            "peak commit one thread {:.1} MB, six threads {:.1} MB (+{:.2} MB); peak working set {:.1} -> {:.1} MB",
+            commit as f64 / 1e6,
+            commit2 as f64 / 1e6,
+            extra as f64 / 1e6,
+            ws as f64 / 1e6,
+            ws2 as f64 / 1e6
+        );
+        assert!(extra < 32 << 20, "threads add at most stacks and piece buffers");
     }
 }
