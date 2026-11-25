@@ -2574,6 +2574,11 @@ impl<'a> Lower<'a> {
     /// byte in it. The map holds two dwords per MiB: which view, and the
     /// byte in it of that MiB's start.
     fn memory(&mut self, lo: V, hi: V, nonuniform: bool) -> (V, V) {
+        let (handle, byte, _) = self.memory_with_residency(lo, hi, nonuniform);
+        (handle, byte)
+    }
+
+    fn memory_with_residency(&mut self, lo: V, hi: V, nonuniform: bool) -> (V, V, V) {
         let c = self.cur;
         let first = self.memory_base();
         let map = self.s.handle_at(c, first, false, false, (11, 0));
@@ -2613,7 +2618,9 @@ impl<'a> Lower<'a> {
         let shared = if shared { 0x4000 } else { 0 };
         let handle = self.s.handle_at(c, index, false, nonuniform, (11 | 0x1000 | shared, 0));
         let within = self.s.m.bin(c, Bin::And, lo, low);
-        (handle, self.s.m.bin(c, Bin::Add, start, within))
+        let null = self.s.m.i32(1);
+        let resident = self.s.m.cmp(c, pred::IUGT, view, null);
+        (handle, self.s.m.bin(c, Bin::Add, start, within), resident)
     }
 
     /// `hi:lo` plus `x` (sign-extended).
@@ -2631,8 +2638,8 @@ impl<'a> Lower<'a> {
     }
 
     /// `count` dwords of title memory at `hi:lo`.
-    fn memory_dwords(&mut self, at: (V, V), count: u32, nonuniform: bool) -> Vec<V> {
-        let (h, off) = self.memory(at.0, at.1, nonuniform);
+    fn memory_dwords(&mut self, at: (V, V), count: u32, nonuniform: bool) -> (Vec<V>, V) {
+        let (h, off, resident) = self.memory_with_residency(at.0, at.1, nonuniform);
         let mut out = Vec::new();
         let mut done = 0;
         while done < count {
@@ -2657,7 +2664,7 @@ impl<'a> Lower<'a> {
             }
             done += n;
         }
-        out
+        (out, resident)
     }
 
     /// The address a global memory instruction gives each lane.
@@ -2723,7 +2730,7 @@ impl<'a> Lower<'a> {
                 return Ok(());
             }
             let n = dwords(rest).ok_or(name)?;
-            let xs = self.memory_dwords(at, n, true);
+            let (xs, _) = self.memory_dwords(at, n, true);
             for (k, x) in xs.into_iter().enumerate() {
                 self.write(inst, Reg::V(reg + k as u8), x, guard);
             }
@@ -2872,9 +2879,22 @@ impl<'a> Lower<'a> {
 
         // Boxes.
         let place = self.begin_guarded(Some(is_box));
-        let node = self.memory_dwords((alo, ahi), 28, true);
+        let (mut node, first_present) = self.memory_dwords((alo, ahi), 16, true);
+        let wide = self.s.m.cmp(self.cur, pred::EQ, kind, k5);
+        let read_tail = self.s.m.bin(self.cur, Bin::And, wide, first_present);
+        let tail = self.begin_guarded(Some(read_tail));
+        let size = k(self, 64);
+        let at = self.add_address((alo, ahi), size, false);
+        let (words, tail_present) = self.memory_dwords(at, 12, true);
+        let zero_bits = k(self, 0);
+        let mut values: Vec<_> = words.into_iter().map(|word| (word, zero_bits)).collect();
+        let yes = self.s.m.bool(true);
+        values.push((tail_present, yes));
+        let mut words = self.end_guarded(tail, &values);
+        let tail_present = words.pop().expect("tail residency");
+        node.extend(words);
         let c = self.cur;
-        let wide = self.s.m.cmp(c, pred::EQ, kind, k5);
+        let present = self.s.m.bin(c, Bin::And, first_present, tail_present);
         let (k16, kffff) = (k(self, 16), k(self, 0xFFFF));
         let f32t = self.s.t.f32;
         let mut bounds = Vec::new();
@@ -2905,6 +2925,7 @@ impl<'a> Lower<'a> {
             let there = self.s.m.cmp(c, pred::NE, pointer, ones);
             let meets = self.s.m.cmp(c, pred::OLE, near_all, far_all);
             let hit = self.s.m.bin(c, Bin::And, there, meets);
+            let hit = self.s.m.bin(c, Bin::And, hit, present);
             let p = self.s.m.select(c, hit, pointer, ones);
             let t = self.s.m.select(c, hit, near_all, far);
             hits.push((p, t));
@@ -2923,7 +2944,7 @@ impl<'a> Lower<'a> {
 
         // Triangles.
         let place = self.begin_guarded(Some(is_tri));
-        let node = self.memory_dwords((alo, ahi), 16, true);
+        let (node, present) = self.memory_dwords((alo, ahi), 16, true);
         let c = self.cur;
         let vertex = |l: &mut Self, v: usize, axis: usize| l.as_float(node[3 * v + axis]);
         // The vertices of each of the node's triangles.
@@ -2992,6 +3013,7 @@ impl<'a> Lower<'a> {
         let id = self.s.m.bin(c, Bin::LShr, id, two);
         let j = pick(self, id);
         let unit = kf(self, 1.0);
+        let inside = self.s.m.bin(c, Bin::And, inside, present);
         let out = [(t, far), (det, unit), (i, zero), (j, zero)].map(|(x, miss)| {
             let x = self.s.m.select(c, inside, x, miss);
             self.as_int(x)
@@ -4682,11 +4704,25 @@ impl<'a> Lower<'a> {
             let at = self.s.m.bin(c, Bin::LShr, at, two);
             let src = self.s.m.bin(c, Bin::And, at, last);
             let z = self.s.m.i32(0);
-            let x = match guard {
-                Some(g) => self.s.m.select(c, g, x, z),
-                None => x,
-            };
-            let r = self.read_lane(x, src);
+            let active = guard.unwrap_or_else(|| self.s.m.bool(true));
+            let i32t = self.s.t.i32;
+            let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+            let ballot = self.s.op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[active]);
+            let lo = self.s.m.extract(c, ballot, 0);
+            let hi = self.s.m.extract(c, ballot, 1);
+            let k32 = self.s.m.i32(32);
+            let k31 = self.s.m.i32(31);
+            let lower = self.s.m.cmp(c, pred::IULT, src, k32);
+            let word = self.s.m.select(c, lower, lo, hi);
+            let index = self.s.m.bin(c, Bin::And, src, k31);
+            let bit = self.s.m.bin(c, Bin::LShr, word, index);
+            let one = self.s.m.i32(1);
+            let bit = self.s.m.bin(c, Bin::And, bit, one);
+            let running = self.s.m.cmp(c, pred::NE, bit, z);
+            let here = self.lane_index();
+            let source = self.s.m.select(c, running, src, here);
+            let r = self.read_lane(x, source);
+            let r = self.s.m.select(c, running, r, z);
             let reg = dst_reg.ok_or("a permutation result")?;
             self.write(inst, Reg::V(reg), r, guard);
             return Ok(());
@@ -5770,7 +5806,7 @@ impl<'a> Lower<'a> {
                     let so = self.operand(inst, soffset)?;
                     address = self.add_address(address, so, false);
                 }
-                let xs = self.memory_dwords(address, count, false);
+                let (xs, _) = self.memory_dwords(address, count, false);
                 for (k, x) in xs.into_iter().enumerate() {
                     self.write(inst, Reg::S(code + k as u8), x, None);
                 }
