@@ -1890,7 +1890,9 @@ impl<'a> Lower<'a> {
             .strip_prefix("s_")
             .and_then(|n| n.strip_suffix(width))
             .ok_or(ELSEWHERE)?;
-        if inst.write(Reg::S(*code)) != Some(lo) || inst.write(Reg::S(EXEC)).is_some() {
+        if inst.write(Reg::S(*code)) != Some(lo)
+            || (*code != EXEC && inst.write(Reg::S(EXEC)).is_some())
+        {
             return Err(ELSEWHERE);
         }
         let at = if b == self.cur_ir {
