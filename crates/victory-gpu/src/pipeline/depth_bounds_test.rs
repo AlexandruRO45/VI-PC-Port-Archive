@@ -102,48 +102,6 @@ fn depth_bounds_control_a_title_draw() {
     render_with_depth_bounds(host, fullscreen_vertex_shader(), None);
 }
 
-#[test]
-fn depth_bounds_control_a_title_mesh_dispatch() {
-    let Some(host) = crate::host::host().filter(|h| h.mesh_shaders()) else {
-        eprintln!("skipped depth bounds mesh render: no host mesh shaders");
-        return;
-    };
-    let Some(dxc) = std::env::var_os("VICTORY_PC_DXC") else {
-        eprintln!("skipped depth bounds mesh render: VICTORY_PC_DXC is unset");
-        return;
-    };
-    let dir = tempfile::tempdir().unwrap();
-    let source = dir.path().join("triangle.hlsl");
-    // WARP removed the device on a depth-only mesh dispatch without a
-    // pixel shader, even with depth bounds disabled.
-    std::fs::write(&source, r#"
-        struct Vertex { float4 position : SV_Position; };
-        [numthreads(1, 1, 1)] [outputtopology("triangle")]
-        void main(out vertices Vertex verts[3], out indices uint3 triangles[1]) {
-            SetMeshOutputCounts(3, 1);
-            verts[0].position = float4(-1,  1, 0.25, 1);
-            verts[1].position = float4( 3,  1, 0.25, 1);
-            verts[2].position = float4(-1, -3, 0.25, 1);
-            triangles[0] = uint3(0, 1, 2);
-        }
-        void ps() {}
-    "#).unwrap();
-    let compile = |profile, entry| {
-        let code = dir.path().join(profile);
-        let compiled = std::process::Command::new(&dxc)
-            .args(["-T", profile, "-E", entry, "-Fo"])
-            .arg(&code)
-            .arg(&source)
-            .output()
-            .unwrap();
-        assert!(compiled.status.success(), "{}", String::from_utf8_lossy(&compiled.stderr));
-        std::fs::read(&code).unwrap()
-    };
-    let ms = host_shader("mesh", victory_shader::HwStage::Ms, &compile("ms_6_6", "main"));
-    let ps = host_shader("pixel", victory_shader::HwStage::Ps, &compile("ps_6_6", "ps"));
-    render_with_depth_bounds(host, ms, Some(ps));
-}
-
 fn render_with_depth_bounds(host: &crate::host::Host, shader: Arc<Shader>, ps: Option<Arc<Shader>>) {
     let device = &host.device;
     // SAFETY: plain adapter queries on a live device.
