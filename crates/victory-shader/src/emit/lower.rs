@@ -182,6 +182,32 @@ fn half_shift(width: u32) -> u32 {
 /// parameter and byte offset.
 type EntryAddress = (usize, u32);
 
+/// A byte or half LDS access (`ds_read_u8`..., `ds_write_b8`..., their
+/// `_d16` and `_d16_hi` forms), from the opcode name: its bits, and
+/// whether a read extends the sign.
+fn lds_sub_dword(name: &str) -> Option<(u32, bool)> {
+    if let Some(rest) = name.strip_prefix("ds_read") {
+        return match rest.trim_end_matches("_hi").trim_end_matches("_d16") {
+            "_u8" => Some((8, false)),
+            "_i8" => Some((8, true)),
+            "_u16" => Some((16, false)),
+            "_i16" => Some((16, true)),
+            _ => None,
+        };
+    }
+    match name.strip_prefix("ds_write")?.trim_end_matches("_d16_hi") {
+        "_b8" => Some((8, false)),
+        "_b16" => Some((16, false)),
+        _ => None,
+    }
+}
+
+/// Whether `name` is a byte or half LDS access.
+#[cfg(test)]
+pub(super) fn sub_dword(name: &str) -> bool {
+    lds_sub_dword(name).is_some()
+}
+
 struct Lower<'a> {
     s: Shader,
     x: &'a Parts<'a>,
@@ -3331,13 +3357,7 @@ impl<'a> Lower<'a> {
             } else {
                 // A byte or half, extended (`_d16`: into the low half,
                 // `_d16_hi`: the high half, the other half kept).
-                let (bits, signed) = match rest.trim_end_matches("_hi").trim_end_matches("_d16") {
-                    "_u8" => (8, false),
-                    "_i8" => (8, true),
-                    "_u16" => (16, false),
-                    "_i16" => (16, true),
-                    _ => return Err("an LDS read of bytes or halves"),
-                };
+                let (bits, signed) = lds_sub_dword(name).ok_or("an LDS read of bytes or halves")?;
                 let reg = dst_reg.ok_or("an LDS read result")?;
                 let (p, inside) = dword(self, offset);
                 let x = self.s.m.load(c, p);
@@ -3394,15 +3414,12 @@ impl<'a> Lower<'a> {
                 vec![(offset, width(name))]
             } else {
                 // A byte or half (`_d16_hi`: the high half of the data) into
-                // its dword through atomics, so lanes writing the other parts
-                // of the dword keep theirs.
-                // shortcut: lanes writing the same part in one instruction
-                // leave the OR of theirs (the console keeps one).
-                let bits = match rest.trim_end_matches("_d16_hi") {
-                    "_b8" => 8,
-                    "_b16" => 16,
-                    _ => return Err("an LDS write of bytes or halves"),
-                };
+                // its dword by a compare-exchange loop, so lanes writing the
+                // other parts of the dword keep theirs, and of lanes writing
+                // the same part one value wins, as on the console. (An
+                // atomic AND then OR would merge two lanes' values written
+                // to the same part, and show a cleared part between the two.)
+                let (bits, _) = lds_sub_dword(name).ok_or("an LDS write of bytes or halves")?;
                 let x = self.vgprs(inst, data.first().ok_or("an LDS write")?, 1)?[0];
                 let x = if rest.ends_with("_d16_hi") {
                     let k16 = self.s.m.i32(16);
@@ -3417,12 +3434,24 @@ impl<'a> Lower<'a> {
                 let part = self.s.m.bin(c, Bin::Shl, mask, sh);
                 let ones = self.s.m.i32(u32::MAX);
                 let keep = self.s.m.bin(c, Bin::Xor, part, ones);
+                // Past the allocation the write is dropped (`on`).
                 let (p, inside) = dword(self, offset);
                 let g = on(self, inside);
                 let at = self.begin_guarded(Some(g));
-                use super::bitcode::Rmw;
-                self.s.m.atomic(self.cur, Rmw::And, p, keep);
-                self.s.m.atomic(self.cur, Rmw::Or, p, set);
+                // first = load; loop: old = phi(first, seen); seen =
+                // cmpxchg(old, old & keep | set); until seen == old.
+                let head = self.cur;
+                let first = self.s.m.load(head, p);
+                let (body, exit) = (self.s.m.new_block(), self.s.m.new_block());
+                self.s.m.terminate(head, Term::Br(body));
+                let old = self.s.m.phi(body, self.s.t.i32);
+                let kept = self.s.m.bin(body, Bin::And, old, keep);
+                let new = self.s.m.bin(body, Bin::Or, kept, set);
+                let seen = self.s.m.cmpxchg(body, p, old, new);
+                self.s.m.set_phi(old, vec![(first, head), (seen, body)]);
+                let done = self.s.m.cmp(body, pred::EQ, seen, old);
+                self.s.m.terminate(body, Term::CondBr(done, exit, body));
+                self.cur = exit;
                 self.end_guarded(at, &[]);
                 return Ok(());
             };

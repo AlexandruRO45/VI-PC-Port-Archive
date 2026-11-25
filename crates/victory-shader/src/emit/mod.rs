@@ -199,6 +199,8 @@ mod bitcode;
 #[cfg(test)]
 mod census_tests;
 #[cfg(all(test, windows))]
+mod buffer_lds_tests;
+#[cfg(all(test, windows))]
 mod bvh_tests;
 mod container;
 #[cfg(all(test, windows))]
