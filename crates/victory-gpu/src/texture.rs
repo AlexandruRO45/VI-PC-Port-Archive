@@ -1311,9 +1311,13 @@ pub(crate) fn unstage(resource: This) {
     // A concurrent creator can finish for callers already using this
     // texture. Remove its result before returning. Another remover may
     // already have removed it and a later use may have staged it again.
+    #[cfg(test)]
+    staging_tests::at(staging_tests::Point::RemovalWaiting);
     let Some(staging) = pending.wait() else {
         return;
     };
+    #[cfg(test)]
+    staging_tests::at(staging_tests::Point::RemovalReady);
     let removed = {
         let mut table = STAGING.lock().unwrap_or_else(|e| e.into_inner());
         let Some(map) = table.as_mut().map(|table| &mut table.entries) else {
@@ -1341,6 +1345,8 @@ fn with_staging<R>(resource: This, read: impl FnOnce(&Arc<Staging>) -> R) -> Opt
             StagingEntry::Creating(pending) => pending.clone(),
         }
     };
+    #[cfg(test)]
+    staging_tests::at(staging_tests::Point::Waiting);
     pending.wait().as_ref().map(read)
 }
 
@@ -1575,6 +1581,8 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
                 StagingEntry::Creating(pending) => {
                     let pending = pending.clone();
                     drop(table);
+                    #[cfg(test)]
+                    staging_tests::at(staging_tests::Point::Waiting);
                     return pending.wait().clone();
                 }
             },
@@ -1589,6 +1597,9 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     // The caller keeps the title resource and its host copy live.
     // Creation cannot lock the resource's host side: its sweep holds that
     // lock while waiting for this reservation in `unstage`.
+    #[cfg(test)]
+    let staging = staging_tests::create(|| new_staging(resource, texture, on_demand));
+    #[cfg(not(test))]
     let staging = new_staging(resource, texture, on_demand);
     creator.publish(staging.clone());
     staging
@@ -1664,6 +1675,9 @@ fn new_staging(resource: This, texture: &ID3D12Resource, on_demand: bool) -> Opt
         pooled,
     }))
 }
+
+#[cfg(test)]
+mod staging_tests;
 
 #[cfg(test)]
 mod title_memory_tests {
