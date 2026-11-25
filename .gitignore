@@ -76,3 +76,9 @@
 *.swp
 Thumbs.db
 .DS_Store
+
+# Local Claude Code state: personal settings and the CodeGraph index
+# (an SQLite database; the policy check would reject it if it were not ignored).
+/.claude/settings.local.json
+/CLAUDE.local.md
+/.codegraph/
