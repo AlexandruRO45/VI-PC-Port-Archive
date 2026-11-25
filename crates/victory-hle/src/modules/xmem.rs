@@ -91,11 +91,26 @@ pub extern "system" fn XMemVirtualAlloc(
     flags: u64,
     protect: u32,
 ) -> *mut c_void {
+    virtual_alloc(base, size, kind, flags, protect, 0)
+}
+
+/// The body of [`XMemVirtualAlloc`], with an alignment the caller's
+/// attributes asked for (0: whatever `kind` says).
+fn virtual_alloc(
+    base: *mut c_void,
+    size: usize,
+    kind: u32,
+    flags: u64,
+    protect: u32,
+    alignment: usize,
+) -> *mut c_void {
     let (lowest, highest) = address_range(flags);
     let mut requirements = MEM_ADDRESS_REQUIREMENTS {
         LowestStartingAddress: lowest as *mut c_void,
         HighestEndingAddress: highest as *mut c_void,
-        Alignment: if kind & (PAGES_2M | PAGES_64K_BIT) == PAGES_2M {
+        Alignment: if alignment != 0 {
+            alignment
+        } else if kind & (PAGES_2M | PAGES_64K_BIT) == PAGES_2M {
             2 * MIB
         } else {
             0
@@ -292,12 +307,18 @@ pub extern "system" fn XMemFree(address: *mut c_void, attributes: u64) {
 /// The system allocator behind [`XMemAlloc`].
 pub extern "system" fn XMemAllocDefault(size: usize, attributes: u64) -> *mut c_void {
     if attributes & ALLOC_32BIT != 0 {
-        return XMemVirtualAlloc(
+        // A 32-bit block gets the alignment its attributes ask for, as a
+        // host-heap block does: the address requirements take it down to the
+        // 64 KiB allocation granularity.
+        let asked = 1usize << (attributes >> ALIGNMENT_SHIFT & 0x1f).max(4);
+        let alignment = if asked >= 64 * 1024 { asked } else { 0 };
+        return virtual_alloc(
             std::ptr::null_mut(),
             size,
             MEM_RESERVE | MEM_COMMIT,
             GRAPHICS | ADDRESS_32BIT,
             PAGE_READWRITE,
+            alignment,
         );
     }
     let Some(layout) = layout(size, attributes) else {
@@ -1363,5 +1384,19 @@ mod tests {
         assert!(page_window(&[a[0], b[0]], 0, PAGE).is_some());
         assert_eq!(XMemFreePhysicalPages(3, a.as_ptr()), 1);
         assert_eq!(XMemFreePhysicalPages(1, b.as_ptr()), 1);
+    }
+
+    /// A 32-bit block gets the alignment its attributes ask for, down to the
+    /// 64 KiB allocation granularity, and stays below 4 GiB.
+    #[test]
+    fn aligned_32_bit_blocks_get_their_alignment() {
+        for (shift, align) in [(17u64, 128 * 1024usize), (20, 1 << 20), (21, 2 << 20)] {
+            let attributes = shift << ALIGNMENT_SHIFT | ALLOC_32BIT;
+            let p = XMemAllocDefault(4096, attributes);
+            assert!(!p.is_null(), "align {align}");
+            assert_eq!(p as usize % align, 0, "align {align}");
+            assert!((p as usize) + 4096 <= 1usize << 32, "below 4 GiB");
+            XMemFreeDefault(p, attributes);
+        }
     }
 }
