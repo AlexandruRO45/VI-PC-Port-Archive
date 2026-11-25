@@ -220,13 +220,19 @@ impl GraphicsState {
             .map(|e| {
                 let slot = e.InputSlot.min(31) as usize;
                 let format = e.Format.0 as u32;
+                let bytes = crate::resource::element(format).map_or(0, |(b, _)| b as u32);
+                // An appended element starts at the next multiple of
+                // min(4, its size) after the previous one, where D3D12 (and
+                // vkd3d) place it; the host pipeline gets the title's
+                // descriptions, so the offsets read here must match.
                 let offset = if e.AlignedByteOffset == D3D12_APPEND_ALIGNED_ELEMENT {
                     next[slot]
+                        .checked_next_multiple_of(bytes.clamp(1, 4))
+                        .unwrap_or(u32::MAX)
                 } else {
                     e.AlignedByteOffset
                 };
-                let bytes = crate::resource::element(format).map_or(0, |(b, _)| b as u32);
-                next[slot] = offset + bytes;
+                next[slot] = offset.saturating_add(bytes);
                 Input {
                     slot: slot as u32,
                     offset,
@@ -312,9 +318,25 @@ pub(crate) struct HostPipeline {
     pub(crate) name: String,
 }
 
+fn aniso_point_mip_supported(device: &ID3D12Device) -> bool {
+    let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS19::default();
+    // SAFETY: the feature query writes the structure of the given size.
+    // Older runtimes may not recognize OPTIONS19; that means no support.
+    unsafe {
+        device.CheckFeatureSupport(
+            D3D12_FEATURE_D3D12_OPTIONS19,
+            (&raw mut options).cast(),
+            size_of_val(&options) as u32,
+        )
+    }
+    .is_ok()
+        && options.AnisoFilterWithPointMipSupported.as_bool()
+}
+
 fn push_stage_params(
     shader: &Arc<Shader>,
     visibility: D3D12_SHADER_VISIBILITY,
+    aniso_point_mip_supported: bool,
     params: &mut Vec<D3D12_ROOT_PARAMETER1>,
     samplers: &mut Vec<D3D12_STATIC_SAMPLER_DESC>,
 ) -> Option<Stage> {
@@ -413,7 +435,7 @@ fn push_stage_params(
     }
     for (n, s) in t.static_samplers.iter().enumerate() {
         samplers.push(D3D12_STATIC_SAMPLER_DESC {
-            Filter: D3D12_FILTER(s.filter as i32),
+            Filter: D3D12_FILTER(s.filter_for_host(aniso_point_mip_supported) as i32),
             AddressU: D3D12_TEXTURE_ADDRESS_MODE(s.address[0] as i32),
             AddressV: D3D12_TEXTURE_ADDRESS_MODE(s.address[1] as i32),
             AddressW: D3D12_TEXTURE_ADDRESS_MODE(s.address[2] as i32),
@@ -506,12 +528,20 @@ impl HostPipeline {
                 shaders,
             );
         }
+        let aniso_point_mip_supported = aniso_point_mip_supported(&host.device);
         if let Some(ms) = mesh {
             if let Some(emu) = ms.translated()?.host.mesh_emu.as_ref() {
                 let Some(g) = g else {
                     return refuse("graphics state not kept (plain description)", shaders);
                 };
-                return emulated_mesh_pipeline(ms, find("pixel"), emu, g, shaders);
+                return emulated_mesh_pipeline(
+                    ms,
+                    find("pixel"),
+                    emu,
+                    g,
+                    aniso_point_mip_supported,
+                    shaders,
+                );
             }
             if !host.mesh_shaders() {
                 return refuse(
@@ -529,6 +559,7 @@ impl HostPipeline {
             bound.push(push_stage_params(
                 shader,
                 visibility,
+                aniso_point_mip_supported,
                 &mut params,
                 &mut samplers,
             )?);
@@ -726,6 +757,7 @@ fn emulated_mesh_pipeline(
     ps: Option<&Arc<Shader>>,
     emu: &MeshEmu,
     g: &GraphicsState,
+    aniso_point_mip_supported: bool,
     shaders: &[Arc<Shader>],
 ) -> Option<HostPipeline> {
     let host = host()?;
@@ -734,6 +766,7 @@ fn emulated_mesh_pipeline(
     let cs_stage = push_stage_params(
         ms,
         D3D12_SHADER_VISIBILITY_ALL,
+        aniso_point_mip_supported,
         &mut cs_params,
         &mut cs_samplers,
     )?;
@@ -831,6 +864,7 @@ fn emulated_mesh_pipeline(
         gfx_stages.push(push_stage_params(
             ps,
             D3D12_SHADER_VISIBILITY_PIXEL,
+            aniso_point_mip_supported,
             &mut gfx_params,
             &mut gfx_samplers,
         )?);
@@ -1069,5 +1103,69 @@ fn root_signature(
         let bytes =
             std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize());
         Ok((device.CreateRootSignature(0, bytes)?, bytes.to_vec()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn element(format: DXGI_FORMAT, offset: u32) -> D3D12_INPUT_ELEMENT_DESC {
+        D3D12_INPUT_ELEMENT_DESC {
+            SemanticName: PCSTR(c"TEXCOORD".as_ptr().cast()),
+            SemanticIndex: 0,
+            Format: format,
+            InputSlot: 0,
+            AlignedByteOffset: offset,
+            InputSlotClass: D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,
+            InstanceDataStepRate: 0,
+        }
+    }
+
+    fn offsets(inputs: &[D3D12_INPUT_ELEMENT_DESC]) -> Vec<u32> {
+        let state = GraphicsState {
+            inputs: inputs.to_vec(),
+            ..GraphicsState::default()
+        };
+        state.elements().iter().map(|e| e.offset).collect()
+    }
+
+    /// An appended element after one of 1 or 2 bytes started right after
+    /// it; D3D12 aligns it to min(4, its size), so the rectangle expansion
+    /// read its vertices from the wrong bytes.
+    #[test]
+    fn appended_elements_are_aligned() {
+        const APPEND: u32 = D3D12_APPEND_ALIGNED_ELEMENT;
+        // RG8 (2 bytes) then RG32 float: 4, not 2.
+        let a = [
+            element(DXGI_FORMAT_R8G8_UNORM, 0),
+            element(DXGI_FORMAT_R32G32_FLOAT, APPEND),
+        ];
+        assert_eq!(offsets(&a), [0, 4]);
+        // R8 then R16 float: 2, not 1; then R8 packs right after it.
+        let b = [
+            element(DXGI_FORMAT_R8_UNORM, 0),
+            element(DXGI_FORMAT_R16_FLOAT, APPEND),
+            element(DXGI_FORMAT_R8_UNORM, APPEND),
+        ];
+        assert_eq!(offsets(&b), [0, 2, 4]);
+        // Already aligned layouts are unchanged.
+        let c = [
+            element(DXGI_FORMAT_R8G8B8A8_UNORM, 0),
+            element(DXGI_FORMAT_R32G32_FLOAT, APPEND),
+            element(DXGI_FORMAT_R32G32B32_FLOAT, APPEND),
+        ];
+        assert_eq!(offsets(&c), [0, 4, 12]);
+    }
+
+    /// An explicit offset near 4 GiB overflowed the next appended offset
+    /// (a panic in debug builds).
+    #[test]
+    fn a_huge_explicit_offset_does_not_overflow() {
+        let inputs = [
+            element(DXGI_FORMAT_R32G32B32A32_FLOAT, u32::MAX - 8),
+            element(DXGI_FORMAT_R32_FLOAT, D3D12_APPEND_ALIGNED_ELEMENT),
+        ];
+        let _ = offsets(&inputs);
     }
 }

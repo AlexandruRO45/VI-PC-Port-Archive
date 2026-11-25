@@ -9,7 +9,7 @@
 //!
 //! ```text
 //! group g (byte offset = g * group_bytes):
-//!   [0 .. index_bytes)                                  max_primitives x u32 (v0 | v1<<10 | v2<<20 | cull<<31)
+//!   [0 .. index_bytes)                                  max_primitives x u32 (9-bit v0 | v1<<10 | v2<<20 | edge_flags | cull<<31)
 //!   [index_bytes .. prim_offset_bytes)                  max_vertices x vertex_dwords x u32
 //!   [prim_offset_bytes .. group_bytes)                  max_primitives x prim_dwords x u32
 //! ```
@@ -235,7 +235,8 @@ pub fn unpack_vertex_shader(emu: &MeshEmu, ps_dxil: Option<&[u8]>) -> Result<Vec
         let k10 = s.m.i32(10);
         let shift = s.m.bin(draw_bb, Bin::Mul, corner, k10);
         let shifted = s.m.bin(draw_bb, Bin::LShr, packed, shift);
-        let mask = s.m.i32(0x3FF);
+        // 9-bit vertex index per 10-bit corner field; bits 9, 19, 29 are console edge flags.
+        let mask = s.m.i32(0x1FF);
         let v_raw = s.m.bin(draw_bb, Bin::And, shifted, mask);
         let mv = s.m.i32(emu.max_vertices);
         let in_bounds = s.m.cmp(draw_bb, pred::IULT, v_raw, mv);
@@ -945,76 +946,76 @@ mod tests {
         );
     }
 
+    fn red_green_triangle_mesh(prim0: Option<u32>) -> HostShader {
+        let mut words = Vec::new();
+        // v0 = tid (0..7)
+        words.extend(vop3(0x365, 0, 193, 128, 0));
+        // Default position: (-1, -1, 0.5, 1.0)
+        words.extend(vop1_lit(0x001, 1, (-1.0f32).to_bits()));
+        words.extend(vop1_lit(0x001, 2, (-1.0f32).to_bits()));
+        words.extend(vop1_lit(0x001, 3, 0.5f32.to_bits()));
+        words.extend(vop1_lit(0x001, 4, 1.0f32.to_bits()));
+        // Default color: RED (1, 0, 0, 1); scratch constants v10=3.0, v11=1.0, v12=0.0
+        words.extend(vop1_lit(0x001, 5, 1.0f32.to_bits()));
+        words.extend(vop1_lit(0x001, 6, 0.0f32.to_bits()));
+        words.extend(vop1_lit(0x001, 7, 0.0f32.to_bits()));
+        words.extend(vop1_lit(0x001, 8, 1.0f32.to_bits()));
+        words.extend(vop1_lit(0x001, 10, 3.0f32.to_bits()));
+        words.extend(vop1_lit(0x001, 11, 1.0f32.to_bits()));
+        words.extend(vop1_lit(0x001, 12, 0.0f32.to_bits()));
+        // tid == 1 or tid == 4 -> pos.x = 3.0
+        words.push(vopc(0x0C2, 129, 0));
+        words.push(vop2(0x001, 1, vgpr(1), 10));
+        words.push(vopc(0x0C2, 132, 0));
+        words.push(vop2(0x001, 1, vgpr(1), 10));
+        // tid == 2 or tid == 5 -> pos.y = 3.0
+        words.push(vopc(0x0C2, 130, 0));
+        words.push(vop2(0x001, 2, vgpr(2), 10));
+        words.push(vopc(0x0C2, 133, 0));
+        words.push(vop2(0x001, 2, vgpr(2), 10));
+        // tid >= 3 (3 <= tid, i.e., 3 < tid + 1 or 2 < tid) -> green (0, 1, 0, 1)
+        words.push(vopc(0x0C1, 130, 0)); // 2 < v0
+        words.push(vop2(0x001, 5, vgpr(5), 12));
+        words.push(vop2(0x001, 6, vgpr(6), 11));
+        words.extend(exp(12, 0xF, [1, 2, 3, 4], false, false));
+        words.extend(exp(32, 0xF, [5, 6, 7, 8], false, false));
+        // v9 = (3 | 4<<10 | 5<<20) | 0x8000_0000 (bit-31 culled green tri)
+        words.extend(vop1_lit(0x001, 9, 0x8050_1003));
+        if let Some(p0) = prim0 {
+            words.extend(vop1_lit(0x001, 13, p0));
+            words.push(vopc(0x0C2, 128, 0)); // v0 == 0
+            words.push(vop2(0x001, 9, vgpr(9), 13));
+        }
+        // Only tid < 2 (2 > v0) exports `exp prim`; slot 2 relies on prologue cull.
+        words.push(vopc(0x0C4, 130, 0)); // 2 > v0
+        words.push(0xBE80_3C6A); // s_and_saveexec_b32 s0, vcc_lo
+        words.push(0xBF88_0002); // s_cbranch_execz +2
+        words.extend(exp(20, 0x1, [9, 0, 0, 0], true, false));
+        words.push(0x887E_007E); // s_or_b32 exec_lo, exec_lo, s0
+        words.push(S_ENDPGM);
+
+        compile_ms(
+            &words,
+            vec![VsOutput {
+                usage: Usage::Generic,
+                row: 0,
+                param: 0,
+                fp16: false,
+                pack2: false,
+            }],
+            &[
+                sig_el("SV_Position", 3, 9, None, 0xF),
+                sig_el("COLOR", 0, 9, Some(0), 0xF),
+            ],
+            &[],
+            (8, 6, 3, 0),
+        )
+    }
+
     #[test]
     fn emulated_mesh_draws_triangle_and_culls_bit31_and_unexported() {
-        let build_variant = |cull_prim0: bool| {
-            let mut words = Vec::new();
-            // v0 = tid (0..7)
-            words.extend(vop3(0x365, 0, 193, 128, 0));
-            // Default position: (-1, -1, 0.5, 1.0)
-            words.extend(vop1_lit(0x001, 1, (-1.0f32).to_bits()));
-            words.extend(vop1_lit(0x001, 2, (-1.0f32).to_bits()));
-            words.extend(vop1_lit(0x001, 3, 0.5f32.to_bits()));
-            words.extend(vop1_lit(0x001, 4, 1.0f32.to_bits()));
-            // Default color: RED (1, 0, 0, 1); scratch constants v10=3.0, v11=1.0, v12=0.0
-            words.extend(vop1_lit(0x001, 5, 1.0f32.to_bits()));
-            words.extend(vop1_lit(0x001, 6, 0.0f32.to_bits()));
-            words.extend(vop1_lit(0x001, 7, 0.0f32.to_bits()));
-            words.extend(vop1_lit(0x001, 8, 1.0f32.to_bits()));
-            words.extend(vop1_lit(0x001, 10, 3.0f32.to_bits()));
-            words.extend(vop1_lit(0x001, 11, 1.0f32.to_bits()));
-            words.extend(vop1_lit(0x001, 12, 0.0f32.to_bits()));
-            // tid == 1 or tid == 4 -> pos.x = 3.0
-            words.push(vopc(0x0C2, 129, 0));
-            words.push(vop2(0x001, 1, vgpr(1), 10));
-            words.push(vopc(0x0C2, 132, 0));
-            words.push(vop2(0x001, 1, vgpr(1), 10));
-            // tid == 2 or tid == 5 -> pos.y = 3.0
-            words.push(vopc(0x0C2, 130, 0));
-            words.push(vop2(0x001, 2, vgpr(2), 10));
-            words.push(vopc(0x0C2, 133, 0));
-            words.push(vop2(0x001, 2, vgpr(2), 10));
-            // tid >= 3 (3 <= tid, i.e., 3 < tid + 1 or 2 < tid) -> green (0, 1, 0, 1)
-            words.push(vopc(0x0C1, 130, 0)); // 2 < v0
-            words.push(vop2(0x001, 5, vgpr(5), 12));
-            words.push(vop2(0x001, 6, vgpr(6), 11));
-            words.extend(exp(12, 0xF, [1, 2, 3, 4], false, false));
-            words.extend(exp(32, 0xF, [5, 6, 7, 8], false, false));
-            // v9 = (3 | 4<<10 | 5<<20) | 0x8000_0000 (bit-31 culled green tri)
-            words.extend(vop1_lit(0x001, 9, 0x8050_1003));
-            if !cull_prim0 {
-                words.extend(vop1_lit(0x001, 13, 0x0020_0400));
-                words.push(vopc(0x0C2, 128, 0)); // v0 == 0
-                words.push(vop2(0x001, 9, vgpr(9), 13));
-            }
-            // Only tid < 2 (2 > v0) exports `exp prim`; slot 2 relies on prologue cull.
-            words.push(vopc(0x0C4, 130, 0)); // 2 > v0
-            words.push(0xBE80_3C6A); // s_and_saveexec_b32 s0, vcc_lo
-            words.push(0xBF88_0002); // s_cbranch_execz +2
-            words.extend(exp(20, 0x1, [9, 0, 0, 0], true, false));
-            words.push(0x887E_007E); // s_or_b32 exec_lo, exec_lo, s0
-            words.push(S_ENDPGM);
-
-            compile_ms(
-                &words,
-                vec![VsOutput {
-                    usage: Usage::Generic,
-                    row: 0,
-                    param: 0,
-                    fp16: false,
-                    pack2: false,
-                }],
-                &[
-                    sig_el("SV_Position", 3, 9, None, 0xF),
-                    sig_el("COLOR", 0, 9, Some(0), 0xF),
-                ],
-                &[],
-                (8, 6, 3, 0),
-            )
-        };
-
-        let ms_active = build_variant(false);
-        let ms_culled = build_variant(true);
+        let ms_active = red_green_triangle_mesh(Some(0x0020_0400));
+        let ms_culled = red_green_triangle_mesh(None);
         let ps = compile_flat_ps("COLOR");
         let emu_active = ms_active.mesh_emu.as_ref().unwrap().clone();
         let emu_culled = ms_culled.mesh_emu.as_ref().unwrap().clone();
@@ -1061,6 +1062,38 @@ mod tests {
             assert!(
                 pixels.iter().all(|&p| p == [0.0, 0.0, 0.0, 0.0]),
                 "{label}: expected all culled, got {:?}",
+                pixels[0]
+            );
+        });
+    }
+
+    #[test]
+    fn emulated_mesh_drops_edge_flags_in_primitive_indices() {
+        const EDGE_FLAGS: u32 = (1 << 9) | (1 << 19) | (1 << 29);
+        let ms = red_green_triangle_mesh(Some(0x0020_0400 | EDGE_FLAGS));
+        let ps = compile_flat_ps("COLOR");
+        let emu = ms.mesh_emu.as_ref().unwrap().clone();
+
+        run_on_hosts(|label, host| {
+            let pipes = host.emulated_mesh_pipelines(&ms, &ps).unwrap();
+            let pixels = host
+                .draw_emulated_mesh(
+                    &pipes,
+                    &EmulatedMeshDraw {
+                        cs_roots: Vec::new(),
+                        ps_roots: Vec::new(),
+                        size: (8, 8),
+                        groups: 1,
+                        max_primitives: emu.max_primitives,
+                        group_bytes: emu.group_bytes(),
+                        base_group: 0,
+                        slot_map: None,
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{label}: edge-flagged draw failed: {e}"));
+            assert!(
+                pixels.iter().all(|&p| p == [1.0, 0.0, 0.0, 1.0]),
+                "{label}: expected full red with edge flags masked, got {:?}",
                 pixels[0]
             );
         });
