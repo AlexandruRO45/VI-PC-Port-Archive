@@ -851,27 +851,27 @@ pub(crate) fn recent_levels() -> Vec<u8> {
     levels.iter().copied().collect()
 }
 
-#[test]
-fn rgba32_uint_captures_keep_rgb_and_ignore_source_alpha() {
-    let format = DXGI_FORMAT_R32G32B32A32_UINT.0 as u32;
-    let rows: Vec<_> = [
-        0x8000_0000, 0x4000_0000, 0, u32::MAX, u32::MAX,
-        0, 0x2000_0000, 0x8000_0000, 0,
-    ]
-    .into_iter()
-    .flat_map(u32::to_le_bytes)
-    .collect();
-    assert_eq!(
-        to_rgba(format, 1, 2, 20, &rows),
-        Some(vec![255, 127, 0, 255, 0, 63, 255, 255])
-    );
-}
-
 #[cfg(test)]
 mod tests {
     #[test]
     fn crc_matches_the_png_check_value() {
         assert_eq!(super::crc32(b"IEND"), 0xae42_6082);
+    }
+
+    #[test]
+    fn rgba32_uint_captures_keep_rgb_and_ignore_source_alpha() {
+        let format = super::DXGI_FORMAT_R32G32B32A32_UINT.0 as u32;
+        let rows: Vec<_> = [
+            0x8000_0000, 0x4000_0000, 0, u32::MAX, u32::MAX,
+            0, 0x2000_0000, 0x8000_0000, 0,
+        ]
+        .into_iter()
+        .flat_map(u32::to_le_bytes)
+        .collect();
+        assert_eq!(
+            super::to_rgba(format, 1, 2, 20, &rows),
+            Some(vec![255, 127, 0, 255, 0, 63, 255, 255])
+        );
     }
 
     /// R16G16B16A16_UNORM is integers, not half floats; 89 is 10:10:10:2,
