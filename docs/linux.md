@@ -36,14 +36,60 @@ wineserver already keeps views in a tree and none of the following is
 needed. Until then, `tools/wine/` builds the patched server and makes a
 Proton copy that uses it:
 
+Two steps: build the server from the Wine source of the exact Proton you
+run, then make a copy of that Proton that uses it. Pick your Proton:
+
+**proton-cachyos 11.0** (tested with the title):
+
 ```sh
-# The Wine source of the exact Proton release you run (here: proton-cachyos 11.0).
 tools/wine/build-wineserver.sh https://github.com/CachyOS/wine-cachyos.git \
-    cachyos-11.0-20260702-proton-native ~/wineserver-build
-# A copy of that Proton whose wineserver is the patched one.
+    cachyos-11.0-20260702-proton-native ~/wineserver-build   # the tag of your release
 tools/wine/proton-with-wineserver.sh /usr/share/steam/compatibilitytools.d/proton-cachyos-native \
     ~/wineserver-build/build/server/wineserver ~/proton-victory
 ```
+
+**Proton Experimental** (Steam's "Proton - Experimental"):
+
+```sh
+tools/wine/build-wineserver.sh https://github.com/ValveSoftware/wine.git \
+    experimental_11.0 ~/wineserver-build
+tools/wine/proton-with-wineserver.sh ~/.steam/steam/steamapps/common/"Proton - Experimental" \
+    ~/wineserver-build/build/server/wineserver ~/proton-victory
+```
+
+Experimental moves often: build again after Steam updates it, or the
+server and the rest of Wine stop matching.
+
+**Valve Proton 10** (Steam's "Proton 10.0"):
+
+```sh
+tools/wine/build-wineserver.sh https://github.com/ValveSoftware/wine.git \
+    proton_10.0 ~/wineserver-build
+tools/wine/proton-with-wineserver.sh ~/.steam/steam/steamapps/common/"Proton 10.0" \
+    ~/wineserver-build/build/server/wineserver ~/proton-victory
+```
+
+**GE-Proton 11** (e.g. GE-Proton11-14): GE's Wine is not in a single
+repository. It is Valve's Wine with GE's patches, which GE's own script
+applies. Prepare that source first, then pass its `wine` directory
+instead of a git URL (`-` for the tag):
+
+```sh
+git clone --recurse-submodules --branch GE-Proton11-14 \
+    https://github.com/GloriousEggroll/proton-ge-custom ~/proton-ge-src   # your release's tag
+cd ~/proton-ge-src && ./patches/protonprep-valve-staging.sh &> patchlog.txt && cd -
+tools/wine/build-wineserver.sh ~/proton-ge-src/wine - ~/wineserver-build
+tools/wine/proton-with-wineserver.sh ~/.steam/steam/compatibilitytools.d/GE-Proton11-14 \
+    ~/wineserver-build/build/server/wineserver ~/proton-victory
+```
+
+The patch applies to GE's Wine as GE's script leaves it, but this path
+has not been built end to end yet.
+
+**Upstream Wine** (a Wine you built or installed yourself, not Proton):
+build from the same source and version as your Wine, e.g.
+`https://gitlab.winehq.org/wine/wine.git` at its tag, and replace that
+Wine's `wineserver` with the one built here.
 
 Then run `victory.exe` with `~/proton-victory/proton runinprefix ...`.
 
@@ -65,7 +111,7 @@ Then run `victory.exe` with `~/proton-victory/proton runinprefix ...`.
   |---|---|---|
   | proton-cachyos 11.0 | `CachyOS/wine-cachyos`, tag of your release | `-cachyos11` |
   | Proton Experimental (11.0) | `ValveSoftware/wine`, `experimental_11.0` | `-cachyos11` |
-  | GE-Proton 11 | Valve's wine at the commit GE pins, plus GE's patches | `-cachyos11` |
+  | GE-Proton 11 | `proton-ge-custom` at your release tag, after GE's prep script (see above) | `-cachyos11` |
   | Valve Proton 10 | `ValveSoftware/wine`, `proton_10.0` | `-proton10` |
   | upstream Wine | `gitlab.winehq.org/wine/wine`, `master` | `-upstream` |
 

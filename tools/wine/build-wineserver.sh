@@ -4,13 +4,16 @@
 # (wineserver-view-tree-*.patch.txt); the first that applies is used.
 #
 # Usage: build-wineserver.sh <git url> <tag or branch> <work dir>
+#    or: build-wineserver.sh <prepared Wine source dir> - <work dir>
+#        (a source tree prepared elsewhere, e.g. GE-Proton's, see docs/linux.md)
 # Examples:
 #   proton-cachyos 11.0: https://github.com/CachyOS/wine-cachyos.git cachyos-11.0-20260702-proton-native
 #   Valve Proton 10:     https://github.com/ValveSoftware/wine.git proton_10.0
 #   Proton Experimental: https://github.com/ValveSoftware/wine.git experimental_11.0 (the 11.0 patch)
 #   upstream Wine:       https://gitlab.winehq.org/wine/wine.git master
-# GE-Proton 11 builds from Valve's wine plus GE's patches: the
-# 11.0 patch applies to it.
+# GE-Proton 11: its Wine is Valve's plus GE's patches, applied by GE's
+# prep script; prepare that tree first and pass its directory (the 11.0
+# patch applies to it).
 #
 # The server must speak the same protocol as the Proton it runs with: build
 # from the source of that exact Proton release. The result is
@@ -19,11 +22,18 @@ set -eu
 url=$1 ref=$2 work=$3
 here=$(cd "$(dirname "$0")" && pwd)
 mkdir -p "$work"
-cd "$work"
-if [ ! -d src ]; then
-    git clone --depth 1 --branch "$ref" "$url" src
+if [ -d "$url" ]; then
+    src=$(cd "$url" && pwd)
+    mkdir -p "$work"
+    cd "$work"
+else
+    cd "$work"
+    if [ ! -d src ]; then
+        git clone --depth 1 --branch "$ref" "$url" src
+    fi
+    src=$(pwd)/src
 fi
-cd src
+cd "$src"
 applied=
 for p in "$here"/wineserver-view-tree-*.patch.txt; do
     if git apply --check --reverse "$p" 2>/dev/null; then
@@ -37,10 +47,10 @@ done
 echo "using $(basename "$applied")"
 [ -x configure ] || ./autogen.sh
 grep -m1 "define SERVER_PROTOCOL_VERSION" include/wine/server_protocol.h
-mkdir -p ../build
-cd ../build
+mkdir -p "$work/build"
+cd "$work/build"
 # Only the server is built, so nearly every library is left out.
-../src/configure --enable-win64 --without-x --without-freetype --without-mingw \
+"$src/configure" --enable-win64 --without-x --without-freetype --without-mingw \
     --without-gstreamer --without-wayland --without-vulkan --without-opengl \
     --without-alsa --without-pulse --without-cups --without-dbus --without-gnutls \
     --without-sane --without-usb --without-v4l2 --without-krb5 --without-netapi \
