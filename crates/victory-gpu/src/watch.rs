@@ -225,6 +225,18 @@ pub(crate) fn wrote(at: usize, len: usize) {
     }
 }
 
+/// Our copy-back wrote `pages` (page numbers) of title memory through a
+/// view no guard covers (`crate::host::write_title_unseen`): nothing faulted,
+/// so the journal is told here, as an asking of its own. Returns its number
+/// and, per page, the asking that had last found the page written (0: none).
+pub(crate) fn wrote_unseen(pages: &[usize]) -> (u64, Vec<u64>) {
+    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    j.asked += 1;
+    let now = j.asked;
+    let before = pages.iter().map(|&page| j.written.insert(page, now).unwrap_or(0)).collect();
+    (now, before)
+}
+
 /// One kernel asking for `pieces` (page ranges in order); by halves if it
 /// fails, as a run across two reservations or into memory that is not
 /// write-watched does. A piece alone is left to [`writes`].

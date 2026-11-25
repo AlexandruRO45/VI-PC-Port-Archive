@@ -4195,6 +4195,60 @@ pub(crate) fn copy_source_written(at: usize, len: usize) {
     }
 }
 
+/// `VICTORY_BACK_ALIAS=1`: the copy-back writes title memory that is a view
+/// of a section through a view of our own of it ([`write_title_unseen`]),
+/// so the guard stays closed and the copy that merged the bytes does not
+/// take them again at its next refresh. Half the bytes refreshed a frame
+/// were that echo (65 of 129 MB, standing in the first room).
+fn back_alias() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BACK_ALIAS").is_some_and(|v| v == "1"))
+}
+
+/// Copy-back writes per frame for the log: through our own view, and
+/// through the title's address.
+pub(crate) static BACK_WRITES: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Writes `n` bytes from `src` into title memory at `at` through our view
+/// of its section ([`back_alias`]) and tells the journal, for every
+/// address the pages show at. Returns the journal's asking and, per page
+/// (page number, asking that had last found it written), for
+/// `Shadow::wrote_unseen`. `None`: nothing written that way (off, not a
+/// view, the runtime is remapping, or the write faulted); the caller
+/// writes as before.
+pub(crate) fn write_title_unseen(at: usize, src: *const u8, n: usize) -> Option<(u64, Vec<(usize, u64)>)> {
+    if !back_alias() || n == 0 || !direct_copy_enabled() {
+        return None;
+    }
+    // The runtime does not move a physical page between finding where the
+    // bytes show and writing them; if it is moving pages now, write as before.
+    let _still = crate::watch::title_memory_reading_now()?;
+    let alias = crate::inplace::alias_of(at, n)?;
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: `alias` shows `n` bytes of the section; a fault is caught.
+    let done = unsafe { direct_copy::try_copy(alias as *mut u8, src, n) };
+    #[cfg(not(target_arch = "x86_64"))]
+    let done = false;
+    if !done {
+        return None;
+    }
+    let first = at / crate::watch::PAGE;
+    let last = (at + n).div_ceil(crate::watch::PAGE);
+    let mut pages = Vec::with_capacity(last - first);
+    for page in first..last {
+        let shown = crate::inplace::pages_of(page * crate::watch::PAGE);
+        if shown.is_empty() {
+            pages.push(page);
+        } else {
+            pages.extend(shown.iter().map(|a| a / crate::watch::PAGE));
+        }
+    }
+    let (now, before) = crate::watch::wrote_unseen(&pages);
+    crate::descriptor::host::remapped(at, n);
+    BACK_WRITES[0].fetch_add(1, Ordering::Relaxed);
+    Some((now, pages.into_iter().zip(before).collect()))
+}
+
 /// After a landing's copy-backs: makes again the copies whose source they
 /// wrote over.
 fn recopy_written_sources() {
@@ -9621,6 +9675,12 @@ impl Meter {
             tracing::info!(
                 "preparing per frame, by part: {under:.1} ms putting title bytes in under flights, {steps:.1} the lists' steps, {flush:.1} flushing their refreshes, {card:.1} the card copies' sends and compare"
             );
+            let [unseen, seen] = [0, 1].map(|i| BACK_WRITES[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            if back_alias() {
+                tracing::info!(
+                    "copy-back writes per frame (VICTORY_BACK_ALIAS=1): {unseen:.0} through our own view of the section, {seen:.0} through the title's address"
+                );
+            }
             let [through, again, fills, stale] = [0, 1, 2, 3].map(|i| COPY_NO_WAIT[i].swap(0, Ordering::Relaxed) as f64 / frames);
             if through + again + fills + stale > 0.0 {
                 tracing::info!(

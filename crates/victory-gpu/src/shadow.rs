@@ -2676,6 +2676,25 @@ impl Shadow {
         shadow
     }
 
+    /// The copy-back wrote pages of this copy's memory through our own view
+    /// (`crate::host::write_title_unseen`), with the same bytes this copy
+    /// holds: a page this copy had taken since the title last wrote it is
+    /// still current, as of the journal's asking `now`, and is not taken
+    /// again. `pages`: page number, and the asking that had last found it
+    /// written before.
+    pub(crate) fn wrote_unseen(&self, now: u64, pages: &[(usize, u64)]) {
+        let base = self.start as usize / PAGE;
+        let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+        for &(page, before) in pages {
+            if let Some(at) = page.checked_sub(base).and_then(|i| copied.get_mut(i))
+                && *at != 0
+                && *at >= before
+            {
+                *at = (*at).max(now);
+            }
+        }
+    }
+
     /// Brings `len` bytes at `address` up to date when `list` is submitted,
     /// and keeps the copy alive until the list is reset.
     pub(crate) fn refresh(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
@@ -2938,9 +2957,15 @@ impl Shadow {
                     *h = merged;
                 }
                 if differs != 0 {
-                    crate::watch::writing(start + at, n);
-crate::host::copy_source_written(start + at, n);
-                    crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+                    crate::host::copy_source_written(start + at, n);
+                    match crate::host::write_title_unseen(start + at, title.as_ptr(), n) {
+                        Some((now, pages)) => self.wrote_unseen(now, &pages),
+                        None => {
+                            crate::host::BACK_WRITES[1].fetch_add(1, Ordering::Relaxed);
+                            crate::watch::writing(start + at, n);
+                            crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+                        }
+                    }
                     written += n;
                 }
             }
@@ -3028,9 +3053,15 @@ crate::host::copy_source_written(start + at, n);
         if !merge_piece(now, held, title) {
             return 0;
         }
-        crate::watch::writing(start + at, n);
-crate::host::copy_source_written(start + at, n);
-        crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+        crate::host::copy_source_written(start + at, n);
+        match crate::host::write_title_unseen(start + at, title.as_ptr(), n) {
+            Some((now, pages)) => self.wrote_unseen(now, &pages),
+            None => {
+                crate::host::BACK_WRITES[1].fetch_add(1, Ordering::Relaxed);
+                crate::watch::writing(start + at, n);
+                crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+            }
+        }
         n
     }
 
@@ -3673,9 +3704,15 @@ crate::host::copy_source_written(start + at, n);
                 *o = merged;
             }
             if differs != 0 {
-                crate::watch::writing(start + at, n);
-crate::host::copy_source_written(start + at, n);
-                crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+                crate::host::copy_source_written(start + at, n);
+                match crate::host::write_title_unseen(start + at, title.as_ptr(), n) {
+                    Some((now, pages)) => self.wrote_unseen(now, &pages),
+                    None => {
+                        crate::host::BACK_WRITES[1].fetch_add(1, Ordering::Relaxed);
+                        crate::watch::writing(start + at, n);
+                        crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+                    }
+                }
                 written = n;
             }
         } else {
@@ -3740,9 +3777,15 @@ crate::host::copy_source_written(start + at, n);
         if !mapped || !changed {
             return 0;
         }
-        crate::watch::writing(start + at, n);
-crate::host::copy_source_written(start + at, n);
-        crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+        crate::host::copy_source_written(start + at, n);
+        match crate::host::write_title_unseen(start + at, title.as_ptr(), n) {
+            Some((now, pages)) => self.wrote_unseen(now, &pages),
+            None => {
+                crate::host::BACK_WRITES[1].fetch_add(1, Ordering::Relaxed);
+                crate::watch::writing(start + at, n);
+                crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+            }
+        }
         n
     }
 }
