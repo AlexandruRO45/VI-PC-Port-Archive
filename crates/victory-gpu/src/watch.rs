@@ -998,6 +998,7 @@ mod tests {
             guard(view, view + 2 * BLOCK),
             Some((view / PAGE..view / PAGE + 1).collect())
         );
+        assert!(!writable(view + 100), "the read no longer holds it open");
         // Told before the view goes, as the runtime does (`xmem`'s
         // `unmap`): told after, another test may have mapped and guarded a
         // view at the address meanwhile, and the telling forgets its guards.

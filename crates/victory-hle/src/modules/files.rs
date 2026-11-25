@@ -550,20 +550,22 @@ pub extern "system" fn ReadFile(
 
 /// With an `OVERLAPPED`, a read of a handle opened for asynchronous I/O
 /// can still be under way when `ReadFile` returns, and its destination is
-/// kept writable only until then: a refresh can guard it again before the
-/// bytes land, and the kernel's write fails. No such read of the title's
-/// is known; the first overlapped read into a title view is logged, and
-/// the first one still under way.
+/// kept writable only until then. If a refresh guards it again before the
+/// bytes land, a cached read fails with `ERROR_INVALID_USER_BUFFER`, and an
+/// unbuffered one lands without a fault, which leaves the GPU side's copy
+/// stale. No such read of the title's is known; the first overlapped read
+/// of any bytes into a title view is logged, and the first one still under
+/// way.
 fn overlapped_read(buffer: *mut u8, len: u32, pending: bool) {
     use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
     static LOGGED: [AtomicBool; 2] = [const { AtomicBool::new(false) }; 2];
     let logged = &LOGGED[usize::from(pending)];
-    if !logged.load(Relaxed) && in_view(buffer) && !logged.swap(true, Relaxed) {
+    if len != 0 && !logged.load(Relaxed) && in_view(buffer) && !logged.swap(true, Relaxed) {
         if pending {
             tracing::warn!(
                 ?buffer,
                 len,
-                "ReadFile into a title view still under way when it returns: a refresh may guard the destination before the bytes land"
+                "ReadFile into a title view still under way when it returns: if a refresh guards the destination first, the read fails or lands unseen"
             );
         } else {
             tracing::info!(?buffer, len, "ReadFile with an OVERLAPPED into a title view, done in the call");
@@ -890,14 +892,17 @@ mod tests {
     }
 
     /// What arrives through the pipe in the tests below.
-    const SENT: &[u8; 13] = b"from the pipe";
+    const SENT: &[u8; 14] = b"sent by a pipe";
+    const LEN: u32 = SENT.len() as u32;
 
-    /// Runs `read` on another thread into 13 bytes of a guarded title view
-    /// (their address given), waiting on the other end of `pipe`. Once the
+    /// Runs `read` on another thread into [`LEN`] bytes of a guarded title
+    /// view that lie in two blocks (their address given), waiting on the
+    /// other end of `pipe`. Once the
     /// read has opened them, a refresh on this thread guards their pages
     /// again through the other view of them, as the GPU side's refreshes
     /// do at any time, and only then does [`SENT`] arrive. The read must
-    /// succeed, by `succeeded`, with the bytes landed and counted written.
+    /// succeed, by `succeeded`, with the bytes landed and counted written,
+    /// and the next refresh must find the destination guarded again.
     fn read_across_a_refresh<T: std::fmt::Debug + Send + 'static>(
         mut pipe: std::io::PipeWriter,
         read: impl FnOnce(usize) -> T + Send + 'static,
@@ -907,7 +912,7 @@ mod tests {
         use std::time::{Duration, Instant};
         let views = Views::new();
         let [view, other] = views.at;
-        let into = view + 100;
+        let into = view + BLOCK - 8;
         assert!(victory_gpu::title_memory_guard(view, 2 * BLOCK).is_some());
         assert!(!writable(into), "the destination starts guarded");
         let reading = std::thread::spawn(move || read(into));
@@ -925,14 +930,16 @@ mod tests {
         let result = reading.join().unwrap();
         assert!(succeeded(&result), "the read failed: {result:?}");
         sent.unwrap();
-        // SAFETY: 13 bytes of our view.
+        // SAFETY: bytes of our view.
         let landed = unsafe { std::slice::from_raw_parts(into as *const u8, SENT.len()) };
         assert_eq!(landed, SENT);
         // The next refresh copies them.
         assert_eq!(
             victory_gpu::title_memory_guard(view, 2 * BLOCK),
-            Some(vec![view / BLOCK])
+            Some(vec![view / BLOCK, view / BLOCK + 1])
         );
+        let last = into + SENT.len() - 1;
+        assert!(!writable(into) && !writable(last), "the read no longer holds them open");
     }
 
     /// The title's synchronous reads land in guarded views while refreshes
@@ -945,10 +952,10 @@ mod tests {
             writer,
             move |into| {
                 let mut n = 0;
-                let done = ReadFile(reader.as_raw_handle(), into as *mut u8, 13, &mut n, std::ptr::null_mut());
+                let done = ReadFile(reader.as_raw_handle(), into as *mut u8, LEN, &mut n, std::ptr::null_mut());
                 (done, n, last_error())
             },
-            |&(done, n, _)| (done, n) == (1, 13),
+            |&(done, n, _)| (done, n) == (1, LEN),
         );
     }
 
@@ -967,13 +974,13 @@ mod tests {
                 let done = ReadFile(
                     reader.as_raw_handle(),
                     into as *mut u8,
-                    13,
+                    LEN,
                     &mut n,
                     overlapped.as_mut_ptr().cast(),
                 );
                 (done, n, last_error())
             },
-            |&(done, n, _)| (done, n) == (1, 13),
+            |&(done, n, _)| (done, n) == (1, LEN),
         );
     }
 
@@ -1006,11 +1013,12 @@ mod tests {
                 assert!(!stream.is_null());
                 let setvbuf = host!("ucrtbase.dll", "setvbuf": extern "C" fn(File, *mut c_char, i32, usize) -> i32);
                 assert_eq!(setvbuf(stream, std::ptr::null_mut(), IONBF, 0), 0);
-                let n = (fread(into as *mut u8, 1, 13, stream), last_error());
+                // Seven items of two bytes: neither number alone reaches the second block.
+                let n = (fread(into as *mut u8, 2, 7, stream), last_error());
                 host!("ucrtbase.dll", "fclose": extern "C" fn(File) -> i32)(stream);
                 n
             },
-            |&(n, _)| n == 13,
+            |&(n, _)| n == 7,
         );
     }
 
@@ -1025,11 +1033,11 @@ mod tests {
         read_across_a_refresh(
             writer,
             move |into| {
-                let n = (_read(fd, into as *mut u8, 13), last_error());
+                let n = (_read(fd, into as *mut u8, LEN), last_error());
                 host!("ucrtbase.dll", "_close": extern "C" fn(i32) -> i32)(fd);
                 n
             },
-            |&(n, _)| n == 13,
+            |&(n, _)| n == LEN as i32,
         );
     }
 
@@ -1101,17 +1109,20 @@ mod tests {
         let wait = host!("kernel32.dll", "WaitForSingleObject": extern "system" fn(Handle, u32) -> u32);
         let views = Views::new();
         tracing::subscriber::with_default(Redirected, || {
+            // A read of no bytes has nothing to land and is not the one warned of.
+            overlapped_read(views.at[0] as *mut u8, 0, true);
+            assert_eq!(WARNINGS.load(Relaxed), 0);
             for k in 0..2 {
                 let into = views.at[0] + 100 + k * SENT.len();
                 // `OVERLAPPED`: two status words, the offset, the event.
                 let mut overlapped = [0, 0, 0, event as usize];
-                let done = ReadFile(server, into as *mut u8, 13, null.cast(), overlapped.as_mut_ptr().cast());
+                let done = ReadFile(server, into as *mut u8, LEN, null.cast(), overlapped.as_mut_ptr().cast());
                 assert_eq!((done, last_error()), (0, ERROR_IO_PENDING));
                 let mut n = 0;
-                assert_ne!(write(client, SENT.as_ptr(), 13, &mut n, null), 0);
+                assert_ne!(write(client, SENT.as_ptr(), LEN, &mut n, null), 0);
                 assert_eq!(wait(event, 5000), 0);
-                assert_eq!(overlapped[..2], [0, 13], "status and bytes read");
-                // SAFETY: 13 bytes of our view.
+                assert_eq!(overlapped[..2], [0, SENT.len()], "status and bytes read");
+                // SAFETY: bytes of our view.
                 let landed = unsafe { std::slice::from_raw_parts(into as *const u8, SENT.len()) };
                 assert_eq!(landed, SENT);
             }
