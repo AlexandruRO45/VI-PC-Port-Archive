@@ -2,6 +2,10 @@
 
 Archived copies of twelve open-source projects that work on running GTA VI on PC, first saved on 2026-11-23 and updated on 2026-11-24.
 ZERO of Rockstars game assets, files, or leaked info is on this repo, NOTHING HERE IS BREAKING ANY LAW OR ANYONE'S TOS
+## GTA VI Launcher
+
+**[Download GTA-VI-Launcher.zip](https://github.com/Guernica4u/GTA6-PC-Port-Archive/releases/latest/download/GTA-VI-Launcher.zip)**: a small Windows launcher for these runtimes. Pick your game's .exe once, choose a runtime and press PLAY. See [`launcher/`](launcher).
+
 ## Important links
 
 - [portwatch-vi.xyz](https://portwatch-vi.xyz)

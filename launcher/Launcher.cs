@@ -1,0 +1,1230 @@
+// Minimal game launcher: pick the game's .exe once, pick a runtime, press PLAY. Slideshow of the pictures in
+// backgrounds\ (drop more on the window), music from the game's own audio.
+// Runtimes: the archive top 3 (AnyXboxX left out, ztrx always 3rd) plus Hyphen (hyphenn, was victory-fork), VIctory and xcl.
+// Build: build.bat (uses the C# compiler that ships with Windows, C# 5).
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Drawing;
+using System.Drawing.Drawing2D;
+using System.Drawing.Imaging;
+using System.Drawing.Text;
+using System.IO;
+using System.Linq;
+using System.Net;
+using System.Reflection;
+using System.Runtime.InteropServices;
+using System.Text;
+using System.Text.RegularExpressions;
+using System.Threading;
+using System.Windows.Forms;
+using System.Xml;
+
+[assembly: AssemblyTitle("GTA VI Launcher")]
+[assembly: AssemblyDescription("Runs your game dump through the PC port runtimes")]
+[assembly: AssemblyProduct("GTA VI Launcher")]
+[assembly: AssemblyVersion("1.4.0.0")]
+[assembly: AssemblyFileVersion("1.4.0.0")]
+
+// One runtime project, as the archive's site describes it.
+class Runtime
+{
+    public string Key, Name, Branch, Note;
+    public int Reached, Top, Rank; // Top: the archive's pinned place (0 = none); Rank: 1-3 in the launcher's top 3, else 0
+    public bool Gone; // removed from GitHub; the archive keeps its last copy
+
+    public string Dir
+    {
+        get
+        {
+            // The victory-fork checkout that already sits next to the launcher.
+            string legacy = Path.GetFullPath(Path.Combine(Launcher.Here, @"..\victory-fork"));
+            string own = Path.Combine(Launcher.Here, "runtimes", Key);
+            return (Key == "hyphenn" || Key == "victory-fork") && !Directory.Exists(own) && Directory.Exists(legacy) ? legacy : own;
+        }
+    }
+
+    // shortcut: a runtime without a recipe here is assumed to build like VIctory (cargo -p victory); add one when the archive's top 3 gains one that doesn't.
+    public string Exe
+    {
+        get { return Path.Combine(Dir, Key == "victory-7900xtx" ? @"target\diag\victory.exe" : @"target\release\" + (Key == "xcl" ? "xcl.exe" : "victory.exe")); }
+    }
+    public bool Installed { get { return File.Exists(Exe); } }
+
+    public string Build
+    {
+        get
+        {
+            if (Key == "xcl") return "cargo build --release -p xcl";
+            if (Key == "dexnom") // its BCPack tables are fetched and hash-checked first
+                return "powershell -NoProfile -ExecutionPolicy Bypass -File Initialize-FormatTables.ps1 && cargo build --locked --release -p victory --features diagnostics --bins";
+            if (Key == "victory-7900xtx") return "cargo build --locked --profile diag -p victory --features diagnostics";
+            return "cargo build --release -p victory";
+        }
+    }
+
+    public string Run(string game)
+    {
+        string exe = "\"" + Exe + "\" ";
+        if (Key == "xcl") return exe + "run \"" + Path.GetDirectoryName(game) + "\"";
+        // victory-play.exe's flags; not victory-play itself, which forces saves into target\release\state inside the repo and victory refuses that.
+        if (Key == "dexnom") return exe + "run \"" + game + "\" --execute --console series-x --unimplemented trap";
+        // Its play.ps1 sets the tuned VICTORY_* switches and keeps our paths; exit with victory's code so a failure stays readable.
+        if (Key == "victory-7900xtx")
+            return "powershell -NoProfile -ExecutionPolicy Bypass -Command \"& '" + Path.Combine(Dir, @"scripts\play.ps1") + "' -Exe '" + game + "'; exit $LASTEXITCODE\"";
+        return exe + "run \"" + game + "\" --execute";
+    }
+}
+
+static class Launcher
+{
+    public static readonly string Here = AppDomain.CurrentDomain.BaseDirectory;
+    public static readonly string Data = Path.Combine(Here, "victory-data");
+    public static readonly string Settings = Path.Combine(Here, "launcher.txt");
+    public const string Archive = "https://github.com/Guernica4u/GTA6-PC-Port-Archive.git";
+    const string ArchiveSite = "https://raw.githubusercontent.com/Guernica4u/GTA6-PC-Port-Archive/main/docs/index.html";
+    static readonly string[] Wanted = { "ztrx", "hyphenn", "victory-fork", "victory", "xcl" }; // the user's picks: Zettrox, Hyphen (renamed), VIctory, xcl; kept even once gone
+    static readonly string[] Excluded = { "anyxboxx" }; // the user doesn't want it, even when it ranks
+    static readonly Dictionary<string, string> Names = new Dictionary<string, string>
+    {
+        { "hyphenn", "Hyphen" }, { "victory-fork", "Hyphen" }, { "dexnom", "DexNom" }, { "belobug", "Belobug" }, { "victory-7900xtx", "7900XTX" },
+    };
+    const string Third = "ztrx"; // the user's pick for 3rd place, wherever the archive ranks it
+
+    public static XmlDocument Manifest(string dir)
+    {
+        string cfg = Path.Combine(dir, "MicrosoftGame.config");
+        if (!File.Exists(cfg)) return null;
+        var doc = new XmlDocument();
+        doc.Load(cfg);
+        return doc;
+    }
+
+    // The title exe: what MicrosoftGame.config names, else the largest .exe in the folder.
+    public static string FindTitleExe(string dir)
+    {
+        var doc = Manifest(dir);
+        var node = doc == null ? null : doc.SelectSingleNode("//*[local-name()='Executable'][@Name]");
+        if (node != null)
+        {
+            string exe = Path.Combine(dir, node.Attributes["Name"].Value);
+            if (File.Exists(exe)) return exe;
+        }
+        return new DirectoryInfo(dir).GetFiles("*.exe").OrderByDescending(f => f.Length).Select(f => f.FullName).FirstOrDefault();
+    }
+
+    // The archive site's PROJECTS table: key, name, branch, reached, top, note, gone.
+    public static List<Runtime> ParseArchive(string html)
+    {
+        var starts = Regex.Matches(html, "^\\s*\"?([\\w-]+)\"?: \\{ repo: \"", RegexOptions.Multiline);
+        var list = new List<Runtime>();
+        for (int i = 0; i < starts.Count; i++)
+        {
+            int end = i + 1 < starts.Count ? starts[i + 1].Index : Math.Min(html.Length, starts[i].Index + 4000);
+            string chunk = html.Substring(starts[i].Index, end - starts[i].Index);
+            Func<string, string> str = k => { var m = Regex.Match(chunk, "\\b" + k + ": \"((?:[^\"\\\\]|\\\\.)*)\""); return m.Success ? m.Groups[1].Value : null; };
+            var reached = Regex.Match(chunk, "\\breached: *(\\d+)");
+            var top = Regex.Match(chunk, "\\btop: *(\\d+)");
+            string key = starts[i].Groups[1].Value;
+            list.Add(new Runtime
+            {
+                Key = key, Name = str("name") ?? key, Branch = str("branch") ?? key, Note = str("note") ?? "",
+                Reached = reached.Success ? int.Parse(reached.Groups[1].Value) : 0,
+                Top = top.Success ? int.Parse(top.Groups[1].Value) : 0,
+                Gone = Regex.IsMatch(chunk, "\\bgone: *(true|\")"),
+            });
+        }
+        return list;
+    }
+
+    // Top 3 in the site's own order (its pinned places, then how far each gets, then name), plus the user's picks.
+    // Projects gone from GitHub are skipped unless the user picked them: the archive still has their last copy.
+    public static List<Runtime> Choose(List<Runtime> all)
+    {
+        var ranked = all.Where(r => !Excluded.Contains(r.Key) && (!r.Gone || Wanted.Contains(r.Key)))
+            .OrderBy(r => r.Top > 0 ? r.Top : int.MaxValue).ThenByDescending(r => r.Reached).ThenBy(r => r.Name, StringComparer.OrdinalIgnoreCase).ToList();
+        var top = ranked.Where(r => !r.Gone).Take(3).ToList();
+        var pick = top.Concat(ranked.Where(r => Wanted.Contains(r.Key) && !top.Contains(r))).ToList();
+        var third = pick.FirstOrDefault(r => r.Key == Third);
+        if (third != null && pick.Count > 2) { pick.Remove(third); pick.Insert(2, third); }
+        for (int i = 0; i < pick.Count; i++) pick[i].Rank = i < 3 ? i + 1 : 0;
+        foreach (var r in pick) { string n; if (Names.TryGetValue(r.Key, out n)) r.Name = n; }
+        return pick;
+    }
+
+    // Offline fallback: the archive on 25 Nov 2026, after victory-fork became hyphenn and ztrx left GitHub.
+    const string Builtin =
+        "  \"victory-7900xtx\": { repo: \"avatarmanz/VIctory-7900XTX\", name: \"VIctory-7900XTX\", top: 1, branch: \"victory-7900xtx\", reached: 5, note: \"Prologue and first mission at 13-22 fps. Needs about 64 GB of RAM.\" },\n" +
+        "  ztrx: { repo: \"Zettrox/ztrx\", gone: \"25 Nov 2026\", name: \"ztrx\", branch: \"ztrx\", reached: 5, note: \"The prologue is playable. NVIDIA only.\" },\n" +
+        "  hyphenn: { repo: \"fxceless/victory-fork\", name: \"hyphenn\", top: 4, branch: \"hyphenn\", reached: 4, note: \"First gameplay scene at 2-4 fps.\" },\n" +
+        "  dexnom: { repo: \"DexNom/VIctory\", name: \"DexNom Runtime\", top: 2, branch: \"dexnom\", reached: 4, note: \"VIctory fork tuned on Radeon, experimental ray tracing.\" },\n" +
+        "  belobug: { repo: \"Belobug/VIctory-Belobug-AMD\", name: \"VIctory-Belobug-AMD\", top: 3, branch: \"belobug\", reached: 4, note: \"The world renders lit at 5-7 fps on an RX 9070 XT.\" },\n" +
+        "  victory: { repo: \"Marvisak/VIctory\", name: \"VIctory\", branch: \"victory\", reached: 3, note: \"Menus and the world intro.\" },\n" +
+        "  xcl: { repo: \"ivall/xcl\", name: \"xcl\", branch: \"xcl\", reached: 2, note: \"Its own code, not VIctory. Menus at 30 fps; gameplay not reached yet.\" },\n";
+
+    public static string CachedArchive { get { return Path.Combine(Data, "archive.html"); } }
+
+    public static List<Runtime> LoadRuntimes(bool online)
+    {
+        string html = null;
+        if (online)
+        {
+            try
+            {
+                ServicePointManager.SecurityProtocol = (SecurityProtocolType)3072; // TLS 1.2
+                using (var wc = new WebClient { Encoding = Encoding.UTF8 }) html = wc.DownloadString(ArchiveSite);
+                if (ParseArchive(html).Count == 0) html = null;
+                else { Directory.CreateDirectory(Data); File.WriteAllText(CachedArchive, html); }
+            }
+            catch { html = null; }
+        }
+        if (html == null && File.Exists(CachedArchive)) html = File.ReadAllText(CachedArchive);
+        var all = html == null ? new List<Runtime>() : ParseArchive(html);
+        return Choose(all.Count > 0 ? all : ParseArchive(Builtin));
+    }
+
+    [DllImport("user32.dll")] static extern bool SetProcessDPIAware();
+
+    [STAThread]
+    static int Main(string[] args)
+    {
+        if (args.Length > 0 && args[0] == "--selftest") return SelfTest();
+        SetProcessDPIAware();
+        Application.EnableVisualStyles();
+        string[] saved = File.Exists(Settings) ? File.ReadAllLines(Settings) : new string[0];
+        string exe = saved.Length > 0 ? saved[0].Trim() : "";
+        try { if (Directory.Exists(exe)) exe = FindTitleExe(exe); } catch { } // settings from v1.0 held the folder
+        Application.Run(new LauncherForm(exe != null && File.Exists(exe) ? exe : null, saved.Length > 1 && saved[1].Trim().Length > 0 ? saved[1].Trim() : null,
+            saved.Length > 2 && saved[2].Trim() == "muted"));
+        return 0;
+    }
+
+    public static void Error(string msg)
+    {
+        MessageBox.Show(msg, "GTA VI Launcher", MessageBoxButtons.OK, MessageBoxIcon.Error);
+    }
+
+    static int SelfTest()
+    {
+        // Next to the exe, not %TEMP%: antivirus on this machine denied unsigned exes writing there.
+        string t = Path.Combine(Here, "selftest-tmp");
+        Directory.CreateDirectory(t);
+        try
+        {
+            File.WriteAllText(Path.Combine(t, "big.exe"), new string('x', 100));
+            File.WriteAllText(Path.Combine(t, "Game.exe"), "x");
+            if (FindTitleExe(t) != Path.Combine(t, "big.exe")) return 1;
+            File.WriteAllText(Path.Combine(t, "MicrosoftGame.config"),
+                "<Game xmlns=\"http://x\"><ExecutableList><Executable Name=\"Game.exe\" Id=\"Game\"/></ExecutableList>" +
+                "<ShellVisuals DefaultDisplayName=\"Test Title\" SplashScreenImage=\"s.png\"/></Game>");
+            if (FindTitleExe(t) != Path.Combine(t, "Game.exe")) return 2;
+            if (LauncherForm.Visual(Manifest(t), "DefaultDisplayName") != "Test Title") return 4;
+            foreach (var f in Directory.GetFiles(t, "*.exe")) File.Delete(f);
+            if (FindTitleExe(t) != null) return 3;
+        }
+        finally { Directory.Delete(t, true); }
+
+        // Ranking: pinned places, then reached, ties by name, gone projects skipped unless picked, the user's picks always present.
+        string site = Builtin.Replace("reached: 3", "reached: 3, note: \"x \\\"q\\\"\"") +
+            "  anyxboxx: { repo: \"LooperSalty/AnyXboxX\", name: \"AnyXboxX\", branch: \"anyxboxx\", reached: 4 },\n" +
+            "  tuxbox: { repo: \"brcly/TuxBox\", name: \"TuxBox\", branch: \"tuxbox\", reached: 2 },\n" +
+            "  \"leonida-old\": { repo: \"x/L\", gone: \"23 Nov 2026\", name: \"Leonida\", reached: 9 },\n";
+        var keys = string.Join(",", Choose(ParseArchive(site)).Select(r => r.Key + r.Rank).ToArray());
+        if (keys != "victory-7900xtx1,dexnom2,ztrx3,belobug0,hyphenn0,victory0,xcl0") return 5;
+        if (Choose(ParseArchive(Builtin)).First(r => r.Key == "hyphenn").Name != "Hyphen") return 6;
+
+        // Opus packet lengths: 20 ms CELT, 2x10 ms SILK, 3x20 ms CELT (code 3, count in byte 2).
+        if (OpusDecoder.Samples(new byte[] { 0xF8 }, 0, 1) != 960 || OpusDecoder.Samples(new byte[] { 0x01 }, 0, 1) != 960 ||
+            OpusDecoder.Samples(new byte[] { 0xFB, 0x03 }, 0, 2) != 2880) return 7;
+        // Decoding through Windows' Opus decoder: a CELT silence packet gives 20 ms of samples.
+        using (var opus = new OpusDecoder()) if (opus.Decode(new byte[] { 0xF8, 0xFF, 0xFE }, 0, 3, new float[4000], 0) != 960) return 8;
+        return 0;
+    }
+}
+
+// Borderless window, custom-drawn. Kept light: every slide is composed once at window size and kept as a GDI bitmap,
+// blitted (crossfades with AlphaBlend); between fades only the PLAY button's glow repaints, and nothing while dragging.
+class LauncherForm : Form
+{
+    [DllImport("dwmapi.dll")] static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int value, int size);
+    [DllImport("gdi32.dll")] static extern IntPtr CreateCompatibleDC(IntPtr hdc);
+    [DllImport("gdi32.dll")] static extern IntPtr SelectObject(IntPtr hdc, IntPtr obj);
+    [DllImport("gdi32.dll")] static extern bool DeleteDC(IntPtr hdc);
+    [DllImport("gdi32.dll")] static extern bool DeleteObject(IntPtr obj);
+    [DllImport("gdi32.dll")] static extern bool BitBlt(IntPtr dst, int x, int y, int w, int h, IntPtr src, int sx, int sy, int rop);
+    [DllImport("msimg32.dll")] static extern bool AlphaBlend(IntPtr dst, int x, int y, int w, int h, IntPtr src, int sx, int sy, int sw, int sh, int blend);
+
+    string exe, title, hover, state = "", runtimeKey; // state: "", "installing", "running"
+    bool muted, moving;
+    List<Runtime> runtimes;
+    readonly List<string> art = new List<string>(); // slideshow image files; a null entry is the launcher's own sunset
+    IntPtr shown, prevBmp, nextBmp; // slides as HBITMAPs at slideSize: on screen, fading out, composed ahead
+    Size slideSize;
+    int slide, nextIndex, ticks; // indexes into art
+    bool preparing;
+    double shownAt, fadeFrom = -9;
+    const double SlideSeconds = 9, FadeSeconds = 1.2;
+    readonly float s; // DPI scale
+    Rectangle closeR, maxR, minR, muteR, playR, changeR;
+    readonly List<Rectangle> pillR = new List<Rectangle>();
+    readonly Font titleF, tagF, pathF, linkF, playF, smallF, pillF, iconF;
+    readonly Icon smallIcon;
+    readonly Stopwatch clock = Stopwatch.StartNew();
+    readonly ToolTip tip = new ToolTip();
+    System.Media.SoundPlayer player;
+    string musicWav;
+    static readonly Color Accent = Color.FromArgb(255, 92, 141);
+
+    int S(float v) { return (int)Math.Round(v * s); }
+    Runtime Current { get { return runtimes.FirstOrDefault(r => r.Key == runtimeKey) ?? runtimes[0]; } }
+
+    public LauncherForm(string exe, string runtimeKey, bool muted)
+    {
+        using (var g = CreateGraphics()) s = g.DpiX / 96f;
+        this.exe = exe;
+        this.muted = muted;
+        Text = "GTA VI Launcher";
+        FormBorderStyle = FormBorderStyle.None;
+        StartPosition = FormStartPosition.CenterScreen;
+        ClientSize = new Size(S(960), S(540));
+        BackColor = Color.Black;
+        DoubleBuffered = true;
+        KeyPreview = true;
+        AllowDrop = true; // drop pictures on the window to add them to the slideshow
+        Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath);
+        smallIcon = new Icon(Icon, S(16), S(16));
+        titleF = Fnt("Bahnschrift SemiBold Condensed", 64, "Segoe UI Semibold");
+        tagF = Fnt("Bahnschrift SemiBold", 13, "Segoe UI Semibold");
+        playF = Fnt("Bahnschrift SemiBold", 22, "Segoe UI Semibold");
+        pathF = Fnt("Segoe UI", 13, "Segoe UI");
+        linkF = new Font(pathF, FontStyle.Underline);
+        smallF = Fnt("Bahnschrift SemiBold", 12, "Segoe UI Semibold");
+        pillF = Fnt("Bahnschrift SemiBold", 14, "Segoe UI Semibold");
+        iconF = Fnt("Segoe MDL2 Assets", 11, "Segoe UI Symbol");
+
+        // Cached ranking now, the live one from the archive as soon as it arrives.
+        runtimes = Launcher.LoadRuntimes(false);
+        this.runtimeKey = runtimeKey ?? (runtimes.FirstOrDefault(r => r.Installed) ?? runtimes[0]).Key;
+        new Thread(() =>
+        {
+            var live = Launcher.LoadRuntimes(true);
+            OnUi(() => { runtimes = live; Invalidate(); });
+        }) { IsBackground = true }.Start();
+
+        LayoutUi();
+        LoadGame(false);
+        var timer = new System.Windows.Forms.Timer { Interval = 40 };
+        timer.Tick += (o, e) => Tick();
+        timer.Start();
+    }
+
+    Font Fnt(string name, float px, string fallback)
+    {
+        var f = new Font(name, px * s, GraphicsUnit.Pixel);
+        if (f.Name == name) return f;
+        f.Dispose();
+        return new Font(fallback, px * s, GraphicsUnit.Pixel);
+    }
+
+    protected override CreateParams CreateParams
+    {
+        get
+        {
+            var cp = base.CreateParams;
+            cp.ClassStyle |= 0x20000; // CS_DROPSHADOW
+            cp.Style |= 0x30000;      // WS_MINIMIZEBOX | WS_MAXIMIZEBOX: taskbar click minimizes, Win+Up and double-click go full screen
+            return cp;
+        }
+    }
+
+    protected override void OnHandleCreated(EventArgs e)
+    {
+        base.OnHandleCreated(e);
+        int round = 2;
+        DwmSetWindowAttribute(Handle, 33, ref round, 4); // Win11 rounded corners
+    }
+
+    protected override void WndProc(ref Message m)
+    {
+        if (m.Msg == 0x231) moving = true;       // WM_ENTERSIZEMOVE: no repaints while dragging
+        else if (m.Msg == 0x232) moving = false; // WM_EXITSIZEMOVE
+        base.WndProc(ref m);
+        // Drag the window from anywhere that isn't a button.
+        if (m.Msg == 0x84 && (int)m.Result == 1)
+        {
+            long lp = m.LParam.ToInt64();
+            var p = PointToClient(new Point((short)(lp & 0xffff), (short)((lp >> 16) & 0xffff)));
+            if (Hit(p) == null) m.Result = (IntPtr)2; // HTCAPTION
+        }
+    }
+
+    void Tick()
+    {
+        if (moving || WindowState == FormWindowState.Minimized) return;
+        double t = clock.Elapsed.TotalSeconds;
+        if (nextBmp != IntPtr.Zero && t - shownAt > SlideSeconds)
+        {
+            if (prevBmp != IntPtr.Zero) DeleteObject(prevBmp);
+            prevBmp = shown;
+            shown = nextBmp;
+            nextBmp = IntPtr.Zero;
+            slide = nextIndex;
+            shownAt = fadeFrom = t;
+            PrepareNext();
+        }
+        else if (prevBmp != IntPtr.Zero && t - fadeFrom > FadeSeconds + 0.5) { DeleteObject(prevBmp); prevBmp = IntPtr.Zero; }
+        if (t < 0.7 || t - fadeFrom < FadeSeconds + 0.1) Invalidate();
+        else if (state == "" && ++ticks % 2 == 0) Invalidate(Glow); // the glow only, at 12 fps
+    }
+
+    protected override void OnResize(EventArgs e)
+    {
+        base.OnResize(e);
+        if (WindowState == FormWindowState.Minimized || shown == IntPtr.Zero || slideSize == ClientSize) return;
+        LayoutUi();
+        ShowSlide(slide);
+    }
+
+    void ToggleFullScreen()
+    {
+        WindowState = WindowState == FormWindowState.Maximized ? FormWindowState.Normal : FormWindowState.Maximized;
+    }
+
+    protected override void OnKeyDown(KeyEventArgs e)
+    {
+        if (e.KeyCode == Keys.F11 || (e.KeyCode == Keys.Enter && e.Alt)) ToggleFullScreen();
+        else if (e.KeyCode == Keys.Escape && WindowState == FormWindowState.Maximized) WindowState = FormWindowState.Normal;
+    }
+
+    Rectangle Glow { get { return Rectangle.Inflate(playR, S(10), S(10)); } }
+
+    void LayoutUi()
+    {
+        int w = ClientSize.Width, h = ClientSize.Height, b = S(46), bh = S(34);
+        closeR = new Rectangle(w - b, 0, b, bh);
+        maxR = new Rectangle(w - 2 * b, 0, b, bh);
+        minR = new Rectangle(w - 3 * b, 0, b, bh);
+        muteR = new Rectangle(w - 4 * b, 0, b, bh);
+        playR = new Rectangle(w - S(256), h - S(100), S(216), S(56));
+    }
+
+    string Hit(Point p)
+    {
+        if (closeR.Contains(p)) return "close";
+        if (maxR.Contains(p)) return "max";
+        if (minR.Contains(p)) return "min";
+        if (musicWav != null && muteR.Contains(p)) return "mute";
+        if (playR.Contains(p)) return "play";
+        if (exe != null && changeR.Contains(p)) return "change";
+        for (int i = 0; i < pillR.Count; i++) if (pillR[i].Contains(p)) return "pill" + i;
+        return null;
+    }
+
+    protected override void OnMouseMove(MouseEventArgs e)
+    {
+        string h = Hit(e.Location);
+        if (h == hover) return;
+        hover = h;
+        Cursor = h == null ? Cursors.Default : Cursors.Hand;
+        tip.Hide(this);
+        if (h != null && h.StartsWith("pill"))
+        {
+            int i = int.Parse(h.Substring(4));
+            if (i < runtimes.Count && runtimes[i].Note.Length > 0)
+                tip.Show(runtimes[i].Note, this, pillR[i].X, pillR[i].Y - S(30), 6000);
+        }
+        else if (h == "mute") tip.Show(muted ? "Play the game's music" : "Mute music", this, muteR.X - S(40), muteR.Bottom + S(4), 3000);
+        Invalidate();
+    }
+
+    protected override void OnMouseLeave(EventArgs e) { hover = null; tip.Hide(this); Invalidate(); }
+
+    protected override void OnMouseClick(MouseEventArgs e)
+    {
+        try
+        {
+            string h = Hit(e.Location);
+            if (h == "close") Close();
+            else if (h == "min") WindowState = FormWindowState.Minimized;
+            else if (h == "max") ToggleFullScreen();
+            else if (h == "mute") { muted = !muted; Save(); PlayMusic(); Invalidate(); }
+            else if (h == "change") Pick();
+            else if (h == "play") { if (state == "" && (exe != null || Pick())) Play(); }
+            else if (h != null && h.StartsWith("pill") && state == "")
+            {
+                int i = int.Parse(h.Substring(4));
+                if (i < runtimes.Count) { runtimeKey = runtimes[i].Key; Save(); Invalidate(); }
+            }
+        }
+        catch (Exception ex) { Launcher.Error(ex.Message); }
+    }
+
+    void Save() { File.WriteAllLines(Launcher.Settings, new[] { exe ?? "", runtimeKey, muted ? "muted" : "" }); }
+
+    bool Pick()
+    {
+        using (var d = new OpenFileDialog
+        {
+            Title = "Select your game's .exe",
+            Filter = "Game (*.exe, MicrosoftGame.config)|*.exe;MicrosoftGame.config",
+            InitialDirectory = exe != null ? Path.GetDirectoryName(exe) : "",
+        })
+        {
+            if (d.ShowDialog(this) != DialogResult.OK) return false;
+            string chosen = d.FileName.EndsWith(".config", StringComparison.OrdinalIgnoreCase)
+                ? Launcher.FindTitleExe(Path.GetDirectoryName(d.FileName)) : d.FileName;
+            if (chosen == null) { Launcher.Error("No game executable next to that file."); return false; }
+            exe = chosen;
+            Save();
+            LoadGame(true);
+            return true;
+        }
+    }
+
+    void Play()
+    {
+        var rt = Current;
+        if (rt.Installed) { Start(rt); return; }
+
+        if (MessageBox.Show(this, rt.Name + " isn't installed yet. Download it from the archive and build it now?\n\n" +
+                "Needs git and Rust. Takes a few minutes; a console window shows the progress.", "GTA VI Launcher",
+                MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
+        var steps = new List<string>();
+        if (!Directory.Exists(rt.Dir))
+            steps.Add("git clone --depth 1 --single-branch --branch " + rt.Branch + "/main " + Launcher.Archive + " \"" + rt.Dir + "\"");
+        steps.Add("cd /d \"" + rt.Dir + "\" && " + rt.Build);
+        var p = RunConsole(string.Join(" && ", steps.ToArray()), Launcher.Here);
+        SetState("installing");
+        p.Exited += (o, e) => OnUi(() =>
+        {
+            SetState("");
+            if (rt.Installed) Start(rt);
+            else Launcher.Error("Installing " + rt.Name + " failed. The console window showed why (is git and Rust installed?).");
+        });
+    }
+
+    void Start(Runtime rt)
+    {
+        string dir = Path.GetDirectoryName(exe);
+        var p = RunConsole(rt.Run(exe), dir, psi =>
+        {
+            psi.EnvironmentVariables["VICTORY_GAME_DIR"] = dir;
+            // Kept next to the launcher: antivirus here blocked unsigned exes writing to %LOCALAPPDATA%.
+            // Cache per runtime (each prepares the game its own way); saves shared.
+            psi.EnvironmentVariables["VICTORY_CACHE_DIR"] = Path.Combine(Launcher.Data, rt.Key, "cache");
+            psi.EnvironmentVariables["VICTORY_DATA_DIR"] = Path.Combine(Launcher.Data, "data");
+            if (rt.Key == "dexnom") psi.EnvironmentVariables["VICTORY_DEBUG_HUD"] = "1"; // as victory-play.exe sets it
+        });
+        SetState("running");
+        p.Exited += (o, e) => OnUi(() => SetState(""));
+    }
+
+    // A console window that stays open if the command fails, so its error can be read.
+    static Process RunConsole(string command, string cwd, Action<ProcessStartInfo> env = null)
+    {
+        var psi = new ProcessStartInfo("cmd.exe", "/c \"" + command + " || pause\"") { WorkingDirectory = cwd, UseShellExecute = false };
+        // Own temp folder: this PC blocks some tools writing to %TEMP% (MSVC failed with D8050 building xcl).
+        string tmp = Path.Combine(Launcher.Data, "tmp");
+        Directory.CreateDirectory(tmp);
+        psi.EnvironmentVariables["TEMP"] = psi.EnvironmentVariables["TMP"] = tmp;
+        if (env != null) env(psi);
+        var p = Process.Start(psi);
+        p.EnableRaisingEvents = true;
+        return p;
+    }
+
+    void OnUi(Action a)
+    {
+        if (IsHandleCreated && !IsDisposed) try { BeginInvoke(a); } catch (InvalidOperationException) { }
+    }
+
+    void SetState(string st) { state = st; PlayMusic(); Invalidate(); }
+
+    // Music plays while the launcher is idle or installing; the game brings its own.
+    void PlayMusic()
+    {
+        bool on = musicWav != null && !muted && state != "running";
+        if (!on) { if (player != null) player.Stop(); return; }
+        if (player == null) player = new System.Media.SoundPlayer(musicWav);
+        player.PlayLooping();
+    }
+
+    protected override void OnFormClosed(FormClosedEventArgs e)
+    {
+        if (player != null) player.Stop();
+        foreach (var b in new[] { shown, prevBmp, nextBmp }) if (b != IntPtr.Zero) DeleteObject(b);
+        base.OnFormClosed(e);
+    }
+
+    public static string Visual(XmlDocument doc, string attr)
+    {
+        var n = doc == null ? null : doc.SelectSingleNode("//*[local-name()='ShellVisuals']/@" + attr);
+        return n != null && n.Value.Length > 0 && !n.Value.StartsWith("ms-resource") ? n.Value : null;
+    }
+
+    public static string Backgrounds { get { return Path.Combine(Launcher.Here, "backgrounds"); } }
+    static bool IsImage(string f) { return new[] { ".png", ".jpg", ".jpeg", ".bmp", ".gif" }.Contains(Path.GetExtension(f).ToLowerInvariant()); }
+
+    // The game's splash (copied to victory-data so it shows even when the game folder isn't there), then its music
+    // (decoded once in the background).
+    void LoadGame(bool changed)
+    {
+        title = "GTA VI";
+        try
+        {
+            Directory.CreateDirectory(Launcher.Data);
+            string cached = Path.Combine(Launcher.Data, "art-splash.png");
+            if (exe != null)
+            {
+                string dir = Path.GetDirectoryName(exe);
+                var doc = Launcher.Manifest(dir);
+                title = Visual(doc, "DefaultDisplayName") ?? title;
+                string src = Visual(doc, "SplashScreenImage");
+                if (src != null && File.Exists(Path.Combine(dir, src))) File.Copy(Path.Combine(dir, src), cached, true);
+                else if (changed) File.Delete(cached);
+            }
+        }
+        catch { } // a broken manifest just means no splash
+        ListArt();
+        ShowSlide(0);
+
+        if (changed && player != null) { player.Stop(); player.Dispose(); player = null; }
+        musicWav = null;
+        if (exe == null) return;
+        string gameDir = Path.GetDirectoryName(exe);
+        new Thread(() =>
+        {
+            string wav = GameMusic.Prepare(gameDir, changed);
+            OnUi(() => { if (exe != null && Path.GetDirectoryName(exe) == gameDir) { musicWav = wav; PlayMusic(); Invalidate(); } });
+        }) { IsBackground = true, Priority = ThreadPriority.BelowNormal }.Start();
+    }
+
+    // The slideshow: every picture in the backgrounds folder; without any, the game's splash; without that, the sunset.
+    void ListArt()
+    {
+        art.Clear();
+        try
+        {
+            if (Directory.Exists(Backgrounds))
+                art.AddRange(Directory.GetFiles(Backgrounds).Where(IsImage).OrderBy(f => f, StringComparer.OrdinalIgnoreCase));
+        }
+        catch { }
+        string splash = Path.Combine(Launcher.Data, "art-splash.png");
+        if (art.Count == 0 && File.Exists(splash)) art.Add(splash);
+        if (art.Count == 0) art.Add(null);
+    }
+
+    protected override void OnDragEnter(DragEventArgs e) { e.Effect = Dropped(e).Length > 0 ? DragDropEffects.Copy : DragDropEffects.None; }
+
+    protected override void OnDragDrop(DragEventArgs e)
+    {
+        try
+        {
+            string first = null;
+            Directory.CreateDirectory(Backgrounds);
+            foreach (var f in Dropped(e))
+            {
+                string to = Path.Combine(Backgrounds, Path.GetFileName(f));
+                if (!File.Exists(to)) File.Copy(f, to);
+                if (first == null) first = to;
+            }
+            ListArt();
+            ShowSlide(Math.Max(0, art.IndexOf(first)));
+        }
+        catch (Exception ex) { Launcher.Error(ex.Message); }
+    }
+
+    static string[] Dropped(DragEventArgs e)
+    {
+        var files = e.Data.GetData(DataFormats.FileDrop) as string[];
+        return files == null ? new string[0] : files.Where(IsImage).ToArray();
+    }
+
+    // Shows slide i now, at the window's size, and composes the one after it in the background.
+    void ShowSlide(int i)
+    {
+        foreach (var b in new[] { shown, prevBmp, nextBmp }) if (b != IntPtr.Zero) DeleteObject(b);
+        prevBmp = nextBmp = IntPtr.Zero;
+        slide = Math.Min(i, art.Count - 1);
+        slideSize = ClientSize;
+        shown = ComposeBitmap(slideSize, art[slide]);
+        shownAt = clock.Elapsed.TotalSeconds;
+        fadeFrom = -9;
+        PrepareNext();
+        Invalidate();
+    }
+
+    void PrepareNext()
+    {
+        if (art.Count < 2 || preparing || nextBmp != IntPtr.Zero) return;
+        int i = (slide + 1) % art.Count;
+        string path = art[i];
+        var size = slideSize;
+        preparing = true;
+        new Thread(() =>
+        {
+            IntPtr b = ComposeBitmap(size, path);
+            OnUi(() =>
+            {
+                preparing = false;
+                // Stale if the window was resized or the list changed meanwhile.
+                if (size != slideSize || nextBmp != IntPtr.Zero || art.Count < 2 || art[(slide + 1) % art.Count] != path) { DeleteObject(b); PrepareNext(); return; }
+                nextBmp = b;
+                nextIndex = i;
+            });
+        }) { IsBackground = true, Priority = ThreadPriority.BelowNormal }.Start();
+    }
+
+    IntPtr ComposeBitmap(Size size, string path)
+    {
+        Image src = null;
+        try
+        {
+            if (path != null)
+                using (var fs = File.OpenRead(path))
+                using (var i = Image.FromStream(fs)) src = new Bitmap(i);
+        }
+        catch { src = null; } // unreadable picture: the sunset instead
+        using (var bmp = Compose(size.Width, size.Height, src))
+        {
+            if (src != null) src.Dispose();
+            return bmp.GetHbitmap();
+        }
+    }
+
+    // One finished slide: the picture filling the window (cropped, not stretched), darkened under the controls.
+    Bitmap Compose(int w, int h, Image src)
+    {
+        var bmp = new Bitmap(w, h, PixelFormat.Format32bppPArgb);
+        using (var g = Graphics.FromImage(bmp))
+        {
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            g.InterpolationMode = InterpolationMode.HighQualityBicubic;
+            g.PixelOffsetMode = PixelOffsetMode.HighQuality;
+            if (src == null) Sunset(g, w, h);
+            else Cover(g, src, w, h);
+
+            int from = (int)(h * 0.5), mid = (int)(h * 0.76);
+            Fade(g, new Rectangle(0, from, w, mid - from), Color.FromArgb(0, 8, 6, 14), Color.FromArgb(205, 8, 6, 14), 90f);
+            Fade(g, new Rectangle(0, mid, w, h - mid), Color.FromArgb(205, 8, 6, 14), Color.FromArgb(245, 8, 6, 14), 90f);
+            Fade(g, new Rectangle(0, 0, w, S(70)), Color.FromArgb(140, 0, 0, 0), Color.FromArgb(0, 0, 0, 0), 90f);
+            if (src == null)
+            {
+                // Title only over the launcher's own art: the game's art carries its logo.
+                Fade(g, new Rectangle(0, 0, (int)(w * 0.6), h), Color.FromArgb(150, 8, 6, 14), Color.FromArgb(0, 8, 6, 14), 0f);
+                g.TextRenderingHint = TextRenderingHint.AntiAliasGridFit;
+                int x = S(40);
+                using (var accent = new SolidBrush(Accent)) g.DrawString("PC PORT LAUNCHER", tagF, accent, x + S(2), h - S(214));
+                using (var white = new SolidBrush(Color.White)) g.DrawString(title.ToUpperInvariant(), titleF, white, x - S(3), h - S(196));
+            }
+        }
+        return bmp;
+    }
+
+    static void Cover(Graphics g, Image src, int w, int h)
+    {
+        float k = Math.Max((float)w / src.Width, (float)h / src.Height);
+        g.DrawImage(src, (w - src.Width * k) / 2, (h - src.Height * k) / 2, src.Width * k, src.Height * k);
+    }
+
+    static void Fade(Graphics g, Rectangle r, Color a, Color b, float angle)
+    {
+        var br = Rectangle.Inflate(r, 1, 1); // avoids the 1px wrap line at gradient edges
+        using (var brush = new LinearGradientBrush(br, a, b, angle)) g.FillRectangle(brush, r);
+    }
+
+    static Color C(int rgb) { return Color.FromArgb(255, Color.FromArgb(rgb)); }
+
+    // Default artwork: dusk sky, striped sun, its reflection on the water.
+    static void Sunset(Graphics g, int w, int h)
+    {
+        int hz = (int)(h * 0.64);
+        using (var sky = new LinearGradientBrush(new Rectangle(0, -1, w, hz + 2), Color.Black, Color.Black, 90f))
+        {
+            sky.InterpolationColors = new ColorBlend
+            {
+                Colors = new[] { C(0x070513), C(0x260A3A), C(0x8A1F5C), C(0xFF6A3D) },
+                Positions = new[] { 0f, .45f, .82f, 1f },
+            };
+            g.FillRectangle(sky, 0, 0, w, hz);
+            var rnd = new Random(7);
+            for (int i = 0; i < 90; i++)
+                using (var star = new SolidBrush(Color.FromArgb(rnd.Next(40, 160), 255, 255, 255)))
+                    g.FillEllipse(star, rnd.Next(w), rnd.Next(hz / 2), 1.6f, 1.6f);
+
+            float r = h * 0.27f, cx = w * 0.70f, cy = hz - r * 0.2f;
+            g.SetClip(new Rectangle(0, 0, w, hz));
+            using (var sun = new LinearGradientBrush(new RectangleF(cx - r, cy - r - 1, 2 * r, 2 * r + 2), C(0xFFD36B), C(0xFF3D7F), 90f))
+                g.FillEllipse(sun, cx - r, cy - r, 2 * r, 2 * r);
+            for (int i = 0; i < 6; i++) // stripes cut with the sky brush, thicker toward the horizon
+            {
+                float y = cy - r * 0.55f + i * r * 0.14f, t = r * (0.015f + i * 0.014f);
+                g.FillRectangle(sky, cx - r, y, 2 * r, t);
+            }
+            g.ResetClip();
+
+            using (var sea = new LinearGradientBrush(new Rectangle(0, hz - 1, w, h - hz + 2), C(0x4A1040), C(0x0A0510), 90f))
+                g.FillRectangle(sea, 0, hz, w, h - hz);
+            Fade(g, new Rectangle(0, hz - (int)(h * 0.08f), w, (int)(h * 0.08f)), Color.FromArgb(0, 255, 120, 70), Color.FromArgb(110, 255, 120, 70), 90f);
+            for (int i = 0; i < 14; i++)
+            {
+                float y = hz + 3 + i * i * 1.1f + i * 4, half = r * (1f - i * 0.06f) * (0.75f + (i % 3) * 0.12f);
+                using (var line = new SolidBrush(Color.FromArgb(Math.Max(30, 235 - i * 14), 255, 150 + i * 3, 100)))
+                    g.FillRectangle(line, cx - half, y, 2 * half, 2f + i * 0.25f);
+            }
+            using (var glow = new Pen(Color.FromArgb(180, 255, 154, 90))) g.DrawLine(glow, 0, hz, w, hz);
+        }
+    }
+
+    protected override void OnPaint(PaintEventArgs e)
+    {
+        var g = e.Graphics;
+        int w = ClientSize.Width, h = ClientSize.Height;
+        double t = clock.Elapsed.TotalSeconds;
+
+        // Background: the current slide, crossfading from the previous one.
+        var clip = Rectangle.Intersect(e.ClipRectangle, new Rectangle(Point.Empty, slideSize));
+        double f = (t - fadeFrom) / FadeSeconds;
+        IntPtr hdc = g.GetHdc(), mem = CreateCompatibleDC(hdc);
+        bool fading = f < 1 && prevBmp != IntPtr.Zero;
+        IntPtr old = SelectObject(mem, fading ? prevBmp : shown);
+        BitBlt(hdc, clip.X, clip.Y, clip.Width, clip.Height, mem, clip.X, clip.Y, 0x00CC0020); // SRCCOPY
+        if (fading)
+        {
+            SelectObject(mem, shown);
+            int a = (int)(255 * f * f * (3 - 2 * f));
+            AlphaBlend(hdc, clip.X, clip.Y, clip.Width, clip.Height, mem, clip.X, clip.Y, clip.Width, clip.Height, a << 16);
+        }
+        SelectObject(mem, old);
+        DeleteDC(mem);
+        g.ReleaseHdc(hdc);
+        g.SmoothingMode = SmoothingMode.AntiAlias;
+        bool onlyPlay = Glow.Contains(e.ClipRectangle); // a glow frame: the rest of the window is unchanged
+        var cur = Current;
+
+        g.TextRenderingHint = TextRenderingHint.AntiAliasGridFit;
+        var muted2 = Color.FromArgb(185, 180, 200);
+
+        if (!onlyPlay)
+        {
+            // Top bar: app name, music, minimize, full screen, close.
+            g.DrawIcon(smallIcon, new Rectangle(S(14), S(9), S(16), S(16)));
+            TextRenderer.DrawText(g, "LAUNCHER", smallF, new Point(S(36), S(9)), Color.FromArgb(220, 255, 255, 255));
+            using (var hot = new SolidBrush(Color.FromArgb(40, 255, 255, 255)))
+            {
+                if (hover == "min") g.FillRectangle(hot, minR);
+                if (hover == "max") g.FillRectangle(hot, maxR);
+                if (hover == "mute") g.FillRectangle(hot, muteR);
+            }
+            if (hover == "close") using (var b = new SolidBrush(Color.FromArgb(232, 17, 35))) g.FillRectangle(b, closeR);
+            using (var pen = new Pen(Color.White, Math.Max(1f, s)))
+            {
+                int k = S(5);
+                g.SmoothingMode = SmoothingMode.None;
+                int mx = minR.X + minR.Width / 2, my = minR.Y + minR.Height / 2;
+                g.DrawLine(pen, mx - k, my, mx + k, my);
+                int xx = maxR.X + maxR.Width / 2, xy = maxR.Y + maxR.Height / 2;
+                g.DrawRectangle(pen, xx - k, xy - k, 2 * k, 2 * k);
+                if (WindowState == FormWindowState.Maximized) g.DrawLine(pen, xx - k + S(2), xy - k - S(2), xx + k + S(2), xy - k - S(2));
+                g.SmoothingMode = SmoothingMode.AntiAlias;
+                int cx = closeR.X + closeR.Width / 2, cy = closeR.Y + closeR.Height / 2;
+                g.DrawLine(pen, cx - k, cy - k, cx + k, cy + k);
+                g.DrawLine(pen, cx + k, cy - k, cx - k, cy + k);
+            }
+            if (musicWav != null)
+                TextRenderer.DrawText(g, muted ? "" : "", iconF, muteR, muted ? muted2 : Color.White, // Mute / Volume glyphs
+                    TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine);
+
+            // Game path and Change.
+            int x = S(40);
+            string line = exe ?? "Select your game's .exe to get started";
+            var flags = TextFormatFlags.PathEllipsis | TextFormatFlags.SingleLine | TextFormatFlags.NoPadding;
+            int maxW = playR.X - x - S(110);
+            int lw = Math.Min(TextRenderer.MeasureText(line, pathF, Size.Empty, TextFormatFlags.SingleLine | TextFormatFlags.NoPadding).Width, maxW);
+            var pathR = new Rectangle(x, h - S(112), lw, pathF.Height + S(4));
+            TextRenderer.DrawText(g, line, pathF, pathR, muted2, flags);
+            changeR = new Rectangle(pathR.Right + S(14), pathR.Y - S(4), TextRenderer.MeasureText("Change", pathF).Width, pathR.Height + S(8));
+            if (exe != null)
+                TextRenderer.DrawText(g, "Change", hover == "change" ? linkF : pathF,
+                    new Point(changeR.X, pathR.Y), hover == "change" ? Color.White : Accent, TextFormatFlags.NoPadding);
+
+            // Runtimes: one pill each; #n marks the archive's top 3.
+            pillR.Clear();
+            int px = x;
+            foreach (var rt in runtimes)
+            {
+                string label = (rt.Rank > 0 ? "#" + rt.Rank + "  " : "") + rt.Name;
+                var r = new Rectangle(px, h - S(80), TextRenderer.MeasureText(label, pillF).Width + S(18), S(34));
+                pillR.Add(r);
+                bool on = rt == cur, hot = hover == "pill" + (pillR.Count - 1);
+                using (var path = Rounded(r, r.Height / 2))
+                {
+                    using (var b = new SolidBrush(on ? Color.FromArgb(235, 255, 255, 255) : Color.FromArgb(hot ? 70 : 38, 255, 255, 255)))
+                        g.FillPath(b, path);
+                    if (!on) using (var pen = new Pen(Color.FromArgb(60, 255, 255, 255))) g.DrawPath(pen, path);
+                }
+                TextRenderer.DrawText(g, label, pillF, r, on ? Color.FromArgb(20, 16, 30) : Color.White,
+                    TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine);
+                px = r.Right + S(8);
+            }
+        }
+
+        // PLAY, with a soft pulsing glow while it's ready.
+        bool ready = state == "";
+        string label2 = state == "installing" ? "INSTALLING..." : state == "running" ? "RUNNING" : exe == null ? "SELECT GAME" : cur.Installed ? "PLAY" : "INSTALL & PLAY";
+        if (ready)
+        {
+            float pulse = 0.5f + 0.5f * (float)Math.Sin(t * 2 * Math.PI / 2.6);
+            for (int i = 1; i <= 3; i++)
+                using (var path = Rounded(Rectangle.Inflate(playR, S(2 * i), S(2 * i)), S(8 + 2 * i)))
+                using (var b = new SolidBrush(Color.FromArgb((int)((14 + 18 * pulse) / i), Accent)))
+                    g.FillPath(b, path);
+        }
+        Color fill = !ready ? Color.FromArgb(90, 255, 255, 255) : hover == "play" ? Color.FromArgb(255, 120, 162) : Accent;
+        using (var path = Rounded(playR, S(8)))
+        using (var b = new SolidBrush(fill))
+            g.FillPath(b, path);
+        TextRenderer.DrawText(g, label2, label2.Length > 10 ? pillF : playF, playR, Color.White,
+            TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine);
+
+        // Fade in on start.
+        if (t < 0.6)
+            using (var b = new SolidBrush(Color.FromArgb((int)(255 * (1 - t / 0.6)), Color.Black)))
+                g.FillRectangle(b, ClientRectangle);
+    }
+
+    static GraphicsPath Rounded(Rectangle r, int rad)
+    {
+        int d = Math.Max(1, rad * 2);
+        var p = new GraphicsPath();
+        p.AddArc(r.X, r.Y, d, d, 180, 90);
+        p.AddArc(r.Right - d, r.Y, d, d, 270, 90);
+        p.AddArc(r.Right - d, r.Bottom - d, d, d, 0, 90);
+        p.AddArc(r.X, r.Bottom - d, d, d, 90, 90);
+        p.CloseFigure();
+        return p;
+    }
+}
+
+// Game music straight from the game's own audio.rpf: its AWC sound banks are stored uncompressed, music as streamed
+// mono Opus channels, decoded here with the Opus decoder that ships with Windows (MSOpusDecoder.dll, a Media
+// Foundation transform). Bank layout follows rpf9-explorer's Tools/OpusPreview.cpp.
+static class GameMusic
+{
+    // shortcut: the bank is located by its offset in the v1.0.2.1 dump (a radio station, 2.8 h; channel 0 is the music),
+    // other dumps just get no music; scan audio.rpf for "ADAT" banks if another build turns up.
+    const long BankOffset = 0x15034A000, BankLength = 260816000;
+    const int Seconds = 180, Rate = 24000;
+    public static string Wav { get { return Path.Combine(Launcher.Data, "music.wav"); } }
+
+    // The decoded music, made on first use; null when this game has none we can read.
+    public static string Prepare(string gameDir, bool fresh)
+    {
+        try
+        {
+            if (fresh) File.Delete(Wav);
+            if (File.Exists(Wav)) return Wav;
+            string rpf = Path.Combine(gameDir, "audio.rpf");
+            if (!File.Exists(rpf) || new FileInfo(rpf).Length < BankOffset + BankLength) return null;
+            Directory.CreateDirectory(Launcher.Data);
+            string part = Wav + ".part";
+            using (var f = new FileStream(rpf, FileMode.Open, FileAccess.Read, FileShare.ReadWrite, 1 << 16))
+                WriteWav(part, Decode(f, Inspect(f, BankOffset)[0], Seconds * 48000));
+            File.Delete(Wav);
+            File.Move(part, Wav);
+            return Wav;
+        }
+        catch { return null; } // music is a nicety; any failure just means silence
+    }
+
+    // 48 kHz float -> 24 kHz 16-bit mono, normalised, with a 2 s fade at each end so the loop point is soft.
+    public static void WriteWav(string path, float[] x)
+    {
+        int n = x.Length / 2;
+        float peak = 1e-6f;
+        foreach (float v in x) peak = Math.Max(peak, Math.Abs(v));
+        float gain = Math.Min(0.8f / peak, 8f);
+        var pcm = new byte[n * 2];
+        for (int i = 0; i < n; i++)
+        {
+            float env = Math.Min(1f, Math.Min(i, n - 1 - i) / (2f * Rate));
+            short v = (short)(Math.Max(-1f, Math.Min(1f, (x[2 * i] + x[2 * i + 1]) / 2 * gain * env)) * 32767);
+            pcm[2 * i] = (byte)v; pcm[2 * i + 1] = (byte)(v >> 8);
+        }
+        using (var o = new BinaryWriter(File.Create(path)))
+        {
+            o.Write(0x46464952); o.Write(36 + pcm.Length); o.Write(0x45564157); o.Write(0x20746d66); o.Write(16); // RIFF, WAVE, fmt
+            o.Write((short)1); o.Write((short)1); o.Write(Rate); o.Write(Rate * 2); o.Write((short)2); o.Write((short)16);
+            o.Write(0x61746164); o.Write(pcm.Length); o.Write(pcm);                                              // data
+        }
+    }
+
+    static byte[] Read(Stream f, long at, int n)
+    {
+        var b = new byte[n];
+        f.Position = at;
+        for (int got = 0; got < n; )
+        {
+            int k = f.Read(b, got, n - got);
+            if (k <= 0) throw new EndOfStreamException();
+            got += k;
+        }
+        return b;
+    }
+
+    // Per music channel of the bank's first streamed-music sound: its Opus data as {offset, bytes, packets' samples to skip}.
+    public static List<long[]>[] Inspect(Stream f, long bank)
+    {
+        var pre = Read(f, bank, 16);
+        uint flags = BitConverter.ToUInt32(pre, 4), n = BitConverter.ToUInt32(pre, 8), headerSize = BitConverter.ToUInt32(pre, 12);
+        if (BitConverter.ToUInt32(pre, 0) != 0x54414441 || (flags & 0xFF00FFFF) != 0xFF000001 || n == 0 || n > 8192 || headerSize > 4 << 20)
+            throw new InvalidDataException("Not an AWC bank."); // "ADAT"
+        var h = Read(f, bank, (int)headerSize);
+        long p = 16 + ((flags & 0x400000) != 0 ? 4 : 0);
+        if ((flags & 0x10000) != 0) p += n * 2;
+        if ((flags & 0x200000) != 0) p += (n + 1) * 4;
+        long info = p;
+        p += n * 4;
+        for (int i = 0; i < n; i++)
+        {
+            uint v = BitConverter.ToUInt32(h, (int)(info + i * 4));
+            long fmt = 0, fmtSize = 0, data = 0, dataSize = 0;
+            for (int j = 0; j < (v >> 29); j++, p += 8)
+            {
+                if (p + 8 > h.Length) throw new InvalidDataException("AWC tag table out of bounds.");
+                ulong tag = BitConverter.ToUInt64(h, (int)p);
+                long type = (long)(tag >> 56), size = (long)((tag >> 28) & 0x0FFFFFFF), at = (long)(tag & 0x0FFFFFFF);
+                if (type == 0x55) { data = at; dataSize = size; }  // data
+                if (type == 0x48) { fmt = at; fmtSize = size; }    // streamed music format
+            }
+            if (fmt == 0 || dataSize == 0) continue;
+            if (fmtSize < 12 || fmtSize > 524) throw new InvalidDataException("Bad music format.");
+            var m = Read(f, bank + fmt, (int)fmtSize);
+            uint blocks = BitConverter.ToUInt32(m, 0), chunk = BitConverter.ToUInt32(m, 4), channels = BitConverter.ToUInt32(m, 8);
+            if (channels == 0 || channels > 32 || m.Length != 12 + channels * 16 || chunk < 2048 || blocks == 0 || (long)blocks * chunk < dataSize)
+                throw new InvalidDataException("Bad music block layout.");
+            var spans = new List<long[]>[channels];
+            for (int c = 0; c < channels; c++)
+            {
+                if (m[12 + c * 16 + 12] != 0x0B) throw new InvalidDataException("Music isn't Opus.");
+                spans[c] = new List<long[]>();
+            }
+            for (long b = 0; b < blocks; b++)
+            {
+                long at = bank + data + b * chunk;
+                var rec = Read(f, at, (int)channels * 24);
+                long total = 0, before = 0;
+                for (int c = 0; c < channels; c++) total += BitConverter.ToUInt32(rec, c * 24 + 4);
+                long header = (channels * 24 + total * 4 + 2047) & ~2047L;
+                for (int c = 0; c < channels; c++)
+                {
+                    long count = BitConverter.ToUInt32(rec, c * 24 + 4);
+                    if (count > 0) spans[c].Add(new[] { at + header + before * 2048, count * 2048, BitConverter.ToUInt32(rec, c * 24 + 8) });
+                    before += count;
+                }
+            }
+            return spans;
+        }
+        throw new InvalidDataException("No streamed music in this bank.");
+    }
+
+    // Up to `frames` samples (48 kHz mono float) of one channel. Packets sit in 2048-byte blocks behind a u16 length;
+    // each block may begin with packets repeated from the previous one, which its skip count covers.
+    public static float[] Decode(Stream f, List<long[]> spans, int frames)
+    {
+        var into = new float[frames];
+        int w = 0;
+        using (var opus = new OpusDecoder())
+            foreach (var s in spans)
+            {
+                long skip = s[2];
+                for (long b = 0; b < s[1] && w < frames; b += 2048)
+                {
+                    var block = Read(f, s[0] + b, 2048);
+                    for (int p = 0; p + 2 <= 2048 && w < frames; )
+                    {
+                        int bytes = block[p] | block[p + 1] << 8;
+                        if (bytes == 0 || bytes > 2046 - p) break; // padding
+                        if (skip > 0) skip -= OpusDecoder.Samples(block, p + 2, bytes);
+                        else w = opus.Decode(block, p + 2, bytes, into, w);
+                        p += 2 + bytes;
+                    }
+                }
+                if (w >= frames) break;
+            }
+        if (w < frames) Array.Resize(ref into, w);
+        return into;
+    }
+}
+
+// One mono 48 kHz Opus stream through Windows' Opus decoder MFT.
+sealed class OpusDecoder : IDisposable
+{
+    static readonly Guid MajorType = new Guid("48eba18e-f8c9-4687-bf11-0a74c9f96a8f"), SubType = new Guid("f7e34c9a-42e8-4714-b74b-cb29d72c35e5"),
+        Audio = new Guid("73647561-0000-0010-8000-00AA00389B71"), OpusFormat = new Guid("0000704F-0000-0010-8000-00AA00389B71"),
+        Float = new Guid("00000003-0000-0010-8000-00AA00389B71"), Pcm = new Guid("00000001-0000-0010-8000-00AA00389B71"),
+        NumChannels = new Guid("37e48bf5-645e-4c5b-89de-ada9e29b696a"), SampleRate = new Guid("5faeeae7-0290-4c31-9e8a-c534f68d9dba"),
+        UserData = new Guid("b6bc765f-4c3b-40a4-bd51-2535b66fe09d");
+    static bool started;
+    readonly IMFTransform t;
+    readonly bool isFloat, provides;
+    readonly int outSize;
+
+    public OpusDecoder()
+    {
+        if (!started) { Check(MFStartup(0x20070, 0)); started = true; }
+        t = (IMFTransform)Activator.CreateInstance(Type.GetTypeFromCLSID(new Guid("63e17c10-2d43-4c42-8fe3-8d8b63e46a6a")));
+        IMFMediaType input;
+        Check(MFCreateMediaType(out input));
+        input.SetGUID(MajorType, Audio);
+        input.SetGUID(SubType, OpusFormat);
+        input.SetUINT32(NumChannels, 1);
+        input.SetUINT32(SampleRate, 48000);
+        var head = new byte[] { 0x4F, 0x70, 0x75, 0x73, 0x48, 0x65, 0x61, 0x64, 1, 1, 0, 0, 0x80, 0xBB, 0, 0, 0, 0, 0 }; // OpusHead: v1, mono, 48 kHz
+        input.SetBlob(UserData, head, head.Length);
+        Check(t.SetInputType(0, input, 0));
+        Marshal.ReleaseComObject(input);
+        for (int i = 0; ; i++)
+        {
+            IMFMediaType o;
+            Check(t.GetOutputAvailableType(0, i, out o));
+            Guid sub;
+            o.GetGUID(SubType, out sub);
+            bool ok = sub == Float || sub == Pcm;
+            if (ok) { isFloat = sub == Float; Check(t.SetOutputType(0, o, 0)); }
+            Marshal.ReleaseComObject(o);
+            if (ok) break;
+        }
+        StreamInfo osi;
+        Check(t.GetOutputStreamInfo(0, out osi));
+        provides = (osi.Flags & 0x300) != 0; // the MFT allocates its own output samples
+        outSize = Math.Max(osi.Size, 5760 * 4);
+        t.ProcessMessage(0x10000000, IntPtr.Zero); // MFT_MESSAGE_NOTIFY_BEGIN_STREAMING
+    }
+
+    // Samples in one Opus packet at 48 kHz (RFC 6716, section 3.1).
+    public static int Samples(byte[] b, int p, int n)
+    {
+        int cfg = b[p] >> 3, code = b[p] & 3;
+        int per = cfg < 12 ? new[] { 480, 960, 1920, 2880 }[cfg & 3] : cfg < 16 ? ((cfg & 1) == 0 ? 480 : 960) : new[] { 120, 240, 480, 960 }[cfg & 3];
+        return per * (code == 0 ? 1 : code == 3 ? (n > 1 ? b[p + 1] & 0x3F : 0) : 2);
+    }
+
+    // Decodes one packet and adds it into `into` from `w`; returns the new write position.
+    public int Decode(byte[] src, int at, int n, float[] into, int w)
+    {
+        IMFMediaBuffer buf;
+        IMFSample sample;
+        IntPtr ptr;
+        int max, cur;
+        Check(MFCreateMemoryBuffer(n, out buf));
+        buf.Lock(out ptr, out max, out cur);
+        Marshal.Copy(src, at, ptr, n);
+        buf.Unlock();
+        buf.SetCurrentLength(n);
+        Check(MFCreateSample(out sample));
+        sample.AddBuffer(buf);
+        Check(t.ProcessInput(0, sample, 0));
+        Marshal.ReleaseComObject(sample);
+        Marshal.ReleaseComObject(buf);
+        while (true)
+        {
+            IMFSample mine = null;
+            IMFMediaBuffer mineBuf = null;
+            if (!provides)
+            {
+                Check(MFCreateMemoryBuffer(outSize, out mineBuf));
+                Check(MFCreateSample(out mine));
+                mine.AddBuffer(mineBuf);
+            }
+            var od = new OutputData { Sample = mine == null ? IntPtr.Zero : Marshal.GetIUnknownForObject(mine) };
+            int status, hr = t.ProcessOutput(0, 1, ref od, out status);
+            IMFSample got = mine;
+            if (od.Sample != IntPtr.Zero)
+            {
+                if (mine == null && hr >= 0) got = (IMFSample)Marshal.GetObjectForIUnknown(od.Sample);
+                Marshal.Release(od.Sample);
+            }
+            if (hr == unchecked((int)0xC00D6D72)) { Release(got, mineBuf); return w; } // MF_E_TRANSFORM_NEED_MORE_INPUT
+            Check(hr);
+            IMFMediaBuffer cb;
+            Check(got.ConvertToContiguousBuffer(out cb));
+            cb.Lock(out ptr, out max, out cur);
+            if (isFloat)
+            {
+                var tmp = new float[cur / 4];
+                Marshal.Copy(ptr, tmp, 0, tmp.Length);
+                for (int i = 0; i < tmp.Length && w < into.Length; i++) into[w++] += tmp[i];
+            }
+            else
+            {
+                var tmp = new short[cur / 2];
+                Marshal.Copy(ptr, tmp, 0, tmp.Length);
+                for (int i = 0; i < tmp.Length && w < into.Length; i++) into[w++] += tmp[i] / 32768f;
+            }
+            cb.Unlock();
+            Release(cb, got, mineBuf);
+        }
+    }
+
+    static void Release(params object[] o) { foreach (var x in o) if (x != null) Marshal.ReleaseComObject(x); }
+    public void Dispose() { Marshal.ReleaseComObject(t); }
+    static void Check(int hr) { if (hr < 0) Marshal.ThrowExceptionForHR(hr); }
+
+    [StructLayout(LayoutKind.Sequential)] struct StreamInfo { public int Flags, Size, Alignment; }
+    [StructLayout(LayoutKind.Sequential)] struct OutputData { public int StreamID; public IntPtr Sample; public int Status; public IntPtr Events; }
+
+    [DllImport("mfplat.dll")] static extern int MFStartup(int version, int flags);
+    [DllImport("mfplat.dll")] static extern int MFCreateMediaType(out IMFMediaType t);
+    [DllImport("mfplat.dll")] static extern int MFCreateSample(out IMFSample s);
+    [DllImport("mfplat.dll")] static extern int MFCreateMemoryBuffer(int max, out IMFMediaBuffer b);
+
+    // Media Foundation interfaces: only the methods used are typed, the x* entries hold their vtable slots.
+    [ComImport, Guid("44ae0fa8-ea31-4109-8d2e-4cae4997c555"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IMFMediaType
+    {
+        void x0(); void x1(); void x2(); void x3(); void x4(); void x5(); void x6();
+        [PreserveSig] int GetGUID([In, MarshalAs(UnmanagedType.LPStruct)] Guid key, out Guid value);
+        void x8(); void x9(); void x10(); void x11(); void x12(); void x13(); void x14(); void x15(); void x16(); void x17();
+        [PreserveSig] int SetUINT32([In, MarshalAs(UnmanagedType.LPStruct)] Guid key, int value);
+        void x19(); void x20();
+        [PreserveSig] int SetGUID([In, MarshalAs(UnmanagedType.LPStruct)] Guid key, [In, MarshalAs(UnmanagedType.LPStruct)] Guid value);
+        void x22();
+        [PreserveSig] int SetBlob([In, MarshalAs(UnmanagedType.LPStruct)] Guid key, [In, MarshalAs(UnmanagedType.LPArray)] byte[] buf, int size);
+    }
+
+    [ComImport, Guid("c40a00f2-b93a-4d80-ae8c-5a1c634f58e4"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IMFSample
+    {
+        void x0(); void x1(); void x2(); void x3(); void x4(); void x5(); void x6(); void x7(); void x8(); void x9();
+        void x10(); void x11(); void x12(); void x13(); void x14(); void x15(); void x16(); void x17(); void x18(); void x19();
+        void x20(); void x21(); void x22(); void x23(); void x24(); void x25(); void x26(); void x27(); void x28(); void x29();
+        void y0(); void y1(); void y2(); void y3(); void y4(); void y5(); void y6(); void y7();
+        [PreserveSig] int ConvertToContiguousBuffer(out IMFMediaBuffer b);
+        [PreserveSig] int AddBuffer(IMFMediaBuffer b);
+    }
+
+    [ComImport, Guid("045FA593-8799-42b8-BC8D-8968C6453507"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IMFMediaBuffer
+    {
+        [PreserveSig] int Lock(out IntPtr p, out int max, out int cur);
+        [PreserveSig] int Unlock();
+        void x2();
+        [PreserveSig] int SetCurrentLength(int n);
+    }
+
+    [ComImport, Guid("bf94c121-5b05-4e6f-8000-ba598961414d"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IMFTransform
+    {
+        void x0(); void x1(); void x2(); void x3();
+        [PreserveSig] int GetOutputStreamInfo(int id, out StreamInfo info);
+        void x5(); void x6(); void x7(); void x8(); void x9(); void x10();
+        [PreserveSig] int GetOutputAvailableType(int id, int index, out IMFMediaType t);
+        [PreserveSig] int SetInputType(int id, IMFMediaType t, int flags);
+        [PreserveSig] int SetOutputType(int id, IMFMediaType t, int flags);
+        void x14(); void x15(); void x16(); void x17(); void x18(); void x19();
+        [PreserveSig] int ProcessMessage(int msg, IntPtr param);
+        [PreserveSig] int ProcessInput(int id, IMFSample s, int flags);
+        [PreserveSig] int ProcessOutput(int flags, int count, ref OutputData buffer, out int status);
+    }
+}
