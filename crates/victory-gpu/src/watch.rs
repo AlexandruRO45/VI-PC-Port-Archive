@@ -155,11 +155,31 @@ pub(crate) fn held_times() -> Vec<(u64, f64, f64)> {
 
 /// (page, other page) for the pages (page numbers) showing the same memory
 /// as `pages` elsewhere.
+/// One look at the links for each run of consecutive pages, none when no
+/// page is linked (most of the time), instead of one per page: this runs
+/// under the guards' lock every copy's check waits for (Belobug f2cc100).
+/// The same pairs, in the same order, as one look per page.
 fn aliases(g: &Guards, pages: &[usize]) -> Vec<(usize, usize)> {
-    pages
-        .iter()
-        .flat_map(|&p| g.alias_of.get(&p).into_iter().flatten().map(move |&a| (p, a)))
-        .collect()
+    linked(&g.alias_of, pages)
+}
+
+fn linked(alias_of: &BTreeMap<usize, Vec<usize>>, pages: &[usize]) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    if alias_of.is_empty() {
+        return out;
+    }
+    let mut i = 0;
+    while i < pages.len() {
+        let first = i;
+        while i + 1 < pages.len() && pages[i].checked_add(1) == Some(pages[i + 1]) {
+            i += 1;
+        }
+        for (&p, others) in alias_of.range(pages[first]..=pages[i]) {
+            out.extend(others.iter().map(|&a| (p, a)));
+        }
+        i += 1;
+    }
+    out
 }
 
 /// Guards the other mappings of taken pages.
@@ -913,5 +933,48 @@ pub(crate) mod tests {
         let top = usize::MAX - 16;
         drop(writing(top, PAGE));
         title_memory_remapped(top, usize::MAX);
+    }
+
+    /// The run lookup gives exactly the pairs, in the order, of one lookup
+    /// per page (f2cc100 port), for runs, gaps, duplicates and no links.
+    #[test]
+    fn aliases_by_run_match_one_look_per_page() {
+        let naive = |m: &BTreeMap<usize, Vec<usize>>, pages: &[usize]| -> Vec<(usize, usize)> {
+            pages.iter().flat_map(|&p| m.get(&p).into_iter().flatten().map(move |&a| (p, a))).collect()
+        };
+        let mut m: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+        assert!(linked(&m, &[1, 2, 3]).is_empty());
+        for (p, o) in [(3, vec![100]), (5, vec![200, 201]), (6, vec![300]), (40, vec![7]), (usize::MAX, vec![1])] {
+            m.insert(p, o);
+        }
+        let cases: [&[usize]; 7] = [
+            &[],
+            &[0, 1, 2],
+            &[2, 3, 4, 5, 6, 7],
+            &[5, 6, 40, 41],
+            &[6, 5, 3, 3, 40],
+            &[usize::MAX - 1, usize::MAX],
+            &[1, 2, 3, 10, 11, 12, 39, 40, 41],
+        ];
+        for pages in cases {
+            assert_eq!(linked(&m, pages), naive(&m, pages), "{pages:?}");
+        }
+        // Pseudo-random sorted page lists as `take` passes them.
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        for _ in 0..200 {
+            let mut pages = Vec::new();
+            let mut p = 0usize;
+            for _ in 0..32 {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                p += 1 + (seed % 4) as usize;
+                pages.push(p);
+            }
+            for q in pages.iter().step_by(3) {
+                m.entry(*q).or_insert_with(|| vec![q + 1000]);
+            }
+            assert_eq!(linked(&m, &pages), naive(&m, &pages));
+        }
     }
 }
