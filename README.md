@@ -105,6 +105,22 @@ victory run <game_scarlett_master.exe> --execute --console series-x
 The first launch after a build translates every shader and builds about
 2,500 pipelines; the loading screen can stay frozen, with sound, for minutes.
 
+### Tests and mutation coverage
+
+Every change needs a test that fails without it. Before a pull request,
+`cargo test --workspace` and a mutation run on the changed lines must both
+pass:
+
+```powershell
+git fetch origin main
+git diff origin/main...HEAD > pr.diff
+cargo mutants --in-diff pr.diff --timeout 300 --jobs 2
+```
+
+A surviving mutant in changed code is a missing test. See
+[docs/mutation-testing.md](docs/mutation-testing.md) for the policy and the
+known tool limits.
+
 ### Known problems
 
 - With the in-game phone out the world is unlit (see the table).

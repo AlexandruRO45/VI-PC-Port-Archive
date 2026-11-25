@@ -1,0 +1,16 @@
+# Mutation-testing policy: every line a pull request changes must be covered
+# by tests that kill its mutants. See docs/mutation-testing.md.
+#
+# CI runs on the changed lines only; locally:
+#   git diff origin/main...HEAD > pr.diff
+#   cargo mutants --in-diff pr.diff --timeout 300 --jobs 2
+
+# Do not reuse a target directory: a stale build must not make a mutant look
+# caught (or a surviving mutant look killed).
+copy_target = false
+
+# Denied lints must not make mutants unviable; the test result is what matters.
+cap_lints = true
+
+# A baseline or mutant test run gets at least this long.
+minimum_test_timeout = 120
