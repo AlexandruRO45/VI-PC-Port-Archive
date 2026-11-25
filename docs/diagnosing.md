@@ -74,8 +74,9 @@ number is a different moment on two machines, so two runs cannot be
 compared.
 
 A real run: `p50 33.4 ms, p95 105.4 ms, p99 370.8 ms, worst 3527 ms` with
-77 presents over 100 ms - against `p99 34.2 ms` for the same build sitting
-in a menu. The average would never show it.
+77 presents over 100 ms - against `p99 34.1 ms` and three presents over
+100 ms for the same build sitting in a menu. The average would never show
+it.
 
 ```
 VICTORY_STALL_LOG=100
@@ -85,10 +86,11 @@ Adds, for any present slower than the threshold, what happened during that
 frame: pipelines created, shaders translated, texture uploads. Counters
 that cannot be read cheaply are reported as `na` rather than guessed.
 
-In that run two thirds of the stalls carried a non-zero upload count and
-shader translation appeared in a handful. That is a correlation and should
-be treated as one: batching uploads to reduce the count made the same
-machine worse, and moving pipeline-library writes to exit changed nothing.
+In that run nearly nine stalls in ten carried a non-zero upload count (81
+of 91, and 88-90% on two further runs) while shader translation appeared in
+a handful. That is a correlation and should be treated as one: batching
+uploads to reduce the count made the same machine worse, and moving
+pipeline-library writes to exit changed nothing.
 
 ## Audio that repeats instead of dropping out
 
