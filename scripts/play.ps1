@@ -3,13 +3,24 @@ param(
     [Parameter(Mandatory = $true)][string]$Game,
     [string]$Cache = "$env:LOCALAPPDATA\ztrx\cache",
     [string]$Data = "$env:LOCALAPPDATA\ztrx\data",
-    [string]$Exe = "$PSScriptRoot\..\target\release\victory.exe"
+    [string]$Exe
 )
+$ErrorActionPreference = "Stop"
+if (-not $Exe) {
+    $Exe = Join-Path $PSScriptRoot "..\target\release\victory.exe"
+}
+if (-not (Test-Path -LiteralPath $Game -PathType Leaf)) {
+    throw "Game executable not found: $Game"
+}
+if (-not (Test-Path -LiteralPath $Exe -PathType Leaf)) {
+    throw "Launcher not found: $Exe. Run 'cargo build --release -p victory' from the repository first."
+}
 foreach ($v in "VICTORY_KEYS", "VICTORY_CAPTURE", "VICTORY_CAPTURE_FRAMES", "VICTORY_DUMP_TARGETS") {
     Remove-Item "Env:$v" -ErrorAction SilentlyContinue
 }
 New-Item -ItemType Directory -Force $Cache, $Data | Out-Null
 $env:VICTORY_CACHE_DIR = $Cache
 $env:VICTORY_DATA_DIR = $Data
+$ErrorActionPreference = "Continue"
 & $Exe run $Game --execute 2>&1 | Out-File "$env:TEMP\ztrx.log" -Encoding utf8
 Write-Host "Exited with $LASTEXITCODE; log: $env:TEMP\ztrx.log"

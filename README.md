@@ -16,7 +16,13 @@ Tested on Windows 11 with an **NVIDIA GeForce RTX 3050** (8 GB):
 | Prologue | playable from the cell to the boat chase: cell, cafeteria, robbery, police chase (wanted level, minimap), boat, binoculars |
 | Stability | 1 h 30 min+ in one session without a crash |
 | Frame rate | 1-3 fps in the world (the first run is slower while shaders translate; they are cached after that) |
-| Known problems | anything in shadow is black and bright scenes overexpose (the game's ray-traced lighting does not run yet); some blocky artifacts; boats sit low in the water |
+| Known problems | eyes and faces in shade are still dark, and reflections are missing (the game's ray-traced passes do not run yet); bright scenes overexpose in places; some blocky artifacts; boats sit low in the water |
+
+Indirect light: the title's bounce light comes from probes filled by tracing
+rays, which do not run on the host, so its resolve pass is replaced by a
+constant right after it runs (`VICTORY_AMBIENT`, 0.6 by default; `0` for none,
+`off` to keep what the title wrote). Before that, the prologue's cell and its
+first cutscene read as a white, blown-out frame.
 
 ## Requirements
 
@@ -38,9 +44,36 @@ powershell -ExecutionPolicy Bypass -File scripts\play.ps1 -Game "<your game fold
 ```
 
 `scripts\play.ps1` keeps the shader cache and saves in folders you choose
-(`-Cache`, `-Data`) and presses no buttons for you. Controller: XInput pads
-(a DualShock/DualSense through DS4Windows works). With no pad connected the
-keyboard acts as one while the game window has focus.
+(`-Cache`, `-Data`) and presses no buttons for you. It finds the release
+executable relative to the script, so the command works from any working
+directory. Controller: XInput pads (a DualShock/DualSense through DS4Windows
+works). With no pad connected the keyboard acts as one while the game window
+has focus.
+
+The launcher writes its log to `%TEMP%\ztrx.log`. The default cache and save
+locations are `%LOCALAPPDATA%\ztrx\cache` and `%LOCALAPPDATA%\ztrx\data`.
+
+## Update and play
+
+Close the game before updating: Windows cannot replace `victory.exe` while it
+is running. From the repository root, pull and rebuild explicitly with:
+
+```powershell
+git -c pull.rebase=false pull --ff-only
+cargo build --release -p victory
+powershell -ExecutionPolicy Bypass -File scripts\play.ps1 -Game "<your game folder>\<the game's exe>"
+```
+
+Or run all three steps with one command:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\update-and-play.ps1 -Game "<your game folder>\<the game's exe>"
+```
+
+The update script also works from any working directory and passes `-Cache`
+and `-Data` through to the launcher. It stops if the game is still running,
+if `git -c pull.rebase=false pull --ff-only` cannot update cleanly (for example because of local
+changes), or if the build fails. Existing shader caches and saves are kept.
 
 ## Faster settings (optional, off by default)
 
