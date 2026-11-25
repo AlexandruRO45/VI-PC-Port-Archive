@@ -1946,7 +1946,12 @@ impl Shadow {
             before.entry(tile).or_insert_with(|| {
                 #[cfg(feature = "diagnostics")]
                 SPARSE_WRITES[1].fetch_add(PAGE as u64, Ordering::Relaxed);
-                let whole = data as usize & !(PAGE - 1);
+                // `data` points `at % PAGE` bytes into the mapped 64 KiB tile.
+                // On Windows WDDM, `ID3D12Resource::Map` is 64 KiB-aligned, so
+                // masking with `!(PAGE - 1)` lands on the tile base; under
+                // Linux/vkd3d-proton, `vkMapMemory`/`mmap` is only 4 KiB-aligned
+                // and masking reads before the mapping (`0xc0000005`).
+                let whole = data as usize - at % PAGE;
                 let mut buf = pooled_tile();
                 // SAFETY: the tile's mapping.
                 buf.extend_from_slice(unsafe { std::slice::from_raw_parts(whole as *const u8, PAGE) });
