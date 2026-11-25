@@ -17,6 +17,7 @@
 //! (`crate::bindless`).
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
@@ -46,6 +47,88 @@ pub(crate) struct Shadow {
     /// 64 KiB title page it touches (tracked memory only): writes through
     /// views of it are marked there ([`Shadow::mark_entry`]).
     marks: Option<u32>,
+    /// Optional VRAM (`DEFAULT` heap, UAV-capable) copy of `buffer` when
+    /// `VICTORY_VRAM_COPIES=1`, with its GPU VA base. `buffer` stays as the
+    /// CPU-mapped staging source/destination.
+    vram: Option<(ID3D12Resource, u64)>,
+    /// Allocated size of `vram` in bytes (for `Drop` accounting).
+    vram_bytes: u64,
+    /// Sorted, disjoint byte ranges `(offset, len)` inside `buffer` that
+    /// CPU updates wrote since the last VRAM sync.
+    vram_dirty: Mutex<DirtyRanges>,
+    /// Fast check for whether `vram_dirty` is non-empty.
+    vram_has_dirty: AtomicBool,
+}
+
+/// Sorted, disjoint `(offset, len)` byte intervals within a buffer.
+#[derive(Default)]
+pub(crate) struct DirtyRanges {
+    ranges: Vec<(u64, u64)>,
+}
+
+impl DirtyRanges {
+    /// Marks `[offset, offset + len)` dirty, merging overlapping or adjacent
+    /// intervals so the list stays sorted and disjoint.
+    pub(crate) fn mark(&mut self, offset: u64, len: u64) {
+        if len == 0 {
+            return;
+        }
+        let Some(end) = offset.checked_add(len) else {
+            return;
+        };
+        let pos = self.ranges.partition_point(|&(a, _)| a < offset);
+        let mut start = offset;
+        let mut merged_end = end;
+        let mut first = pos;
+        if pos > 0 {
+            let (pa, plen) = self.ranges[pos - 1];
+            if pa + plen >= start {
+                start = pa;
+                merged_end = merged_end.max(pa + plen);
+                first = pos - 1;
+            }
+        }
+        let mut remove_end = pos;
+        while remove_end < self.ranges.len() {
+            let (na, nlen) = self.ranges[remove_end];
+            if na > merged_end {
+                break;
+            }
+            merged_end = merged_end.max(na + nlen);
+            remove_end += 1;
+        }
+        self.ranges.splice(first..remove_end, [(start, merged_end - start)]);
+    }
+
+    /// Returns all dirty ranges and clears the list.
+    pub(crate) fn take(&mut self) -> Vec<(u64, u64)> {
+        std::mem::take(&mut self.ranges)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn as_slice(&self) -> &[(u64, u64)] {
+        &self.ranges
+    }
+}
+
+/// Live VRAM copies and their total bytes (`VICTORY_VRAM_COPIES=1`).
+static VRAM_ALLOCS: AtomicU64 = AtomicU64::new(0);
+static VRAM_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// `(count, bytes)` of live VRAM shadow copies.
+pub(crate) fn vram_counts() -> (u64, u64) {
+    (
+        VRAM_ALLOCS.load(Ordering::Relaxed),
+        VRAM_BYTES.load(Ordering::Relaxed),
+    )
+}
+
+/// `VICTORY_VRAM_COPIES=1` keeps a VRAM (`DEFAULT` heap) copy of each host
+/// buffer copy and updates only changed pages via GPU copies. Off by
+/// default until verified in game.
+pub(crate) fn vram_copies() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_VRAM_COPIES").is_ok_and(|v| v.trim() == "1"))
 }
 
 /// Snapshot segments (offset, bytes) and the pieces compared.
@@ -97,7 +180,50 @@ unsafe impl Sync for Shadow {}
 impl Shadow {
     /// The host GPU address of a title address inside the buffer.
     pub(crate) fn gpu(&self, address: u64) -> u64 {
-        self.gpu + (address - self.start)
+        let base = self.vram.as_ref().map_or(self.gpu, |&(_, gpu)| gpu);
+        base + (address - self.start)
+    }
+
+    /// The host `ID3D12Resource` shaders bind and view (VRAM copy when
+    /// enabled and allocated, else the system-memory copy).
+    pub(crate) fn host_resource(&self) -> &ID3D12Resource {
+        self.vram.as_ref().map_or(&self.buffer, |(r, _)| r)
+    }
+
+    /// The VRAM resource, if this copy has one.
+    pub(crate) fn vram_resource(&self) -> Option<&ID3D12Resource> {
+        self.vram.as_ref().map(|(r, _)| r)
+    }
+
+    /// Whether CPU updates dirtied `buffer` since the last VRAM sync.
+    pub(crate) fn has_vram_dirty(&self) -> bool {
+        self.vram.is_some() && self.vram_has_dirty.load(Ordering::Acquire)
+    }
+
+    /// Drains dirty byte ranges `(offset, len)` needing `buffer -> vram` copy.
+    pub(crate) fn take_vram_dirty(&self) -> Vec<(u64, u64)> {
+        let mut dirty = self.vram_dirty.lock().unwrap_or_else(|e| e.into_inner());
+        let out = dirty.take();
+        self.vram_has_dirty.store(false, Ordering::Release);
+        out
+    }
+
+    /// Marks `[offset, offset + len)` in `buffer` dirty for VRAM sync.
+    pub(crate) fn mark_vram_dirty(&self, offset: u64, len: u64) {
+        if self.vram.is_none() || len == 0 {
+            return;
+        }
+        let mut dirty = self.vram_dirty.lock().unwrap_or_else(|e| e.into_inner());
+        dirty.mark(offset, len);
+        self.vram_has_dirty.store(true, Ordering::Release);
+    }
+
+    /// Buffer-relative `(offset, len)` for a 64 KiB `page` at title address,
+    /// clipped to this buffer.
+    pub(crate) fn page_range(&self, page: usize) -> Option<(u64, u64)> {
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let (from, to) = (page.max(start), (page + PAGE).min(end));
+        (from < to).then(|| ((from - start) as u64, (to - from) as u64))
     }
 
     /// Bytes from a title address to the buffer's end.
@@ -203,8 +329,48 @@ impl Shadow {
     }
 
     fn new(buffer: ID3D12Resource, data: *mut u8, gpu: u64, start: u64, len: u64) -> Arc<Shadow> {
+        Self::new_with(buffer, data, gpu, start, len, vram_copies())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_with_vram(start: u64, len: u64) -> Option<Arc<Shadow>> {
+        let h = host()?;
+        let (buffer, data) = h.shared_buffer(len.next_multiple_of(1 << 16))?;
+        // SAFETY: a live buffer.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        Some(Self::new_with(buffer, data, gpu, start, len, true))
+    }
+
+    fn new_with(
+        buffer: ID3D12Resource,
+        data: *mut u8,
+        gpu: u64,
+        start: u64,
+        len: u64,
+        with_vram: bool,
+    ) -> Arc<Shadow> {
         let tracked = crate::watch::track(start as usize, len as usize, true);
         let marks = tracked.as_ref().and_then(|_| marks().take(pages(start, len)));
+        let mut vram_bytes = 0;
+        let vram = if with_vram {
+            host().and_then(|h| {
+                // Match `buffer`'s aligned width so view bounds (`within`) match.
+                // SAFETY: a live buffer.
+                let width = unsafe { buffer.GetDesc() }.Width;
+                let res = h.default_uav_buffer(width)?;
+                crate::host::name(&res, || {
+                    format!("vram copy of title buffer {start:#x}+{len:#x}")
+                });
+                // SAFETY: a live buffer.
+                let vram_gpu = unsafe { res.GetGPUVirtualAddress() };
+                vram_bytes = width;
+                VRAM_ALLOCS.fetch_add(1, Ordering::Relaxed);
+                VRAM_BYTES.fetch_add(width, Ordering::Relaxed);
+                Some((res, vram_gpu))
+            })
+        } else {
+            None
+        };
         let shadow = Arc::new(Shadow {
             buffer,
             data,
@@ -215,6 +381,10 @@ impl Shadow {
             pending: Mutex::default(),
             before: Mutex::default(),
             marks,
+            vram,
+            vram_bytes,
+            vram_dirty: Mutex::default(),
+            vram_has_dirty: AtomicBool::new(false),
         });
         if let Some(base) = marks {
             self::marks().owners.insert(base, Arc::downgrade(&shadow));
@@ -239,7 +409,7 @@ impl Shadow {
     }
 
     /// `[address, address + len)` cut to the buffer, as offsets in the copy.
-    fn inside(&self, address: usize, len: usize) -> (usize, usize) {
+    pub(crate) fn inside(&self, address: usize, len: usize) -> (usize, usize) {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let from = address.clamp(start, end);
         (from - start, (address + len).clamp(from, end) - start)
@@ -382,7 +552,11 @@ impl Shadow {
                     }
                     let title = &mut title[..n];
                     if crate::host::read_into((start + at) as *const u8, title) {
-                        diff_piece_runs(host, old, title, &mut runs);
+                        if diff_piece_runs(host, old, title, &mut runs) {
+                            // Concurrent title bytes were placed into `host`:
+                            // push them to the VRAM copy before the next run.
+                            self.mark_vram_dirty(at as u64, n as u64);
+                        }
                         written += write_runs(start + at, n, title, &runs, &mut writable, mode);
                         synced.push((start + at) / PAGE);
                     }
@@ -591,13 +765,21 @@ impl Shadow {
         let (from, to) = (from.max(start), to.min(end));
         // SAFETY: inside the mapping (`from` and `to` are within the buffer).
         let at = unsafe { self.data.add(from - start) };
-        crate::host::copy_mapped(at, from as *const u8, to - from, false);
-        to - from
+        let n = to - from;
+        crate::host::copy_mapped(at, from as *const u8, n, false);
+        if n > 0 {
+            self.mark_vram_dirty((from - start) as u64, n as u64);
+        }
+        n
     }
 }
 
 impl Drop for Shadow {
     fn drop(&mut self) {
+        if self.vram.is_some() {
+            VRAM_ALLOCS.fetch_sub(1, Ordering::Relaxed);
+            VRAM_BYTES.fetch_sub(self.vram_bytes, Ordering::Relaxed);
+        }
         if let Some(base) = self.marks {
             let mut m = marks();
             m.owners.remove(&base);
@@ -1011,16 +1193,17 @@ pub(crate) fn all() -> Vec<Arc<Shadow>> {
 /// For device-removed reports: the copy of title memory whose host range
 /// starts closest below host GPU address `va`, and where `va` is in it.
 pub(crate) fn near(va: u64) -> String {
+    let gpu_base = |s: &Shadow| s.vram.as_ref().map_or(s.gpu, |&(_, g)| g);
     let mut all: Vec<(u64, u64, u64)> = buffers()
         .values()
-        .filter_map(|e| e.shadow.as_deref().map(|s| (s.gpu, s.start, s.len)))
+        .filter_map(|e| e.shadow.as_deref().map(|s| (gpu_base(s), s.start, s.len)))
         .collect();
     all.extend(
         LOOSE
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .values()
-            .map(|s| (s.gpu, s.start, s.len)),
+            .map(|s| (gpu_base(s), s.start, s.len)),
     );
     let below = all.iter().filter(|c| c.0 <= va).max();
     let above = all.iter().filter(|c| c.0 > va).min();
@@ -1349,6 +1532,85 @@ mod tests {
         assert!(w.covers(at + (64 << 10), 64 << 10));
         assert!(w.covers(at + (128 << 10), 64 << 10));
     }
+
+    #[test]
+    fn dirty_ranges_coalesces_adjacent_overlapping_and_out_of_order() {
+        let mut d = DirtyRanges::default();
+        d.mark(0, 0);
+        assert_eq!(d.as_slice(), &[]);
+
+        d.mark(2 * PAGE as u64, PAGE as u64);
+        d.mark(0, PAGE as u64);
+        assert_eq!(d.as_slice(), &[(0, PAGE as u64), (2 * PAGE as u64, PAGE as u64)]);
+
+        // Bridging the gap merges all three into one interval.
+        d.mark(PAGE as u64, PAGE as u64);
+        assert_eq!(d.as_slice(), &[(0, 3 * PAGE as u64)]);
+
+        // Overlapping interior and extending past end.
+        d.mark(5 * PAGE as u64, PAGE as u64);
+        d.mark(2 * PAGE as u64, 4 * PAGE as u64);
+        assert_eq!(d.as_slice(), &[(0, 6 * PAGE as u64)]);
+
+        // Out-of-order range further out, then taken and cleared.
+        d.mark(10 * PAGE as u64, 512);
+        assert_eq!(d.take(), vec![(0, 6 * PAGE as u64), (10 * PAGE as u64, 512)]);
+        assert_eq!(d.as_slice(), &[]);
+    }
+
+    #[test]
+    fn diff_piece_runs_reports_host_update_only_when_title_differs() {
+        let old = [1u8; 64];
+        let mut host = [1u8; 64];
+        let mut title = [1u8; 64];
+        let mut runs = Vec::new();
+        assert!(!diff_piece_runs(&mut host, &old, &mut title, &mut runs));
+        assert!(runs.is_empty());
+
+        // GPU wrote byte 5; title did not write concurrently -> host already matches title.
+        host[5] = 9;
+        assert!(!diff_piece_runs(&mut host, &old, &mut title, &mut runs));
+        assert_eq!(runs, vec![(5, 6)]);
+        assert_eq!(title[5], 9);
+
+        // Title concurrently wrote byte 40 (outside the GPU write) -> host must be updated.
+        title[40] = 77;
+        assert!(diff_piece_runs(&mut host, &old, &mut title, &mut runs));
+        assert!(runs.is_empty());
+        assert_eq!(host[40], 77);
+    }
+
+    #[test]
+    fn shadow_vram_dirty_tracks_only_changed_pages() {
+        let p = crate::watch::tests::pool(4);
+        let len = 4 * PAGE;
+        let Some(copy) = Shadow::new_with_vram(p as u64, len as u64) else {
+            crate::watch::tests::free(p);
+            return; // no host GPU here
+        };
+        assert!(copy.vram_resource().is_some());
+        assert_ne!(copy.gpu(p as u64), copy.gpu);
+
+        // First update takes all 4 pages.
+        assert_eq!(copy.update(p, len), len);
+        assert!(copy.has_vram_dirty());
+        assert_eq!(copy.take_vram_dirty(), vec![(0, len as u64)]);
+        assert!(!copy.has_vram_dirty());
+
+        // No writes -> nothing dirtied.
+        assert_eq!(copy.update(p, len), 0);
+        assert!(!copy.has_vram_dirty());
+
+        // Write page 2 -> only page 2 is dirtied.
+        // SAFETY: our pool, guarded since the first update took it.
+        unsafe { ((p + 2 * PAGE + 12) as *mut u8).write_volatile(0xab) };
+        assert_eq!(copy.update(p, len), PAGE);
+        assert_eq!(copy.take_vram_dirty(), vec![((2 * PAGE) as u64, PAGE as u64)]);
+        assert!(!copy.has_vram_dirty());
+
+        drop(copy);
+        crate::watch::tests::free(p);
+    }
 }
 
 fn push_run(runs: &mut Vec<(usize, usize)>, idx: usize) {
@@ -1361,14 +1623,16 @@ fn push_run(runs: &mut Vec<(usize, usize)>, idx: usize) {
 /// Finds the byte runs in `[0..n)` that the GPU changed (`host != old`) and title memory does
 /// not already hold (`title != host`), putting those bytes into `title` and `title`'s bytes into
 /// `host`. Skips equal 32-byte stretches (`host == old`); runs are never merged across unchanged
-/// bytes or bytes already equal to the title's.
+/// bytes or bytes already equal to the title's. Returns whether any byte of `host` was changed to
+/// match `title`.
 fn diff_piece_runs(
     host: &mut [u8],
     old: &[u8],
     title: &mut [u8],
     runs: &mut Vec<(usize, usize)>,
-) {
+) -> bool {
     runs.clear();
+    let mut host_updated = false;
     let n = host.len().min(old.len()).min(title.len());
     let mut k = 0;
     while k + 32 <= n {
@@ -1378,6 +1642,7 @@ fn diff_piece_runs(
             let t: &[u8; 32] = title[k..k + 32].try_into().unwrap();
             if h != t {
                 host[k..k + 32].copy_from_slice(t);
+                host_updated = true;
             }
         } else {
             for idx in k..k + 32 {
@@ -1385,7 +1650,10 @@ fn diff_piece_runs(
                     title[idx] = host[idx];
                     push_run(runs, idx);
                 }
-                host[idx] = title[idx];
+                if host[idx] != title[idx] {
+                    host[idx] = title[idx];
+                    host_updated = true;
+                }
             }
         }
         k += 32;
@@ -1395,8 +1663,12 @@ fn diff_piece_runs(
             title[idx] = host[idx];
             push_run(runs, idx);
         }
-        host[idx] = title[idx];
+        if host[idx] != title[idx] {
+            host[idx] = title[idx];
+            host_updated = true;
+        }
     }
+    host_updated
 }
 
 /// Finds the byte runs where `host` differs from `title`, skipping equal 32-byte stretches.

@@ -2393,11 +2393,32 @@ impl Host {
         self.copy_dest_buffer(size, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_NONE)
     }
 
+    /// A GPU-only buffer of `size` bytes that shaders may also write
+    /// (unordered access), starting in the common state.
+    pub(crate) fn default_uav_buffer(&self, size: u64) -> Option<ID3D12Resource> {
+        self.buffer_with(
+            size,
+            D3D12_HEAP_TYPE_DEFAULT,
+            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_COMMON,
+        )
+    }
+
     fn copy_dest_buffer(
         &self,
         size: u64,
         kind: D3D12_HEAP_TYPE,
         flags: D3D12_RESOURCE_FLAGS,
+    ) -> Option<ID3D12Resource> {
+        self.buffer_with(size, kind, flags, D3D12_RESOURCE_STATE_COPY_DEST)
+    }
+
+    fn buffer_with(
+        &self,
+        size: u64,
+        kind: D3D12_HEAP_TYPE,
+        flags: D3D12_RESOURCE_FLAGS,
+        initial: D3D12_RESOURCE_STATES,
     ) -> Option<ID3D12Resource> {
         let heap = D3D12_HEAP_PROPERTIES {
             Type: kind,
@@ -2421,11 +2442,14 @@ impl Host {
                 &heap,
                 D3D12_HEAP_FLAG_NONE,
                 &desc,
-                D3D12_RESOURCE_STATE_COPY_DEST,
+                initial,
                 None,
                 &mut buffer,
             )
         };
+        if let Err(e) = &made {
+            tracing::warn!(error = %e, size, "no default buffer");
+        }
         made.ok().and(buffer)
     }
 
