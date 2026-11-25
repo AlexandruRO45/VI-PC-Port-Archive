@@ -346,7 +346,6 @@ fn account_frame(frame: u64) {
 
 /// One plane of a `PresentX` call (0x48-byte stride): frame token,
 /// resource count, and pointer to the plane's resources.
-
 #[repr(C)]
 pub(crate) struct Plane {
     token: u64,
