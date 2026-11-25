@@ -125,18 +125,29 @@ fn depth_bounds_control_a_title_mesh_dispatch() {
     render_with_depth_bounds(host, ms, Some(ps));
 }
 
-fn render_with_depth_bounds(host: &crate::host::Host, shader: Arc<Shader>, ps: Option<Arc<Shader>>) {
-    let device = &host.device;
-    // SAFETY: plain adapter queries on a live device.
-    let adapter = unsafe {
-        let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).unwrap();
-        let adapter: IDXGIAdapter1 = factory.EnumAdapterByLuid(device.GetAdapterLuid()).unwrap();
-        adapter.GetDesc1().unwrap()
+#[test]
+fn storing_draw_counts_as_a_write() {
+    let Some(host) = crate::host::host() else {
+        eprintln!("skipped clamp hoist test: no host D3D12 device");
+        return;
     };
-    let name = String::from_utf16_lossy(&adapter.Description);
-    let supported = host.depth_bounds_supported;
+    let pso = depth_bounds_pipeline(fullscreen_vertex_shader(), None);
+    let list = host.new_list().unwrap();
+    let mut state = crate::draw::State::default();
+    state.set_pipeline(pso);
+    state.set_topology(&list, 4); // Triangle list.
+
+    // The fixture marks its translated vertex stage as writing memory.
+    state.draw(&list, 3, 1, 0, 0);
+    list.close();
+    assert_eq!(slot::<extern "system" fn(This) -> u32>(pso, 0x10)(pso), 0);
+
+    assert!(list.worked(), "the draw must have been recorded");
+    assert_eq!(list.writes(), 1, "a storing draw must count as a write");
+}
+
+fn depth_bounds_pipeline(shader: Arc<Shader>, ps: Option<Arc<Shader>>) -> This {
     let mesh = shader.stage == "mesh";
-    eprintln!("{} depth bounds on {}: {supported}", shader.stage, name.trim_end_matches('\0'));
 
     #[repr(C)]
     struct Stream {
@@ -171,7 +182,24 @@ fn render_with_depth_bounds(host: &crate::host::Host, shader: Arc<Shader>, ps: O
     let mut pso = null;
     assert_eq!(create_stream(null, &desc, &PIPELINE_IIDS[0], &mut pso), S_OK);
     assert_eq!(host_pipeline(pso).expect("host refused the depth bounds pipeline").mesh, mesh);
+    pso
+}
 
+fn render_with_depth_bounds(host: &crate::host::Host, shader: Arc<Shader>, ps: Option<Arc<Shader>>) {
+    let device = &host.device;
+    // SAFETY: plain adapter queries on a live device.
+    let adapter = unsafe {
+        let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).unwrap();
+        let adapter: IDXGIAdapter1 = factory.EnumAdapterByLuid(device.GetAdapterLuid()).unwrap();
+        adapter.GetDesc1().unwrap()
+    };
+    let name = String::from_utf16_lossy(&adapter.Description);
+    let supported = host.depth_bounds_supported;
+    let mesh = shader.stage == "mesh";
+    eprintln!("{} depth bounds on {}: {supported}", shader.stage, name.trim_end_matches('\0'));
+    let pso = depth_bounds_pipeline(shader, ps);
+
+    let null = std::ptr::null();
     let mut allocator = null;
     let mut list = null;
     let iid = |g: GUID| guid(g.data1, g.data2, g.data3, g.data4);

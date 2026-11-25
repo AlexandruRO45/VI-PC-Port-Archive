@@ -66,7 +66,7 @@ unsafe impl Send for Fixed {}
 
 /// Where the clamps of a run of indirect draws go: the list `clamps`, open,
 /// that runs before the host list at `into`, as long as that one has
-/// `writes` dispatches and copies (a later one may write the arguments).
+/// `writes` commands that may write the arguments.
 pub(crate) struct Hoist {
     pub(crate) clamps: std::sync::Arc<HostList>,
     pub(crate) into: usize,
@@ -130,6 +130,14 @@ impl Drop for State {
 
 /// Draws recorded on the host GPU since the last frame line.
 static DRAWN: AtomicU64 = AtomicU64::new(0);
+
+fn count_draw(list: &HostList, writes_memory: bool) {
+    if writes_memory {
+        list.count_write();
+    }
+    list.count_work();
+    DRAWN.fetch_add(1, Ordering::Relaxed);
+}
 
 /// Draws run on the host so far.
 pub(crate) fn drawn() -> u64 {
@@ -750,30 +758,32 @@ impl State {
         }
     }
 
-    /// Brings the host list up to date for a draw; false if the draw cannot
-    /// run on the host.
-    fn prepare(&mut self, list: &HostList, indexed: bool) -> bool {
+    /// Brings the host list up to date for a draw and returns its pipeline.
+    fn prepare(&mut self, list: &HostList, indexed: bool) -> Option<&HostPipeline> {
         self.prepare_for(list, indexed, false)
     }
 
     /// As [`State::prepare`], for draws (`mesh` false) or mesh dispatches.
-    fn prepare_for(&mut self, list: &HostList, indexed: bool, mesh: bool) -> bool {
+    fn prepare_for(&mut self, list: &HostList, indexed: bool, mesh: bool) -> Option<&HostPipeline> {
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
-            return no("skipped by name");
+            no("skipped by name");
+            return None;
         }
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
-            return no("no host pipeline");
+            no("no host pipeline");
+            return None;
         };
         if p.compute || p.mesh != mesh {
             once!(
                 mesh,
                 "a draw or mesh dispatch with another kind of pipeline"
             );
-            return no("another kind of pipeline");
+            no("another kind of pipeline");
+            return None;
         }
         if !self.bind(list, p, false) {
-            return false;
+            return None;
         }
         if p.stages.iter().any(|s| s.shader.draws_sky)
             && let Some(&sky) = self.targets.first()
@@ -811,7 +821,8 @@ impl State {
         if indexed {
             let v = self.index;
             let Some(shadow) = crate::shadow::find(v.address, u64::from(v.size)) else {
-                return no("no index buffer");
+                no("no index buffer");
+                return None;
             };
             shadow.refresh(list, v.address, u64::from(v.size));
             let view = D3D12_INDEX_BUFFER_VIEW {
@@ -830,7 +841,7 @@ impl State {
         if self.depth != 0 {
             crate::list::ensure_state(list, self.depth as This, DEPTH_WRITE);
         }
-        true
+        Some(p)
     }
 
     /// A descriptor a shader reads through a table: its host slot made if
@@ -898,8 +909,7 @@ impl State {
             && let Some(host_heap) = crate::descriptor::heap(self.heaps[0] as This).host_arc()
         {
             host_heap.prepare_bindless_record(list);
-            let writes = p.stages.iter().any(|s| s.translated().writes_memory);
-            list.defer_bindless(&host_heap, writes);
+            list.defer_bindless(&host_heap, p.writes_memory());
         }
         for stage in &p.stages {
             let t = stage.translated();
@@ -1216,22 +1226,21 @@ impl State {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             return;
         }
-        let ran = self.prepare_for(list, false, true)
-            && match list.list.cast::<ID3D12GraphicsCommandList6>() {
-                Ok(l6) => {
-                    #[cfg(feature = "diagnostics")]
-                    list.note_op(|| self.op_text(format!("mesh {x}"), false, false));
-        #[cfg(feature = "diagnostics")]
-        crate::capture::pass(list, self.targets.first().copied().unwrap_or(0), || self.op_text(format!("mesh {x}"), false, true));
-                    // SAFETY: an open list with everything set.
-                    unsafe { l6.DispatchMesh(x, 1, 1) };
-                    list.count_work();
-                    DRAWN.fetch_add(1, Ordering::Relaxed);
-                    true
-                }
-                Err(_) => false,
-            };
-        if !ran {
+        if let Some(writes) = self
+            .prepare_for(list, false, true)
+            .map(HostPipeline::writes_memory)
+            && let Ok(l6) = list.list.cast::<ID3D12GraphicsCommandList6>()
+        {
+            #[cfg(feature = "diagnostics")]
+            list.note_op(|| self.op_text(format!("mesh {x}"), false, false));
+            #[cfg(feature = "diagnostics")]
+            crate::capture::pass(list, self.targets.first().copied().unwrap_or(0), || {
+                self.op_text(format!("mesh {x}"), false, true)
+            });
+            // SAFETY: an open list with everything set.
+            unsafe { l6.DispatchMesh(x, 1, 1) };
+            count_draw(list, writes);
+        } else {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             list.missed_draw();
             #[cfg(feature = "diagnostics")]
@@ -1533,8 +1542,9 @@ impl State {
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
         let rects = self.topology == RECTANGLES && !self.draws_rectangles();
-        let ran = self.prepare(list, false) && (!rects || self.rectangles(list, vertices, first));
-        if ran {
+        if let Some(writes) = self.prepare(list, false).map(HostPipeline::writes_memory)
+            && (!rects || self.rectangles(list, vertices, first))
+        {
             // Rectangles were expanded into their own vertex buffers.
             let (count, from) = if rects {
                 (vertices / 3 * 6, 0)
@@ -1550,10 +1560,8 @@ impl State {
                 list.list
                     .DrawInstanced(count, instances, from, first_instance)
             };
-            list.count_work();
-            DRAWN.fetch_add(1, Ordering::Relaxed);
-        }
-        if !ran {
+            count_draw(list, writes);
+        } else {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             list.missed_draw();
             #[cfg(feature = "diagnostics")]
@@ -1636,8 +1644,7 @@ impl State {
         if rects {
             once!("indexed rectangles not drawn");
         }
-        let ran = !rects && self.prepare(list, true);
-        if ran {
+        if !rects && let Some(writes) = self.prepare(list, true).map(HostPipeline::writes_memory) {
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("indexed {indices}x{instances}"), false, false));
         #[cfg(feature = "diagnostics")]
@@ -1647,10 +1654,8 @@ impl State {
                 list.list
                     .DrawIndexedInstanced(indices, instances, first, base, first_instance)
             };
-            list.count_work();
-            DRAWN.fetch_add(1, Ordering::Relaxed);
-        }
-        if !ran {
+            count_draw(list, writes);
+        } else {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             list.missed_draw();
             #[cfg(feature = "diagnostics")]
@@ -1860,7 +1865,7 @@ impl State {
         }
         let ran = match kind {
             DRAW if rect_args.is_some() => {
-                let ok = self.prepare(list, false);
+                let ok = self.prepare(list, false).is_some();
                 if ok {
                     for (slot, view) in &rect_vertices {
                         // SAFETY: an open list; the view names a buffer the list keeps.
@@ -1871,9 +1876,9 @@ impl State {
             }
             DRAW | INDEXED => {
                 (self.topology != RECTANGLES || self.draws_rectangles())
-                    && self.prepare(list, kind == INDEXED)
+                    && self.prepare(list, kind == INDEXED).is_some()
             }
-            MESH => self.prepare_for(list, false, true),
+            MESH => self.prepare_for(list, false, true).is_some(),
             DISPATCH => match crate::pipeline::host_pipeline(self.pipeline as This) {
                 Some(p) if p.compute => {
                     crate::twin::begin();
@@ -1961,8 +1966,7 @@ impl State {
                 self.continue_in(list);
             }
         } else {
-            list.count_work();
-            DRAWN.fetch_add(1, Ordering::Relaxed);
+            count_draw(list, p.writes_memory());
         }
         true
     }

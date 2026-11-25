@@ -395,6 +395,10 @@ fn refuse(reason: &'static str, shaders: &[Arc<Shader>]) -> Option<HostPipeline>
 }
 
 impl HostPipeline {
+    pub(crate) fn writes_memory(&self) -> bool {
+        self.stages.iter().any(|s| s.translated().writes_memory)
+    }
+
     /// A host pipeline for vertex and pixel shaders with the graphics
     /// state `g`, or for one compute shader.
     pub(crate) fn new(shaders: &[Arc<Shader>], g: Option<&GraphicsState>) -> Option<HostPipeline> {

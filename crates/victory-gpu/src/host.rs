@@ -694,8 +694,8 @@ pub(crate) struct HostList {
     indirect_args: Mutex<Option<(ID3D12Resource, u64)>>,
     /// Host fence value signalled by the last submission that ran this list.
     last_fence: std::sync::atomic::AtomicU64,
-    /// Dispatches and buffer copies recorded since the reset: what may have
-    /// written indirect arguments (`crate::indirect` clamps hoisted before).
+    /// Commands recorded since the reset that may have written indirect
+    /// arguments (`crate::indirect` clamps hoisted before).
     writes: std::sync::atomic::AtomicU64,
     /// Buffers for clamped indirect arguments when this list holds the
     /// clamps of the list after it (`clamp_room`).
@@ -2383,12 +2383,12 @@ impl HostList {
         self.queries.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 
-    /// Counts a dispatch or a copy: what may write indirect arguments.
+    /// Counts a command that may write indirect arguments.
     pub(crate) fn count_write(&self) {
         self.writes.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Dispatches and copies since the reset.
+    /// Commands that may write indirect arguments since the reset.
     pub(crate) fn writes(&self) -> u64 {
         self.writes.load(Ordering::Relaxed)
     }
