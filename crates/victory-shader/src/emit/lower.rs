@@ -2527,13 +2527,9 @@ impl<'a> Lower<'a> {
         self.s.m.cast(c, Cast::Trunc, hi, self.s.t.i32)
     }
 
-<<<<<<< HEAD
     /// `0 × anything = 0`, as in D3D9. As on RDNA2, a denormal operand counts
     /// as zero, so the test is on the exponent bits rather than a float
     /// compare (whose result would depend on the host's denormal mode).
-=======
-    /// `0 Ã— anything = 0`, as in D3D9.
->>>>>>> e57aa16 (Shaders: extract wave64 lowering helpers and keep EXEC guard on v_readfirstlane_b32)
     fn legacy_mul(&mut self, a: V, b: V) -> V {
         let c = self.cur;
         let m = self.s.m.bin(c, Bin::Mul, a, b);
