@@ -14,6 +14,12 @@ const BUILD_1_0_2_1: &str = "b99f876b74d4a77f03af5f878223b27bd647b5c35a79d5decd9
 /// Environment variable that turns the watchdog hook on.
 pub(crate) const NO_WATCHDOG_ENV: &str = "VICTORY_NO_WATCHDOG";
 
+/// Environment variable that makes the title pick its own temporal upscaler
+/// on every console profile (the Series S profile otherwise picks FSR, whose
+/// console DLL has passes that do not translate yet). Ported from the
+/// ScarlettPort runtime (GPL-3.0), `victory-loader/src/hooks.rs`.
+pub(crate) const OWN_UPSCALER_ENV: &str = "VICTORY_OWN_UPSCALER";
+
 /// One code patch: `rva` must hold exactly `expect` before `new` is written.
 struct Patch {
     what: &'static str,
@@ -45,6 +51,29 @@ const WATCHDOG: &[Patch] = &[
         new: &[0x66, 0x66, 0x2E, 0x0F, 0x1F, 0x84, 0, 0, 0, 0, 0],
     },
 ];
+
+/// The upscaler choice: `mov eax, 6` (own upscaler) then `cmovne eax, ecx`
+/// (FSR when the profile asks for it). NOPing the `cmovne` keeps 6.
+const OWN_UPSCALER: Patch = Patch {
+    what: "upscaler: always the title's own",
+    rva: 0x7e9426,
+    // cmovne eax, ecx
+    expect: &[0x0F, 0x45, 0xC1],
+    // a three-byte NOP
+    new: &[0x0F, 0x1F, 0x00],
+};
+
+/// Applies the own-upscaler patch if its bytes match. Returns whether it did.
+///
+/// # Safety
+/// See `disarm_watchdog`.
+pub(crate) unsafe fn own_upscaler(base: usize, hash: &blake3::Hash) -> bool {
+    if hash.to_hex().as_str() != BUILD_1_0_2_1 {
+        return false;
+    }
+    // SAFETY: forwarded from this function's contract.
+    unsafe { apply(base, &OWN_UPSCALER) }
+}
 
 /// Applies the watchdog patches whose bytes match. Returns how many applied.
 ///
@@ -139,6 +168,46 @@ mod tests {
             assert_eq!(disarm_watchdog(base, &accepted), WATCHDOG.len());
             assert!(WATCHDOG.iter().all(|p| read(p) == p.new));
             assert_eq!(disarm_watchdog(base, &accepted), 0);
+        }
+    }
+
+    #[test]
+    fn own_upscaler_hook_checks_build_and_bytes_before_writing() {
+        let p = &OWN_UPSCALER;
+        let size = p.rva + p.expect.len();
+        // SAFETY: owned synthetic mapping; no bytes are executed.
+        unsafe {
+            let image = VirtualAlloc(std::ptr::null(), size, MEM_RESERVE, PAGE_READWRITE);
+            assert!(!image.is_null());
+            struct Mapping(*mut std::ffi::c_void);
+            impl Drop for Mapping {
+                fn drop(&mut self) {
+                    // SAFETY: the base of the reservation owned by this guard.
+                    unsafe { VirtualFree(self.0, 0, MEM_RELEASE) };
+                }
+            }
+            let _mapping = Mapping(image);
+            let base = image as usize;
+            let dest = image.cast::<u8>().add(p.rva);
+            assert!(!VirtualAlloc(dest.cast(), p.expect.len(), MEM_COMMIT, PAGE_READWRITE).is_null());
+            let read = || std::slice::from_raw_parts(dest, p.expect.len()).to_vec();
+            let mut accepted = [0u8; 32];
+            for (i, byte) in accepted.iter_mut().enumerate() {
+                *byte = u8::from_str_radix(&BUILD_1_0_2_1[2 * i..2 * i + 2], 16).unwrap();
+            }
+            let accepted = blake3::Hash::from_bytes(accepted);
+            // Unexpected bytes: nothing written.
+            std::ptr::write_bytes(dest, 0xCC, p.expect.len());
+            assert!(!own_upscaler(base, &accepted));
+            assert_eq!(read(), vec![0xCC; p.expect.len()]);
+            // Another build: nothing written.
+            std::ptr::copy_nonoverlapping(p.expect.as_ptr(), dest, p.expect.len());
+            assert!(!own_upscaler(base, &blake3::hash(b"not the title")));
+            assert_eq!(read(), p.expect);
+            // This build and its bytes: patched once.
+            assert!(own_upscaler(base, &accepted));
+            assert_eq!(read(), p.new);
+            assert!(!own_upscaler(base, &accepted));
         }
     }
 }

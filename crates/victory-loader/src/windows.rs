@@ -88,6 +88,11 @@ pub fn load(prepared: &PreparedImage, dir: &Path) -> Result<LoadedImage> {
             let applied = unsafe { crate::hooks::disarm_watchdog(loaded.base(), &prepared.original_hash) };
             tracing::info!(applied, "title watchdog compatibility hook");
         }
+        if std::env::var_os(crate::hooks::OWN_UPSCALER_ENV).is_some_and(|v| v != "0") {
+            // SAFETY: this is the main image, mapped before any title code runs.
+            let applied = unsafe { crate::hooks::own_upscaler(loaded.base(), &prepared.original_hash) };
+            tracing::info!(applied, "title own-upscaler hook");
+        }
     }
     tracing::info!(
         base = format_args!("{:#x}", loaded.base()),
