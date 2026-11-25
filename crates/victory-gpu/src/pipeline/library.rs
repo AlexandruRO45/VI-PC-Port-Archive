@@ -302,9 +302,18 @@ pub(crate) fn save(now: bool) {
         }
         *last = Some(std::time::Instant::now());
     }
+    save_to(dir, library, &USED, &USED_CHANGED);
+}
+
+fn save_to(
+    dir: &std::path::Path,
+    library: &Mutex<Library>,
+    used: &Mutex<Option<Used>>,
+    used_changed: &AtomicBool,
+) {
     let (blob, prebuilt) = {
         let mut l = library.lock().unwrap_or_else(|e| e.into_inner());
-        if l.added == 0 && !l.prebuilt_changed && !USED_CHANGED.swap(false, Ordering::Relaxed) {
+        if l.added == 0 && !l.prebuilt_changed && !used_changed.swap(false, Ordering::Relaxed) {
             return;
         }
         // SAFETY: a buffer of the size the library asks for.
@@ -327,7 +336,7 @@ pub(crate) fn save(now: bool) {
             }
         }
     };
-    let used = USED.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(Used::list).unwrap_or_default();
+    let used = used.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(Used::list).unwrap_or_default();
     let written = std::fs::create_dir_all(dir)
         .and_then(|()| write_atomically(&dir.join(LIBRARY_FILE), &blob))
         .and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()))
@@ -350,7 +359,13 @@ pub(crate) fn save(now: bool) {
             shaders_translated,
             "host pipeline library saved"
         ),
-        Err(e) => tracing::warn!(error = %e, "host pipeline library not saved"),
+        Err(e) => {
+            if prebuilt.is_some() {
+                // The list still needs to be published with the matching library.
+                library.lock().unwrap_or_else(|e| e.into_inner()).prebuilt_changed = true;
+            }
+            tracing::warn!(error = %e, "host pipeline library not saved");
+        }
     }
 }
 
@@ -638,6 +653,33 @@ mod tests {
         for (i, code) in codes.iter().enumerate() {
             shared.load(i, code).expect("every pipeline");
         }
+    }
+
+    #[test]
+    fn a_prebuilt_list_is_retried_after_a_failed_publication() {
+        let Some(device) = crate::host::host().and_then(|h| h.device.cast::<ID3D12Device1>().ok()) else {
+            return; // no host GPU here
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(PREBUILT_FILE);
+        // A directory at the destination stops the staged file from replacing it.
+        std::fs::create_dir(&path).unwrap();
+        let mut library = open(&device, Vec::new()).expect("an empty library");
+        library.prebuilt_changed |= library.prebuilt.insert("recorded".to_owned());
+        let library = Mutex::new(library);
+        let used = Mutex::new(None);
+        let used_changed = AtomicBool::new(false);
+
+        save_to(dir.path(), &library, &used, &used_changed);
+        assert!(dir.path().join(LIBRARY_FILE).is_file(), "the library was saved");
+        assert!(path.is_dir(), "the prebuilt list was blocked");
+        std::fs::remove_dir(&path).unwrap();
+
+        save_to(dir.path(), &library, &used, &used_changed);
+        let records = std::fs::read(&path).expect("the next save retries the prebuilt list");
+        let blob = std::fs::read(dir.path().join(LIBRARY_FILE)).unwrap();
+        assert_eq!(listed(&records, &tag(&blob)), HashSet::from(["recorded".to_owned()]));
+        assert!(!library.lock().unwrap().prebuilt_changed);
     }
 
     #[test]
