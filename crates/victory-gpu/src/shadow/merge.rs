@@ -7,7 +7,7 @@ pub(super) fn merge(title: &mut [u8], host: &mut [u8], old: &[u8]) -> bool {
     assert_eq!(title.len(), host.len());
     assert_eq!(title.len(), old.len());
     #[cfg(target_arch = "x86_64")]
-    if std::arch::is_x86_feature_detected!("avx2") {
+    if title.len() >= 32 && std::arch::is_x86_feature_detected!("avx2") {
         // SAFETY: the CPU supports AVX2; all three slices have equal length.
         return unsafe { avx2(title, host, old) };
     }
@@ -82,6 +82,21 @@ mod tests {
         let mut host = [1; 65];
         assert!(!merge(&mut title, &mut host, &[1; 65]));
         assert_eq!(host, title);
+    }
+
+    #[test]
+    fn one_changed_byte_at_each_vector_boundary() {
+        for at in [0, 30, 31, 32, 33, 63, 64] {
+            let old = [0u8; 65];
+            let mut title = [0x55u8; 65];
+            let mut host = old;
+            host[at] = 0x80;
+            let mut expected = title;
+            expected[at] = 0x80;
+            assert!(merge(&mut title, &mut host, &old));
+            assert_eq!(title, expected);
+            assert_eq!(host, expected);
+        }
     }
 
     #[test]
