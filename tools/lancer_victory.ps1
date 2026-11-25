@@ -29,13 +29,9 @@
   variables as the game (the cache key depends on them). Measured on 2026-11-25 (RTX 4070 Super): 25,689 shaders in
   about 4.5 min, 296 refused, 13 GB in %LOCALAPPDATA%\victory\cache. Later launches reuse that cache.
 
-.PARAMETER BatchCardRehash
-  Optional. Sets VICTORY_CARD_REHASH_RUNS=1 so VIctory hashes adjacent or overlapping GPU memory ranges in batches
-  after uploading them. Without this switch the launcher leaves the environment variable as inherited.
-
 .NOTES
   The first cold launch may crash while the pipelines compile; launch again once the cache is filled.
-  Settings measured on 2026-11-24 with the submodule's pinned commit (fxceless/victory-gta6).
+  Settings measured on 2026-11-24 with the VIctory commit then pinned (fxceless/victory-gta6).
 
 .EXAMPLE
   .\tools\lancer_victory.ps1 -GameDir D:\Games\MyPackage
@@ -51,8 +47,7 @@ param(
     [switch]$Dred,
     [switch]$Precompile,
     [string]$XgDll,
-    [ValidateSet('real', 'compare')][string]$XgMode = 'real',
-    [switch]$BatchCardRehash
+    [ValidateSet('real', 'compare')][string]$XgMode = 'real'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -62,7 +57,7 @@ $victory = Join-Path $repo 'third_party\victory'
 $manifest = Join-Path $victory 'Cargo.toml'
 
 if (-not (Test-Path -LiteralPath $manifest)) {
-    throw "third_party/victory is empty: run 'git submodule update --init third_party/victory'."
+    throw "third_party/victory/Cargo.toml is missing: this copy of AnyXboxX is incomplete."
 }
 
 $gameExe = Join-Path $GameDir 'game_scarlett_master.exe'
@@ -70,12 +65,12 @@ if (-not (Test-Path -LiteralPath $gameExe)) {
     throw "game_scarlett_master.exe not found in '$GameDir'."
 }
 
-# The submodule is its own Cargo workspace: its target folder is third_party\victory\target
+# VIctory is its own Cargo workspace: its target folder is third_party\victory\target
 # unless CARGO_TARGET_DIR is set.
 $target = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { Join-Path $victory 'target' }
 $exe = Join-Path $target 'diag\victory.exe'
 
-# Always ask cargo: it does nothing when victory.exe is current, and rebuilds it after a submodule update (an old
+# Always ask cargo: it does nothing when victory.exe is current, and rebuilds it after a pull that changes third_party/victory (an old
 # victory.exe would ignore the settings the pinned commit reads).
 Write-Host 'Building VIctory (diag profile, diagnostics feature)...'
 & cargo build --profile diag -p victory --features diagnostics --manifest-path $manifest
@@ -107,9 +102,6 @@ if (-not $NoTunedSettings) {
 # VIctory turns DRED on when the variable exists, whatever its value: only set it when asked.
 if ($Dred) {
     $env:VICTORY_D3D12_DRED = '1'
-}
-if ($BatchCardRehash) {
-    $env:VICTORY_CARD_REHASH_RUNS = '1'
 }
 if ($PSBoundParameters.ContainsKey('SkipPipelines') -and $SkipPipelines) {
     $env:VICTORY_SKIP_PIPELINES = $SkipPipelines
