@@ -818,7 +818,16 @@ pub(crate) mod tests {
             assert_ne!(CloseHandle(section), 0);
             (a, b)
         };
-        assert!(a != 0 && b != 0);
+        if a == 0 || b == 0 {
+            use windows_sys::Win32::System::Memory::{MEMORY_MAPPED_VIEW_ADDRESS, UnmapViewOfFile};
+            for view in [a, b].into_iter().filter(|&view| view != 0) {
+                // SAFETY: a successful mapping from the section above.
+                unsafe {
+                    UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: view as *mut _ });
+                }
+            }
+            panic!("could not map both section views");
+        }
         for k in (0..len).step_by(PAGE) {
             title_memory_aliased(b + k, &[a + k]);
         }
