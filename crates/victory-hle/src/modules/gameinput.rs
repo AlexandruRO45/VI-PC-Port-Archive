@@ -375,7 +375,7 @@ fn latch_enabled() -> bool {
 /// that begins and ends between two frames: at one or two frames a second
 /// that is most taps. So a button or key pressed since the title last read
 /// this device's current state stays pressed in what we record until such a
-/// read has seen it; that read then records the host's own state, so a
+/// read has seen it (presses from different polls one per read, in order); that read then records the host's own state, so a
 /// release follows in the next read. Only presses are held: a release of a
 /// press the title already saw is recorded at once, and sticks and triggers
 /// are always the latest value. Readers of the history see every press and
@@ -386,10 +386,15 @@ struct Latch {
     read: Option<u64>,
     /// The host's last state, without held presses.
     raw: Option<Value>,
-    /// Buttons and keys pressed since that read.
-    buttons: u32,
-    keys: Vec<KeyState>,
+    /// Presses since that read, oldest first, each the buttons or keys that
+    /// went down in one poll: each read takes the oldest, so presses in
+    /// sequence are not handed out as one chord.
+    buttons: VecDeque<u32>,
+    keys: VecDeque<Vec<KeyState>>,
 }
+
+/// The most presses a latch holds for reads to come.
+const LATCH_QUEUE: usize = 16;
 
 fn same_key(a: &KeyState, b: &KeyState) -> bool {
     a.virtual_key == b.virtual_key && a.scan_code == b.scan_code
@@ -400,7 +405,7 @@ impl Latch {
     fn hold(&mut self, value: Value, now: u64, enabled: bool) -> Value {
         let reader = self.read.is_some_and(|t| now.saturating_sub(t) < LATCH_IDLE);
         if !enabled || !reader {
-            self.buttons = 0;
+            self.buttons.clear();
             self.keys.clear();
         } else {
             match (&value, &self.raw) {
@@ -409,19 +414,20 @@ impl Latch {
                         Some(Value::Pad(raw)) => raw.buttons,
                         _ => 0,
                     };
-                    self.buttons |= pad.buttons & !before;
+                    let pressed = pad.buttons & !before;
+                    if pressed != 0 && self.buttons.len() < LATCH_QUEUE {
+                        self.buttons.push_back(pressed);
+                    }
                 }
                 (Value::Keys(keys), raw) => {
                     let before: &[KeyState] = match raw {
                         Some(Value::Keys(raw)) => raw,
                         _ => &[],
                     };
-                    for key in keys {
-                        if !before.iter().any(|b| same_key(b, key))
-                            && !self.keys.iter().any(|k| same_key(k, key))
-                        {
-                            self.keys.push(*key);
-                        }
+                    let pressed: Vec<KeyState> =
+                        keys.iter().filter(|k| !before.iter().any(|b| same_key(b, k))).copied().collect();
+                    if !pressed.is_empty() && self.keys.len() < LATCH_QUEUE {
+                        self.keys.push_back(pressed);
                     }
                 }
             }
@@ -430,14 +436,23 @@ impl Latch {
         self.apply(value)
     }
 
+    /// `value` as the next read is to see it: the oldest held press added,
+    /// presses that came after it left for later reads.
     fn apply(&self, value: Value) -> Value {
         match value {
             Value::Pad(mut pad) => {
-                pad.buttons |= self.buttons;
+                let later = self.buttons.iter().skip(1).fold(0, |a, b| a | b);
+                let first = self.buttons.front().copied().unwrap_or(0);
+                pad.buttons = (pad.buttons & !(later & !first)) | first;
                 Value::Pad(pad)
             }
             Value::Keys(mut keys) => {
-                for key in &self.keys {
+                let first: &[KeyState] = self.keys.front().map_or(&[], |k| k);
+                let later = self.keys.iter().skip(1).flatten();
+                let later: Vec<&KeyState> =
+                    later.filter(|l| !first.iter().any(|f| same_key(f, l))).collect();
+                keys.retain(|k| !later.iter().any(|l| same_key(l, k)));
+                for key in first {
                     if !keys.iter().any(|k| same_key(k, key)) {
                         keys.push(*key);
                     }
@@ -447,27 +462,33 @@ impl Latch {
         }
     }
 
-    /// A current-state read saw the device: drops the held presses and
-    /// returns the host's state when it differs from what was recorded.
+    /// A current-state read saw the device: the oldest held press is let
+    /// go, and the reading the next read is to see is returned when it
+    /// differs from what was recorded.
     fn seen(&mut self, now: u64, recorded: &Value) -> Option<Value> {
         self.read = Some(now);
         // Diagnostics: presses held only by the latch (released again
         // before this read), which the read would have missed without it.
         #[cfg(feature = "diagnostics")]
         match &self.raw {
-            Some(Value::Pad(raw)) if self.buttons & !raw.buttons != 0 => {
-                tracing::info!(buttons = format_args!("{:#x}", self.buttons & !raw.buttons), "a tap kept for the title's read (released before it)");
+            Some(Value::Pad(raw)) => {
+                if let Some(&first) = self.buttons.front()
+                    && first & !raw.buttons != 0
+                {
+                    tracing::info!(buttons = format_args!("{:#x}", first & !raw.buttons), "a tap kept for the title's read (released before it)");
+                }
             }
             Some(Value::Keys(raw)) => {
-                for key in self.keys.iter().filter(|k| !raw.iter().any(|r| same_key(r, k))) {
+                for key in self.keys.front().into_iter().flatten().filter(|k| !raw.iter().any(|r| same_key(r, k))) {
                     tracing::info!(virtual_key = key.virtual_key, "a key tap kept for the title's read (released before it)");
                 }
             }
-            _ => {}
+            None => {}
         }
-        self.buttons = 0;
-        self.keys.clear();
-        self.raw.clone().filter(|raw| raw != recorded)
+        self.buttons.pop_front();
+        self.keys.pop_front();
+        let next = self.raw.clone().map(|raw| self.apply(raw))?;
+        (&next != recorded).then_some(next)
     }
 }
 
@@ -2056,6 +2077,50 @@ mod tests {
         );
         release(r);
         assert_eq!(buttons(hub, 0).0, X);
+    }
+
+    /// Different buttons tapped one after another between two reads are
+    /// handed out one per read, not as a chord nobody pressed (reported by
+    /// Dathinel on #2230).
+    #[test]
+    fn taps_in_sequence_are_not_reported_as_a_chord() {
+        let (hub, host) = fake();
+        host.lock().unwrap().pads[0] = Some(PadState::default());
+        hub.poll();
+        assert_eq!(buttons(hub, 0).0, 0);
+        for b in [A, 0, B, 0] {
+            host.lock().unwrap().pads[0] = Some(PadState {
+                buttons: b,
+                ..Default::default()
+            });
+            hub.poll();
+        }
+        assert_eq!(buttons(hub, 0).0, A, "the first tap");
+        assert_eq!(buttons(hub, 0).0, B, "then the second, alone");
+        assert_eq!(buttons(hub, 0).0, 0);
+        // Pressed together in one poll: still one chord.
+        host.lock().unwrap().pads[0] = Some(PadState {
+            buttons: A | B,
+            ..Default::default()
+        });
+        hub.poll();
+        host.lock().unwrap().pads[0] = Some(PadState::default());
+        hub.poll();
+        assert_eq!(buttons(hub, 0).0, A | B);
+        assert_eq!(buttons(hub, 0).0, 0);
+    }
+
+    #[test]
+    fn key_taps_in_sequence_are_not_reported_together() {
+        let (hub, host) = fake();
+        assert_eq!(held_keys(hub), Vec::<u8>::new());
+        for keys in [vec![key(b'Q')], vec![], vec![key(b'E')], vec![]] {
+            host.lock().unwrap().keys = keys;
+            hub.poll();
+        }
+        assert_eq!(held_keys(hub), [b'Q']);
+        assert_eq!(held_keys(hub), [b'E']);
+        assert_eq!(held_keys(hub), Vec::<u8>::new());
     }
 
     #[test]
