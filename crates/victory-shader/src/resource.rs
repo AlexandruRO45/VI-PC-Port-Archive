@@ -147,9 +147,8 @@ pub struct Resources {
     /// User SGPRs holding root parameters: value on entry, layout index,
     /// dword within the parameter.
     pub params: Vec<(Value, usize, u32)>,
-    /// Scalar loads of one descriptor the code keeps per lane in VGPRs
-    /// ([`Tracer::lane_copies`]): they read one address, so their dwords
-    /// stand in for each other.
+    /// Scalar loads of a descriptor kept per lane in VGPRs. The loads read
+    /// one address, so their dwords stand in for each other.
     pub lane_copied: Vec<Site>,
     pub waterfall: Waterfall,
     /// Every `image_bvh_intersect_ray` and `image_bvh64_intersect_ray`: where
