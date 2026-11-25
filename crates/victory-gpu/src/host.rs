@@ -5225,6 +5225,12 @@ impl HostList {
                 Step::Run(work) | Step::Host(work) => {
                     if matches!(step, Step::Run(_)) {
                         batch.title_written();
+                    } else {
+                        // A host step may read what a queued texture check
+                        // wrote (levels on demand map the levels `detile`
+                        // has just held): the queue goes first, in the order
+                        // the steps were recorded, as without the switch.
+                        batch.refresh_textures();
                     }
                     work();
                     // It wrote title memory, where is not known here: the
