@@ -3080,8 +3080,11 @@ impl Meter {
             #[cfg(windows)]
             {
                 let reuses = crate::shadow::REUSES.load(Ordering::Relaxed);
+                let (windows, window_bytes) = crate::shadow::loose_stats();
                 tracing::info!(
-                    "loose windows: {} covered by a wider one since start",
+                    "loose windows: {windows} ({:.0} MB, never freed), {} covered by a wider \
+                     one since start",
+                    window_bytes as f64 / 1e6,
                     reuses
                 );
             }

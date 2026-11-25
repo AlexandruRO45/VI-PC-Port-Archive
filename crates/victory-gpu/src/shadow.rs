@@ -1064,6 +1064,16 @@ static LOOSE: Mutex<BTreeMap<(u64, u64), Arc<Shadow>>> = Mutex::new(BTreeMap::ne
 #[cfg(windows)]
 pub(crate) static REUSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// The loose windows by count and bytes (diagnostics): the shared segment's
+/// own content; the copies are never freed, so what this reaches is what
+/// the segment carries until the process ends.
+#[cfg(windows)]
+pub(crate) fn loose_stats() -> (usize, u64) {
+    let map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+    let bytes = map.iter().map(|((_, len), _)| *len).sum();
+    (map.len(), bytes)
+}
+
 fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     let start = address & !(WINDOW - 1);
     let len = end.next_multiple_of(WINDOW) - start;
