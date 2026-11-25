@@ -145,8 +145,104 @@ trait Source: Send {
     fn scripted_keys(&mut self) -> Vec<KeyState> {
         Vec::new()
     }
-    /// Motor speeds: low frequency (left), high frequency (right).
-    fn rumble(&mut self, slot: usize, low: u16, high: u16);
+    /// Sets the four rumble motors of the pad in host slot `slot`.
+    fn rumble(&mut self, slot: usize, rumble: Rumble);
+}
+
+/// The rumble motors a console pad has: low and high frequency, left and
+/// right trigger.
+const RUMBLE_MOTORS: u32 = 0xF;
+
+/// A rumble state: each motor's level, 0 to 1.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct Rumble {
+    low: f32,
+    high: f32,
+    left_trigger: f32,
+    right_trigger: f32,
+}
+
+impl Rumble {
+    /// From the title's `GameInputRumbleParams`; none turns all off. Levels
+    /// are clamped to 0..=1, NaN is 0.
+    fn from_params(params: Option<[f32; 4]>) -> Rumble {
+        let level = |v: f32| if v.is_nan() { 0.0 } else { v.clamp(0.0, 1.0) };
+        let [low, high, left, right] = params.unwrap_or_default().map(level);
+        Rumble {
+            low,
+            high,
+            left_trigger: left,
+            right_trigger: right,
+        }
+    }
+
+    /// XInput's motor speeds: low frequency (left), high frequency (right).
+    fn motor_speeds(&self) -> (u16, u16) {
+        let speed = |level: f32| (level * f32::from(u16::MAX)) as u16;
+        (speed(self.low), speed(self.high))
+    }
+
+    fn triggers_on(&self) -> bool {
+        self.left_trigger > 0.0 || self.right_trigger > 0.0
+    }
+}
+
+/// The host's two big motors per pad slot (XInput).
+trait Motors: Send {
+    fn set(&mut self, slot: usize, low: u16, high: u16);
+}
+
+/// Host pads that can drive trigger motors (Windows.Gaming.Input), in that
+/// API's order.
+trait Triggers: Send {
+    /// Sets all four motors of the `pad`th such pad; false when there is
+    /// none (or the API is unavailable).
+    fn set(&mut self, pad: usize, rumble: Rumble) -> bool;
+}
+
+/// Sends a title's rumble to the host: the big motors through XInput, the
+/// trigger motors (XInput has none) through the trigger API when that has
+/// the pad. That API takes all four levels at once, so it gets the motors'
+/// too, the same as XInput's, and nothing is undone.
+#[cfg_attr(not(windows), allow(dead_code))]
+struct Router<M, T> {
+    motors: M,
+    triggers: T,
+    /// Trigger levels sent per slot are not all zero: the next state goes
+    /// through the trigger API too, to stop them.
+    triggers_on: [bool; PADS],
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+impl<M: Motors, T: Triggers> Router<M, T> {
+    fn new(motors: M, triggers: T) -> Self {
+        Router {
+            motors,
+            triggers,
+            triggers_on: [false; PADS],
+        }
+    }
+
+    /// `connected`: which XInput slots have a pad.
+    // shortcut: XInput slots and Windows.Gaming.Input pads are matched by
+    // order (the nth connected slot is the nth pad there); neither API says
+    // which of the other's pads is which. Right with one pad; with several
+    // the triggers of another pad may answer.
+    fn rumble(&mut self, slot: usize, connected: [bool; PADS], rumble: Rumble) {
+        let (low, high) = rumble.motor_speeds();
+        self.motors.set(slot, low, high);
+        if !connected[slot] {
+            self.triggers_on[slot] = false;
+            return;
+        }
+        // Without trigger levels to set or clear, XInput did it all.
+        if !rumble.triggers_on() && !self.triggers_on[slot] {
+            return;
+        }
+        let pad = connected[..slot].iter().filter(|&&c| c).count();
+        let sent = self.triggers.set(pad, rumble);
+        self.triggers_on[slot] = sent && rumble.triggers_on();
+    }
 }
 
 fn fallback(keys: &[KeyState]) -> PadState {
@@ -262,8 +358,9 @@ impl Device {
             id,
             root_id: id,
             supported_input: kind(index),
-            // Low and high frequency.
-            rumble_motors: if index < PADS { 0x3 } else { 0 },
+            // All four, as a console pad: the triggers' reach the host
+            // through Windows.Gaming.Input where it has the pad.
+            rumble_motors: if index < PADS { RUMBLE_MOTORS } else { 0 },
             ..Default::default()
         };
         Device {
@@ -641,7 +738,7 @@ fn host() -> Box<dyn Source> {
         fn keys(&mut self) -> Vec<KeyState> {
             Vec::new()
         }
-        fn rumble(&mut self, _: usize, _: u16, _: u16) {}
+        fn rumble(&mut self, _: usize, _: Rumble) {}
     }
     Box::new(Nothing)
 }
@@ -1169,24 +1266,17 @@ extern "system" fn device_status(this: *const Device) -> u32 {
         0
     }
 }
-// shortcut: trigger motors are dropped (XInput has none). The host API that
-// drives them without a redistributable is Windows.Gaming.Input (WinRT
-// `Gamepad.Vibration`), which needs WinRT bindings this crate lacks outside
-// diagnostics builds; Grand Theft Auto VI sends trigger levels in slot 0x50.
+/// The four motors of a host pad (see `Router`); the keyboard and its
+/// stand-in pad have none.
 extern "system" fn set_rumble(this: *const Device, params: *const [f32; 4]) {
     // SAFETY: one of our devices.
     let device = unsafe { &*this };
     if device.index >= PADS {
         return;
     }
-    let [low, high, ..] = if params.is_null() {
-        [0.0; 4]
-    } else {
-        // SAFETY: checked non-null; four motor levels.
-        unsafe { *params }
-    };
-    let speed = |level: f32| (level.clamp(0.0, 1.0) * f32::from(u16::MAX)) as u16;
-    lock(&device.hub().source).rumble(device.index, speed(low), speed(high));
+    // SAFETY: null or four motor levels.
+    let rumble = Rumble::from_params(unsafe { params.as_ref() }.copied());
+    lock(&device.hub().source).rumble(device.index, rumble);
 }
 /// `GameInputBatteryState`: rates and capacities, then a status.
 #[repr(C)]
@@ -1464,9 +1554,70 @@ mod host {
         }
     }
 
-    #[derive(Default)]
     pub(super) struct Host {
         empty_until: [Option<Instant>; PADS],
+        /// Slots that had a pad when last read.
+        connected: [bool; PADS],
+        rumble: Router<XInput, GamingInput>,
+    }
+
+    impl Default for Host {
+        fn default() -> Self {
+            Host {
+                empty_until: Default::default(),
+                connected: Default::default(),
+                rumble: Router::new(XInput, GamingInput::default()),
+            }
+        }
+    }
+
+    struct XInput;
+
+    impl Motors for XInput {
+        fn set(&mut self, slot: usize, low: u16, high: u16) {
+            let speeds = XINPUT_VIBRATION {
+                wLeftMotorSpeed: low,
+                wRightMotorSpeed: high,
+            };
+            // SAFETY: a valid vibration; an empty slot just fails.
+            unsafe { XInputSetState(slot as u32, &speeds) };
+        }
+    }
+
+    /// Windows.Gaming.Input's gamepads, the API with trigger motors. Without
+    /// it (no WinRT), triggers stay still and the motors work as before.
+    #[derive(Default)]
+    struct GamingInput {
+        unavailable: bool,
+    }
+
+    impl Triggers for GamingInput {
+        fn set(&mut self, pad: usize, rumble: Rumble) -> bool {
+            use windows::Gaming::Input::{Gamepad, GamepadVibration};
+            if self.unavailable {
+                return false;
+            }
+            let pads = match Gamepad::Gamepads() {
+                Ok(pads) => pads,
+                Err(error) => {
+                    tracing::warn!(%error, "no Windows.Gaming.Input: trigger rumble is off");
+                    self.unavailable = true;
+                    return false;
+                }
+            };
+            // The list fills in shortly after the first call; until then
+            // and for a pad it lacks, there is nothing to set.
+            let Ok(gamepad) = pads.GetAt(pad as u32) else {
+                return false;
+            };
+            let vibration = GamepadVibration {
+                LeftMotor: f64::from(rumble.low),
+                RightMotor: f64::from(rumble.high),
+                LeftTrigger: f64::from(rumble.left_trigger),
+                RightTrigger: f64::from(rumble.right_trigger),
+            };
+            gamepad.SetVibration(vibration).is_ok()
+        }
     }
 
     fn key_state(vk: u8) -> KeyState {
@@ -1489,9 +1640,11 @@ mod host {
             // SAFETY: room for the state.
             if unsafe { XInputGetState(slot as u32, &mut state) } != 0 {
                 self.empty_until[slot] = Some(Instant::now() + EMPTY_SLOT_RECHECK);
+                self.connected[slot] = false;
                 return None;
             }
             self.empty_until[slot] = None;
+            self.connected[slot] = true;
             Some(convert(&state.Gamepad))
         }
 
@@ -1525,13 +1678,8 @@ mod host {
             }
         }
 
-        fn rumble(&mut self, slot: usize, low: u16, high: u16) {
-            let speeds = XINPUT_VIBRATION {
-                wLeftMotorSpeed: low,
-                wRightMotorSpeed: high,
-            };
-            // SAFETY: a valid vibration; an empty slot just fails.
-            unsafe { XInputSetState(slot as u32, &speeds) };
+        fn rumble(&mut self, slot: usize, rumble: Rumble) {
+            self.rumble.rumble(slot, self.connected, rumble);
         }
     }
 
@@ -1584,6 +1732,15 @@ mod host {
         }
     }
 
+    /// The real trigger API, with all motors off: whether or not WinRT and
+    /// pads are there, a pad it lacks is no pad.
+    #[test]
+    fn the_host_trigger_api_has_no_pad_it_lacks() {
+        let mut api = GamingInput::default();
+        assert!(!api.set(PADS * 4, Rumble::default()));
+        assert!(!api.set(PADS * 4, Rumble::default()));
+    }
+
     #[test]
     fn host_pads_convert_to_console_pads() {
         let pad = XINPUT_GAMEPAD {
@@ -1622,7 +1779,7 @@ mod tests {
         pads: [Option<PadState>; PADS],
         keys: Vec<KeyState>,
         scripted: Vec<KeyState>,
-        rumble: Vec<(usize, u16, u16)>,
+        rumble: Vec<(usize, Rumble)>,
     }
 
     struct Fake(Arc<Mutex<FakeHost>>);
@@ -1637,8 +1794,8 @@ mod tests {
         fn scripted_keys(&mut self) -> Vec<KeyState> {
             self.0.lock().unwrap().scripted.clone()
         }
-        fn rumble(&mut self, slot: usize, low: u16, high: u16) {
-            self.0.lock().unwrap().rumble.push((slot, low, high));
+        fn rumble(&mut self, slot: usize, rumble: Rumble) {
+            self.0.lock().unwrap().rumble.push((slot, rumble));
         }
     }
 
@@ -2260,12 +2417,137 @@ mod tests {
         assert_eq!(find(&hub.object, &[1; 32], &mut out), DEVICE_NOT_FOUND);
         assert!(out.is_null());
 
-        type Rumble = extern "system" fn(*const Device, *const [f32; 4]);
-        let rumble = slot::<Rumble, _>(device, 0x50);
-        rumble(device, &[0.5, 1.0, 1.0, 1.0]);
+        // A pad has all four motors, the keyboard and its stand-in none.
+        let motors = |d: *const Device| {
+            // SAFETY: the info has the motors at +0x6c (after the ids,
+            // family, capabilities and supported input).
+            unsafe { *(info(d).add(0x6c) as *const u32) }
+        };
+        assert_eq!(std::mem::offset_of!(DeviceInfo, rumble_motors), 0x6c);
+        assert_eq!(motors(device), RUMBLE_MOTORS);
+        assert_eq!(motors(&hub.devices[FALLBACK]), 0);
+        assert_eq!(motors(&hub.devices[KEYBOARD]), 0);
+
+        type SetRumble = extern "system" fn(*const Device, *const [f32; 4]);
+        let rumble = slot::<SetRumble, _>(device, 0x50);
+        rumble(device, &[0.5, 1.0, 0.25, 3.0]);
         rumble(&hub.devices[FALLBACK], &[1.0; 4]);
         rumble(device, std::ptr::null());
-        assert_eq!(host.lock().unwrap().rumble, [(2, 32767, 65535), (2, 0, 0)]);
+        let all = Rumble {
+            low: 0.5,
+            high: 1.0,
+            left_trigger: 0.25,
+            right_trigger: 1.0,
+        };
+        assert_eq!(
+            host.lock().unwrap().rumble,
+            [(2, all), (2, Rumble::default())]
+        );
+    }
+
+    #[test]
+    fn rumble_levels_are_clamped_and_scaled() {
+        let r = Rumble::from_params(Some([0.5, 1.0, -0.5, 7.0]));
+        assert_eq!(
+            r,
+            Rumble {
+                low: 0.5,
+                high: 1.0,
+                left_trigger: 0.0,
+                right_trigger: 1.0
+            }
+        );
+        assert_eq!(r.motor_speeds(), (32767, 65535));
+        assert!(r.triggers_on());
+        let r = Rumble::from_params(Some([f32::NAN, f32::INFINITY, f32::NAN, 0.0]));
+        assert_eq!(r.motor_speeds(), (0, 65535));
+        assert!(!r.triggers_on());
+        assert_eq!(Rumble::from_params(None), Rumble::default());
+        assert_eq!(Rumble::default().motor_speeds(), (0, 0));
+    }
+
+    /// Host rumble calls seen by the fakes.
+    #[derive(Default)]
+    struct RumbleLog {
+        motors: Vec<(usize, u16, u16)>,
+        triggers: Vec<(usize, Rumble)>,
+    }
+
+    struct FakeMotors(Arc<Mutex<RumbleLog>>);
+    impl Motors for FakeMotors {
+        fn set(&mut self, slot: usize, low: u16, high: u16) {
+            self.0.lock().unwrap().motors.push((slot, low, high));
+        }
+    }
+
+    /// `pads` pads with trigger motors.
+    struct FakeTriggers(Arc<Mutex<RumbleLog>>, usize);
+    impl Triggers for FakeTriggers {
+        fn set(&mut self, pad: usize, rumble: Rumble) -> bool {
+            self.0.lock().unwrap().triggers.push((pad, rumble));
+            pad < self.1
+        }
+    }
+
+    fn router(trigger_pads: usize) -> (Router<FakeMotors, FakeTriggers>, Arc<Mutex<RumbleLog>>) {
+        let log = Arc::new(Mutex::new(RumbleLog::default()));
+        let router = Router::new(
+            FakeMotors(Arc::clone(&log)),
+            FakeTriggers(Arc::clone(&log), trigger_pads),
+        );
+        (router, log)
+    }
+
+    fn levels(low: f32, high: f32, left: f32, right: f32) -> Rumble {
+        Rumble::from_params(Some([low, high, left, right]))
+    }
+
+    #[test]
+    fn motors_go_to_xinput_and_triggers_to_the_trigger_api() {
+        let (mut router, log) = router(2);
+        let connected = [false, true, false, true];
+        // Motors only: XInput alone.
+        router.rumble(1, connected, levels(0.5, 0.25, 0.0, 0.0));
+        assert_eq!(log.lock().unwrap().motors, [(1, 32767, 16383)]);
+        assert!(log.lock().unwrap().triggers.is_empty());
+
+        // Triggers: the trigger API gets all four, for the pad of the same
+        // rank (slot 3 is the second connected slot); XInput the motors.
+        let both = levels(1.0, 0.0, 0.5, 0.75);
+        router.rumble(3, connected, both);
+        assert_eq!(log.lock().unwrap().motors[1], (3, 65535, 0));
+        assert_eq!(log.lock().unwrap().triggers, [(1, both)]);
+        router.rumble(1, connected, both);
+        assert_eq!(log.lock().unwrap().triggers[1], (0, both));
+
+        // Back to motors only: the triggers are stopped once, then left be.
+        let motors = levels(0.25, 0.25, 0.0, 0.0);
+        router.rumble(3, connected, motors);
+        router.rumble(3, connected, motors);
+        router.rumble(3, connected, Rumble::default());
+        let log = log.lock().unwrap();
+        assert_eq!(log.triggers[2..], [(1, motors)]);
+        assert_eq!(log.motors.len(), 6);
+        assert_eq!(log.motors[5], (3, 0, 0));
+    }
+
+    #[test]
+    fn rumble_without_a_trigger_pad_still_drives_the_motors() {
+        let (mut router, log) = router(0);
+        let connected = [true, false, false, false];
+        let both = levels(0.5, 0.5, 1.0, 1.0);
+        router.rumble(0, connected, both);
+        // No pad there: nothing to stop later.
+        router.rumble(0, connected, Rumble::default());
+        // An empty slot has no pad to rank: XInput is told (and fails), the
+        // trigger API is not asked.
+        router.rumble(2, connected, both);
+        let log = log.lock().unwrap();
+        assert_eq!(
+            log.motors,
+            [(0, 32767, 32767), (0, 0, 0), (2, 32767, 32767)]
+        );
+        assert_eq!(log.triggers, [(0, both)]);
     }
 
     #[test]
