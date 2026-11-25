@@ -92,22 +92,26 @@ impl Journal {
         }
         let mut crashed = read_list(&crashed_file);
         let mut suspects = read_list(&suspects_file);
-        let mut left = Vec::new();
+        // (key, its stages and container sizes, as the note names them)
+        let mut left: Vec<(String, String)> = Vec::new();
         for entry in std::fs::read_dir(&pending).into_iter().flatten().flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
-            let key = name.split('@').next().unwrap_or(&name).to_owned();
-            if !crashed.contains(&key) && !left.contains(&key) {
-                left.push(key);
+            let parts: Vec<&str> = name.split('@').collect();
+            let key = parts[0].to_owned();
+            let detail = if parts.len() == 3 { parts[1] } else { "" }.to_owned();
+            if !crashed.contains(&key) && !left.iter().any(|(k, _)| *k == key) {
+                left.push((key, detail));
             }
             let _ = std::fs::remove_file(entry.path());
         }
         match left.len() {
             0 => {}
             1 => {
-                let key = left.pop().unwrap();
+                let (key, detail) = left.pop().unwrap();
                 tracing::warn!(
                     pipeline = %key,
-                    "the last run ended while creating this host pipeline; it is refused from now on"
+                    stages = %detail,
+                    "the last run ended while creating this host pipeline; it is refused from now on, and its draws and dispatches are dropped"
                 );
                 suspects.remove(&key);
                 write_list(&suspects_file, &suspects);
@@ -117,6 +121,9 @@ impl Journal {
                     .open(&crashed_file);
                 match file {
                     Ok(mut f) => {
+                        if !detail.is_empty() {
+                            let _ = writeln!(f, "# {}", detail.replace('+', " + "));
+                        }
                         let _ = writeln!(f, "{key}");
                     }
                     Err(e) => {
@@ -130,16 +137,24 @@ impl Journal {
                     pipelines = ?left,
                     "the last run ended while creating these host pipelines together; each is created alone from now on until it succeeds"
                 );
-                suspects.extend(left);
+                suspects.extend(left.into_iter().map(|(k, _)| k));
                 write_list(&suspects_file, &suspects);
             }
         }
+        let mut listed: Vec<&String> = crashed.iter().collect();
+        listed.sort();
         tracing::info!(
             refused = crashed.len(),
             suspects = suspects.len(),
             path = %crashed_file.display(),
             "pipeline journal on"
         );
+        if !listed.is_empty() {
+            tracing::warn!(
+                pipelines = ?listed,
+                "these host pipelines are refused (they ended earlier runs): every draw and dispatch that uses one is dropped; each is logged once when first skipped"
+            );
+        }
         Some(Journal {
             pending,
             crashed_file,
@@ -152,7 +167,10 @@ impl Journal {
         })
     }
 
-    fn enter(&self, key: &str) -> Option<Pending<'_>> {
+    /// `detail` names the stages and their container sizes (`compute-2232` or
+    /// `vertex-1024+pixel-2048`); it goes into the note's name, then into a comment
+    /// above the pipeline's line in `crashed.txt`.
+    fn enter(&self, key: &str, detail: &str) -> Option<Pending<'_>> {
         if self.crashed.contains(key) {
             let mut logged = self.logged.lock().unwrap_or_else(|e| e.into_inner());
             if logged.insert(key.to_owned()) {
@@ -174,8 +192,13 @@ impl Journal {
         } else {
             Gate::Shared(self.gate.read().unwrap_or_else(|e| e.into_inner()))
         };
+        let detail = if detail.is_empty() {
+            String::new()
+        } else {
+            format!("{detail}@")
+        };
         let path = self.pending.join(format!(
-            "{key}@{}-{}",
+            "{key}@{detail}{}-{}",
             std::process::id(),
             self.next.fetch_add(1, Ordering::Relaxed)
         ));
@@ -229,9 +252,9 @@ impl Drop for Pending<'_> {
 
 /// Notes that the pipeline `key` is being created, or `None` if it ended a
 /// run before (it must not be created). Always `Some` with the journal off.
-pub(crate) fn enter(key: &str) -> Option<Pending<'static>> {
+pub(crate) fn enter(key: &str, detail: &str) -> Option<Pending<'static>> {
     match journal() {
-        Some(j) => j.enter(key),
+        Some(j) => j.enter(key, detail),
         None => Some(Pending {
             note: None,
             cleared: None,
@@ -249,15 +272,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         {
             let j = Journal::open(dir.path()).unwrap();
-            let done = j.enter("aaaaaaaaaaaaaaaa").unwrap();
+            let done = j.enter("aaaaaaaaaaaaaaaa", "").unwrap();
             drop(done);
-            let crashing = j.enter("bbbbbbbbbbbbbbbb+cccccccccccccccc").unwrap();
+            let crashing = j.enter("bbbbbbbbbbbbbbbb+cccccccccccccccc", "").unwrap();
             // The process ends here: the note stays.
             std::mem::forget(crashing);
         }
         let j = Journal::open(dir.path()).unwrap();
-        assert!(j.enter("bbbbbbbbbbbbbbbb+cccccccccccccccc").is_none());
-        assert!(j.enter("aaaaaaaaaaaaaaaa").is_some());
+        assert!(j.enter("bbbbbbbbbbbbbbbb+cccccccccccccccc", "").is_none());
+        assert!(j.enter("aaaaaaaaaaaaaaaa", "").is_some());
         let listed = std::fs::read_to_string(dir.path().join("crashed.txt")).unwrap();
         assert_eq!(listed, "bbbbbbbbbbbbbbbb+cccccccccccccccc\n");
         assert_eq!(
@@ -274,8 +297,8 @@ mod tests {
         {
             let j = Journal::open(dir.path()).unwrap();
             // Two pipelines in creation at once when the process ends.
-            std::mem::forget(j.enter("eeeeeeeeeeeeeeee").unwrap());
-            std::mem::forget(j.enter("ffffffffffffffff").unwrap());
+            std::mem::forget(j.enter("eeeeeeeeeeeeeeee", "").unwrap());
+            std::mem::forget(j.enter("ffffffffffffffff", "").unwrap());
         }
         let j = Journal::open(dir.path()).unwrap();
         assert_eq!(
@@ -285,17 +308,17 @@ mod tests {
         let suspects = std::fs::read_to_string(dir.path().join("suspects.txt")).unwrap();
         assert_eq!(suspects, "eeeeeeeeeeeeeeee\nffffffffffffffff\n");
         // A suspect is created alone: no other pipeline may hold the gate.
-        let alone = j.enter("eeeeeeeeeeeeeeee").unwrap();
+        let alone = j.enter("eeeeeeeeeeeeeeee", "").unwrap();
         assert!(j.gate.try_read().is_err());
         drop(alone);
         // Its creation returned, so it is no longer a suspect.
         let suspects = std::fs::read_to_string(dir.path().join("suspects.txt")).unwrap();
         assert_eq!(suspects, "ffffffffffffffff\n");
         // Created alone again, it crashes: now it is named.
-        std::mem::forget(j.enter("ffffffffffffffff").unwrap());
+        std::mem::forget(j.enter("ffffffffffffffff", "").unwrap());
         drop(j);
         let j = Journal::open(dir.path()).unwrap();
-        assert!(j.enter("ffffffffffffffff").is_none());
+        assert!(j.enter("ffffffffffffffff", "").is_none());
         assert_eq!(
             std::fs::read_to_string(dir.path().join("suspects.txt")).unwrap(),
             ""
@@ -303,11 +326,40 @@ mod tests {
     }
 
     #[test]
+    fn a_crashed_pipeline_is_listed_with_its_stages_and_sizes() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let j = Journal::open(dir.path()).unwrap();
+            std::mem::forget(
+                j.enter(
+                    "1234123412341234+5678567856785678",
+                    "vertex-1024+pixel-2048",
+                )
+                .unwrap(),
+            );
+            let names: Vec<String> = std::fs::read_dir(dir.path().join("pending"))
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            assert_eq!(names.len(), 1);
+            assert!(
+                names[0].starts_with("1234123412341234+5678567856785678@vertex-1024+pixel-2048@")
+            );
+        }
+        let j = Journal::open(dir.path()).unwrap();
+        assert!(j.enter("1234123412341234+5678567856785678", "").is_none());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("crashed.txt")).unwrap(),
+            "# vertex-1024 + pixel-2048\n1234123412341234+5678567856785678\n"
+        );
+    }
+
+    #[test]
     fn ordinary_pipelines_are_created_together() {
         let dir = tempfile::tempdir().unwrap();
         let j = Journal::open(dir.path()).unwrap();
-        let a = j.enter("1111111111111111").unwrap();
-        let b = j.enter("2222222222222222").unwrap();
+        let a = j.enter("1111111111111111", "").unwrap();
+        let b = j.enter("2222222222222222", "").unwrap();
         drop((a, b));
     }
 
@@ -316,6 +368,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("crashed.txt"), "# tried again\n").unwrap();
         let j = Journal::open(dir.path()).unwrap();
-        assert!(j.enter("dddddddddddddddd").is_some());
+        assert!(j.enter("dddddddddddddddd", "").is_some());
     }
 }

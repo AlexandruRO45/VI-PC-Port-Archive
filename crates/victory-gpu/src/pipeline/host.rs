@@ -391,7 +391,12 @@ impl HostPipeline {
             .map(|(s, _)| s.hash.as_str())
             .collect::<Vec<_>>()
             .join("+");
-        let _pending = super::journal::enter(&key)?;
+        let detail = stages
+            .iter()
+            .map(|(s, _)| format!("{}-{}", s.stage.to_lowercase(), s.container.len()))
+            .collect::<Vec<_>>()
+            .join("+");
+        let _pending = super::journal::enter(&key, &detail)?;
 
         // The root signature the translated shaders' bindings define.
         let mut params: Vec<D3D12_ROOT_PARAMETER1> = Vec::new();
