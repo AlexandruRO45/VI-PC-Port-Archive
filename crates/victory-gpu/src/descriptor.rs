@@ -416,7 +416,7 @@ pub(crate) fn forget(resource: usize) {
         return;
     };
     #[cfg(windows)]
-    host::bindless_viewed_changed();
+    let mut bumped: Vec<(u32, u32)> = Vec::new();
     for i in entries {
         let (view, generation) = views.list[i as usize].clone();
         // Entries freed through a view's other resource may hold another
@@ -426,9 +426,16 @@ pub(crate) fn forget(resource: usize) {
         }
         views.index.remove(&view);
         views.list[i as usize].1 = generation.wrapping_add(1).max(1);
+        #[cfg(windows)]
+        bumped.push((i, generation));
         // The view's other resource (a counter) keeps a stale entry, which
         // `forget` of that resource skips.
         views.free.push(i);
+    }
+    drop(views);
+    #[cfg(windows)]
+    if !bumped.is_empty() {
+        host::bindless_views_bumped(&bumped);
     }
 }
 

@@ -1110,7 +1110,14 @@ fn direct(address: u64, end: u64) -> Option<Arc<Shadow>> {
     use windows::core::Interface;
     static DEVICE: std::sync::OnceLock<Option<ID3D12Device13>> = std::sync::OnceLock::new();
     if cfg!(test) {
-        return None;
+        let map = windows_of_memory();
+        return map
+            .range(..=address)
+            .rev()
+            .take(8)
+            .map(|(_, s)| s)
+            .find(|s| s.start + s.len >= end)
+            .cloned();
     }
     let device = DEVICE.get_or_init(|| {
         // Diagnostics: copies, as without this.
@@ -1215,8 +1222,121 @@ fn direct(address: u64, end: u64) -> Option<Arc<Shadow>> {
 /// only when it moved ([`died`]).
 static DIED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Bounded ring of direct shadows (`Arc::as_ptr` as `usize`) that died lately,
+/// tagged with monotonic sequence numbers, and total count dead so far.
+/// Strictly a leaf lock (never nests another lock).
+static DEAD_RING: Mutex<(std::collections::VecDeque<(u64, usize)>, u64)> =
+    Mutex::new((std::collections::VecDeque::new(), 0));
+const DEAD_RING_KEPT: usize = 1 << 14;
+
 pub(crate) fn died() -> u64 {
     DIED.load(Ordering::Acquire)
+}
+
+fn record_dead_shadows(ptrs: &[usize]) {
+    if ptrs.is_empty() {
+        return;
+    }
+    let mut ring = DEAD_RING.lock().unwrap_or_else(|e| e.into_inner());
+    for &ptr in ptrs {
+        ring.1 += 1;
+        let seq = ring.1;
+        if ring.0.len() == DEAD_RING_KEPT {
+            ring.0.pop_front();
+        }
+        ring.0.push_back((seq, ptr));
+    }
+    DIED.store(ring.1, Ordering::Release);
+}
+
+/// Direct shadow pointers (`Arc::as_ptr` as `usize`) that died after `seen`,
+/// and the current dead sequence. Returns `None` if the ring wrapped past
+/// `seen` so the caller falls back to a full direct-slot scan.
+pub(crate) fn dead_since(seen: u64) -> (Option<Vec<usize>>, u64) {
+    let ring = DEAD_RING.lock().unwrap_or_else(|e| e.into_inner());
+    let now = ring.1;
+    if now <= seen {
+        return (Some(Vec::new()), now);
+    }
+    let n = (now - seen) as usize;
+    if n > ring.0.len() {
+        return (None, now);
+    }
+    let list = ring
+        .0
+        .iter()
+        .skip(ring.0.len() - n)
+        .map(|&(_, ptr)| ptr)
+        .collect();
+    (Some(list), now)
+}
+
+#[cfg(test)]
+pub(crate) fn test_register_direct(start: u64, len: u64) -> Option<Arc<Shadow>> {
+    use windows::Win32::Graphics::Direct3D12::*;
+    let host = host()?;
+    let (buffer, _) = host.shared_buffer(len.max(256))?;
+    let mut heap: Option<ID3D12Heap> = None;
+    let heap_desc = D3D12_HEAP_DESC {
+        SizeInBytes: 64 << 10,
+        Properties: D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT,
+            ..Default::default()
+        },
+        Alignment: 64 << 10,
+        Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS,
+    };
+    // SAFETY: valid heap description on a live device.
+    unsafe { host.device.CreateHeap(&heap_desc, &mut heap) }.ok()?;
+    let heap = heap?;
+    // SAFETY: live buffer.
+    let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+    let shadow = Arc::new(Shadow {
+        buffer,
+        data: start as *mut u8,
+        gpu,
+        start,
+        len,
+        copied: Mutex::default(),
+        watched: AtomicU8::new(NOT_WATCHED),
+        pending: Mutex::default(),
+        before: Mutex::default(),
+        direct: Some(Direct {
+            heap,
+            aliases: Mutex::default(),
+            dead: std::sync::atomic::AtomicBool::new(false),
+        }),
+        unwatched: Mutex::default(),
+        clean_spans: Mutex::default(),
+        sparse: None,
+        card: None,
+    });
+    windows_of_memory().insert(start, shadow.clone());
+    Some(shadow)
+}
+
+#[cfg(test)]
+pub(crate) fn test_unregister_direct(start: u64) {
+    windows_of_memory().remove(&start);
+}
+
+#[cfg(test)]
+pub(crate) fn test_dead_ring_capacity() -> usize {
+    DEAD_RING_KEPT
+}
+
+#[cfg(test)]
+pub(crate) fn test_push_dummy_dead(count: usize) {
+    let mut ring = DEAD_RING.lock().unwrap_or_else(|e| e.into_inner());
+    for _ in 0..count {
+        ring.1 += 1;
+        let seq = ring.1;
+        if ring.0.len() == DEAD_RING_KEPT {
+            ring.0.pop_front();
+        }
+        ring.0.push_back((seq, 0));
+    }
+    DIED.store(ring.1, Ordering::Release);
 }
 
 /// Stretches shorter than this are copied: each window is a host heap.
@@ -1359,21 +1479,23 @@ pub(crate) fn remapped(start: u64, end: u64) {
         .filter(|(_, s)| s.start + s.len > start)
         .map(|(k, _)| *k)
         .collect();
+    let mut dead_ptrs = Vec::new();
     for key in over {
         let Some(s) = map.remove(&key) else { continue };
         let mut gone = GONE.lock().unwrap_or_else(|e| e.into_inner());
         gone.insert(s.buffer.as_raw() as usize);
         if let Some(d) = &s.direct {
             d.dead.store(true, Ordering::Release);
-            DIED.fetch_add(1, Ordering::Release);
+            dead_ptrs.push(Arc::as_ptr(&s) as usize);
             for (_, a) in d.aliases.lock().unwrap_or_else(|e| e.into_inner()).iter() {
                 gone.insert(a.buffer.as_raw() as usize);
                 if let Some(d) = &a.direct {
                     d.dead.store(true, Ordering::Release);
-            DIED.fetch_add(1, Ordering::Release);
+                    dead_ptrs.push(Arc::as_ptr(a) as usize);
                 }
             }
         }
+        drop(gone);
         // shortcut: kept for good, pages too (`GONE` names its buffers by
         // address); drop them with their last view if the title remaps much.
         std::mem::forget(s);
@@ -1383,6 +1505,8 @@ pub(crate) fn remapped(start: u64, end: u64) {
             tracing::info!(count, "title memory in place was mapped anew");
         }
     }
+    drop(map);
+    record_dead_shadows(&dead_ptrs);
 }
 
 /// The memory behind a buffer view with elements of `element` bytes, of

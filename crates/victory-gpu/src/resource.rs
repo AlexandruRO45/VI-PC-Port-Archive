@@ -1449,16 +1449,22 @@ fn hand_out_resource(
 #[cfg(windows)]
 impl Drop for Resource {
     fn drop(&mut self) {
+        let mut removed_target = false;
         if self.desc.flags & 5 != 0 && self.host.is_some() {
             let at = std::ptr::from_ref::<Resource>(self) as usize;
             let mut targets = TARGETS.lock().unwrap_or_else(|e| e.into_inner());
             let start = self.data() as u64;
             if let Some(list) = targets.get_mut(&start) {
+                let before = list.len();
                 list.retain(|&r| r != at);
+                removed_target = list.len() != before;
                 if list.is_empty() {
                     targets.remove(&start);
                 }
             }
+        }
+        if removed_target {
+            record_evicted_placed(&[std::ptr::from_ref::<Resource>(self) as usize]);
         }
         #[cfg(feature = "diagnostics")]
         if self
@@ -1662,14 +1668,81 @@ type PlacedTextureMap = std::collections::BTreeMap<(u64, [u32; 14]), (usize, u64
 static PLACED_TEXTURES: std::sync::Mutex<PlacedTextureMap> =
     std::sync::Mutex::new(std::collections::BTreeMap::new());
 
-/// Incremented whenever [`evict_placed_textures`] removes an entry so
-/// bindless heaps re-check placed texture slots.
+/// Incremented whenever [`evict_placed_textures`] removes an entry (or a target
+/// resource leaves [`TARGETS`]) so bindless heaps re-check placed texture slots.
 #[cfg(windows)]
 static PLACED_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Bounded ring of evicted placed/target texture resource pointers `(seq, res_ptr)`
+/// and total evicted count. Strictly a leaf lock (never nests another lock).
+#[cfg(windows)]
+static EVICTED_PLACED: std::sync::Mutex<(std::collections::VecDeque<(u64, usize)>, u64)> =
+    std::sync::Mutex::new((std::collections::VecDeque::new(), 0));
+#[cfg(windows)]
+const EVICTED_PLACED_KEPT: usize = 1 << 16;
 
 #[cfg(windows)]
 pub(crate) fn placed_epoch() -> u64 {
     PLACED_EPOCH.load(std::sync::atomic::Ordering::Acquire)
+}
+
+#[cfg(windows)]
+fn record_evicted_placed(ptrs: &[usize]) {
+    if ptrs.is_empty() {
+        return;
+    }
+    let mut ring = EVICTED_PLACED.lock().unwrap_or_else(|e| e.into_inner());
+    for &ptr in ptrs {
+        ring.1 += 1;
+        let seq = ring.1;
+        if ring.0.len() == EVICTED_PLACED_KEPT {
+            ring.0.pop_front();
+        }
+        ring.0.push_back((seq, ptr));
+    }
+    PLACED_EPOCH.store(ring.1, std::sync::atomic::Ordering::Release);
+}
+
+/// Evicted placed/target texture resource pointers after `seen`, and the latest
+/// sequence. Returns `None` if the ring wrapped past `seen` so the caller falls
+/// back to [`placed_live`].
+#[cfg(windows)]
+pub(crate) fn placed_evicted_since(seen: u64) -> (Option<Vec<usize>>, u64) {
+    let ring = EVICTED_PLACED.lock().unwrap_or_else(|e| e.into_inner());
+    let now = ring.1;
+    if now <= seen {
+        return (Some(Vec::new()), now);
+    }
+    let n = (now - seen) as usize;
+    if n > ring.0.len() {
+        return (None, now);
+    }
+    let list = ring
+        .0
+        .iter()
+        .skip(ring.0.len() - n)
+        .map(|&(_, ptr)| ptr)
+        .collect();
+    (Some(list), now)
+}
+
+#[cfg(all(test, windows))]
+pub(crate) fn test_evicted_placed_capacity() -> usize {
+    EVICTED_PLACED_KEPT
+}
+
+#[cfg(all(test, windows))]
+pub(crate) fn test_push_dummy_evicted_placed(count: usize) {
+    let mut ring = EVICTED_PLACED.lock().unwrap_or_else(|e| e.into_inner());
+    for _ in 0..count {
+        ring.1 += 1;
+        let seq = ring.1;
+        if ring.0.len() == EVICTED_PLACED_KEPT {
+            ring.0.pop_front();
+        }
+        ring.0.push_back((seq, 0));
+    }
+    PLACED_EPOCH.store(ring.1, std::sync::atomic::Ordering::Release);
 }
 
 /// A reference to a placed texture: eviction does not free it while held.
@@ -1889,7 +1962,7 @@ pub(crate) fn evict_placed_textures(start: u64, end: u64) {
     }
     EVICTED.fetch_add(evicted.len() as u64, std::sync::atomic::Ordering::Relaxed);
     if !evicted.is_empty() {
-        PLACED_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Release);
+        record_evicted_placed(&evicted);
         for res in evicted {
             resource_release(res as This);
         }
