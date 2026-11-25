@@ -2426,7 +2426,7 @@ impl Batch {
                     .current
                     .entry(key)
                     .or_insert_with(|| (shadow.clone(), vec![]));
-                push_range(current, 0, from, to);
+                push_copied(current, from, to);
             }
         }
         total
@@ -2463,6 +2463,31 @@ fn push_range(ranges: &mut Vec<(usize, usize)>, gap: usize, address: usize, end:
 /// Whether `[address, end)` lies inside one of `ranges`.
 fn covered(ranges: &[(usize, usize)], address: usize, end: usize) -> bool {
     ranges.iter().any(|&(a, e)| a <= address && end <= e)
+}
+
+/// Adds the range a flush copied to `ranges`, the ranges already copied:
+/// joined only where they meet across a page boundary. The flushes take
+/// only pages their ranges cover whole, so two ranges meeting inside a
+/// page (half each) together claim the page none of them took: a later
+/// request for the page must stay a refresh.
+fn push_copied(ranges: &mut Vec<(usize, usize)>, from: usize, to: usize) {
+    let (mut f, mut t) = (from, to);
+    let mut i = 0;
+    while i < ranges.len() {
+        let (a, e) = ranges[i];
+        let overlaps = from < e && a < to;
+        let meets_right = from == e && e % crate::watch::PAGE == 0;
+        let meets_left = to == a && a % crate::watch::PAGE == 0;
+        if overlaps || meets_right || meets_left {
+            ranges.remove(i);
+            f = f.min(a);
+            t = t.max(e);
+        } else {
+            i += 1;
+        }
+    }
+    ranges.push((f, t));
+    ranges.sort_unstable();
 }
 
 /// Copies title memory at submission. The ranges were checked against their
@@ -3553,22 +3578,30 @@ mod batch {   // `mod tests` is already taken at the top of this file
         assert!(covered(&rs, 0x2_0000, 0x4f_0000));
     }
 
-    /// The ranges a flush copied merge only where they touch: a page's
+    /// The ranges a flush copied join only where they meet across a page
+    /// boundary, and a request is covered only inside one range: a page's
     /// gap coalesces what to copy, never what has been copied (a missed
     /// refresh found on hardware: pages 0, 2 and 1 flushed in that order
     /// copied pages 0 and 2 and skipped 1).
     #[test]
     fn the_gap_between_copied_ranges_is_not_covered() {
+        use crate::watch::PAGE;
         let mut copied = vec![(0x1_0000, 0x1_1000)];
-        push_range(&mut copied, 0, 0x2_1000, 0x2_2000);
-        // A page apart: not merged, the gap between them stays pending.
+        push_copied(&mut copied, 0x2_1000, 0x2_2000);
+        // A page apart: not joined, the gap between them stays pending.
         assert_eq!(copied, [(0x1_0000, 0x1_1000), (0x2_1000, 0x2_2000)]);
         assert!(!covered(&copied, 0x1_1000, 0x2_1000));
-        // Touching: merged, so a request inside is skipped.
-        push_range(&mut copied, 0, 0x2_1000, 0x2_2000);
-        push_range(&mut copied, 0, 0x1_1000, 0x2_1000);
-        assert_eq!(copied, [(0x1_0000, 0x2_2000)]);
-        assert!(covered(&copied, 0x1_1000, 0x2_1000));
+        // Meeting inside a page: not joined either — `Tracked::take` takes
+        // only pages a range covers whole, so two ranges meeting there
+        // together must not claim the page none of them took.
+        push_copied(&mut copied, 0x1_1000, 0x2_1000);
+        assert_eq!(copied, [(0x1_0000, 0x1_1000), (0x1_1000, 0x2_1000), (0x2_1000, 0x2_2000)]);
+        assert!(!covered(&copied, 0x1_1000 - 4, 0x1_1000 + 4));
+        // Meeting at a page boundary: joined, so a request inside is skipped.
+        let mut whole = vec![(0x1_0000, 0x2_0000)];
+        push_copied(&mut whole, 0x2_0000, 0x3_0000);
+        assert_eq!(whole, [(0x1_0000, 0x3_0000)]);
+        assert!(covered(&whole, 0x1_1000, 0x2_1000));
     }
 
     /// A submission asking for distant parts of one copy refreshes them
@@ -3588,6 +3621,33 @@ mod batch {   // `mod tests` is already taken at the top of this file
         batch.add(&copy, p + 6 * PAGE, PAGE / 2);
         let ranges = &batch.pending.values().next().unwrap().1;
         assert_eq!(ranges, &[(p, p + PAGE / 2), (p + 6 * PAGE, p + 6 * PAGE + PAGE / 2)]);
+        crate::shadow::unregister(p, p as u64);
+        drop(copy);
+        crate::watch::tests::free(p);
+    }
+
+    /// Two flushes that each copy part of one page do not make the page
+    /// current: what they copied meets inside the page, and `Tracked::take`
+    /// took nothing of it, so a later whole-page request in the same
+    /// submission must still refresh (the split page of #2473).
+    #[test]
+    fn a_page_copied_in_two_halves_is_refreshed_whole() {
+        use crate::watch::PAGE;
+        let p = crate::watch::tests::pool(2);
+        let len = 2 * PAGE;
+        crate::shadow::register(p, p as u64, len as u64);
+        let Some(copy) = crate::shadow::find(p as u64, len as u64) else {
+            crate::shadow::unregister(p, p as u64);
+            return; // no host GPU here
+        };
+        let mut batch = Batch::default();
+        batch.add(&copy, p, PAGE / 2);
+        assert_eq!(batch.flush(), 0, "half a page is not taken");
+        batch.add(&copy, p + PAGE / 2, PAGE / 2);
+        assert_eq!(batch.flush(), 0, "the other half is not taken either");
+        // The two halves together must not skip the page they never took.
+        batch.add(&copy, p, PAGE);
+        assert_eq!(batch.flush(), PAGE, "the whole page is refreshed");
         crate::shadow::unregister(p, p as u64);
         drop(copy);
         crate::watch::tests::free(p);
