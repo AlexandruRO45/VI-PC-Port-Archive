@@ -499,7 +499,9 @@ struct Views {
     free: Vec<u32>,
 }
 
-static VIEWS: std::sync::Mutex<Views> = std::sync::Mutex::new(Views {
+/// Read by every table entry a draw binds, written as the title records
+/// views: readers share it.
+static VIEWS: std::sync::RwLock<Views> = std::sync::RwLock::new(Views {
     list: Vec::new(),
     index: std::collections::BTreeMap::new(),
     by_resource: std::collections::BTreeMap::new(),
@@ -522,7 +524,21 @@ fn record(handle: u64, view: View) {
     if handle == 0 {
         return;
     }
-    let mut views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    // Most records are of views recorded before: the shared lock finds them.
+    let known = {
+        let views = VIEWS.read().unwrap_or_else(|e| e.into_inner());
+        views.index.get(&view).map(|&i| {
+            let generation = views.list[i as usize].1;
+            // SAFETY: the handle is a descriptor slot, at least 16 bytes.
+            unsafe { (handle as *mut [u32; 3]).write_unaligned([VIEW_TAG, i, generation]) };
+        })
+    };
+    if known.is_some() {
+        #[cfg(windows)]
+        mirror(handle);
+        return;
+    }
+    let mut views = VIEWS.write().unwrap_or_else(|e| e.into_inner());
     let i = match views.index.get(&view) {
         Some(&i) => i,
         None => {
@@ -553,7 +569,7 @@ fn record(handle: u64, view: View) {
 
 /// The title released `resource`: the views naming it go stale.
 pub(crate) fn forget(resource: usize) {
-    let mut views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut views = VIEWS.write().unwrap_or_else(|e| e.into_inner());
     let Some(entries) = views.by_resource.remove(&resource) else {
         return;
     };
@@ -575,7 +591,9 @@ pub(crate) fn forget(resource: usize) {
 /// The view of entry `i` if `generation` is still its own.
 #[cfg(windows)]
 fn view_at(i: u32, generation: u32) -> Option<View> {
-    let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    let waiting = crate::cpuprof::time(crate::cpuprof::Stage::ViewsLock);
+    let views = VIEWS.read().unwrap_or_else(|e| e.into_inner());
+    drop(waiting);
     let (view, current) = views.list.get(i as usize)?;
     (*current == generation).then(|| view.clone())
 }
@@ -587,7 +605,9 @@ pub(crate) fn view(handle: u64) -> Option<View> {
     }
     // SAFETY: the handle is a descriptor slot the title passes back.
     let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
-    let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    let waiting = crate::cpuprof::time(crate::cpuprof::Stage::ViewsLock);
+    let views = VIEWS.read().unwrap_or_else(|e| e.into_inner());
+    drop(waiting);
     let (view, current) = views.list.get(i as usize)?;
     (tag == VIEW_TAG && *current == generation).then(|| view.clone())
 }

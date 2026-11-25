@@ -1135,7 +1135,10 @@ impl State {
             return;
         };
         crate::cpuprof::count(crate::cpuprof::Count::Mirror);
-        if let Some(view) = host.mirror(index, handle, true) {
+        let mirrored = crate::cpuprof::time(crate::cpuprof::Stage::EntryMirror);
+        let view = host.mirror(index, handle, true);
+        drop(mirrored);
+        if let Some(view) = view {
             readable(list, u, &view, true);
         }
     }
@@ -1817,6 +1820,7 @@ fn readable(list: &HostList, u: &UsedResource, view: &View, marked: bool) {
     let _timed = crate::cpuprof::time(crate::cpuprof::Stage::Readable);
     const SHADER_RESOURCE: u32 = 0x40 | 0x80;
     const UNORDERED_ACCESS: u32 = 0x8;
+    let placing = crate::cpuprof::time(crate::cpuprof::Stage::EntryPlaced);
     let placed = crate::descriptor::host::placed_texture(view);
     // A placed view of memory the GPU writes through another title texture
     // reads that one's host copy.
@@ -1825,11 +1829,13 @@ fn readable(list: &HostList, u: &UsedResource, view: &View, marked: bool) {
     {
         crate::texture::alias_copy(list, a, *b as This);
     }
+    drop(placing);
     let view = placed.as_ref().unwrap_or(view);
     // Buffer views read title memory: their range is copied at submission;
     // what shaders write through unordered access goes back to it after.
     // Constant buffers (raw views) to their copy's end at most; others in
     // the copy their host view reads.
+    let looking = crate::cpuprof::time(crate::cpuprof::Stage::EntryCopyLookup);
     let range = match *view {
         View::Constant(address, size) => crate::shadow::find(address, 1).and_then(|s| {
             let len = u64::from(size).min(s.left(address));
@@ -1837,14 +1843,17 @@ fn readable(list: &HostList, u: &UsedResource, view: &View, marked: bool) {
         }),
         _ => crate::descriptor::host::view_copy(view),
     };
+    drop(looking);
     if let Some((shadow, address, len)) = range
         && len > 0
     {
+        let _deferring = crate::cpuprof::time(crate::cpuprof::Stage::EntryDefer);
         shadow.refresh(list, address, len);
         if u.kind == ResourceType::Uav {
             shadow.gpu_writes(list, address, len, marked);
         }
     }
+    let _texture = crate::cpuprof::time(crate::cpuprof::Stage::EntryTexture);
     match (view, u.kind) {
         (View::Shader(resource, _), ResourceType::Srv) => {
             if let Some(t) = crate::resource::host_resource(*resource as This)
@@ -2723,6 +2732,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         }
         crate::cpuprof::force(false);
     }
+
 
     #[cfg(feature = "diagnostics")]
     #[test]

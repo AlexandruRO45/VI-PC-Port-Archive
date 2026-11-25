@@ -780,10 +780,28 @@ struct Entry {
 }
 
 /// Title buffers by (start address, resource), with their copy once made.
-static BUFFERS: Mutex<BTreeMap<(u64, usize), Entry>> = Mutex::new(BTreeMap::new());
+/// Every table entry a draw binds looks its copy up here: lookups of copies
+/// already made share the lock.
+static BUFFERS: std::sync::RwLock<BTreeMap<(u64, usize), Entry>> = std::sync::RwLock::new(BTreeMap::new());
 
-fn buffers() -> std::sync::MutexGuard<'static, BTreeMap<(u64, usize), Entry>> {
-    BUFFERS.lock().unwrap_or_else(|e| e.into_inner())
+fn buffers() -> std::sync::RwLockWriteGuard<'static, BTreeMap<(u64, usize), Entry>> {
+    let _waiting = crate::cpuprof::time(crate::cpuprof::Stage::BuffersLock);
+    BUFFERS.write().unwrap_or_else(|e| e.into_inner())
+}
+
+fn buffers_read() -> std::sync::RwLockReadGuard<'static, BTreeMap<(u64, usize), Entry>> {
+    let _waiting = crate::cpuprof::time(crate::cpuprof::Stage::BuffersLock);
+    BUFFERS.read().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The innermost of the 64 title buffers starting nearest below `address`
+/// that holds `[address, end)`.
+fn innermost(map: &BTreeMap<(u64, usize), Entry>, address: u64, end: u64) -> Option<((u64, usize), &Entry)> {
+    map.range(..=(address, usize::MAX))
+        .rev()
+        .take(64)
+        .find(|(_, e)| e.end >= end)
+        .map(|(k, e)| (*k, e))
 }
 
 /// Counts copies made and title buffers released: [`all`] may differ when
@@ -822,13 +840,20 @@ pub(crate) fn unregister(resource: usize, start: u64) {
 pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
     crate::cpuprof::count(crate::cpuprof::Count::ShadowFind);
     let end = address.checked_add(len.max(1))?;
+    {
+        let map = buffers_read();
+        match innermost(&map, address, end) {
+            None => {
+                drop(map);
+                return loose(address, end);
+            }
+            Some((_, Entry { shadow: Some(shadow), .. })) => return Some(shadow.clone()),
+            // Its copy is made under the exclusive lock.
+            Some(_) => {}
+        }
+    }
     let mut map = buffers();
-    let key = map
-        .range(..=(address, usize::MAX))
-        .rev()
-        .take(64)
-        .find(|(_, e)| e.end >= end)
-        .map(|(k, _)| *k);
+    let key = innermost(&map, address, end).map(|(k, _)| k);
     let Some(key) = key else {
         drop(map);
         return loose(address, end);
@@ -978,7 +1003,7 @@ fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
 
 /// Every host copy of title memory made so far (buffers and windows).
 pub(crate) fn all() -> Vec<Arc<Shadow>> {
-    let mut all: Vec<Arc<Shadow>> = buffers().values().filter_map(|e| e.shadow.clone()).collect();
+    let mut all: Vec<Arc<Shadow>> = buffers_read().values().filter_map(|e| e.shadow.clone()).collect();
     all.extend(LOOSE.lock().unwrap_or_else(|e| e.into_inner()).values().cloned());
     all
 }

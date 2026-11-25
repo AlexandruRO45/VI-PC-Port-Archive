@@ -26,6 +26,15 @@ pub(crate) enum Stage {
     BindPipeline,
     Tables,
     TableEntries,
+    EntryMirror,
+    MirrorMadeLock,
+    ViewsLock,
+    MirrorMake,
+    EntryPlaced,
+    EntryCopyLookup,
+    BuffersLock,
+    EntryDefer,
+    EntryTexture,
     FreshTables,
     Readable,
     UserData,
@@ -64,6 +73,15 @@ const NAMES: [(&str, u8); STAGES] = [
     ("root signature + pipeline", 2),
     ("tables", 2),
     ("table entries (mirror + readable)", 3),
+    ("entry mirror", 4),
+    ("made-slots lock wait", 5),
+    ("view records lock wait", 5),
+    ("slot descriptors made", 5),
+    ("entry placed texture + alias", 4),
+    ("entry copy lookup", 4),
+    ("buffer copies lock wait", 5),
+    ("entry deferred refresh + gpu write", 4),
+    ("entry texture upload + state", 4),
     ("fresh tables", 3),
     ("readable", 4),
     ("user data", 2),
@@ -99,9 +117,11 @@ pub(crate) enum Count {
     Mirror,
     Barrier,
     Steps,
+    SlotRemade,
+    TableReused,
 }
 
-const COUNTS: usize = Count::Steps as usize + 1;
+const COUNTS: usize = Count::TableReused as usize + 1;
 const COUNT_NAMES: [&str; COUNTS] = [
     "buffer copy lookups",
     "deferred-step locks",
@@ -109,6 +129,8 @@ const COUNT_NAMES: [&str; COUNTS] = [
     "table mirrors",
     "state checks",
     "deferred steps run",
+    "slots remade",
+    "tables reused",
 ];
 
 static NS: [AtomicU64; STAGES] = [const { AtomicU64::new(0) }; STAGES];
@@ -235,7 +257,7 @@ mod tests {
     #[test]
     fn names_cover_every_stage() {
         assert_eq!(NAMES.len(), Stage::VramSync as usize + 1);
-        assert_eq!(COUNT_NAMES.len(), Count::Steps as usize + 1);
+        assert_eq!(COUNT_NAMES.len(), Count::TableReused as usize + 1);
     }
 
     #[test]
