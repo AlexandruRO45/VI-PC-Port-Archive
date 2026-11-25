@@ -4443,6 +4443,19 @@ fn refreshed_under_flights(runs: &[&HostList]) -> Vec<(std::sync::Arc<crate::sha
 /// is taken first (`take_reserve`, [`Host::patch_reserve`]) where a copy in
 /// the card's memory is among those refreshed: without it the short runs
 /// take copies too, and past 512 a settle is due, as before the patches.
+/// Nanoseconds of a submission's preparing, for the log: title bytes put in
+/// under flights, the lists' steps, the flush of their refreshes, the card
+/// copies' sends and compare.
+static PREPARING_NS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// Runs `f`, its time added to part `i` of [`PREPARING_NS`].
+fn timed<T>(i: usize, f: impl FnOnce() -> T) -> T {
+    let started = std::time::Instant::now();
+    let out = f();
+    PREPARING_NS[i].fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    out
+}
+
 fn put_in_under_flights<B>(
     spans: &[(std::sync::Arc<crate::shadow::Shadow>, usize, usize)],
     reserve: &mut Option<B>,
@@ -7598,17 +7611,18 @@ impl Host {
             // may write too, and this submission refreshes it. The flights
             // are settled, and the asking made again: the copy-back wrote
             // title memory, which other copies of it must see.
-            if behind && stale_under_flights(self, runs, &mut reserve) {
+            if behind && timed(0, || stale_under_flights(self, runs, &mut reserve)) {
                 let settling = std::time::Instant::now();
                 self.settle(&mut submitted, WHY_STALE);
                 settled += settling.elapsed();
                 crate::watch::ask_once(&ranges);
             }
-        } else if behind && stale_under_flights(self, runs, &mut reserve) {
+        } else if behind && timed(0, || stale_under_flights(self, runs, &mut reserve)) {
             let settling = std::time::Instant::now();
             self.settle(&mut submitted, WHY_STALE);
             settled += settling.elapsed();
         }
+        let stepping = std::time::Instant::now();
         for list in runs {
             list.run_deferred(&mut batch);
             firsts.push(lists.len());
@@ -7617,7 +7631,8 @@ impl Host {
             }
             lists.push(list.list.cast().ok());
         }
-        batch.flush();
+        PREPARING_NS[1].fetch_add(stepping.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        timed(2, || batch.flush());
         crate::watch::ask_once_end();
         // The snapshots of the ranges shaders may write, if they were left
         // for now (`crate::shadow::wide_back`): the refreshes are done, the
@@ -7642,7 +7657,7 @@ impl Host {
             }
             settled += settling.elapsed();
         }
-        let card = self.card_before(runs, flown, reserve, relay());
+        let card = timed(3, || self.card_before(runs, flown, reserve, relay()));
         if let Some(check) = card.as_ref().and_then(|c| c.check.clone()) {
             lists.push(Some(check));
         }
@@ -9602,6 +9617,10 @@ impl Meter {
                     if join_copies() { "on" } else { "off" }
                 );
             }
+            let [under, steps, flush, card] = [0, 1, 2, 3].map(|i| PREPARING_NS[i].swap(0, Ordering::Relaxed) as f64 / 1e6 / frames);
+            tracing::info!(
+                "preparing per frame, by part: {under:.1} ms putting title bytes in under flights, {steps:.1} the lists' steps, {flush:.1} flushing their refreshes, {card:.1} the card copies' sends and compare"
+            );
             let [through, again, fills, stale] = [0, 1, 2, 3].map(|i| COPY_NO_WAIT[i].swap(0, Ordering::Relaxed) as f64 / frames);
             if through + again + fills + stale > 0.0 {
                 tracing::info!(
