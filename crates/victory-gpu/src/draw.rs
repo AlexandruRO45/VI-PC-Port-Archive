@@ -1435,9 +1435,12 @@ impl State {
         let heap = self.view_heap()?;
         let host = heap.host()?;
         let gpu = host.strides_gpu()?;
-        // One key per list, as textures have: no title resource is there.
-        const ONCE: usize = usize::MAX - 0x5e;
-        if !list.first_use(ONCE) {
+        // One key per list and heap, as textures have: no title resource is
+        // there (the heap's address with every bit flipped is past user
+        // space). A list that binds a second heap runs that heap's pass and
+        // keeps its table too.
+        const ONCE: usize = usize::MAX;
+        if !list.first_use(ONCE ^ std::ptr::from_ref(heap) as usize) {
             return Some(gpu);
         }
         // The list may outlive the title's heap object, which owns the table.

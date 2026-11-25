@@ -372,7 +372,21 @@ fn translate(
             let _ = std::fs::write(std::path::Path::new(dir).join(format!("{name}.{hash}.cdxil")), &bytes[..]);
         }
     }
-    if !lock(seen).insert(code) {
+    // `VICTORY_WAVE_WIDE_ONLY=<hash>,...` names the shaders that may take the wave-wide form,
+    // as in a run, where each container is looked up by its own hash: one named is not a
+    // duplicate of the same code unnamed
+    static WIDE_ONLY: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    let wide_only = WIDE_ONLY.get_or_init(|| {
+        std::env::var("VICTORY_WAVE_WIDE_ONLY")
+            .unwrap_or_default()
+            .split(',')
+            .map(|h| h.trim().to_ascii_lowercase())
+            .filter(|h| h.len() == 16 && h.bytes().all(|b| b.is_ascii_hexdigit()))
+            .collect()
+    });
+    let wide = wide_only.contains(&hash);
+    let key = if wide { blake3::hash(&[code.as_bytes().as_slice(), b"wide"].concat()) } else { code };
+    if !lock(seen).insert(key) {
         t.duplicates += 1;
         if t.list {
             t.lines.push(format!("{}  duplicate", example()));
@@ -387,18 +401,7 @@ fn translate(
     // has them (`.cdxil`), to work on a translator gap offline
     let dump = std::env::var_os("VICTORY_FAIL_DUMP");
     let before: Option<BTreeMap<String, usize>> = dump.as_ref().map(|_| t.failed.iter().map(|(k, v)| (k.clone(), v.0)).collect());
-    // `VICTORY_WAVE_WIDE_ONLY=<hash>,...` names the shaders that may take the wave-wide form,
-    // as in a run
-    static WIDE_ONLY: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
-    let wide_only = WIDE_ONLY.get_or_init(|| {
-        std::env::var("VICTORY_WAVE_WIDE_ONLY")
-            .unwrap_or_default()
-            .split(',')
-            .map(|h| h.trim().to_ascii_lowercase())
-            .filter(|h| h.len() == 16 && h.bytes().all(|b| b.is_ascii_hexdigit()))
-            .collect()
-    });
-    if wide_only.contains(&hash) {
+    if wide {
         victory_shader::emit::with_wave_wide(|| translate_programs(&container, programs, &example, t, checks));
     } else {
         translate_programs(&container, programs, &example, t, checks);

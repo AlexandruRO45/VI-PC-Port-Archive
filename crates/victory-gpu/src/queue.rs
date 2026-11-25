@@ -316,6 +316,10 @@ pub(crate) fn release_held(all: bool) {
         return;
     }
     let _one = lock(&RELEASING);
+    // What was held and now ran may have written into fences too (its
+    // bottom-of-pipe writes, run at once without `late`): their events are
+    // looked at again once nothing more moves.
+    let mut ran_any = false;
     loop {
         let queues = lock(&WAITING).clone();
         let mut moved = false;
@@ -423,6 +427,10 @@ pub(crate) fn release_held(all: bool) {
         if !moved {
             break;
         }
+        ran_any = true;
+    }
+    if ran_any {
+        crate::fence::wake_reached();
     }
 }
 

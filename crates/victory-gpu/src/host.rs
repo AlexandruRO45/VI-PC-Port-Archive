@@ -282,16 +282,13 @@ pub(crate) fn log_removal_context() {
     tracing::error!("when the host device went: {}", removal_context());
 }
 
-/// Time spent in submissions since the last frame-rate line, in
-/// microseconds: preparing them on the CPU (title memory copies, texture
-/// detiling), then waiting for the GPU.
 /// Since the last frame line, microseconds of the submitting thread's
 /// preparing ([`SUBMISSION_US`] 0) by phase: the submission's one
 /// write-watch asking, the title's bytes put in under flights, the lists'
-/// deferred steps (the frame line's copies are part of these), their state
-/// preludes, the last refreshes, the snapshots of shader-written ranges,
-/// and the copies in the card's memory (what goes up, the compare). Settles
-/// inside a phase are not its time.
+/// deferred steps, their state preludes, the last refreshes, the snapshots
+/// of shader-written ranges, and the copies in the card's memory (what goes
+/// up, the compare). The frame line's copies fall in the deferred steps and
+/// the last refreshes. Settles inside a phase are not its time.
 static PREPARE_SPLIT: [std::sync::atomic::AtomicU64; 7] = [const { std::sync::atomic::AtomicU64::new(0) }; 7];
 const PREPARE_ASK: usize = 0;
 const PREPARE_MERGE: usize = 1;
@@ -301,6 +298,9 @@ const PREPARE_FLUSH: usize = 4;
 const PREPARE_SNAPSHOTS: usize = 5;
 const PREPARE_CARD: usize = 6;
 
+/// Time spent in submissions since the last frame-rate line, in
+/// microseconds: preparing them on the CPU (title memory copies, texture
+/// detiling), then waiting for the GPU.
 static SUBMISSION_US: [std::sync::atomic::AtomicU64; 2] =
     [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
 
@@ -9739,7 +9739,7 @@ impl Meter {
             let rest = cpu - p.iter().sum::<f64>();
             tracing::info!(
                 "preparing per frame by phase: write-watch asking {:.1} ms, title bytes put in under flights {:.1} ms, \
-                 the lists' deferred steps {:.1} ms (copies {copy_ms:.1} ms of them), state preludes {:.1} ms, last refreshes \
+                 the lists' deferred steps {:.1} ms (copies and refreshes, here and in the last refreshes, {copy_ms:.1} ms), state preludes {:.1} ms, last refreshes \
                  {:.1} ms, snapshots {:.1} ms, copies in the card's memory {:.1} ms; the rest {rest:.1} ms",
                 p[PREPARE_ASK],
                 p[PREPARE_MERGE],
