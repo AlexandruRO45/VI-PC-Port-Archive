@@ -412,12 +412,25 @@ fn protect(g: &mut Guards, pages: &[usize]) -> Vec<usize> {
         // SAFETY: title memory; only its protection changes.
         unsafe { VirtualProtect((from * PAGE) as *const _, (to - from) * PAGE, PAGE_READONLY, &mut old) != 0 }
     };
+    // Nothing committed anywhere in the page (not just at its start: a page
+    // committed in part cannot be guarded, but its committed part takes
+    // writes).
     let unmapped = |page: usize| {
-        // SAFETY: plain data filled in by the query.
-        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-        // SAFETY: a valid out pointer of the right size.
-        let n = unsafe { VirtualQuery((page * PAGE) as *const _, &mut info, size_of_val(&info)) };
-        n == 0 || info.State != MEM_COMMIT
+        let (mut at, end) = (page * PAGE, (page + 1) * PAGE);
+        while at < end {
+            // SAFETY: plain data filled in by the query.
+            let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+            // SAFETY: a valid out pointer of the right size.
+            let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+            if n == 0 {
+                return true;
+            }
+            if info.State == MEM_COMMIT {
+                return false;
+            }
+            at = (info.BaseAddress as usize + info.RegionSize).max(at + 1);
+        }
+        true
     };
     let mut taken = Vec::with_capacity(pages.len());
     let busy = |page: usize| g.busy.iter().any(|&(a, b)| (a..b).contains(&page));
@@ -721,6 +734,27 @@ pub(crate) mod tests {
         assert!(t.take(p, p + 3 * PAGE).is_empty());
         drop(t);
         free(p);
+    }
+
+    /// A page committed only in part (its first 4 KiB reserved) cannot be
+    /// guarded, and is not "nothing mapped" either: it stays changed, so
+    /// writes to its committed part are not missed.
+    #[test]
+    fn a_page_committed_in_part_stays_changed() {
+        // SAFETY: a reservation of ours, freed below; its tail committed.
+        let r = unsafe { VirtualAlloc(std::ptr::null(), PAGE, MEM_RESERVE, PAGE_READWRITE) } as usize;
+        assert!(r != 0 && r.is_multiple_of(PAGE));
+        // SAFETY: inside the reservation.
+        let tail = unsafe { VirtualAlloc((r + 4096) as *const _, PAGE - 4096, MEM_COMMIT, PAGE_READWRITE) };
+        assert_ne!(tail as usize, 0);
+        let t = track(r, PAGE, true).expect("reserved memory is tracked");
+        assert_eq!(t.take(r, r + PAGE), [(r, r + PAGE)], "copied");
+        assert!(t.changed(r / PAGE), "cannot be guarded, so still changed");
+        // SAFETY: committed, writable memory of ours.
+        unsafe { ((r + 8192) as *mut u8).write_volatile(1) };
+        assert_eq!(t.take(r, r + PAGE), [(r, r + PAGE)], "copied again");
+        drop(t);
+        free(r);
     }
 
     /// Plain committed memory (the C heap) is not tracked; reserved memory
