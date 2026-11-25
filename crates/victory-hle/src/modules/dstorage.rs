@@ -325,6 +325,8 @@ struct Scheduler {
     work: Condvar,
     /// A request finished (for full queues and `close`).
     finished: Condvar,
+    /// Whether the first attempt to start the pool started any workers.
+    started: OnceLock<bool>,
 }
 
 /// Priority weights per class (low, normal, high and real-time), as the
@@ -394,47 +396,54 @@ unsafe impl Send for Job {}
 /// The scheduler, with its workers started on first use; `None` if not
 /// even one worker could start.
 fn scheduler() -> Option<&'static Scheduler> {
-    static SCHEDULER: OnceLock<Option<Scheduler>> = OnceLock::new();
-    static STARTED: std::sync::Once = std::sync::Once::new();
-    let scheduler = SCHEDULER
-        .get_or_init(|| {
-            Some(Scheduler {
-                lanes: Mutex::new(Lanes {
-                    lanes: HashMap::new(),
-                    next_id: 0,
-                    next_seq: 0,
-                    staged: 0,
-                    staging: STAGING,
-                    starved: false,
-                    clock: [0; 3],
-                    now: 0,
-                    lane_now: [0; 3],
-                    done: Default::default(),
-                    refused: 0,
-                    bcpack: Default::default(),
-                    since: None,
-                }),
-                work: Condvar::new(),
-                finished: Condvar::new(),
-            })
-        })
-        .as_ref()?;
-    STARTED.call_once(|| {
+    static SCHEDULER: OnceLock<Scheduler> = OnceLock::new();
+    let scheduler = SCHEDULER.get_or_init(Scheduler::new);
+    scheduler.start_workers(|| {
         let workers = std::thread::available_parallelism().map_or(4, |n| n.get());
-        let started = (0..workers)
+        (0..workers)
             .filter(|i| {
                 std::thread::Builder::new()
                     .name(format!("dstorage {i}"))
                     .spawn(|| work(scheduler))
                     .is_ok()
             })
-            .count();
-        tracing::info!(workers = started, "dstorage: workers");
-    });
-    Some(scheduler)
+            .count()
+    })
 }
 
 impl Scheduler {
+    fn new() -> Self {
+        Self {
+            lanes: Mutex::new(Lanes {
+                lanes: HashMap::new(),
+                next_id: 0,
+                next_seq: 0,
+                staged: 0,
+                staging: STAGING,
+                starved: false,
+                clock: [0; 3],
+                now: 0,
+                lane_now: [0; 3],
+                done: Default::default(),
+                refused: 0,
+                bcpack: Default::default(),
+                since: None,
+            }),
+            work: Condvar::new(),
+            finished: Condvar::new(),
+            started: OnceLock::new(),
+        }
+    }
+
+    fn start_workers(&self, spawn: impl FnOnce() -> usize) -> Option<&Self> {
+        let started = *self.started.get_or_init(|| {
+            let workers = spawn();
+            tracing::info!(workers, "dstorage: workers");
+            workers > 0
+        });
+        started.then_some(self)
+    }
+
     fn lock(&self) -> MutexGuard<'_, Lanes> {
         self.lanes.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -1141,6 +1150,25 @@ mod tests {
 
     fn pattern(n: usize) -> Vec<u8> {
         (0..n).map(|i| (i * 7 + i / 251) as u8).collect()
+    }
+
+    #[test]
+    fn worker_pool_stays_unavailable_if_all_starts_fail() {
+        let scheduler = Scheduler::new();
+        assert!(scheduler.start_workers(|| 0).is_none());
+        let started = scheduler.start_workers(|| panic!("pool startup retried"));
+        assert!(started.is_none());
+    }
+
+    #[test]
+    fn worker_pool_stays_available_with_one_of_three_workers() {
+        let scheduler = Scheduler::new();
+        let attempts = [false, true, false];
+        let spawn = || attempts.into_iter().filter(|&started| started).count();
+        let started = scheduler.start_workers(spawn);
+        assert!(std::ptr::eq(started.unwrap(), &scheduler));
+        let started = scheduler.start_workers(|| panic!("pool startup retried"));
+        assert!(std::ptr::eq(started.unwrap(), &scheduler));
     }
 
     #[test]
