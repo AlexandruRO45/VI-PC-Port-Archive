@@ -550,8 +550,15 @@ impl TextureQueue {
         self.cancel_recheck(check.index);
         check.checks += 1;
         if changed {
+            // Queued as a write the title made now, the newest, which the
+            // next pass serves first. Under the write of its view it sat
+            // in the middle of the backlog, past the oldest and the newest
+            // writes a pass serves, until the backlog drained to it; and a
+            // pass still at work on the old write could take it out. The
+            // checks already spent carry over.
+            self.writes += 1;
             self.slots.insert(check.index, Waiting {
-                due: frame, written: frame, write: check.write, looks: 0, mapped: 0, checks: check.checks,
+                due: frame, written: frame, write: self.writes, looks: 0, mapped: 0, checks: check.checks,
             });
         } else {
             self.schedule_recheck(check, now);
@@ -2551,19 +2558,59 @@ mod tests {
         let mut queue = TextureQueue::default();
         let mut now = Instant::now();
         queue.written(7, 0, 0, false);
-        let write = queue.due(0, 1).0[0].1;
+        let mut write = queue.due(0, 1).0[0].1;
         queue.uploaded(7, write, (0x10000, 4096), 1, now);
         for (step, ms) in TEXTURE_CHECK_MS.into_iter().enumerate() {
             let frame = step as u64 + 1;
             now += Duration::from_millis(ms);
             let check = queue.due_rechecks(frame, now, 1)[0];
             assert!(queue.finish_recheck(check, true, frame, now));
-            assert_eq!(queue.due(frame, 1).0, [(7, write)]);
+            // Handed out again as a newer write, with the checks spent.
+            let (index, again) = queue.due(frame, 1).0[0];
+            assert_eq!(index, 7);
+            assert!(again > write);
+            write = again;
             queue.uploaded(7, write, (0x10000, 4096), frame + 1, now);
         }
         assert!(queue.rechecks.is_empty());
         assert!(queue.deadlines.is_empty());
         assert!(queue.slots.is_empty());
+    }
+
+    /// A texture a content check finds changed is handed to the next pass
+    /// first, as a write of the title that just happened. Under the write
+    /// number of its view it waited in the middle of the backlog: a pass
+    /// is handed the oldest and the newest writes, 2,048 of each at most.
+    #[test]
+    fn a_texture_found_changed_by_a_content_check_is_uploaded_next() {
+        let mut queue = TextureQueue::default();
+        let now = Instant::now();
+        // 3,000 slots wait. Slot 7, written after them, is served alone
+        // and uploaded whole; 3,000 more are written before its check.
+        for index in 1000..4000 {
+            queue.written(index, 1, 1, false);
+        }
+        queue.written(7, 1, 1, false);
+        let (ready, _) = queue.due(1, 1);
+        let (index, write) = ready[0];
+        assert_eq!((ready.len(), index), (1, 7));
+        queue.uploaded(7, write, (0x10000, 4096), 123, now);
+        for index in 4000..7000 {
+            queue.written(index, 2, 2, false);
+        }
+        // The check finds its memory changed.
+        let at = now + Duration::from_millis(TEXTURE_CHECK_MS[0]);
+        let check = queue.due_rechecks(3, at, 1)[0];
+        assert_eq!(check.index, 7);
+        assert!(queue.finish_recheck(check, true, 3, at));
+        let (ready, counts) = queue.due(3, 4096);
+        assert_eq!((ready.len(), counts[1]), (4096, 6001));
+        let position = ready.iter().position(|&(index, _)| index == 7);
+        let newer = queue.slots.values().filter(|w| w.write > queue.slots[&7].write).count();
+        assert_eq!(position, Some(0), "slot 7, with {newer} newer writes due, handed out at {position:?}");
+        // What a pass still at work on the old write says then changes nothing.
+        queue.done(7, write);
+        assert_eq!(queue.due(3, 1).0[0].0, 7);
     }
 
     /// The upload queue serves retries first, then alternates the newest and oldest writes.
