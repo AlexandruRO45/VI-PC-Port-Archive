@@ -118,7 +118,22 @@ const WRITES_RESIDENT: u8 = 2;
 const SLOT_ELSEWHERE: u8 = 4;
 
 fn touched(what: u8) {
-    TOUCHED.set(TOUCHED.get() | what);
+    if draw_probes() {
+        TOUCHED.set(TOUCHED.get() | what);
+    }
+}
+
+/// Whether the draw-time probes run: the `+R`/`+W`/`+S` tags, the check
+/// of every bound slot against its view's copy (a lock per view), and the
+/// views of the pipelines in `VICTORY_PROBE_PIPELINES`. Off unless
+/// `VICTORY_DRAW_PROBES=1` or `VICTORY_PROBE_PIPELINES` names pipelines:
+/// they cost draw time. Off, the residents' line counts no slots.
+pub(crate) fn draw_probes() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("VICTORY_DRAW_PROBES").is_some_and(|v| v == "1")
+            || std::env::var_os("VICTORY_PROBE_PIPELINES").is_some_and(|v| !v.is_empty())
+    })
 }
 
 /// A command's note with its first word tagged by what the draw's views
@@ -1066,7 +1081,7 @@ impl State {
             let t = stage.translated();
             // What this stage declares written, by its narrowest store.
             let _writer = crate::shadow::writer(t.width);
-            PROBE.set(probed(&p.name));
+            PROBE.set(draw_probes() && probed(&p.name));
             if PROBE.get() {
                 PIPELINE_NAME.with(|n| *n.borrow_mut() = p.name.clone());
                 static SAID: std::sync::Mutex<Option<std::collections::HashSet<String>>> = std::sync::Mutex::new(None);
@@ -2555,6 +2570,7 @@ impl State {
             // a slot that shows another buffer than the one brought up to
             // date for it.
             if let Some(copy) = copy
+                && draw_probes()
                 && crate::resident::on()
                 && host.shows(index, &copy.buffer) == Some(false)
             {
