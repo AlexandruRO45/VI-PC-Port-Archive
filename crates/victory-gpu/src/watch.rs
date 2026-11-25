@@ -985,7 +985,15 @@ mod tests {
         JOURNAL.lock().unwrap().written.insert(page, title_write);
         assert!(!writable(view + 100), "guarded");
         let bytes = *b"through our own";
-        let (now, pages) = crate::host::write_unseen(view + 100, bytes.as_ptr(), bytes.len()).expect("written");
+        // Another test may be remapping (the write then waits for the next try).
+        let started = std::time::Instant::now();
+        let (now, pages) = loop {
+            if let Some(done) = crate::host::write_unseen(view + 100, bytes.as_ptr(), bytes.len()) {
+                break done;
+            }
+            assert!(started.elapsed().as_secs() < 5, "never written");
+            std::thread::yield_now();
+        };
         // SAFETY: our view.
         let landed = unsafe { std::slice::from_raw_parts((view + 100) as *const u8, bytes.len()) };
         assert_eq!(landed, &bytes);
