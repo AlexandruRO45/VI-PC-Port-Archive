@@ -61,6 +61,13 @@ pub fn is_spilled(native: &NativeProgram) -> bool {
     spilled(native).is_some()
 }
 
+/// `native` with its EXEC masked on entry by the dispatch's thread count
+/// ([`crate::emit::USER_DISPATCH_THREADS_X`]), for a host of 32-lane waves.
+/// shortcut: not done yet: the program comes back unchanged.
+pub fn thread_limited(native: NativeProgram) -> NativeProgram {
+    native
+}
+
 /// Rewrites the loads of `native`'s spilled user-data table in `p`; returns
 /// how many loads it replaced. Nothing changes unless the program is a
 /// compute program whose layout has entries past its user SGPRs, the first
