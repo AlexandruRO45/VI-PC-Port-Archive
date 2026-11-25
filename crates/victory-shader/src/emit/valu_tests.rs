@@ -981,6 +981,34 @@ fn v_cvt_f16_u16_and_i16_widen_the_integer_first() {
 }
 
 #[test]
+fn v_cvt_f32_ubyte_converts_each_byte() {
+    // v_cvt_f32_ubyte{0,1,2,3} v0, v1 (VOP1 0x11..0x14): byte n of the source,
+    // as an unsigned integer, converted to f32.
+    let values = [
+        0u32,
+        0xFF,
+        0x0102_0304,
+        0x8070_6050,
+        0xFFFF_FFFF,
+        0x00FF_00FF,
+    ];
+    let cases: Vec<[u32; 4]> = values.iter().map(|&v| [v, 0, 0, 0]).collect();
+    for byte in 0..4u16 {
+        let shader = build_valu_cs(&[vop1(0x11 + byte, 0, vgpr(1))]);
+        run_cases(&shader, &cases, |backend, _, inp, got| {
+            let want = ((inp[0] >> (8 * byte)) & 0xFF) as f32;
+            assert_eq!(
+                got,
+                want.to_bits(),
+                "{backend}: v_cvt_f32_ubyte{byte}({:#010x}) = {got:#010x}, want {:#010x}",
+                inp[0],
+                want.to_bits(),
+            );
+        });
+    }
+}
+
+#[test]
 fn v_sin_and_v_cos_f16_reduce_large_turns() {
     let sin_shader = build_valu_cs(&[vop1(0x060, 0, vgpr(1))]);
     let cos_shader = build_valu_cs(&[vop1(0x061, 0, vgpr(1))]);
