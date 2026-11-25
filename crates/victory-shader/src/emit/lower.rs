@@ -6,7 +6,8 @@
 //! emitter cannot express is `Missing` with a reason, and only fails the
 //! program when something with an effect (an export, a branch) needs it.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
+use crate::hash::{HashMap, HashSet};
 
 use super::UserData;
 use super::bitcode::{Attr, Bin, Cast, Term, V, pred};
@@ -86,7 +87,7 @@ enum Stop {
 }
 
 pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
-    let mut bad = HashMap::new();
+    let mut bad = HashMap::default();
     loop {
         match Lower::new(parts, &bad).run() {
             Ok(l) => return Ok(l),
@@ -442,7 +443,7 @@ fn half_outputs(io: &StageIo) -> HashMap<u8, bool> {
     let entries = match io {
         StageIo::Vs { outputs, .. } => outputs,
         StageIo::Ms(ms) => &ms.outputs,
-        _ => return HashMap::new(),
+        _ => return HashMap::default(),
     };
     entries
         .iter()
@@ -470,7 +471,7 @@ fn smem_dwords(name: &str) -> Option<u32> {
 impl<'a> Lower<'a> {
     fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>) -> Self {
         let p = x.p;
-        let mut phi_at = HashMap::new();
+        let mut phi_at = HashMap::default();
         for (b, block) in p.blocks.iter().enumerate() {
             for (i, phi) in block.phis.iter().enumerate() {
                 phi_at.insert(phi.value, (b, i));
@@ -531,7 +532,7 @@ impl<'a> Lower<'a> {
                 s.wave_size = Some(wave);
             }
         }
-        let mut no_barrier = HashSet::new();
+        let mut no_barrier = HashSet::default();
         if let StageIo::Ms(ms) = &x.native.io {
             s.prims = x.prims.clone();
             s.threads = Some([ms.threads, 1, 1]);
@@ -580,23 +581,23 @@ impl<'a> Lower<'a> {
             s,
             x,
             bad,
-            lane_fail: HashMap::new(),
-            vals: HashMap::new(),
-            floats: HashMap::new(),
-            low16: HashMap::new(),
+            lane_fail: HashMap::default(),
+            vals: HashMap::default(),
+            floats: HashMap::default(),
+            low16: HashMap::default(),
             block: vec![None; p.blocks.len()],
             cur: 0,
-            bools: HashMap::new(),
-            lane_bits: HashMap::new(),
+            bools: HashMap::default(),
+            lane_bits: HashMap::default(),
             phi_at,
-            mask_phis: HashMap::new(),
+            mask_phis: HashMap::default(),
             pending_masks: Vec::new(),
             data_phis: Vec::new(),
-            read_phis: HashSet::new(),
+            read_phis: HashSet::default(),
             params: x.res.params.iter().map(|&(v, p, d)| (v, (p, d))).collect(),
             user_data: None,
             user_reads: BTreeMap::new(),
-            root_views: HashMap::new(),
+            root_views: HashMap::default(),
             samplers: Vec::new(),
             descriptors: x
                 .res
@@ -607,8 +608,8 @@ impl<'a> Lower<'a> {
             scalar: x.res.scalar.iter().copied().collect(),
             exports: x.io.exports.iter().map(|e| (e.site, e)).collect(),
             interps: x.io.interps.iter().map(|(s, i)| (*s, i)).collect(),
-            handles: HashMap::new(),
-            edges: HashMap::new(),
+            handles: HashMap::default(),
+            edges: HashMap::default(),
             exported: vec![false; p.blocks.len()],
             rpo: vec![usize::MAX; p.blocks.len()],
             tail: vec![None; p.blocks.len()],
@@ -628,8 +629,8 @@ impl<'a> Lower<'a> {
                 _ => MaskData::None,
             },
             mask_ok: false,
-            ballots: HashMap::new(),
-            balloting: HashSet::new(),
+            ballots: HashMap::default(),
+            balloting: HashSet::default(),
             def_block: p
                 .blocks
                 .iter()
@@ -643,10 +644,10 @@ impl<'a> Lower<'a> {
                 })
                 .collect(),
             cur_ir: 0,
-            sections: HashMap::new(),
-            section_out: HashSet::new(),
+            sections: HashMap::default(),
+            section_out: HashSet::default(),
             code_table: None,
-            counters: HashMap::new(),
+            counters: HashMap::default(),
             abort: None,
             round16: round16(p),
             mode16: Some(0),
@@ -1002,7 +1003,7 @@ impl<'a> Lower<'a> {
     /// Finds the whole-wave sections and the values they leave.
     fn find_sections(&mut self) {
         let p = self.x.p;
-        let mut inside: HashMap<Value, (usize, usize, usize)> = HashMap::new();
+        let mut inside: HashMap<Value, (usize, usize, usize)> = HashMap::default();
         for b in 0..p.blocks.len() {
             let found = super::wave::sections(p, b);
             for (&start, sec) in &found {
@@ -3949,7 +3950,7 @@ impl<'a> Lower<'a> {
             }
             _ => None,
         };
-        let mut rows: HashMap<u32, V> = HashMap::new();
+        let mut rows: HashMap<u32, V> = HashMap::default();
         for k in 0..count {
             let x = match constant {
                 Some(base) => {
@@ -8401,7 +8402,7 @@ impl<'a> Lower<'a> {
             return Err("a gather of several channels");
         }
         let mip_filter = bits(w2, 26, 2) != 0;
-        if mip_filter && self.whole(lod, &mut HashSet::new()) != Some(true) {
+        if mip_filter && self.whole(lod, &mut HashSet::default()) != Some(true) {
             return Err("a gather at a level that may not be whole");
         }
         let c = self.cur;
@@ -9534,11 +9535,11 @@ impl<'a> Lower<'a> {
         let p = self.x.p;
         let st = self.x.st;
         // Values computed from the stale one on some path followed.
-        let mut tainted = HashSet::new();
-        let mut work = vec![(b, n, HashMap::new(), BTreeSet::from([reg]))];
+        let mut tainted = HashSet::default();
+        let mut work = vec![(b, n, HashMap::default(), BTreeSet::from([reg]))];
         // Per block reached and registers holding tainted values on entry:
         // the phi values known there, over the paths so far.
-        let mut at: HashMap<(usize, BTreeSet<Reg>), HashMap<Value, u32>> = HashMap::new();
+        let mut at: HashMap<(usize, BTreeSet<Reg>), HashMap<Value, u32>> = HashMap::default();
         let mut visits = 0;
         while let Some((b, n, mut env, mut regs)) = work.pop() {
             let block = &p.blocks[b];
@@ -9624,7 +9625,7 @@ impl<'a> Lower<'a> {
                     taken,
                     not_taken,
                 } => {
-                    let (no, yes) = self.can_be(when, &env, &mut HashMap::new());
+                    let (no, yes) = self.can_be(when, &env, &mut HashMap::default());
                     !(no && yes && self.touches(when, &env, &tainted))
                         && (!yes || go(taken, env.clone(), regs.clone()))
                         && (!no || go(not_taken, env, regs))
@@ -9641,7 +9642,7 @@ impl<'a> Lower<'a> {
     /// of a `tainted` value.
     fn touches(&self, b: Bool, env: &HashMap<Value, u32>, tainted: &HashSet<Value>) -> bool {
         let mut stack = vec![b];
-        let mut seen = HashSet::new();
+        let mut seen = HashSet::default();
         while let Some(b) = stack.pop() {
             let Some((atom, lo, hi)) = self.x.st.bools.node(b) else {
                 continue;
@@ -9795,8 +9796,8 @@ impl<'a> Lower<'a> {
         let (p, st) = (self.x.p, &self.x.st);
         let mut work: Vec<(Value, Vec<(Bool, bool)>)> =
             self.read_phis.iter().map(|&v| (v, Vec::new())).collect();
-        let mut live = HashSet::new();
-        let mut seen = HashMap::<Value, Vec<Vec<(Bool, bool)>>>::new();
+        let mut live = HashSet::default();
+        let mut seen = HashMap::<Value, Vec<Vec<(Bool, bool)>>>::default();
         while let Some((v, known)) = work.pop() {
             let Some(&(b, i)) = self.phi_at.get(&v) else {
                 continue;
