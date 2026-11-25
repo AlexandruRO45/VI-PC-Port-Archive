@@ -620,8 +620,8 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
     let px = |x: usize, y: usize, n: usize| &rows[y * pitch + x * n..][..n];
     let u16_at = |b: &[u8], i: usize| u16::from_le_bytes([b[2 * i], b[2 * i + 1]]);
     let u32_at = |b: &[u8], i: usize| u32::from_le_bytes(b[4 * i..4 * i + 4].try_into().unwrap_or([0; 4]));
-    let half_at = |b: &[u8], i| f64::from(half(u16_at(b, i)));
-    let float_at = |b: &[u8], i| f64::from(f32::from_bits(u32_at(b, i)));
+    let half_at = move |b: &[u8], i| f64::from(half(u16_at(b, i)));
+    let float_at = move |b: &[u8], i| f64::from(f32::from_bits(u32_at(b, i)));
     // Keep all 32-bit integers exact through the range calculation.
     type Decode = Box<dyn Fn(&[u8]) -> [f64; 3]>;
     let (n, decode): (usize, Decode) = match format {
