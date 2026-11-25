@@ -806,6 +806,38 @@ mod relay_tests {
     }
 }
 
+/// The parts of a snapshot range not already covered by earlier declarations.
+/// Reuse the two temporary vectors throughout the subtraction instead of
+/// allocating a fresh vector for every declaration. Keep the exact previous
+/// order and split boundaries, including empty intervals.
+fn snapshot_parts(
+    range: (usize, usize),
+    covered: impl IntoIterator<Item = (usize, usize)>,
+) -> Vec<(usize, usize)> {
+    let mut parts = vec![range];
+    let mut rest = Vec::new();
+    for (a, e) in covered {
+        if parts.is_empty() {
+            break;
+        }
+        rest.clear();
+        for &(from, to) in &parts {
+            if e <= from || a >= to {
+                rest.push((from, to));
+                continue;
+            }
+            if from < a {
+                rest.push((from, a));
+            }
+            if e < to {
+                rest.push((e, to));
+            }
+        }
+        std::mem::swap(&mut parts, &mut rest);
+    }
+    parts
+}
+
 /// Snapshot memory kept for reuse (already touched, so no page faults).
 static POOL: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
 
@@ -876,6 +908,53 @@ fn last_difference(a: &[u8], b: &[u8]) -> Option<usize> {
         .zip(&b[word..word + 8])
         .rposition(|(x, y)| x != y)
         .map(|i| word + i)
+}
+
+#[cfg(test)]
+mod snapshot_parts_tests {
+    use super::snapshot_parts;
+
+    #[test]
+    fn snapshot_parts_preserve_exact_splits_and_order() {
+        assert_eq!(snapshot_parts((0, 100), [(20, 30), (70, 80), (25, 75)]), [(0, 20), (80, 100)]);
+        assert_eq!(snapshot_parts((0, 100), [(40, 40)]), [(0, 40), (40, 100)]);
+        assert_eq!(snapshot_parts((0, 100), [(0, 100), (20, 40)]), []);
+        assert_eq!(snapshot_parts((10, 10), []), [(10, 10)]);
+    }
+
+    #[test]
+    fn snapshot_parts_match_previous_subtraction() {
+        // Reference implementation allocates a fresh vector each round.
+        fn reference(range: (usize, usize), covered: &[(usize, usize)]) -> Vec<(usize, usize)> {
+            let mut parts = vec![range];
+            for &(a, e) in covered {
+                let mut rest = Vec::with_capacity(parts.len() + 1);
+                for (from, to) in parts {
+                    if e <= from || a >= to {
+                        rest.push((from, to));
+                    } else {
+                        if from < a {
+                            rest.push((from, a));
+                        }
+                        if e < to {
+                            rest.push((e, to));
+                        }
+                    }
+                }
+                parts = rest;
+            }
+            parts
+        }
+        let intervals: Vec<_> = (0..8).flat_map(|a| (a..8).map(move |b| (a, b))).collect();
+        for &range in &intervals {
+            for &first in &intervals {
+                for &second in &intervals {
+                    let covered = [first, second];
+                    assert_eq!(snapshot_parts(range, covered), reference(range, &covered));
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1785,24 +1864,10 @@ impl Shadow {
         // The parts no declared range holds yet: their bytes are taken now,
         // just after the range's refresh (a part declared earlier has not
         // been refreshed since, and keeps the bytes taken then).
-        let mut parts = vec![self.inside(address, len)];
-        for &(a, e) in pending.iter() {
-            let (a, e) = self.inside(a, e - a);
-            let mut rest = Vec::with_capacity(parts.len() + 1);
-            for (from, to) in parts {
-                if e <= from || a >= to {
-                    rest.push((from, to));
-                    continue;
-                }
-                if from < a {
-                    rest.push((from, a));
-                }
-                if e < to {
-                    rest.push((e, to));
-                }
-            }
-            parts = rest;
-        }
+        let parts = snapshot_parts(
+            self.inside(address, len),
+            pending.iter().map(|&(a, e)| self.inside(a, e - a)),
+        );
         pending.push(range);
         let taken: usize = parts.iter().map(|&(from, to)| to.saturating_sub(from)).sum();
         BACK_CLASS[usize::from(!self.window)].fetch_add(taken as u64, Ordering::Relaxed);
