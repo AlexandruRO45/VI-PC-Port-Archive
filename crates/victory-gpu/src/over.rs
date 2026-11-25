@@ -394,7 +394,10 @@ void stretch(uint3 id : SV_DispatchThreadID) {
     float3 amp = sqrt(saturate(min(mn, 2.0 - mx) / max(mx, 1e-4)));
     float3 lobe = amp * (-1.0 / lerp(8.0, 5.0, SHARP));
     float3 o = (c + (n + s + w + e) * lobe) / (1.0 + 4.0 * lobe);
-    target[id.xy] = float4(itm(saturate(o)), cr.a);
+    // Never brighter than the brightest neighbour: back in HDR a value near
+    // 1 here would be a speck many times brighter than anything around it.
+    o = clamp(o, 0.0, mx);
+    target[id.xy] = float4(itm(o), cr.a);
 }
 "#;
 
