@@ -65,6 +65,12 @@ pub(crate) struct State {
     /// Bound render target and depth resources, for their host states.
     targets: Vec<usize>,
     depth: usize,
+    #[cfg(feature = "diagnostics")]
+    hdr_targets: Vec<hdr_trace::Target>,
+    #[cfg(feature = "diagnostics")]
+    hdr_bindings: Vec<hdr_trace::Binding>,
+    #[cfg(feature = "diagnostics")]
+    hdr_program: Option<hdr_trace::Program>,
     /// The title's primitive topology (the host's may differ).
     topology: u32,
     /// What the host list has: pipeline, root signature, heaps.
@@ -291,6 +297,8 @@ impl State {
             return;
         };
         self.targets.clear();
+        #[cfg(feature = "diagnostics")]
+        if hdr_trace::enabled() { self.hdr_targets.clear(); }
         let mut rtvs = Vec::new();
         for &h in handles {
             let Some(record) = crate::descriptor::rtv_record(h) else {
@@ -306,7 +314,12 @@ impl State {
             self.targets.push(record.resource as usize);
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(list, record.resource);
-            rtvs.push(host.rtv(texture, record.desc().as_ref()));
+            let desc = record.desc();
+            rtvs.push(host.rtv(texture, desc.as_ref()));
+            #[cfg(feature = "diagnostics")]
+            if hdr_trace::enabled() {
+                self.hdr_targets.push(hdr_trace::Target::rtv(record.resource, texture, desc.as_ref()));
+            }
         }
         self.depth = 0;
         let dsv = crate::descriptor::dsv_record(depth).and_then(|record| {
@@ -532,9 +545,22 @@ impl State {
             }
             crate::bindless::note_draw(writes);
         }
+        #[cfg(feature = "diagnostics")]
+        if hdr_trace::enabled() {
+            self.hdr_bindings.clear();
+            self.hdr_program = None;
+        }
         for stage in &p.stages {
             let t = stage.translated();
             let made = self.tables(list, &t.used, title_compute);
+            #[cfg(feature = "diagnostics")]
+            if hdr_trace::active_frame().is_some()
+                && let Some(program) = hdr_trace::Program::from_hash(&stage.shader.hash)
+                && let Some(made) = &made
+            {
+                self.hdr_program = Some(program);
+                self.hdr_views(program, &t.used, title_compute, made);
+            }
             // A depth copy of ours made readable a texture the tables hold
             // (`crate::twin`), with a compute pipeline: this one's again
             // (root arguments are set below).
@@ -867,11 +893,15 @@ impl State {
         #[cfg(feature = "diagnostics")]
         self.probe_small(list, true);
         #[cfg(feature = "diagnostics")]
+        let hdr = self.hdr_before(list, format_args!("dispatch {x}x{y}x{z}"), x != 0 && y != 0 && z != 0);
+        #[cfg(feature = "diagnostics")]
         list.crumb(|| pipeline_crumb(p, crate::crumbs::Command::Dispatch, [x, y, z]));
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
         #[cfg(feature = "diagnostics")]
         self.probe_written(list);
+        #[cfg(feature = "diagnostics")]
+        hdr_trace::after(list, hdr);
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
@@ -1282,6 +1312,31 @@ impl State {
         Some(made)
     }
 
+    #[cfg(feature = "diagnostics")]
+    fn hdr_views(&mut self, program: hdr_trace::Program, used: &[UsedResource], compute: bool, made: &[(u8, u32)]) {
+        for u in used {
+            if u.root != RootType::Table || !program.slot(u.slot, u.table_offset_dwords) { continue; }
+            let Some(Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else { continue; };
+            let at = table + u64::from(u.table_offset_dwords) * 4;
+            let Some(heap) = self.heap_of(*table) else { continue; };
+            let Some(host) = heap.host() else { continue; };
+            let index = match made.iter().find(|(s, _)| *s == u.slot) {
+                Some(&(_, offset)) => offset / 32 + u.table_offset_dwords / 8,
+                None => { let Some(i) = heap.index(at) else { continue; }; i }
+            };
+            let view = crate::descriptor::view(at);
+            let (cpu, backing, observed) = host.hdr_slot(index);
+            self.hdr_bindings.push(hdr_trace::Binding::new(u, index, cpu, view.as_ref(), backing, observed));
+        }
+    }
+
+    #[cfg(feature = "diagnostics")]
+    fn hdr_before(&self, list: &HostList, op: std::fmt::Arguments<'_>, nonempty: bool) -> Option<hdr_trace::Event> {
+        let program = self.hdr_program?;
+        if !nonempty { return None; }
+        hdr_trace::before(list, program, op, &self.hdr_bindings, &self.hdr_targets)
+    }
+
     /// The first draws, at debug level: what they bind and read
     /// (diagnostics builds).
     #[cfg(feature = "diagnostics")]
@@ -1326,7 +1381,7 @@ impl State {
     /// is submitted (before the GPU runs it) and after it has run.
     #[cfg(feature = "diagnostics")]
     fn probe_small(&self, list: &HostList, compute: bool) {
-        if !crate::capture::listed(crate::queue::presented() + 1) {
+        if !crate::capture::listed(crate::queue::presented() + 1) || hdr_trace::enabled() {
             return;
         }
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else { return };
@@ -1364,6 +1419,7 @@ impl State {
         if !crate::capture::listed(crate::queue::presented() + 1) {
             return;
         }
+        if hdr_trace::enabled() { return; }
         let (Some(p), Some(host)) = (
             crate::pipeline::host_pipeline(self.pipeline as This),
             crate::host::host(),
@@ -1512,9 +1568,13 @@ impl State {
         #[cfg(feature = "diagnostics")]
         self.probe_small(list, false);
         #[cfg(feature = "diagnostics")]
+        let hdr = self.hdr_before(list, format_args!("draw {count}x{instances}"), count != 0 && instances != 0);
+        #[cfg(feature = "diagnostics")]
         self.crumb(list, crate::crumbs::Command::Draw, [count, instances, from]);
         // SAFETY: an open list with everything set.
         unsafe { list.list.DrawInstanced(count, instances, from, first_instance) };
+        #[cfg(feature = "diagnostics")]
+        hdr_trace::after(list, hdr);
         DRAWN.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
@@ -1596,8 +1656,12 @@ impl State {
         list.note_op(|| self.op_text(format!("indexed {indices}x{instances}"), false));
         #[cfg(feature = "diagnostics")]
         self.crumb(list, crate::crumbs::Command::Indexed, [indices, instances, first]);
+        #[cfg(feature = "diagnostics")]
+        let hdr = self.hdr_before(list, format_args!("indexed {indices}x{instances}"), indices != 0 && instances != 0);
         // SAFETY: an open list with everything set.
         unsafe { list.list.DrawIndexedInstanced(indices, instances, first, base, first_instance) };
+        #[cfg(feature = "diagnostics")]
+        hdr_trace::after(list, hdr);
         DRAWN.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
@@ -1694,6 +1758,13 @@ impl State {
         });
         #[cfg(feature = "diagnostics")]
         self.crumb(list, crate::crumbs::Command::Indirect, [kind, max, stride]);
+        #[cfg(feature = "diagnostics")]
+        let mut hdr = self.hdr_before(list, format_args!("indirect kind={kind} max={max} stride={stride}"), max != 0);
+        #[cfg(feature = "diagnostics")]
+        if let Some(event) = &mut hdr {
+            event.indirect(list, (&args.buffer, args.offset(arguments)),
+                counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at))), kind, stride, max);
+        }
         // SAFETY: an open list with everything set; the buffers are host
         // copies the list keeps alive (refresh), the signature is cached.
         unsafe {
@@ -1706,6 +1777,8 @@ impl State {
                 counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
             )
         };
+        #[cfg(feature = "diagnostics")]
+        hdr_trace::after(list, hdr);
         // A listed frame: what the records held (after the clamp).
         #[cfg(feature = "diagnostics")]
         if crate::capture::dump_on() {
@@ -1933,6 +2006,405 @@ pub(crate) fn blend_factor(list: &HostList, factor: Option<&[f32; 4]>) {
 pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
     // SAFETY: an open list.
     unsafe { list.list.OMSetStencilRef(reference) };
+}
+
+#[cfg(feature = "diagnostics")]
+pub(crate) mod hdr_trace {
+    use super::{HostList, This, UsedResource, View};
+    use crate::descriptor::host::{HdrViewInfo, hdr_current};
+    use crate::host::{host, transition};
+    use std::sync::{Mutex, OnceLock};
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
+    use windows::core::Interface;
+
+    pub(crate) fn enabled() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("VICTORY_HDR_TRACE").is_some_and(|v| v == "1")
+            && std::env::var_os("VICTORY_CAPTURE_WORLD").is_some()
+            && crate::capture::listed_only())
+    }
+
+    pub(crate) fn frame_is_selected(frame: u64) -> bool {
+        enabled() && crate::capture::listed(frame)
+    }
+
+    pub(crate) fn active_frame() -> Option<u64> {
+        if !enabled() { return None; }
+        let frame = crate::queue::presented() + 1;
+        crate::capture::listed(frame).then_some(frame)
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    #[repr(usize)]
+    pub(super) enum Program { Temporal, Diffusion, Tiled, TiledNoDir, Taa, Composite, CompositeNoise }
+
+    impl Program {
+        pub(super) fn from_hash(hash: &str) -> Option<Self> {
+            Some(match hash {
+                "34fb51b8a0312e82" => Self::Temporal,
+                "68029c67dca01425" => Self::Diffusion,
+                "1cd9bc634417a981" => Self::Tiled,
+                "48e74d16cbfa45e3" => Self::TiledNoDir,
+                "df11dcd012cd7382" => Self::Taa,
+                "7c649c422f6208e4" => Self::Composite,
+                "5970ee6dbc47ec61" => Self::CompositeNoise,
+                _ => return None,
+            })
+        }
+
+        fn graphics(self) -> bool {
+            matches!(self, Self::Tiled | Self::TiledNoDir | Self::Composite | Self::CompositeNoise)
+        }
+
+        pub(super) fn slot(self, slot: u8, dwords: u32) -> bool {
+            matches!((self, slot, dwords),
+                (Self::Temporal, 0, 448 | 464 | 520 | 640 | 688) |
+                (Self::Temporal, 1, 8..=208) |
+                (Self::Diffusion, 0, 224 | 480 | 568) |
+                (Self::Diffusion, 1, 8 | 16) |
+                (Self::Taa, 1, 56 | 112 | 136 | 160) |
+                (Self::Composite | Self::CompositeNoise, 1, 32 | 304))
+        }
+
+        fn takes_sample(self, slot: u8, offset: u32) -> Option<Coord> {
+            match (self, slot, offset) {
+                (Self::Temporal, 0, 448) => Some(Coord::Tile),
+                (Self::Diffusion, 0, 568) => Some(Coord::PackedY),
+                (Self::Temporal, 0, 464) |
+                (Self::Temporal, 1, 48 | 80 | 96 | 128 | 136 | 208) |
+                (Self::Diffusion, 1, 8 | 16) |
+                (Self::Taa, 1, 56 | 112 | 136 | 160) |
+                (Self::Composite | Self::CompositeNoise, 1, 32 | 304) => Some(Coord::Pixel),
+                _ => None,
+            }
+        }
+    }
+
+    // These IDs are advisory sample points, not asserted classifications.
+    // The Temporal depth output at the same points supplies the witness.
+    #[derive(Clone, Copy, Debug)]
+    enum Coord { Pixel, Tile, PackedY }
+
+    #[derive(Clone)]
+    pub(super) struct Target {
+        object: usize,
+        backing: ID3D12Resource,
+        format: Option<i32>,
+        sub: Option<(u32, u32, u32)>,
+    }
+
+    impl Target {
+        pub(super) fn rtv(resource: This, texture: &ID3D12Resource, desc: Option<&D3D12_RENDER_TARGET_VIEW_DESC>) -> Self {
+            // SAFETY: live resource and view whose dimension selects the union member.
+            let (format, sub) = unsafe { match desc {
+                None => {
+                    let d = texture.GetDesc();
+                    (d.Format.0, (d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D).then_some((0, 0, 0)))
+                }
+                Some(d) => (d.Format.0, match d.ViewDimension {
+                    D3D12_RTV_DIMENSION_TEXTURE2D => {
+                        let a = d.Anonymous.Texture2D; Some((a.MipSlice, 0, a.PlaneSlice))
+                    }
+                    D3D12_RTV_DIMENSION_TEXTURE2DARRAY => {
+                        let a = d.Anonymous.Texture2DArray; Some((a.MipSlice, a.FirstArraySlice, a.PlaneSlice))
+                    }
+                    _ => None,
+                }),
+            }};
+            Self { object: resource as usize, backing: texture.clone(), format: (format != 0).then_some(format), sub }
+        }
+    }
+
+    #[derive(Clone)]
+    pub(super) struct Binding {
+        slot: u8,
+        offset: u32,
+        kind: victory_shader::ResourceType,
+        host_slot: u32,
+        cpu: usize,
+        object: usize,
+        memory: Option<u64>,
+        requested: Option<u32>,
+        info: Option<HdrViewInfo>,
+        backing: Option<ID3D12Resource>,
+        twin: bool,
+    }
+
+    impl Binding {
+        pub(super) fn new(u: &UsedResource, host_slot: u32, cpu: usize, view: Option<&View>,
+            backing: Option<ID3D12Resource>, info: Option<HdrViewInfo>) -> Self
+        {
+            let (object, requested, memory) = match view {
+                Some(View::Shader(id, desc) | View::Unordered(id, _, desc)) =>
+                    (*id, desc.map(|d| crate::resource::pc_format(d[0])), None),
+                Some(View::Placed(_, _, d)) =>
+                    (0, Some(crate::resource::pc_format(d[0])), Some(u64::from(d[10]) | (u64::from(d[11]) << 32))),
+                _ => (0, None, None),
+            };
+            let twin = object != 0 && backing.as_ref().is_some_and(|b|
+                crate::resource::host_copy(object as This).is_some_and(|c| c.texture.as_raw() != b.as_raw()));
+            Self { slot: u.slot, offset: u.table_offset_dwords, kind: u.kind, host_slot,
+                cpu, object, memory, requested, info, backing, twin }
+        }
+
+        fn stable(&self) -> bool { self.info.is_some() && hdr_current(self.cpu) == self.info }
+    }
+
+    pub(crate) struct Event {
+        frame: u64,
+        program: Program,
+        command: String,
+        bindings: Vec<Binding>,
+        targets: Vec<Target>,
+        samples: Vec<(String, Sample)>,
+        args: Option<(Readback, u32, u32, bool, u32)>,
+        issued: bool,
+    }
+
+    // COM objects here are only D3D12 resources, documented free-threaded.
+    // SAFETY: mappings are read only after the submission fence under its lock.
+    unsafe impl Send for Event {}
+
+    struct Quota { frame: u64, seen: [u8; 7] }
+    static QUOTA: Mutex<Quota> = Mutex::new(Quota { frame: 0, seen: [0; 7] });
+
+    pub(super) fn before(list: &HostList, program: Program, command: std::fmt::Arguments<'_>,
+        bindings: &[Binding], targets: &[Target]) -> Option<Event>
+    {
+        let frame = active_frame()?;
+        let mut q = QUOTA.lock().unwrap_or_else(|e| e.into_inner());
+        if q.frame != frame { *q = Quota { frame, seen: [0; 7] }; }
+        let seen = &mut q.seen[program as usize];
+        if *seen != 0 { return None; }
+        *seen = 1;
+        drop(q);
+        let mut event = Event { frame, program, command: command.to_string(), bindings: bindings.to_vec(),
+            targets: if program.graphics() { targets.to_vec() } else { Vec::new() },
+            samples: Vec::new(), args: None, issued: false };
+        event.record(list, false);
+        Some(event)
+    }
+
+    pub(super) fn after(list: &HostList, event: Option<Event>) {
+        if let Some(mut event) = event {
+            event.record(list, true);
+            list.hdr.lock().unwrap_or_else(|e| e.into_inner()).push(event);
+        }
+    }
+
+    impl Event {
+        fn record(&mut self, list: &HostList, after: bool) {
+            let Some(h) = host() else { return; };
+            if let Some(t) = self.targets.first()
+                && let Some(state) = list.hdr_state(&t.backing)
+                && let Some(sample) = t.sub.and_then(|sub| sample(&h.device, &list.list, &t.backing, state, sub, Coord::Pixel))
+            {
+                self.samples.push((if after { "MRT0-after" } else { "MRT0-before" }.into(), sample));
+            }
+            for b in &self.bindings {
+                if after != (b.kind == victory_shader::ResourceType::Uav) { continue; }
+                let Some(coord) = self.program.takes_sample(b.slot, b.offset) else { continue; };
+                let (Some(backing), Some(sub)) = (&b.backing, b.info.and_then(|i| i.sub)) else { continue; };
+                let Some(state) = list.hdr_state(backing) else { continue; };
+                if let Some(sample) = sample(&h.device, &list.list, backing, state, sub, coord) {
+                    self.samples.push((format!("s{}+{}-{}", b.slot, b.offset, if after { "after" } else { "before" }), sample));
+                }
+            }
+        }
+
+        pub(super) fn indirect(&mut self, list: &HostList, args: (&ID3D12Resource, u64),
+            count: Option<(&ID3D12Resource, u64)>, kind: u32, stride: u32, max: u32)
+        {
+            // Read only the prefix. We can prove work if a counted prefix
+            // includes one nonempty record, not prove none when truncated.
+            let n = max.min(32);
+            if !matches!(kind, 0..=2) || !(12..=64).contains(&stride) || stride % 4 != 0 { return; }
+            let len = u64::from(n) * u64::from(stride);
+            let Some(h) = host() else { return; };
+            let Some(buffer) = Readback::new(&h.device, len + 4) else { return; };
+            let read = D3D12_RESOURCE_STATE_COPY_SOURCE;
+            let arg = D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT;
+            // SAFETY: args are bounded and transitioned by indirect::bound;
+            // the counter follows the existing indirect capture's state contract.
+            unsafe {
+                let l = &list.list;
+                l.ResourceBarrier(&[transition(args.0, arg, read)]);
+                l.CopyBufferRegion(&buffer.0, 0, args.0, args.1, len);
+                if let Some((c, at)) = count {
+                    let same = c.as_raw() == args.0.as_raw();
+                    let write = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+                    if !same { l.ResourceBarrier(&[transition(c, write, read)]); }
+                    l.CopyBufferRegion(&buffer.0, len, c, at, 4);
+                    if !same { l.ResourceBarrier(&[transition(c, read, write)]); }
+                }
+                l.ResourceBarrier(&[transition(args.0, read, arg)]);
+            }
+            self.args = Some((buffer, n, stride, count.is_some(), kind));
+        }
+    }
+
+    pub(crate) fn submit(list: &HostList, frame: u64, submission: u64, ordinal: usize) {
+        let mut events = list.hdr.lock().unwrap_or_else(|e| e.into_inner());
+        for (op, e) in events.iter_mut().enumerate().filter(|(_, e)| e.frame == frame) {
+            e.issued = true;
+            let id = list.list.as_raw();
+            tracing::info!(target: "victory_gpu::hdr_trace", frame, submission, ordinal, list = ?id, op,
+                program = ?e.program, command = %e.command, "recorded host operation");
+            for b in &e.bindings {
+                let stable = b.stable();
+                let observed = stable.then_some(b.info).flatten();
+                let effective = observed.and_then(|i| i.effective);
+                let expected_f32 = matches!(e.program, Program::Temporal | Program::Diffusion)
+                    && e.program.takes_sample(b.slot, b.offset).is_some();
+                let integer = effective.is_some_and(|f| matches!(f, 3|4|7|8|12|14|17|18|25|30|32|36|38|42|43|50|52|57|59|62|64));
+                tracing::info!(target: "victory_gpu::hdr_trace", frame, submission, ordinal, list = ?id, op,
+                    slot = b.slot, dwords = b.offset, kind = ?b.kind, b.host_slot, cpu = format_args!("{:#x}", b.cpu),
+                    object = format_args!("{:#x}", b.object), ?b.memory, requested = ?b.requested,
+                    effective = ?effective, generation_at_bind = ?b.info.map(|i| i.generation),
+                    generation_now = ?hdr_current(b.cpu).map(|i| i.generation), stable,
+                    backing = ?b.backing.as_ref().map(Interface::as_raw), twin = b.twin,
+                    null_or_unretained = b.backing.is_none(), sub = ?observed.and_then(|i| i.sub),
+                    expected_f32, class_mismatch = expected_f32 && integer, "table view (None = not observed)");
+            }
+            for (mrt, t) in e.targets.iter().enumerate() {
+                tracing::info!(target: "victory_gpu::hdr_trace", frame, submission, ordinal, list = ?id, op, mrt,
+                    object = format_args!("{:#x}", t.object), backing = ?t.backing.as_raw(),
+                    effective = ?t.format, sub = ?t.sub, "bound render target");
+            }
+        }
+    }
+
+    pub(crate) fn complete(list: &HostList, frame: u64, fence: u64, ordinal: usize) {
+        let events = list.hdr.lock().unwrap_or_else(|e| e.into_inner());
+        for (op, e) in events.iter().enumerate().filter(|(_, e)| e.frame == frame && e.issued) {
+            let id = list.list.as_raw();
+            let stable = e.bindings.iter().all(|b| b.info.is_none() || b.stable());
+            for (name, s) in &e.samples {
+                tracing::info!(target: "victory_gpu::hdr_trace", frame, fence, ordinal, list = ?id, op,
+                    %name, stable, coordinates = ?s.points, footprint_format = s.format, words = ?s.words(),
+                    "raw texels (not shader return values)");
+            }
+            if let Some((args, n, stride, counted, kind)) = &e.args {
+                let len = (*n * *stride) as usize;
+                let words = args.read(len + 4);
+                let count = if *counted { words.as_ref().and_then(|b| word(&b[len..])) } else { Some(*n) };
+                let live = count.map(|c| c.min(*n) as usize);
+                let found = words.as_ref().zip(live).and_then(|(b, live)| b[..len].chunks_exact(*stride as usize)
+                    .take(live).position(|r| r.chunks_exact(4).take(if *kind == 2 { 3 } else { 2 })
+                        .all(|w| word(w).is_some_and(|w| w > 0))));
+                tracing::info!(target: "victory_gpu::hdr_trace", frame, fence, ordinal, list = ?id, op,
+                    count, captured_records = n, first_nonempty_record = ?found, "indirect argument prefix");
+            }
+        }
+    }
+
+    fn word(b: &[u8]) -> Option<u32> { Some(u32::from_le_bytes(b.get(..4)?.try_into().ok()?)) }
+
+    struct Readback(ID3D12Resource);
+    impl Readback {
+        fn new(device: &ID3D12Device, size: u64) -> Option<Self> {
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER, Width: size, Height: 1, DepthOrArraySize: 1,
+                MipLevels: 1, SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR, ..Default::default()
+            };
+            let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() };
+            let mut buffer = None;
+            // SAFETY: plain creation with an owned out pointer.
+            unsafe { device.CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+                D3D12_RESOURCE_STATE_COPY_DEST, None, &mut buffer).ok()?; }
+            buffer.map(Self)
+        }
+
+        fn read(&self, size: usize) -> Option<Vec<u8>> {
+            let mut data = std::ptr::null_mut();
+            // SAFETY: after the fence, allocation has at least `size` bytes.
+            unsafe {
+                self.0.Map(0, None, Some(&mut data)).ok()?;
+                let out = std::slice::from_raw_parts(data.cast::<u8>(), size).to_vec();
+                self.0.Unmap(0, None);
+                Some(out)
+            }
+        }
+    }
+
+    pub(crate) struct Sample {
+        buffer: Readback,
+        points: [(u32, u32); 2],
+        format: i32,
+        bytes: usize,
+    }
+
+    impl Sample {
+        pub(crate) fn words(&self) -> Option<[String; 2]> {
+            let b = self.buffer.read(512 + self.bytes)?;
+            Some([&b[..self.bytes], &b[512..]].map(|slot| {
+                let hex = slot.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join("");
+                if self.format != 10 { return hex; }
+                let fp16 = |i: usize| {
+                    let w = u16::from_le_bytes([slot[i], slot[i + 1]]);
+                    let sign = if w & 0x8000 == 0 { 1.0 } else { -1.0 };
+                    let exp = (w >> 10) & 31;
+                    let f = f32::from(w & 1023) / 1024.0;
+                    sign * match exp { 0 => f * 2f32.powi(-14), 31 if f == 0.0 => f32::INFINITY,
+                        31 => f32::NAN, _ => (1.0 + f) * 2f32.powi(i32::from(exp) - 15) }
+                };
+                format!("{hex} rgb={:?}", [fp16(0), fp16(2), fp16(4)])
+            }))
+        }
+    }
+
+    fn sample(device: &ID3D12Device, list: &ID3D12GraphicsCommandList, texture: &ID3D12Resource,
+        state: D3D12_RESOURCE_STATES, (mip, array, plane): (u32, u32, u32), coord: Coord) -> Option<Sample>
+    {
+        // SAFETY: live resource. No partial copies of depth/stencil or MSAA.
+        let desc = unsafe { texture.GetDesc() };
+        let format = desc.Format.0;
+        if desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.SampleDesc.Count != 1 || plane != 0
+            || desc.Flags.contains(D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)
+            || mip >= u32::from(desc.MipLevels) || array >= u32::from(desc.DepthOrArraySize)
+            || !matches!(format, 9..=14 | 23..=43 | 48..=54 | 56..=57 | 60..=65 | 67 | 87..=93)
+        { return None; }
+        let (bytes, 1) = crate::resource::element(format as u32)? else { return None; };
+        let (w, h) = (u32::try_from(desc.Width).ok()?.checked_shr(mip)?.max(1), desc.Height.checked_shr(mip)?.max(1));
+        let points = [3, 13].map(|row| {
+            let (sx, sy) = match coord { Coord::Pixel => (1, 1), Coord::Tile => (16, 16), Coord::PackedY => (1, 16) };
+            // Mid-screen x; sky/geometry candidates at 3/16 and 13/16.
+            // Scale to the previously observed scene size for tile masks.
+            let (x, y) = if sx == 1 && sy == 1 { (w / 2, h * row / 16) } else { (1280 / sx, 1440 * row / 16 / sy) };
+            (x.min(w - 1), y.min(h - 1))
+        });
+        let index = mip + array * u32::from(desc.MipLevels);
+        let buffer = Readback::new(device, 1024)?;
+        let read = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        // SAFETY: boxed copies are inside a color subresource; aligned offsets
+        // and pitch, matching format, live objects. Restore exact state.
+        unsafe {
+            if state != read { list.ResourceBarrier(&[transition(texture, state, read)]); }
+            let from = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(texture),
+                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: index } };
+            for (i, (x, y)) in points.into_iter().enumerate() {
+                let to = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(&buffer.0),
+                    Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                        Offset: i as u64 * 512, Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                            Format: desc.Format, Width: 1, Height: 1, Depth: 1, RowPitch: 256 } } } };
+                list.CopyTextureRegion(&to, 0, 0, 0, &from, Some(&D3D12_BOX {
+                    left: x, top: y, front: 0, right: x + 1, bottom: y + 1, back: 1 }));
+            }
+            if state != read { list.ResourceBarrier(&[transition(texture, read, state)]); }
+        }
+        Some(Sample { buffer, points, format, bytes: bytes as usize })
+    }
+
+    pub(crate) fn present_probe(device: &ID3D12Device, list: &ID3D12GraphicsCommandList,
+        back: &ID3D12Resource, state: D3D12_RESOURCE_STATES, frame: u64) -> Option<Sample>
+    {
+        if !frame_is_selected(frame) { return None; }
+        sample(device, list, back, state, (0, 0, 0), Coord::Pixel)
+    }
 }
 
 #[cfg(test)]

@@ -410,6 +410,8 @@ impl HostHeap {
     /// (both multiples of 4), which it holds; a null one for no buffer, or
     /// for unordered access to a buffer shaders cannot write.
     pub(crate) fn raw_view_at(&self, index: u32, buffer: Option<&ID3D12Resource>, first: u64, bytes: u64, uav: bool) {
+        #[cfg(feature = "diagnostics")]
+        hdr::clear(self.cpu(index));
         let Some(host) = host() else { return };
         let writable = |b: &ID3D12Resource| {
             // SAFETY: a live buffer.
@@ -463,6 +465,8 @@ impl HostHeap {
 
     /// Makes slot `index` read nothing: a null view, or a plain sampler.
     pub(crate) fn make_null(&self, index: u32) {
+        #[cfg(feature = "diagnostics")]
+        hdr::clear(self.cpu(index));
         if self.sampler {
             self.null_sampler(index);
         } else {
@@ -554,6 +558,11 @@ impl HostHeap {
     /// slots borrow the buffer: submission pins keep it live until the fence,
     /// and the table is rebuilt before using a stale slot.
     pub(crate) fn raw_pair_at(&self, index: u32, buffer: Option<&ID3D12Resource>, bytes: u64) {
+        #[cfg(feature = "diagnostics")]
+        {
+            hdr::clear(self.cpu(index));
+            hdr::clear(self.cpu(index + 1));
+        }
         let Some(host) = host() else { return };
         // shortcut: a buffer view holds at most 2^27 elements (512 MiB raw);
         // a longer copy's rest reads 0 through it.
@@ -665,6 +674,8 @@ impl HostHeap {
                 make(&view, self.cpu(index))
             };
             if kept.is_none() && !self.sampler {
+                #[cfg(feature = "diagnostics")]
+                hdr::clear(self.cpu(index));
                 null_for(&view, self.cpu(index));
             }
             let valid = kept.is_some();
@@ -1112,6 +1123,8 @@ pub(crate) fn make_view(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<
 /// Makes the host descriptor for `view` at `at`: the host resource it
 /// views, or `None` if it cannot.
 fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
+    #[cfg(feature = "diagnostics")]
+    hdr::clear(at);
     let host = host()?;
     let device = &host.device;
     match view {
@@ -1156,6 +1169,8 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                         at,
                     )
                 };
+                #[cfg(feature = "diagnostics")]
+                hdr::srv(at, texture, desc.as_ref());
                 Some(Some((texture.clone(), None, None)))
             } else if let (Some((data, len)), Some(desc)) =
                 (crate::resource::buffer_bytes(resource), desc)
@@ -1179,8 +1194,11 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             // A depth texture's unordered views write its twin.
             // SAFETY: a live resource.
             if unsafe { texture.GetDesc() }.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL.0 != 0 {
-                return crate::twin::uav(resource, &copy, desc.as_ref(), at)
-                    .map(|twin| Some((twin, None, None)));
+                return crate::twin::uav(resource, &copy, desc.as_ref(), at).map(|twin| {
+                    #[cfg(feature = "diagnostics")]
+                    hdr::record(at, &twin, None, None);
+                    Some((twin, None, None))
+                });
             }
             let mut desc = desc.as_ref().map(uav_desc);
             if desc.is_none() && !default_view(resource) {
@@ -1198,6 +1216,8 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                     at,
                 )
             };
+            #[cfg(feature = "diagnostics")]
+            hdr::uav(at, texture, desc.as_ref());
             Some(Some((texture.clone(), None, None)))
         }
         View::Sampler(words) => {
@@ -1241,6 +1261,102 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 buffer_srv(address, len, srv_desc(words), at)
             }
         }
+    }
+}
+
+#[cfg(feature = "diagnostics")]
+mod hdr {
+    use super::*;
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use windows::core::Interface;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) struct ViewInfo {
+        pub generation: u64,
+        pub effective: Option<i32>,
+        pub sub: Option<(u32, u32, u32)>, // mip, first array slice, plane
+        pub backing: usize,
+    }
+
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    static VIEWS: std::sync::LazyLock<Mutex<HashMap<usize, ViewInfo>>> =
+        std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+    pub(super) fn record(at: D3D12_CPU_DESCRIPTOR_HANDLE, texture: &ID3D12Resource,
+        effective: Option<i32>, sub: Option<(u32, u32, u32)>)
+    {
+        if !crate::draw::hdr_trace::enabled() { return; }
+        VIEWS.lock().unwrap_or_else(|e| e.into_inner()).insert(at.ptr, ViewInfo {
+            generation: NEXT.fetch_add(1, Ordering::Relaxed), effective, sub,
+            backing: texture.as_raw() as usize,
+        });
+    }
+
+    pub(super) fn clear(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
+        if crate::draw::hdr_trace::enabled() {
+            VIEWS.lock().unwrap_or_else(|e| e.into_inner()).remove(&at.ptr);
+        }
+    }
+
+    pub(crate) fn current(at: usize) -> Option<ViewInfo> {
+        VIEWS.lock().unwrap_or_else(|e| e.into_inner()).get(&at).copied()
+    }
+
+    pub(super) fn srv(at: D3D12_CPU_DESCRIPTOR_HANDLE, texture: &ID3D12Resource,
+        desc: Option<&D3D12_SHADER_RESOURCE_VIEW_DESC>)
+    {
+        if !crate::draw::hdr_trace::enabled() { return; }
+        // SAFETY: the dimension selects the written union member; a live texture.
+        let (fmt, sub) = unsafe { match desc {
+            None => (Some(texture.GetDesc().Format.0), Some((0, 0, 0))),
+            Some(d) => (Some(d.Format.0), match d.ViewDimension {
+                D3D12_SRV_DIMENSION_TEXTURE2D => {
+                    let a = d.Anonymous.Texture2D; Some((a.MostDetailedMip, 0, a.PlaneSlice))
+                }
+                D3D12_SRV_DIMENSION_TEXTURE2DARRAY => {
+                    let a = d.Anonymous.Texture2DArray; Some((a.MostDetailedMip, a.FirstArraySlice, a.PlaneSlice))
+                }
+                _ => None,
+            }),
+        }};
+        record(at, texture, fmt.filter(|&n| n != 0), sub);
+    }
+
+    pub(super) fn uav(at: D3D12_CPU_DESCRIPTOR_HANDLE, texture: &ID3D12Resource,
+        desc: Option<&D3D12_UNORDERED_ACCESS_VIEW_DESC>)
+    {
+        if !crate::draw::hdr_trace::enabled() { return; }
+        // SAFETY: the dimension selects the written union member; a live texture.
+        let (fmt, sub) = unsafe { match desc {
+            None => (Some(texture.GetDesc().Format.0), Some((0, 0, 0))),
+            Some(d) => (Some(d.Format.0), match d.ViewDimension {
+                D3D12_UAV_DIMENSION_TEXTURE2D => {
+                    let a = d.Anonymous.Texture2D; Some((a.MipSlice, 0, a.PlaneSlice))
+                }
+                D3D12_UAV_DIMENSION_TEXTURE2DARRAY => {
+                    let a = d.Anonymous.Texture2DArray; Some((a.MipSlice, a.FirstArraySlice, a.PlaneSlice))
+                }
+                _ => None,
+            }),
+        }};
+        record(at, texture, fmt.filter(|&n| n != 0), sub);
+    }
+}
+
+#[cfg(feature = "diagnostics")]
+pub(crate) use hdr::{ViewInfo as HdrViewInfo, current as hdr_current};
+
+#[cfg(feature = "diagnostics")]
+impl HostHeap {
+    /// Existing bound resource and the descriptor creation record. Do not
+    /// rebuild a view for tracing; a changed/unsupported slot stays unknown.
+    pub(crate) fn hdr_slot(&self, index: u32) -> (usize, Option<ID3D12Resource>, Option<HdrViewInfo>) {
+        let at = self.cpu(index).ptr;
+        let backing = self.kept.lock().unwrap_or_else(|e| e.into_inner())
+            .get(index as usize).and_then(|k| k.as_ref().map(|k| k.0.clone()));
+        let info = hdr_current(at).filter(|i| backing.as_ref().is_some_and(|b| windows::core::Interface::as_raw(b) as usize == i.backing));
+        (at, backing, info)
     }
 }
 

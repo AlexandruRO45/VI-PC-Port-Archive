@@ -426,6 +426,8 @@ pub(crate) struct HostList {
     targets: Mutex<Vec<(usize, String)>>,
     #[cfg(feature = "diagnostics")]
     show: Mutex<crate::capture::ShowNotes>,
+    #[cfg(feature = "diagnostics")]
+    pub(crate) hdr: Mutex<Vec<crate::draw::hdr_trace::Event>>,
     /// With `VICTORY_GPU_TIMING`: a GPU timestamp before each noted command
     /// and at the end, and where they are read back.
     #[cfg(feature = "diagnostics")]
@@ -710,6 +712,8 @@ impl Host {
                 #[cfg(feature = "diagnostics")]
                 show: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
+                hdr: Mutex::default(),
+                #[cfg(feature = "diagnostics")]
                 stamps: OnceLock::new(),
             })
         }
@@ -784,7 +788,8 @@ impl Host {
         // the order the GPU runs them (with `VICTORY_D3D12_DRED`, which
         // notes them).
         #[cfg(feature = "diagnostics")]
-        let traced = crate::capture::listed(crate::queue::presented() + 1);
+        let traced = crate::capture::listed(crate::queue::presented() + 1)
+            && !crate::draw::hdr_trace::enabled();
         #[cfg(feature = "diagnostics")]
         if traced {
             for (i, r) in runs.iter().enumerate() {
@@ -830,6 +835,14 @@ impl Host {
             })
         };
         batch.flush();
+        #[cfg(feature = "diagnostics")]
+        let hdr_frame = crate::draw::hdr_trace::active_frame();
+        #[cfg(feature = "diagnostics")]
+        if let Some(frame) = hdr_frame {
+            for (i, list) in runs.iter().enumerate() {
+                crate::draw::hdr_trace::submit(list, frame, *submitted + 1, i);
+            }
+        }
         let prepared = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::FaultsPrep, crate::copystat::page_faults().saturating_sub(faults));
@@ -930,6 +943,12 @@ impl Host {
                 last_notes(runs),
                 removed_during(runs, removed_in)
             ));
+        }
+        #[cfg(feature = "diagnostics")]
+        if let Some(frame) = hdr_frame {
+            for (i, list) in runs.iter().enumerate() {
+                crate::draw::hdr_trace::complete(list, frame, *submitted, i);
+            }
         }
         // What shaders wrote goes back before the bottom-of-pipe writes,
         // which tell the title the GPU is done; each range once per
@@ -1329,6 +1348,10 @@ impl HostList {
         #[cfg(feature = "diagnostics")]
         self.targets.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
+        if crate::draw::hdr_trace::enabled() {
+            self.hdr.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        }
+        #[cfg(feature = "diagnostics")]
         {
             *self.show.lock().unwrap_or_else(|e| e.into_inner()) = Default::default();
         }
@@ -1409,6 +1432,15 @@ impl HostList {
             D3D12_RESOURCE_STATES(before as i32),
             D3D12_RESOURCE_STATES(wanted as i32),
         ))
+    }
+
+    /// State at this point in the recorded list, including whichever
+    /// side of a depth twin the actual descriptor names. No state guessed.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn hdr_state(&self, resource: &ID3D12Resource) -> Option<D3D12_RESOURCE_STATES> {
+        let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
+        states.values().find(|(_, _, copy)| copy.texture.as_raw() == resource.as_raw())
+            .map(|(_, state, _)| D3D12_RESOURCE_STATES(*state as i32))
     }
 
     /// A use of the depth texture `depth` (with a twin) needing `side`
@@ -1552,7 +1584,9 @@ impl HostList {
     #[cfg(feature = "diagnostics")]
     fn note(&self, what: impl FnOnce() -> String, range: Option<(u64, u64)>) {
         if !dred_on() {
-            if crate::capture::listed_only() && crate::capture::listed(crate::queue::presented() + 1) {
+            if crate::capture::listed_only() && crate::capture::listed(crate::queue::presented() + 1)
+                && !crate::draw::hdr_trace::enabled()
+            {
                 self.notes.lock().unwrap_or_else(|e| e.into_inner()).push((what(), range));
             }
             return;
@@ -2493,8 +2527,12 @@ impl Host {
             if !shown && state != read {
                 list.ResourceBarrier(&[transition(texture, read, state)]);
             }
+            #[cfg(feature = "diagnostics")]
+            let hdr = crate::draw::hdr_trace::present_probe(&self.device, list, &back, back_state, frame);
             list.ResourceBarrier(&[transition(&back, back_state, D3D12_RESOURCE_STATE_PRESENT)]);
             p.copy.close();
+            #[cfg(feature = "diagnostics")]
+            let hdr_fence = if crate::draw::hdr_trace::frame_is_selected(frame) { *submitted + 1 } else { 0 };
             self.execute_locked(
                 &[&p.copy], submitted,
                 #[cfg(feature = "diagnostics")]
@@ -2504,7 +2542,16 @@ impl Host {
             if let Some((buffer, footprint)) = capture {
                 crate::capture::save_read_back(frame, &buffer, &footprint);
             }
-            let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            let result = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            #[cfg(feature = "diagnostics")]
+            if hdr_fence != 0 {
+                tracing::info!(target: "victory_gpu::hdr_trace", frame, fence = hdr_fence,
+                    source = ?texture.as_raw(), swap_buffer = ?back.as_raw(), index, shown,
+                    present_hr = format_args!("{:#x}", result.0),
+                    samples = ?hdr.map(|s| s.words()), "actual DXGI Present");
+            }
+            #[cfg(not(feature = "diagnostics"))]
+            let _ = result;
             p.meter.frame(p.hwnd);
             #[cfg(feature = "diagnostics")]
             return Some((state.0 as u32, probe.is_some_and(|b| crate::capture::black(&b))));
