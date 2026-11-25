@@ -180,11 +180,19 @@ fn parse_manifest(bytes: &[u8]) -> Option<Vec<String>> {
 }
 
 fn remove_path(path: &Path) -> std::io::Result<()> {
-    match std::fs::symlink_metadata(path) {
-        Ok(meta) if meta.is_dir() => std::fs::remove_dir_all(path),
-        Ok(_) => std::fs::remove_file(path),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(e),
+    let kind = match std::fs::symlink_metadata(path) {
+        Ok(meta) => meta.file_type(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    #[cfg(windows)]
+    if std::os::windows::fs::FileTypeExt::is_symlink_dir(&kind) {
+        return std::fs::remove_dir(path);
+    }
+    if kind.is_dir() {
+        std::fs::remove_dir_all(path)
+    } else {
+        std::fs::remove_file(path)
     }
 }
 
@@ -227,7 +235,7 @@ fn current(dir: &Path) -> std::io::Result<Option<Version>> {
     for entry in std::fs::read_dir(dir)?.flatten() {
         let file = entry.file_name();
         let file = file.to_string_lossy();
-        if file.ends_with(".new") {
+        if file.strip_suffix(".new").and_then(version_number).is_some() {
             remove_path(&entry.path())?;
         } else if let Some(n) = version_number(&file) {
             highest = highest.max(n);
@@ -299,9 +307,7 @@ fn commit(
     blobs: &[(&str, Source<'_>)],
 ) -> std::io::Result<()> {
     let staged = dir.join(format!("v{number}.new"));
-    if staged.exists() {
-        remove_path(&staged)?;
-    }
+    remove_path(&staged)?;
     std::fs::create_dir_all(&staged)?;
     let write = |path: PathBuf, data: &[u8]| -> std::io::Result<()> {
         let mut file = std::fs::File::create(path)?;
@@ -1531,6 +1537,8 @@ mod tests {
         std::fs::write(v2.join(MANIFEST), b"\x05\x00").unwrap();
         std::fs::write(container_dir.join("v99"), b"stray").unwrap();
         std::fs::write(container_dir.join("v3.new"), b"stray").unwrap();
+        let unrelated = container_dir.join("notes.new");
+        std::fs::write(&unrelated, b"keep me").unwrap();
 
         let v = current(&container_dir).unwrap().expect("must recover v1");
         assert_eq!(v.dir, container_dir.join("v1"));
@@ -1546,6 +1554,7 @@ mod tests {
             !container_dir.join("v3.new").exists(),
             "stray .new file cleaned up"
         );
+        assert_eq!(std::fs::read(unrelated).unwrap(), b"keep me");
 
         // Also test a v2 whose manifest parses cleanly but whose blob file is missing.
         let v2_missing = container_dir.join("v2");
@@ -1562,6 +1571,19 @@ mod tests {
         assert_eq!(v.highest, 99);
         assert_eq!(std::fs::read(v.dir.join("0")).unwrap(), b"good-save");
         assert!(v2_missing.exists());
+    }
+
+    #[test]
+    fn a_staged_version_file_can_be_replaced_on_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let staged = dir.path().join("v1.new");
+        std::fs::write(&staged, b"stray file").unwrap();
+
+        commit(dir.path(), 1, "Slot", "one", &[("a", Source::Data(b"new a"))]).unwrap();
+
+        assert!(!staged.exists());
+        let version = current(dir.path()).unwrap().unwrap();
+        assert_eq!(std::fs::read(version.dir.join("0")).unwrap(), b"new a");
     }
 
     /// Only `v<N>` as `commit` writes it is a version: `v01` and the like
