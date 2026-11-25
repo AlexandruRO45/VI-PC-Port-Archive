@@ -96,10 +96,12 @@ struct Window {
     base: u64,
     records: u32,
     scratch: ID3D12Resource,
+    /// Pointer of the host list currently holding `scratch` in `INDIRECT_ARGUMENT`.
+    list_id: usize,
 }
 
 /// The most records clamped in one pass ([`windows`]).
-const WINDOW_MOST: u64 = 64;
+const WINDOW_MOST: u64 = 256;
 
 /// Whether indirect draws that read record after record of one argument
 /// buffer are clamped a window at a time (`VICTORY_INDIRECT_WINDOW=1`; off
@@ -144,6 +146,19 @@ const WINDOW_MOST: u64 = 64;
 fn windows() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_WINDOW").is_some_and(|v| v == "1"))
+}
+
+/// Whether pure depth-only draws targeting square shadow-map viewports are
+/// skipped (`VICTORY_SKIP_SHADOW_PASSES=1`; off by default). Preserves the
+/// main 16:9 depth pre-pass, all color/G-buffer/UI draws, and any shader that
+/// stores to UAV buffers.
+fn skip_shadow_passes() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SKIP_SHADOW_PASSES").is_some_and(|v| v == "1"))
+}
+
+fn is_shadow_viewport(width: f32, height: f32) -> bool {
+    width >= 128.0 && (width - height).abs() < 1.0
 }
 
 /// What one title list has set, and what its host list was last given.
@@ -614,6 +629,7 @@ impl State {
     /// descriptors as they are now, not as they were when the title set
     /// the targets (a descriptor rewritten in between names another view).
     pub(crate) fn replay(&mut self, list: &HostList) {
+        self.window = None;
         self.host_pipeline = 0;
         self.host_roots = [0; 2];
         self.host_heaps = [0; 2];
@@ -1311,7 +1327,15 @@ impl State {
             .entry(std::ptr::from_ref(host) as usize)
             .or_insert_with(|| (0, Ranges::new()));
         let changed = host.buffer_changes();
-        let slots = if *passes % 16 == 0 {
+        static RESCAN: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        let rescan = *RESCAN.get_or_init(|| {
+            std::env::var("VICTORY_HEAP_BUFFERS_RESCAN")
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .unwrap_or(16)
+                .max(1)
+        });
+        let slots = if *passes % rescan == 0 {
             ranges.clear();
             host.buffer_slots()
         } else {
@@ -1679,10 +1703,37 @@ impl State {
         });
     }
 
+    /// Transitions an open indirect window's scratch buffer back to `COMMON`
+    /// on the list that opened it and drops the window.
+    fn close_window(&mut self, list: &HostList) {
+        if let Some(w) = self.window.take()
+            && w.list_id == std::ptr::from_ref(list) as usize
+        {
+            crate::indirect::done(list, &w.scratch);
+        }
+    }
+
+    /// Whether the currently bound pipeline can store to buffers (or is not
+    /// known yet), which could modify an indirect argument buffer.
+    fn pipeline_stores(&self) -> bool {
+        crate::pipeline::host_pipeline(self.pipeline as This)
+            .is_none_or(|p| p.stages.iter().any(|stage| stage.translated().stores))
+    }
+
+    /// True when `VICTORY_SKIP_SHADOW_PASSES=1` and the current graphics pass
+    /// renders depth-only into a square shadow-map viewport without UAV stores.
+    fn skipping_shadow_draw(&self) -> bool {
+        skip_shadow_passes()
+            && self.targets.is_empty()
+            && self.depth != 0
+            && self.viewports.first().is_some_and(|v| is_shadow_viewport(v.Width, v.Height))
+            && !self.pipeline_stores()
+    }
+
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
         // It may write the arguments a window holds clamped.
-        self.window = None;
+        self.close_window(list);
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -1815,7 +1866,12 @@ impl State {
     /// Runs a mesh dispatch of `x` groups on the host (the title's mesh
     /// programs are one-dimensional).
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
-        self.window = None;
+        if self.skipping_shadow_draw() {
+            return;
+        }
+        if self.pipeline_stores() {
+            self.close_window(list);
+        }
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
         let ran = mesh_test() != 1
@@ -2138,7 +2194,12 @@ impl State {
         first: u32,
         first_instance: u32,
     ) {
-        self.window = None;
+        if self.skipping_shadow_draw() {
+            return;
+        }
+        if self.pipeline_stores() {
+            self.close_window(list);
+        }
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
         let ready = self.prepare(list, false);
@@ -2243,7 +2304,12 @@ impl State {
         base: i32,
         first_instance: u32,
     ) {
-        self.window = None;
+        if self.skipping_shadow_draw() {
+            return;
+        }
+        if self.pipeline_stores() {
+            self.close_window(list);
+        }
         #[cfg(feature = "diagnostics")]
         self.trace("indexed", indices, first);
         // Indexed rectangles are drawn by the rectangle geometry stage
@@ -2298,6 +2364,9 @@ impl State {
         const INDEXED: u32 = 1;
         const DISPATCH: u32 = 2;
         const MESH: u32 = 10;
+        if kind != DISPATCH && self.skipping_shadow_draw() {
+            return true;
+        }
         #[cfg(feature = "diagnostics")]
         let why = |what: &str| crate::pipeline::note_why(format!("indirect kind {kind}: {what}"));
         #[cfg(not(feature = "diagnostics"))]
@@ -2376,8 +2445,10 @@ impl State {
             && !p.stages.iter().any(|stage| stage.translated().stores);
         // Another host list (a new one after a cut, or this one after its
         // reset) has another scratch buffer, or this one's with old bytes.
-        if !windowed || list.first_use(WINDOW_USE) {
+        if list.first_use(WINDOW_USE) {
             self.window = None;
+        } else if !windowed {
+            self.close_window(list);
         }
         let same = |w: &Window| w.copy == args.id() && w.kind == kind && w.stride == stride;
         let hit = self
@@ -2403,13 +2474,16 @@ impl State {
                             && (w.records == 1 || step == u64::from(w.step));
                         if walks {
                             let fit = (args.left(arguments) / step).min(WINDOW_MOST) as u32;
-                            (step as u32, (if w.records == 1 { 16 } else { w.records * 2 }).min(fit).max(1))
+                            (step as u32, (if w.records == 1 { 32 } else { w.records * 4 }).min(fit).max(1))
                         } else {
                             (stride, max)
                         }
                     }
                     _ => (stride, max),
                 };
+                // Return the previous window's scratch buffer to `COMMON` once
+                // before `bound` / `bound_ahead` reuses it as a UAV.
+                self.close_window(list);
                 args.refresh(list, arguments, len.max(u64::from(step) * u64::from(records)));
                 if let Some((s, at)) = &counter {
                     s.refresh(list, *at, 4);
@@ -2440,6 +2514,7 @@ impl State {
                     base: offset,
                     records,
                     scratch: bounded.clone(),
+                    list_id: std::ptr::from_ref(list) as usize,
                 });
                 (bounded, 0)
             }
@@ -2451,7 +2526,9 @@ impl State {
             _ => false,
         };
         if !ran {
-            crate::indirect::done(list, &bounded);
+            if !windowed {
+                crate::indirect::done(list, &bounded);
+            }
             why("prepare failed");
             return false;
         }
@@ -2477,7 +2554,9 @@ impl State {
         if kind == MESH {
             self.mesh_scissor(list, false);
         }
-        crate::indirect::done(list, &bounded);
+        if !windowed {
+            crate::indirect::done(list, &bounded);
+        }
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {
@@ -2705,4 +2784,21 @@ pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
     crate::capture::op(std::ptr::from_ref(list) as usize, || format!("STENCIL REF {reference:#x}"));
     // SAFETY: an open list.
     unsafe { list.list.OMSetStencilRef(reference) };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_shadow_viewport;
+
+    #[test]
+    fn shadow_viewport_matches_square_maps_only() {
+        assert!(is_shadow_viewport(512.0, 512.0));
+        assert!(is_shadow_viewport(1024.0, 1024.0));
+        assert!(is_shadow_viewport(2048.0, 2048.0));
+        assert!(is_shadow_viewport(4096.0, 4096.0));
+        assert!(!is_shadow_viewport(3840.0, 2160.0));
+        assert!(!is_shadow_viewport(1920.0, 1080.0));
+        assert!(!is_shadow_viewport(1280.0, 720.0));
+        assert!(!is_shadow_viewport(64.0, 64.0));
+    }
 }
