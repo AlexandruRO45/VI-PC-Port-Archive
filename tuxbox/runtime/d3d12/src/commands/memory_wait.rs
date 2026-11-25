@@ -105,12 +105,19 @@ impl Word {
         })
     }
 
-    fn reached(&self, value: u64) -> bool {
+    fn value(&self) -> u64 {
         // X64 aligned 64-bit load. The COM resource and its CPU mapping stay alive
         // until all queued waits release their segment.
-        unsafe { AtomicU64::from_ptr(self.mapped as *mut u64).load(Ordering::Acquire) >= value }
+        unsafe { AtomicU64::from_ptr(self.mapped as *mut u64).load(Ordering::Acquire) }
+    }
+
+    fn reached(&self, value: u64) -> bool {
+        self.value() >= value
     }
 }
+
+/// How long the queue is held for a guest memory word before it is released.
+const STALL: Duration = Duration::from_secs(5);
 
 pub(super) struct Segment {
     prefix: Option<(ID3D12CommandList, ID3D12CommandAllocator)>,
@@ -138,10 +145,29 @@ pub(super) unsafe extern "system" fn wait_value64(
             return Ok(());
         }
         if state.prefix.in_body {
-            crate::diagnostics::recording_error(format_args!(
-                "GPU memory wait after rendering commands"
+            // Honoring this would split the list and replay its bound state.
+            // Order the work already in this list with a global UAV barrier and
+            // continue: a value produced by another queue or the CPU is not
+            // waited for, so later commands can read data before it is ready.
+            // Failing the list would poison the queue and fail Present.
+            if unsafe { list.native.GetType() } != D3D12_COMMAND_LIST_TYPE_COPY {
+                let barrier = D3D12_RESOURCE_BARRIER {
+                    Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+                    Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                    Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                        UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                            pResource: std::mem::ManuallyDrop::new(None),
+                        }),
+                    },
+                };
+                // SAFETY: the list is open, and a null resource names every UAV.
+                unsafe { list.native.ResourceBarrier(&[barrier]) };
+            }
+            static FIRST: std::sync::Once = std::sync::Once::new();
+            crate::diagnostics::log_once(&FIRST, || format!(
+                "GPU memory wait {address:#x} >= {target:#x} after rendering commands replaced by a barrier"
             ));
-            return Err(E_NOTIMPL.into());
+            return Ok(());
         }
         state
             .prefix
@@ -201,9 +227,17 @@ impl Worker {
                 for job in jobs {
                     let result = (|| -> Result<()> {
                         unsafe { job.fence.SetEventOnCompletion(1, HANDLE::default())? };
+                        let started = std::time::Instant::now();
                         while !job.segment.word.reached(job.segment.target) {
                             unsafe {
                                 job.device.GetDeviceRemovedReason()?;
+                            }
+                            if started.elapsed() >= STALL {
+                                // Nothing wrote the value, for example because
+                                // the work that should have was dropped. A queue
+                                // held forever trips the title's GPU watchdog.
+                                report_stall(job.segment.target, job.segment.word.value());
+                                break;
                             }
                             std::thread::sleep(Duration::from_millis(1));
                         }
@@ -231,6 +265,18 @@ impl Worker {
             })
             .map_err(|_| E_OUTOFMEMORY)?;
         Ok(Self(sender))
+    }
+}
+
+/// Report a released wait: the first eight, then each power of two.
+fn report_stall(target: u64, value: u64) {
+    static COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let count = COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    if count <= 8 || count.is_power_of_two() {
+        crate::diagnostics::log(&format!(
+            "GPU memory wait released after {}s without reaching its target (#{count}): target={target:#x} value={value:#x}",
+            STALL.as_secs()
+        ));
     }
 }
 

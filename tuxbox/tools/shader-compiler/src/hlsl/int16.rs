@@ -71,15 +71,21 @@ pub(super) fn expression(ins: &Insn) -> Result<Option<String>, String> {
     if !ins.is_complete() || ins.raw.len() < 2 || ins.src.len() < arity {
         return Err("incomplete 16-bit integer instruction".into());
     }
-    // New forms are initially limited to ordinary VGPR inputs. In particular
-    // do not interpret an EXEC/VCC selector as packed integer data.
+    // Do not interpret an EXEC/VCC selector as packed integer data.
     if new_packed && (!packed || !ins.src[..arity].iter().all(|s| matches!(s, Opnd::Vgpr(_)))) {
         return Err("unsupported packed integer source or encoding".into());
     }
-    if new_half(ins) && (packed || !ins.src[..arity].iter().all(|s| matches!(s, Opnd::Vgpr(_)))) {
+    let (w0, w1) = (ins.raw[0], ins.raw[1]);
+    let allow_immediates = matches!(ins.mnemonic.as_str(), "v_add_nc_i16" | "v_sub_nc_i16");
+    // For these two operations, accept integer immediates in the verified low-half form.
+    if new_half(ins) && (packed || !ins.src[..arity].iter().enumerate().all(|(i, src)| {
+        matches!(src, Opnd::Vgpr(_))
+            || (allow_immediates
+                && matches!(src, Opnd::ConstInt(_) | Opnd::Literal(_))
+                && w0 & (1 << (11 + i)) == 0)
+    })) {
         return Err("unsupported ordinary 16-bit integer source or encoding".into());
     }
-    let (w0, w1) = (ins.raw[0], ins.raw[1]);
     // RDNA2 ISA sections 6.5 and 12.10: clamp arithmetic to the
     // representable signed/unsigned 16-bit interval, independently per half.
     let clamped = w0 & 0x8000 != 0;
@@ -182,6 +188,30 @@ pub(super) fn expression(ins: &Insn) -> Result<Option<String>, String> {
 mod tests {
     use super::*;
     use crate::rdna2::disassemble;
+
+    #[test]
+    fn signed_half_add_and_subtract_preserve_the_untouched_half_with_immediates() {
+        use crate::hlsl::float64::tests::translate;
+        use crate::Stage;
+
+        // LLVM gfx1030: v_add_nc_i16 v7, v4, -1
+        //              v_sub_nc_i16 v8, 0x1234, v5 op_sel:[0,1,1]
+        let hlsl = translate(
+            Stage::Compute,
+            &[0xd70d_0007, 0x0001_8304, 0xd70e_5008, 0x0002_0aff, 0x1234],
+        )
+        .unwrap();
+        assert!(
+            hlsl.contains("(v7 & 0xffff0000u) | (((v4 & 0xffffu) + (0xffffffffu & 0xffffu)) & 0xffffu)"),
+            "{hlsl}"
+        );
+        assert!(
+            hlsl.contains("(v8 & 0xffffu) | (((0x1234u & 0xffffu) - (v5 >> 16)) << 16)"),
+            "{hlsl}"
+        );
+        // v_add_nc_i16 v7, v4, -1 op_sel:[0,1,0]
+        assert!(translate(Stage::Compute, &[0xd70d_1007, 0x0001_8304]).is_err());
+    }
 
     #[test]
     fn ordinary_half_forms_preserve_the_other_half() {

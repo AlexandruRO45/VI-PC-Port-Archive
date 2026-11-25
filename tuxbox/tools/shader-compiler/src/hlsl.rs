@@ -4417,21 +4417,17 @@ uint tb_fmac_half(uint a, uint b, uint c) {
                 return Ok(());
             }
             if is_quad_exchange(ins) {
-                if self.loop_depth != 0 {
+                if self.loop_depth != 0 && !(self.pixel_wave && ins.op != OP_ROW_MIRROR) {
                     return Err("DPP16 exchange inside backward control flow".into());
                 }
                 if open {
                     self.end_guard(&mut open);
                     cur.clear();
                 }
-                let source = r(&ins.src[0])?;
                 if self.pixel_wave && ins.op != OP_ROW_MIRROR {
-                    // Quad operations include helper lanes, as FI=1 does. Lane bits are x, y.
-                    let perm = ins.aux.imm;
-                    self.line(&format!("uint q{i}lane = WaveGetLaneIndex() & 3u, q{i}src = (({perm}u >> (2u * q{i}lane)) & 3u) ^ q{i}lane;"));
-                    self.line(&format!("uint q{i}x = QuadReadAcrossX({source}), q{i}y = QuadReadAcrossY({source}), q{i}d = QuadReadAcrossDiagonal({source});"));
-                    self.line(&format!("uint q{i} = q{i}src == 0u ? {source} : q{i}src == 1u ? q{i}x : q{i}src == 2u ? q{i}y : q{i}d;"));
+                    self.emit_pixel_quad_exchange(i, ins)?;
                 } else if ins.op == OP_ROW_MIRROR {
+                    let source = r(&ins.src[0])?;
                     // FI=0: a source lane inactive in EXEC contributes 0. row_mirror
                     // mirrors local lanes within a 16-lane row.
                     self.line(&format!("uint q{i}lane = WaveGetLaneIndex();"));
@@ -4439,6 +4435,7 @@ uint tb_fmac_half(uint a, uint b, uint c) {
                     self.line(&format!("uint q{i}act = q{i}src < 32u ? (exec_lo >> q{i}src) & 1u : (exec_hi >> (q{i}src - 32u)) & 1u;"));
                     self.line(&format!("uint q{i} = q{i}act != 0u ? WaveReadLaneAt({source}, q{i}src) : 0u;"));
                 } else {
+                    let source = r(&ins.src[0])?;
                     // FI=1 fetches the saved VGPR even from an EXEC-disabled lane. All
                     // host lanes must reach the exchange, including those skipping this
                     // block. Reapply the branch and EXEC guards to the destination write.
@@ -4525,6 +4522,16 @@ uint tb_fmac_half(uint a, uint b, uint c) {
     /// (`tb_pc`). The id one past the last instruction terminates the program.
     /// (Implicit-derivative sampling cannot live inside this loop — FXC rejects it, and the
     /// shader then fails to compile rather than silently changing meaning.)
+    fn emit_pixel_quad_exchange(&mut self, i: usize, ins: &Insn) -> Result<(), String> {
+        let source = r(&ins.src[0])?;
+        let perm = ins.aux.imm;
+        // Quad operations include helper lanes, as FI=1 does. Lane bits are x, y.
+        self.line(&format!("uint q{i}lane = WaveGetLaneIndex() & 3u, q{i}src = (({perm}u >> (2u * q{i}lane)) & 3u) ^ q{i}lane;"));
+        self.line(&format!("uint q{i}x = QuadReadAcrossX({source}), q{i}y = QuadReadAcrossY({source}), q{i}d = QuadReadAcrossDiagonal({source});"));
+        self.line(&format!("uint q{i} = q{i}src == 0u ? {source} : q{i}src == 1u ? q{i}x : q{i}src == 2u ? q{i}y : q{i}d;"));
+        Ok(())
+    }
+
     fn emit_body_dispatch(&mut self, is_ps: bool, entry: usize) -> Result<(), String> {
         self.dispatched = true;
         let n = self.insns.len();
@@ -4576,6 +4583,9 @@ uint tb_fmac_half(uint a, uint b, uint c) {
                 let ins = &insns[i];
                 for o in ins.src.iter().chain(ins.dst.iter()) {
                     self.touch(o);
+                }
+                if is_quad_exchange(ins) && self.pixel_wave && ins.op != OP_ROW_MIRROR {
+                    self.emit_pixel_quad_exchange(i, ins)?;
                 }
                 let is_ctl = ins.enc == Enc::Sopp && (Self::branch_cond(ins.op).is_some() || ins.op == 1);
                 if !is_ctl || ins.mnemonic == "s_swappc_b64" {
@@ -6145,7 +6155,9 @@ uint tb_fmac_half(uint a, uint b, uint c) {
             return self.ws(&d, &read);
         }
         if is_quad_exchange(ins) {
-            if self.dispatched { return Err("quad exchange in a block-dispatched program".into()); }
+            if self.dispatched && !(self.pixel_wave && ins.op != OP_ROW_MIRROR) {
+                return Err("quad exchange in a block-dispatched program".into());
+            }
             if ins.op != OP_QUAD_ADD_F32 { return self.wv(&d, &format!("q{}", self.cur_idx)); }
             return self.wv(&d, &format!("asuint(asfloat(q{}) + {})", self.cur_idx, f(&s[1])?));
         }
@@ -9499,13 +9511,19 @@ fn heap_descriptor(sym: &HashMap<u16, Sym>, base: u16, n: u16) -> bool {
         && heap_words(sym, base, n)
 }
 
-/// Root-less pixel shaders receive descriptor heap bases like compute: the user SGPR
+/// Pixel shaders receive descriptor heap bases like compute: the user SGPR
 /// named by one FSSM user-data row (class 5 the resource heap, 6 the sampler heap),
-/// when SFI0 declares that heap directly indexed (bits 25 and 26). The row sits next
-/// to the pixel stage's table rows, which count SGPRs the same way.
+/// when SFI0 declares that heap directly indexed (bits 25 and 26). Rooted pixel
+/// shaders also allow class 5 when `RESOURCE_HEAP_DIRECTLY_INDEXED` (0x400) is set
+/// and `sampler_heap::resource_base` does not already claim the root layout.
 fn pixel_heap_base(ex: &ShaderExtract, class: u32) -> Option<u8> {
-    if ex.stage != Stage::Pixel || ex.root_sig.is_some() || ex.required_features? & (1 << (20 + class)) == 0 {
+    if ex.stage != Stage::Pixel || ex.required_features? & (1 << (20 + class)) == 0 {
         return None;
+    }
+    if let Some(root) = ex.root_sig.as_ref() {
+        if class != 5 || root.flags & 0x400 == 0 || sampler_heap::resource_base(ex).is_some() {
+            return None;
+        }
     }
     let mut rows = tuxbox_dxbc::compute_table::user_data_records(&ex.fssm)?.filter(|&[c, ..]| c == class);
     let [_, 0, 1, 0, loc @ 0..=0xff] = rows.next()? else { return None };
@@ -9599,6 +9617,160 @@ mod tests {
     fn dpp16_mov_missing_control_word_is_refused() {
         let mut insns = vec![Insn { raw: vec![0x7e0802fa], ..dpp16_move_insn(0) }];
         assert!(lower_wave_reductions(&mut insns).is_err());
+    }
+
+    #[test]
+    fn pixel_heap_base_accepts_rooted_resource_heap_without_heap_map() {
+        let mut fssm = vec![0u8; 0x124];
+        fssm[..8].copy_from_slice(b"FSSM\x01\x01\0\0");
+        let len = (fssm.len() - 16) as u32;
+        fssm[8..12].copy_from_slice(&len.to_le_bytes());
+        fssm[0xe8..0xf0].copy_from_slice(&0x100u64.to_le_bytes());
+        fssm[0xf8..0xfc].copy_from_slice(&1u32.to_le_bytes());
+        for (k, v) in [5u32, 0, 1, 0, 10].into_iter().enumerate() {
+            fssm[0x110 + k * 4..0x114 + k * 4].copy_from_slice(&v.to_le_bytes());
+        }
+        let mut ex = ShaderExtract {
+            stage: Stage::Pixel,
+            shader_model: (6, 6),
+            required_features: Some(1 << 25 | 1 << 26),
+            bitcode_stripped: true,
+            fspx_config: None,
+            ps09_pixel_inputs: None,
+            fssm,
+            entry: Some("main".into()),
+            isa_data: Vec::new(),
+            isa: Vec::new(),
+            isa_offset_in_fssm: 0,
+            psv_threads: None,
+            flat_inputs: Vec::new(),
+            flat_outputs: Vec::new(),
+            isa_preamble: [0, 64, 1, 1],
+            has_input_sig: false,
+            has_output_sig: false,
+            has_psv0: false,
+            has_root_sig: false,
+            input_sig: Vec::new(),
+            output_sig: Vec::new(),
+            resources: Vec::new(),
+            gs_info: None,
+            mesh_info: None,
+            primitive_sig: vec![],
+            root_sig: None,
+        };
+        assert_eq!(pixel_heap_base(&ex, 5), Some(10));
+        ex.root_sig = Some(crate::meta::RootSig { version: 2, flags: 0x401, params: vec![], num_static_samplers: 0, static_samplers: vec![] });
+        assert_eq!(pixel_heap_base(&ex, 5), Some(10));
+        assert_eq!(pixel_heap_base(&ex, 6), None);
+        ex.root_sig.as_mut().unwrap().flags = 0x1;
+        assert_eq!(pixel_heap_base(&ex, 5), None);
+    }
+
+    #[test]
+    fn pixel_wave_quad_exchange_works_in_block_dispatch() {
+        let ex = ShaderExtract {
+            stage: Stage::Pixel,
+            shader_model: (6, 6),
+            required_features: None,
+            bitcode_stripped: true,
+            fspx_config: None,
+            ps09_pixel_inputs: None,
+            fssm: Vec::new(),
+            entry: Some("main".into()),
+            isa_data: Vec::new(),
+            isa: Vec::new(),
+            isa_offset_in_fssm: 0,
+            psv_threads: None,
+            flat_inputs: Vec::new(),
+            flat_outputs: Vec::new(),
+            isa_preamble: [0, 64, 1, 1],
+            has_input_sig: false,
+            has_output_sig: false,
+            has_psv0: false,
+            has_root_sig: false,
+            input_sig: Vec::new(),
+            output_sig: Vec::new(),
+            resources: Vec::new(),
+            gs_info: None,
+            mesh_info: None,
+            primitive_sig: vec![],
+            root_sig: None,
+        };
+        let mut insns = vec![Insn { offset: 0x0, ..dpp16_move_insn(dpp16_word(0, 0xb1, 1, 1, 0xf, 0xf)) }];
+        lower_wave_reductions(&mut insns).unwrap();
+        let mut em = Emitter::new(&ex, insns.clone());
+        em.pixel_wave = true;
+        em.emit_body_dispatch(true, 0).expect("pixel_wave block dispatch quad exchange");
+        assert!(em.body.contains("QuadReadAcrossX("));
+
+        let mut em_non_pw = Emitter::new(&ex, insns);
+        let err = em_non_pw.emit_body_dispatch(true, 0).expect_err("non-pixel_wave refused");
+        assert!(err.contains("quad exchange in a block-dispatched program"), "{err}");
+    }
+
+    #[test]
+    fn dpp16_quad_exchange_in_loop_allowed_only_for_pixel_wave_quad_ops() {
+        let ex = ShaderExtract {
+            stage: Stage::Pixel,
+            shader_model: (6, 6),
+            required_features: None,
+            bitcode_stripped: true,
+            fspx_config: None,
+            ps09_pixel_inputs: None,
+            fssm: Vec::new(),
+            entry: Some("main".into()),
+            isa_data: Vec::new(),
+            isa: Vec::new(),
+            isa_offset_in_fssm: 0,
+            psv_threads: None,
+            flat_inputs: Vec::new(),
+            flat_outputs: Vec::new(),
+            isa_preamble: [0, 64, 1, 1],
+            has_input_sig: false,
+            has_output_sig: false,
+            has_psv0: false,
+            has_root_sig: false,
+            input_sig: Vec::new(),
+            output_sig: Vec::new(),
+            resources: Vec::new(),
+            gs_info: None,
+            mesh_info: None,
+            primitive_sig: vec![],
+            root_sig: None,
+        };
+        let loop_insns = |dpp_word: u32| {
+            let mut insns = vec![
+                Insn { offset: 0x0, ..dpp16_move_insn(dpp_word) },
+                Insn {
+                    offset: 0x8,
+                    dwords: 1,
+                    enc: Enc::Sopp,
+                    op: 4, // s_cbranch_scc0
+                    raw: vec![0xbf84fffd],
+                    mnemonic: "s_cbranch_scc0".into(),
+                    dst: vec![],
+                    src: vec![],
+                    aux: tuxbox_dxbc::rdna2::InsnAux { imm: -3, ..Default::default() },
+                },
+            ];
+            lower_wave_reductions(&mut insns).unwrap();
+            insns
+        };
+        let quad_insns = loop_insns(dpp16_word(0, 0xb1, 1, 1, 0xf, 0xf));
+        let mut em = Emitter::new(&ex, quad_insns.clone());
+        em.pixel_wave = true;
+        em.emit_body(true).expect("pixel_wave quad exchange in loop");
+        assert!(em.body.contains("QuadReadAcrossX("));
+
+        let mut em_non_pw = Emitter::new(&ex, quad_insns);
+        let err = em_non_pw.emit_body(true).expect_err("non-pixel_wave refused");
+        assert!(err.contains("DPP16 exchange inside backward control flow"), "{err}");
+
+        let mirror_insns = loop_insns(dpp16_word(2, 0x140, 0, 1, 0xf, 0xf));
+        let mut em_mirror = Emitter::new(&ex, mirror_insns);
+        em_mirror.pixel_wave = true;
+        let err = em_mirror.emit_body(true).expect_err("row_mirror refused");
+        assert!(err.contains("DPP16 exchange inside backward control flow"), "{err}");
     }
 
     #[test]

@@ -223,9 +223,16 @@ pub(super) unsafe extern "system" fn sample_mask(list: &List, mask: u64) {
     if !state.can_record(&list.native) {
         return;
     }
+    // A mask that differs between the four pixels of a quad, such as the
+    // checkerboard 0x0000ffffffff0000, has no desktop equivalent: the host has
+    // one pipeline sample mask for every pixel. Draw with full coverage. Pixels
+    // the title meant to leave untouched are shaded too. Failing the list here
+    // would poison the queue and fail the title's Present.
     if mask != u64::MAX {
-        crate::diagnostics::recording_error(format_args!("SetSampleMaskX quad mask {mask:#018x}"));
-        state.error = windows::Win32::Foundation::E_NOTIMPL;
+        static FIRST: std::sync::Once = std::sync::Once::new();
+        crate::diagnostics::log_once(&FIRST, || {
+            format!("SetSampleMaskX quad mask {mask:#018x} ignored; drawing with full coverage")
+        });
     }
 }
 

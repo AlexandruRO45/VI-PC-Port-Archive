@@ -466,7 +466,12 @@ def draw_projectscarlett_shaders(svg, y, evidence):
     tested, created = pipelines.get("tested"), pipelines.get("created")
     gpu_result = (type(tested) is int and type(created) is int and 0 <= created <= tested <= compiled
                   and tested and pipelines.get("gpu") and pipelines.get("log_sha256"))
-    height = 110 if gpu_result else 88
+    play = read_json(evidence / "projectscarlett-gameplay.json")
+    report = play.get("title_crash_report", {})
+    frame, code = report.get("frame"), play.get("result", {}).get("exit_code")
+    play_result = (play.get("executable_sha256") == title["executable_sha256"] and report.get("sha256")
+                   and report.get("game_state") == "Game Running" and type(frame) is int and type(code) is int)
+    height = 88 + 22*bool(gpu_result) + 22*bool(play_result)
     rect(group, 0, 0, INNER, height, PANEL, stroke=LINE)
     text(group, 18, 30, "Project Scarlett shader preparation", 23, AMBER, bold=True)
     text(group, INNER-18, 30, f"{share:.1%}", 23, AQUA, bold=True, anchor="end")
@@ -476,6 +481,10 @@ def draw_projectscarlett_shaders(svg, y, evidence):
     text(group, INNER-18, 73, f"{unsupported:,} unsupported · {failed:,} failed", 14, MUTED, anchor="end")
     if gpu_result:
         text(group, 18, 96, f"{created:,}/{tested:,} new mesh pipelines created on {pipelines['gpu']}", 14, MUTED)
+    if play_result:
+        outcome = f"then exited with code {code}" if code else "then exited"
+        text(group, 18, height-14, f"Furthest run reached gameplay at frame {frame:,}, {outcome} · not yet playable",
+             14, MUTED)
     return y+height+GAP
 
 

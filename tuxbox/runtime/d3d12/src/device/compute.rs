@@ -154,9 +154,16 @@ pub(super) unsafe extern "system" fn create_pipeline_x(
 ) -> HRESULT {
     // The progress panel counts one pipeline per call from the title.
     let building = crate::progress::building();
+    crate::failures::begin();
+    // SAFETY: a non-null guest descriptor is readable for this call.
+    if let Some(desc) = unsafe { desc.as_ref() } {
+        crate::failures::stage("CS", desc.CS.pShaderBytecode.cast(), desc.CS.BytecodeLength);
+    }
     // SAFETY: the arguments are passed through unchanged.
     let status = unsafe { create_pipeline_x_inner(this, desc, extension_count, _extensions, iid, out) };
     building.finish(status.is_ok());
+    // SAFETY: the guest shaders noted above stay readable for this whole call.
+    unsafe { super::record_pipeline("slot62", status) };
     status
 }
 
@@ -268,14 +275,23 @@ unsafe fn create_pipeline_x_inner(
         let shader = shader.to_vec();
         let node_mask = desc.NodeMask;
         let flags = desc.Flags;
+        let name = label.clone();
         crate::big_stack::run_deadline(&label, move || {
+            // Large programs queue here so the driver does not compile them
+            // all at once. The queue is on the detached compile thread, so the
+            // title's own thread still returns at the deadline.
+            let _slot = crate::compile_gate::large_compile(shader.len(), |slots| {
+                crate::diagnostics::log(&format!("{name} waits for one of {slots} large compile slots"));
+            });
             owned_compile(device, signature, shader, node_mask, flags)
         })
     };
     // Boot 174727 substituted null pipelines for translated shaders whose
     // driver compile passed 20s. Those null pipelines have no paged layout, so
     // the dispatch that precedes the account-picker draws was dropped.
-    let mut native = if translation.is_some() {
+    // Large translated programs are the exception: the driver can take longer
+    // than any load will wait, so they get the deadline and a stand-in too.
+    let mut native = if translation.is_some() && !crate::compile_gate::is_large(code.len()) {
         static WAIT: std::sync::Once = std::sync::Once::new();
         crate::diagnostics::log_once(&WAIT, || {
             "translated compute pipelines wait for the driver compile".to_string()
@@ -339,6 +355,26 @@ unsafe fn create_pipeline_x_inner(
 
 /// Compile one compute pipeline from copies the helper thread owns.
 ///
+/// Compile a large translated program on a detached thread, a few at a time,
+/// and stop waiting at the pipeline deadline. The compile owns everything it
+/// reads and carries on, so the driver can cache its result.
+pub(super) fn large_deferred(
+    label: &str,
+    device: ID3D12Device,
+    root: Option<ID3D12RootSignature>,
+    shader: Vec<u8>,
+    node_mask: u32,
+    flags: D3D12_PIPELINE_STATE_FLAGS,
+) -> crate::big_stack::PipelineWait<windows::core::Result<ID3D12PipelineState>> {
+    let name = label.to_owned();
+    crate::big_stack::run_deadline(label, move || {
+        let _slot = crate::compile_gate::large_compile(shader.len(), |slots| {
+            crate::diagnostics::log(&format!("{name} waits for one of {slots} large compile slots"));
+        });
+        owned_compile(device, root, shader, node_mask, flags)
+    })
+}
+
 /// The guest descriptor can be released as soon as the caller returns. A
 /// deadline does that while the driver is still compiling, so the bytes and
 /// the root signature in that descriptor must not be the ones the driver reads.

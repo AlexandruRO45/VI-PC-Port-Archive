@@ -332,8 +332,10 @@ pub(super) fn import_buffer_with_heap(
     let tight = if !offset.is_multiple_of(D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT as u64) {
         D3D12_RESOURCE_FLAGS(0x400)
     } else { D3D12_RESOURCE_FLAG_NONE };
+    // Console-only bits stay on the guest's description, not the host's.
     let host_desc = D3D12_RESOURCE_DESC {
-        Flags: desc.Flags | D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER | tight,
+        Flags: D3D12_RESOURCE_FLAGS(desc.Flags.0 & super::format::HOST_FLAGS)
+            | D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER | tight,
         ..*desc
     };
     let info = unsafe { device.native.GetResourceAllocationInfo(0, &[host_desc]) };
@@ -386,7 +388,7 @@ fn commit_guest_pages(start: u64, bytes: u64) -> bool {
 fn device_buffer(device: &Device, desc: &D3D12_RESOURCE_DESC, state: D3D12_RESOURCE_STATES)
     -> windows::core::Result<ID3D12Resource> {
     let host = D3D12_RESOURCE_DESC {
-        Flags: D3D12_RESOURCE_FLAGS(desc.Flags.0 & !0x2_0000),
+        Flags: D3D12_RESOURCE_FLAGS(desc.Flags.0 & super::format::HOST_FLAGS),
         ..*desc
     };
     let heap = D3D12_HEAP_PROPERTIES {
@@ -412,9 +414,13 @@ fn import_with_commit(device: &Device, address: u64, desc: &D3D12_RESOURCE_DESC,
             // Match the native import's size/alignment query. Do not commit
             // guessed ranges for invalid descriptors or overflowing addresses.
             let tight = if offset != 0 { D3D12_RESOURCE_FLAGS(0x400) } else { D3D12_RESOURCE_FLAG_NONE };
-            let host = D3D12_RESOURCE_DESC {
-                Flags: desc.Flags | D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER | tight,
+            let legacy = D3D12_RESOURCE_DESC {
+                Flags: D3D12_RESOURCE_FLAGS(desc.Flags.0 & super::format::HOST_FLAGS),
                 ..*desc
+            };
+            let host = D3D12_RESOURCE_DESC {
+                Flags: legacy.Flags | D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER | tight,
+                ..legacy
             };
             let info = unsafe { device.native.GetResourceAllocationInfo(0, &[host]) };
             let size = (info.SizeInBytes != u64::MAX && info.Alignment != 0
@@ -426,7 +432,7 @@ fn import_with_commit(device: &Device, address: u64, desc: &D3D12_RESOURCE_DESC,
                     // compatibility when host import alignment is unavailable.
                     // Strict diagnostic mode never commits a guessed span.
                     if strict_buffer_import() { return None; }
-                    let info = unsafe { device.native.GetResourceAllocationInfo(0, std::slice::from_ref(desc)) };
+                    let info = unsafe { device.native.GetResourceAllocationInfo(0, std::slice::from_ref(&legacy)) };
                     let bytes = if info.SizeInBytes == u64::MAX { desc.Width } else { info.SizeInBytes };
                     offset.checked_add(bytes)?.checked_next_multiple_of(65536)
                 });

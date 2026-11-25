@@ -120,6 +120,32 @@ impl Section {
         Ok(())
     }
 
+    /// Copy `len` bytes to `offset` in this section through a temporary view.
+    /// Every mapping of the section, including GPU imports, sees the write.
+    pub(super) fn write_at(&self, offset: u64, src: *const u8, len: usize) -> Result<(), u32> {
+        let base = offset & !(PAGE as u64 - 1);
+        let within = (offset - base) as usize;
+        let span = within + len;
+        let view = unsafe {
+            MapViewOfFile(self.handle()?, FILE_MAP_WRITE, (base >> 32) as u32, base as u32, span)
+        };
+        if view.Value.is_null() {
+            return Err(unsafe { GetLastError() });
+        }
+        if !self.committed.load(Ordering::Acquire)
+            && unsafe { VirtualAlloc(view.Value, span, MEM_COMMIT, PAGE_READWRITE) }.is_null()
+        {
+            let err = unsafe { GetLastError() };
+            unsafe { UnmapViewOfFile(view) };
+            return Err(err);
+        }
+        unsafe {
+            ptr::copy_nonoverlapping(src, view.Value.cast::<u8>().add(within), len);
+            UnmapViewOfFile(view);
+        }
+        Ok(())
+    }
+
     pub(super) fn read_into(&self, offset: u64, dest: *mut u8) -> Result<(), u32> {
         let view = unsafe {
             MapViewOfFile(

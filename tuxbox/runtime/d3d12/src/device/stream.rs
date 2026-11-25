@@ -161,6 +161,8 @@ unsafe fn create(
                     let code = unsafe {
                         slice::from_raw_parts(shader.pShaderBytecode.cast(), shader.BytecodeLength)
                     };
+                    const NAMES: [&str; 8] = ["VS", "PS", "DS", "HS", "GS", "CS", "AS", "MS"];
+                    crate::failures::stage(NAMES[index], code.as_ptr(), code.len());
                     fields[index] = Some(ptr::from_mut(shader));
                     let compiled = match tag {
                         1 | 2 | AMPLIFICATION_X | MESH_X => None,
@@ -369,9 +371,49 @@ unsafe fn create(
         pPipelineStateSubobjectStream: output.cast(),
     };
     let label = stream_label(&original);
-    // SAFETY: the stream storage, translated shaders, and guest-owned inputs
-    // all stay alive throughout this synchronous call on the desktop Device2.
-    let initial = crate::big_stack::run_logged(&label, || unsafe { host.CreatePipelineState(&native_desc) });
+    // A large translated compute program can compile for longer than any load
+    // will wait. It runs on a detached, queued compile with a deadline; past
+    // that the title gets the stand-in, as on the direct compute path.
+    let compute_code = original[5]
+        .and_then(|(_, translated)| translated.map(|index| &stages[index]))
+        .filter(|code| crate::compile_gate::is_large(code.len()));
+    let initial = if let Some(code) = compute_code {
+        let signature = match (&pipeline.scene_root, root_record) {
+            (Some(root), _) => Some(root.native.clone()),
+            // SAFETY: the record holds the native root written above, which the
+            // guest keeps alive until this call returns. Cloning takes a reference.
+            (None, Some(field)) => unsafe {
+                ID3D12RootSignature::from_raw_borrowed(&*field).cloned()
+            },
+            (None, None) => None,
+        };
+        match compute::large_deferred(
+            &label,
+            device.native.clone(),
+            signature,
+            code.clone(),
+            node_mask,
+            D3D12_PIPELINE_STATE_FLAG_NONE,
+        ) {
+            crate::big_stack::PipelineWait::Ready(result) => result,
+            crate::big_stack::PipelineWait::Deferred => {
+                let hashes = original.map(|stage| {
+                    stage.and_then(|(code, prepared)| {
+                        shader_cache::source_digest(code).map(|hash| (hash, prepared.is_some()))
+                    })
+                });
+                // SAFETY: the stream storage and its field pointers are still live.
+                return unsafe {
+                    null_pipeline(host, &native_desc, &fields, stream_output, geometry_record, pipeline, &hashes)
+                }
+                .unwrap_or_else(|| Err(E_NOTIMPL.into()));
+            }
+        }
+    } else {
+        // SAFETY: the stream storage, translated shaders, and guest-owned inputs
+        // all stay alive throughout this synchronous call on the desktop Device2.
+        crate::big_stack::run_logged(&label, || unsafe { host.CreatePipelineState(&native_desc) })
+    };
     let Err(error) = &initial else {
         if rectangles {
             static FIRST_RECTANGLE: std::sync::Once = std::sync::Once::new();
@@ -542,9 +584,12 @@ pub(super) unsafe extern "system" fn create_pipeline(
 ) -> HRESULT {
     // The progress panel counts one pipeline per call from the title.
     let building = crate::progress::building();
+    crate::failures::begin();
     // SAFETY: the arguments are passed through unchanged.
     let status = unsafe { create_pipeline_inner(device, desc, iid, out) };
     building.finish(status.is_ok());
+    // SAFETY: the guest shaders noted above stay readable for this whole call.
+    unsafe { super::record_pipeline("slot86", status) };
     status
 }
 

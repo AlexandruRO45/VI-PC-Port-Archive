@@ -908,6 +908,19 @@ unsafe extern "system" fn release_device(this: *mut Device) -> u32 {
     }) }
 }
 
+/// Add this thread's pipeline to the per-run failure record if it failed or got
+/// a stand-in.
+///
+/// # Safety
+/// The guest shaders given to `failures::stage` must still be readable.
+pub(super) unsafe fn record_pipeline(path: &str, status: HRESULT) {
+    // SAFETY: forwarded from the caller.
+    let started = unsafe { crate::failures::finish(path, status.0, shader_cache::source_digest) };
+    if let Some(file) = started {
+        crate::diagnostics::log(&format!("pipeline failures are recorded in {}", file.display()));
+    }
+}
+
 static DEVICE: Slots<160> = {
     let mut slots = object_slots::<ID3D12Device, dxgi::DxgiDevice, 160>();
     slots[0] = crate::slot!(dxgi::query);

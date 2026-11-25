@@ -96,6 +96,14 @@ class ProgressMapTests(unittest.TestCase):
             self.assertIn("4 unsupported · 1 failed", graphic)
             self.assertIn(">37.5%<", graphic)
             self.assertIn(">Unmeasured<", graphic)
+            self.assertNotIn("Furthest run", graphic)
+            play = {"executable_sha256": "title", "result": {"exit_code": 5},
+                    "title_crash_report": {"sha256": "report", "game_state": "Game Running", "frame": 10146}}
+            gameplay = root / "projectscarlett-gameplay.json"
+            gameplay.write_text(json.dumps(play))
+            self.assertIn("reached gameplay at frame 10,146, then exited with code 5", render_map(root))
+            gameplay.write_text(json.dumps(dict(play, executable_sha256="other")))
+            self.assertNotIn("Furthest run", render_map(root))
             for changed in (dict(executable_sha256="other"), dict(requests=dict(run["requests"], total=7))):
                 report.write_text(json.dumps(dict(run, **changed)))
                 self.assertNotIn(">Project Scarlett shader preparation<", render_map(root))

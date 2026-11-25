@@ -16,6 +16,10 @@ The Series export `D3D12ZeroMemoryX` clears aligned CPU memory ranges. Tests aga
 
 The default export ordinals match the reviewed 54-export Scarlett DLL. Other builds can assign different ordinals to the same names. Use `python build.py d3d12 --d3d12-reference /path/to/d3d12_xs.dll` to take the ordinal assignments from a supplied library, then run `python tuxbox.py verify --only d3d12-guids --output build/d3d12-identifiers.json`.
 
+## Keeping ProjectScarlett running
+
+ProjectScarlett exercises paths where the provider can't yet reproduce the console. The runtime limits how many large translated compute shaders compile at once and gives the title an empty stand-in after a deadline. It releases GPU memory waits that never complete, records every failed or substituted pipeline, and draws a shader progress panel over the game. These are compatibility measures with known costs, not verified equivalents. [Behavior and settings](../../docs/PROJECTSCARLETT.md#large-pipeline-compiles) · [Compile limit](src/compile_gate.rs) · [Failure record](src/failures.rs)
+
 ## What runs on the GPU
 
 Frosty displays the menu and video preview through this provider on Linux. With checkout-built platform and media adapters, keyboard input opens Settings and starts the Wake Up sequence. The graphics trace records a 712-byte pipeline stream at Xbox device slot 86, direct queue submissions and a 3840 × 2160 display buffer. [Independent run](../../evidence/matrix-awakens/independent-menu.json) · [Graphics trace](../../evidence/matrix-awakens/tuxbox-menu-startup.json)

@@ -463,6 +463,48 @@ impl Pool {
     }
 }
 
+/// TuxBox extension for xcrdapi: write `len` bytes across the 64 KiB physical
+/// pages named by `tokens`, starting `offset` bytes into the first page. This
+/// is a DirectStorage request whose destination is physical pages (Xbox
+/// request option bit 21). Returns 1 on success, 0 with the last error set.
+///
+/// # Safety
+/// `tokens` holds enough readable entries to cover `offset + len` bytes, and
+/// `data` holds `len` readable bytes.
+#[unsafe(export_name = "TuxBoxWritePhysicalPages")]
+pub unsafe extern "system" fn write_pages(tokens: *const u64, count: usize, offset: usize, data: *const u8, len: usize) -> i32 {
+    if len == 0 {
+        return 1;
+    }
+    if tokens.is_null() || data.is_null() || offset.checked_add(len).is_none_or(|end| end.div_ceil(PAGE) > count) {
+        return failure(ERROR_INVALID_PARAMETER);
+    }
+    // SAFETY: the caller supplies `count` entries.
+    let tokens = unsafe { slice::from_raw_parts(tokens, count) };
+    let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+    let (mut index, mut within, mut done) = (offset / PAGE, offset % PAGE, 0usize);
+    while done < len {
+        let chunk = (PAGE - within).min(len - done);
+        let Some(page) = pool.pages.get_mut(&tokens[index]) else {
+            return failure(ERROR_INVALID_ADDRESS);
+        };
+        // SAFETY: `data` has `len` bytes; `chunk` stays inside one page.
+        let src = unsafe { data.add(done) };
+        if !page.saved.is_empty() {
+            unsafe { ptr::copy_nonoverlapping(src, page.saved.as_mut_ptr().add(within), chunk) };
+        } else {
+            if let Err(e) = page.section.write_at(page.offset + within as u64, src, chunk) {
+                return failure(e);
+            }
+            page.has_section_data = true;
+        }
+        done += chunk;
+        index += 1;
+        within = 0;
+    }
+    1
+}
+
 /// # Safety
 /// The count points to a writable SIZE_T. The separate token array has space
 /// for the requested number of UINT64 entries.

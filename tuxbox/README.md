@@ -2,7 +2,7 @@
 
 TuxBox is an experimental Xbox Series X|S compatibility layer for x86-64 Windows and Linux.
 
-- **Linux** uses Valve’s stock Proton Experimental. NVIDIA support is verified on a GeForce RTX 4070 Ti SUPER, including ProjectScarlett’s player selection screen and Frosty’s mesh shader tests. [GPU and host test results](docs/RESULTS.md)
+- **Linux** uses Valve’s stock Proton Experimental. NVIDIA support is verified on a GeForce RTX 4070 Ti SUPER, including Frosty’s mesh shader tests. [GPU and host test results](docs/RESULTS.md)
 - **Windows** has a native Direct3D 12 backend. Windows game compatibility is still in development. [Windows build instructions](examples/lanes/README.md#build-requirements)
 
 ## Why so few Xbox libraries?
@@ -13,8 +13,7 @@ Many calls an Xbox Series game makes already work through standard Windows APIs.
 
 - **Lanes** is a small game that uses TuxBox’s Xbox graphics, memory and input libraries. Collect coins and dodge barriers using a keyboard, mouse or Xbox controller.
 - **The Matrix Awakens (Frosty)** reaches the Wake Up chase cinematic on Linux with TuxBox XG and reduced graphics settings. Earlier reduced-settings runs reached the highway chase and open city. With the original Xbox settings it loads the Construct map and presents a black frame before stopping while creating a compute shader during scene setup. You supply the game, its matching Xbox system files and Proton. [Setup and test results](docs/MATRIX_AWAKENS.md)
-
-**GTA VI (ProjectScarlett)** shows the player selection prompt at 3840×2160 on stock Proton Experimental. [Title progress](docs/PROGRESS.md) · [Setup guide](docs/PROJECTSCARLETT.md)
+- **GTA VI (ProjectScarlett)** gets into the story intro on Linux with stock Proton Experimental. It isn’t playable yet: many shaders are unsupported, and the recorded run crashed after about ten minutes. [Title progress](docs/PROGRESS.md) · [Setup guide](docs/PROJECTSCARLETT.md)
 
 ### Project Scarlett graphics trials
 
@@ -26,7 +25,7 @@ The Series S trial requested a 1920×1080 render resource and stopped on a textu
 
 On Linux, the launcher prepares shaders before opening Frosty and ProjectScarlett. Frosty uses a profile of its game files. ProjectScarlett records the shaders the game requests and prepares them before subsequent launches. New shaders can still compile as the game encounters them.
 
-The launcher shows compilation progress and reuses the cache on later runs. Pass `--prepare-only` to prepare the cache without opening the game, or `--no-shader-prep` to skip preparation for one launch. Place either option before the game path.
+The launcher shows compilation progress and reuses the cache on later runs. After a TuxBox update, shaders that translate to the same source reuse their compiled output. While ProjectScarlett runs, a small panel over the game shows shader and pipeline progress. Pass `--prepare-only` to prepare the cache without opening the game, or `--no-shader-prep` to skip preparation for one launch. Place either option before the game path.
 
 ## Try Lanes
 

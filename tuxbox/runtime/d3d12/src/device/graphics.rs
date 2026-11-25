@@ -17,9 +17,18 @@ pub(super) unsafe extern "system" fn create_pipeline(
 ) -> HRESULT {
     // The progress panel counts one pipeline per call from the title.
     let building = crate::progress::building();
+    crate::failures::begin();
+    // SAFETY: a non-null guest descriptor is readable for this call.
+    if let Some(desc) = unsafe { desc.as_ref() } {
+        for (name, code) in [("VS", &desc.VS), ("PS", &desc.PS), ("DS", &desc.DS), ("HS", &desc.HS), ("GS", &desc.GS)] {
+            crate::failures::stage(name, code.pShaderBytecode.cast(), code.BytecodeLength);
+        }
+    }
     // SAFETY: the arguments are passed through unchanged.
     let status = unsafe { create_pipeline_inner(this, desc, extension_count, _extensions, iid, out) };
     building.finish(status.is_ok());
+    // SAFETY: the guest shaders noted above stay readable for this whole call.
+    unsafe { super::record_pipeline("slot60", status) };
     status
 }
 

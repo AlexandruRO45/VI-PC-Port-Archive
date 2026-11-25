@@ -49,6 +49,8 @@ enum Source {
 
 struct Read {
     source: Source,
+    /// Physical page tokens and the byte offset into the first page.
+    pages: Option<(Vec<u64>, usize)>,
     dest: usize,
     capacity: usize,
     size: usize,
@@ -62,9 +64,24 @@ struct Read {
 unsafe fn capture(queue_type: u64, req: *const Request) -> Result<Read, HRESULT> {
     let req = unsafe { req.as_ref() }.ok_or(E_POINTER)?;
     const FROM_MEMORY: u64 = 1 << 22;
-    if req.options & !(FROM_MEMORY | 1) != 0 {
+    // Bit 21: the destination is an array of 64 KiB physical page tokens,
+    // written linearly from `page_offset` into the first page.
+    const TO_PAGES: u64 = 1 << 21;
+    if req.options & !(FROM_MEMORY | TO_PAGES | 1) != 0 {
         return Err(E_NOTIMPL);
     }
+    // Snapshot the page array now: the title may reuse it after enqueueing.
+    let pages = if req.options & TO_PAGES != 0 {
+        if req.destination.is_null() {
+            return Err(E_INVALIDARG);
+        }
+        let offset = usize::from(req.page_offset);
+        let count = (offset + req.destination_size as usize).div_ceil(65536);
+        let tokens = unsafe { core::slice::from_raw_parts(req.destination.cast::<u64>(), count) }.to_vec();
+        Some((tokens, offset))
+    } else {
+        None
+    };
     let memory = req.options & FROM_MEMORY != 0;
     if memory != (queue_type == 1)
         || req.destination.is_null()
@@ -86,6 +103,7 @@ unsafe fn capture(queue_type: u64, req: *const Request) -> Result<Read, HRESULT>
     };
     Ok(Read {
         source,
+        pages,
         dest: req.destination as usize,
         capacity: req.destination_size as usize,
         size: req.size as usize,
@@ -130,11 +148,16 @@ impl Read {
         }
         let mut local = Vec::new();
         let compressed = &mut local;
+        let mut plain = Vec::new();
         let target = if self.options & 1 != 0 {
             compressed
                 .try_reserve_exact(self.size)
                 .map_err(|_| E_OUTOFMEMORY)?;
             compressed.spare_capacity_mut().as_mut_ptr().cast::<u8>()
+        } else if self.pages.is_some() {
+            plain.try_reserve_exact(self.size).map_err(|_| E_OUTOFMEMORY)?;
+            plain.resize(self.size, 0);
+            plain.as_mut_ptr()
         } else {
             self.dest as *mut u8
         };
@@ -193,9 +216,14 @@ impl Read {
                     .saturating_add(u32::from(output.is_err()));
             }
             let output = output.map_err(|_| HRESULT::from_win32(ERROR_INVALID_DATA.0))?;
+            if let Some((tokens, offset)) = &self.pages {
+                return write_pages(tokens, *offset, &output);
+            }
             unsafe {
                 core::ptr::copy_nonoverlapping(output.as_ptr(), self.dest as *mut u8, output.len())
             };
+        } else if let Some((tokens, offset)) = &self.pages {
+            return write_pages(tokens, *offset, &plain);
         }
         Ok(())
     }
@@ -578,4 +606,31 @@ impl IQueue2_Impl for Queue_Impl {
             });
         }
     }
+}
+
+
+fn debug(text: &str) {
+    let line = std::ffi::CString::new(format!("{text}\n")).unwrap_or_default();
+    unsafe { windows::Win32::System::Diagnostics::Debug::OutputDebugStringA(windows::core::PCSTR(line.as_ptr().cast())) };
+}
+
+/// Write a decoded payload into physical pages through xmem's
+/// `TuxBoxWritePhysicalPages`, which owns the page sections.
+fn write_pages(tokens: &[u64], offset: usize, data: &[u8]) -> Result<(), HRESULT> {
+    type Write = unsafe extern "system" fn(*const u64, usize, usize, *const u8, usize) -> i32;
+    static WRITE: std::sync::OnceLock<Option<Write>> = std::sync::OnceLock::new();
+    let write = WRITE.get_or_init(|| unsafe {
+        use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
+        let module = GetModuleHandleW(windows::core::w!("xmem.dll")).ok()?;
+        let proc = GetProcAddress(module, windows::core::s!("TuxBoxWritePhysicalPages"))?;
+        Some(core::mem::transmute::<_, Write>(proc))
+    });
+    let Some(write) = write else {
+        debug("TuxBox xcrdapi: xmem.dll has no TuxBoxWritePhysicalPages; page destinations fail");
+        return Err(E_NOTIMPL);
+    };
+    if unsafe { write(tokens.as_ptr(), tokens.len(), offset, data.as_ptr(), data.len()) } == 0 {
+        return Err(HRESULT::from_win32(unsafe { GetLastError() }.0));
+    }
+    Ok(())
 }

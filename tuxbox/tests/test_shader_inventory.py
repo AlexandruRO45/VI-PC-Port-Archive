@@ -20,7 +20,7 @@ def counted(records):
 class ShaderInventoryTests(unittest.TestCase):
     def test_archive_counts_memberships_distinct_sources_and_request_evidence(self):
         with TemporaryDirectory() as tmp:
-            root = Path(tmp)
+            root = Path(tmp).resolve()
             title = root / "Frosty/Binaries/XSX/Frosty-XSX-Shipping.exe"
             title.parent.mkdir(parents=True)
             title.write_bytes(b"test game")

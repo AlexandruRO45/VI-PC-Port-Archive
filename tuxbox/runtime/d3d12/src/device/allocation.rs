@@ -222,10 +222,10 @@ pub(super) unsafe extern "system" fn info2(
         } else if let Some(requirement) = packed_requirements(&device.native, visible, d) {
             requirement
         } else if let Ok(host) = device.native.cast::<ID3D12Device8>() {
+            // Image creation keeps only the desktop bits, DCC included, so the
+            // requirements must be queried with the same flags.
             let mut native = *d;
-            if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D {
-                native.Flags.0 &= !DCC_FLAGS;
-            }
+            native.Flags.0 &= super::format::HOST_FLAGS;
             let guest = D3D12_RESOURCE_DESC {
                 Dimension: d.Dimension, Alignment: d.Alignment, Width: d.Width, Height: d.Height,
                 DepthOrArraySize: d.DepthOrArraySize, MipLevels: d.MipLevels, Format: d.Format,
