@@ -137,6 +137,7 @@ groupshared uint single_run;
 uint compute_clamped(uint kind, uint src_at, out uint2 draw_counts, out uint3 groups) {
     draw_counts = uint2(0, 0);
     groups = uint3(0, 0, 0);
+    [branch]
     if (kind <= 1) {
         uint count = min(src_args.Load(src_at), 1u << 24);
         uint instances = min(src_args.Load(src_at + 4), (1u << 26) / max(count, 1u));
@@ -144,8 +145,10 @@ uint compute_clamped(uint kind, uint src_at, out uint2 draw_counts, out uint3 gr
         return count * instances;
     } else if (kind == 2) {
         uint3 g = min(src_args.Load3(src_at), uint3(65535u, 65535u, 65535u));
-        if (g.z != 0 && g.x * g.y > GROUPS / g.z) {
-            g = uint3(0, 0, 0);
+        if (g.z != 0) {
+            if (g.x * g.y > GROUPS / max(g.z, 1u)) {
+                g = uint3(0, 0, 0);
+            }
         }
         groups = g;
         return g.x * g.y * g.z * 64u;
@@ -188,14 +191,26 @@ void main(uint lane : SV_GroupIndex) {
     uint end = first_job + job_count;
     while (j < end) {
         // Fast path: clamp up to 64 consecutive single-record jobs in one wave.
-        bool has_job = (j + lane < end);
-        uint4 j0 = has_job ? jobs.Load4((j + lane) * 32) : uint4(0, 0, 0, 0);
-        uint4 j1 = has_job ? jobs.Load4((j + lane) * 32 + 16) : uint4(0, 0, 0, 0);
+        // Guard root-SRV loads with `[branch]` so inactive tail lanes never
+        // load past the end of `jobs` (root descriptors have no HW bounds check).
+        uint4 j0 = uint4(0, 0, 0, 0);
+        uint4 j1 = uint4(0, 0, 0, 0);
+        [branch]
+        if (j + lane < end) {
+            j0 = jobs.Load4((j + lane) * 32);
+            j1 = jobs.Load4((j + lane) * 32 + 16);
+        }
         costs[lane] = j0.z;
         GroupMemoryBarrierWithGroupSync();
         if (lane == 0) {
             uint run = 0;
-            while (run < 64 && costs[run] == 1) {
+            // Avoid `&&` here: FXC evaluates both sides, which would read
+            // `costs[64]` past the 64-element groupshared array.
+            [loop]
+            while (run < 64) {
+                if (costs[run] != 1) {
+                    break;
+                }
                 run++;
             }
             single_run = run;
@@ -207,8 +222,17 @@ void main(uint lane : SV_GroupIndex) {
             uint cost = 0;
             uint2 draw_counts = uint2(0, 0);
             uint3 groups = uint3(0, 0, 0);
+            [branch]
             if (lane < run) {
-                active = (j1.x == 0) || (count_buf.Load(j1.y) >= 1u);
+                active = true;
+                // Guard `count_buf.Load` with `[branch]` rather than `||`: FXC
+                // does not short-circuit `||` and would unconditionally read
+                // offset 0 of `count_buf`, faulting on unmapped sparse tiles.
+                [branch]
+                if (j1.x != 0) {
+                    active = (count_buf.Load(j1.y) >= 1u);
+                }
+                [branch]
                 if (active) {
                     cost = compute_clamped(j0.x, j0.w, draw_counts, groups);
                 }
@@ -226,6 +250,7 @@ void main(uint lane : SV_GroupIndex) {
                 }
             }
             GroupMemoryBarrierWithGroupSync();
+            [branch]
             if (active) {
                 write_record(j0.x, j0.y, j0.w, j1.z, costs[lane] == PAST, draw_counts, groups);
             }
@@ -234,6 +259,7 @@ void main(uint lane : SV_GroupIndex) {
             uint4 m0 = jobs.Load4(j * 32);
             uint4 m1 = jobs.Load4(j * 32 + 16);
             uint eff_count = m0.z;
+            [branch]
             if (m1.x != 0) {
                 eff_count = min(eff_count, count_buf.Load(m1.y));
             }
@@ -245,6 +271,7 @@ void main(uint lane : SV_GroupIndex) {
                 uint cost = 0;
                 uint2 draw_counts = uint2(0, 0);
                 uint3 groups = uint3(0, 0, 0);
+                [branch]
                 if (record < eff_count) {
                     cost = compute_clamped(m0.x, src_at, draw_counts, groups);
                 }
@@ -261,6 +288,7 @@ void main(uint lane : SV_GroupIndex) {
                     }
                 }
                 GroupMemoryBarrierWithGroupSync();
+                [branch]
                 if (record < eff_count) {
                     write_record(m0.x, m0.y, src_at, dst_at, costs[lane] == PAST, draw_counts, groups);
                 }
@@ -588,6 +616,9 @@ unsafe impl Send for JobUpload {}
 #[derive(Default)]
 pub(crate) struct ClampBatch {
     jobs: Vec<BatchJob>,
+    /// Cached CPU copy of the packed 32-byte job descriptors so growing
+    /// `upload` mid-list never reads back from write-combined upload memory.
+    payload: Vec<[u32; 8]>,
     /// Index of the first job not yet flushed to the command list.
     flushed: usize,
     /// True if an unbatched dispatch (e.g. a non-7 diagnostic mode) ran on
@@ -604,6 +635,7 @@ unsafe impl Send for ClampBatch {}
 impl ClampBatch {
     pub(crate) fn reset(&mut self) {
         self.jobs.clear();
+        self.payload.clear();
         self.flushed = 0;
         self.had_unbatched = false;
         self.kept.clear();
@@ -633,16 +665,16 @@ impl ClampBatch {
         crate::host::name(&buffer, || format!("hoisted clamp jobs ({capacity})"));
         // SAFETY: a live upload buffer.
         let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-        if let Some(old) = &self.upload
-            && !self.jobs.is_empty()
-        {
-            // SAFETY: both mappings are valid for `self.jobs.len() * 32` bytes and disjoint.
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    old.mapped as *const u8,
-                    data,
-                    self.jobs.len() * 32,
-                );
+        if let Some(old) = &self.upload {
+            if !self.payload.is_empty() {
+                // SAFETY: `data` has room for `capacity >= self.payload.len()` 32-byte jobs.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        self.payload.as_ptr().cast::<u8>(),
+                        data,
+                        self.payload.len() * 32,
+                    );
+                }
             }
             // Keep the old upload buffer alive until reset in case earlier
             // dispatches in this list already referenced its GPU address.
@@ -683,6 +715,7 @@ impl ClampBatch {
                 (u.mapped as *mut [u32; 8]).add(slot).write(words);
             }
         }
+        self.payload.push(words);
         self.jobs.push(BatchJob {
             src_gpu,
             count_gpu,
@@ -700,7 +733,7 @@ pub(crate) fn flush_before(clamps: &HostList) -> bool {
     if batch.flushed >= batch.jobs.len() {
         return false;
     }
-    let (Some(c), Some((budget_resource, budget_gpu)), Some(upload_gpu)) = (
+    let (Some(c), Some((_, budget_gpu)), Some(upload_gpu)) = (
         batch_clamp(),
         clamps.budget_resource(),
         batch.upload.as_ref().map(|u| u.gpu),
@@ -714,7 +747,7 @@ pub(crate) fn flush_before(clamps: &HostList) -> bool {
     // source, count, destination (`clamp_room`) and budget buffers.
     unsafe {
         if batch.had_unbatched {
-            l.ResourceBarrier(&[uav_barrier_of(Some(budget_resource))]);
+            l.ResourceBarrier(&[uav_barrier()]);
             batch.had_unbatched = false;
         }
         l.SetComputeRootSignature(&c.root);
@@ -741,12 +774,17 @@ pub(crate) fn flush_before(clamps: &HostList) -> bool {
                 run_end += 1;
             }
             if run_index > 0 {
-                l.ResourceBarrier(&[uav_barrier_of(Some(budget_resource))]);
+                // Full UAV barrier between runs: keeps both `budget` and
+                // adjacent 16-byte-aligned slices of the same `clamp_room`
+                // chunk coherent across runs on wide-cache-line GPUs.
+                l.ResourceBarrier(&[uav_barrier()]);
             }
             let constants = [run_start as u32, (run_end - run_start) as u32, 0, 0];
             l.SetComputeRoot32BitConstants(0, 4, constants.as_ptr().cast(), 0);
             l.SetComputeRootShaderResourceView(2, src_gpu);
-            l.SetComputeRootShaderResourceView(3, count_gpu.unwrap_or(src_gpu));
+            // Bind `upload_gpu` (always resident, non-sparse) when no job in
+            // the run uses `count_buf`; the shader also branches on `has_count`.
+            l.SetComputeRootShaderResourceView(3, count_gpu.unwrap_or(upload_gpu));
             l.SetComputeRootUnorderedAccessView(4, dst_gpu);
             l.Dispatch(1, 1, 1);
             run_start = run_end;
@@ -833,12 +871,10 @@ fn bound_before_mode(
     }
     // Non-7 diagnostic modes or fallback: flush any prior batched jobs first so
     // live mode switches preserve draw order.
-    if flush_before(clamps)
-        && let Some((budget_resource, _)) = clamps.budget_resource()
-    {
-        // SAFETY: an open list and live budget buffer; serialize the
-        // following unbatched dispatch after the flushed batch's budget write.
-        unsafe { clamps.list.ResourceBarrier(&[uav_barrier_of(Some(budget_resource))]) };
+    if flush_before(clamps) {
+        // SAFETY: an open list; serialize the following unbatched dispatch
+        // after the flushed batch's budget and scratch writes.
+        unsafe { clamps.list.ResourceBarrier(&[uav_barrier()]) };
     }
     clamps.clamp_batch().had_unbatched = true;
     let c = clamp()?;
@@ -884,19 +920,12 @@ fn done_on(list: &ID3D12GraphicsCommandList, scratch: &ID3D12Resource) {
 }
 
 fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
-    uav_barrier_of(None)
-}
-
-fn uav_barrier_of(resource: Option<&ID3D12Resource>) -> D3D12_RESOURCE_BARRIER {
     D3D12_RESOURCE_BARRIER {
         Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
         Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
         Anonymous: D3D12_RESOURCE_BARRIER_0 {
             UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
-                pResource: std::mem::ManuallyDrop::new(resource.map(|r| {
-                    // SAFETY: a borrowed pointer; the barrier never releases it.
-                    unsafe { std::mem::transmute_copy(r) }
-                })),
+                pResource: std::mem::ManuallyDrop::new(None),
             }),
         },
     }
@@ -2142,5 +2171,186 @@ void main() {
             "{DRAWS} hoisted mode-7 indirect draw clamps: per-draw {old_ms:.2} ms/frame vs batched {new_ms:.2} ms/frame ({:.1}x)",
             old_ms / new_ms.max(1e-6)
         );
+    }
+
+    /// Regression test for the two FXC non-short-circuiting root-SRV faults in
+    /// `BATCH_SOURCE`:
+    /// 1. Exact 64 KiB upload-buffer boundary (`2048` jobs = `65,536` bytes,
+    ///    plus `2047` partial-tail jobs) where unguarded `has_job ? jobs.Load4`
+    ///    previously read up to 2,016 bytes past the end of `jobs`.
+    /// 2. Uncounted single-record draws (`count = None`) on a `CreateReservedResource`
+    ///    sparse buffer whose Tile 0 (`0..65,536`) is unmapped (`NULL`) and only
+    ///    Tile 1 (`65,536..131,072`) is backed, proving `BATCH_SOURCE` never
+    ///    loads offset `0` of `src_args` when `has_count == 0`.
+    #[test]
+    fn batched_bound_before_guards_page_boundary_and_sparse_unmapped_tile_zero() {
+        let Some(host) = super::host() else {
+            return;
+        };
+        let (Ok(clamps), Ok(copy_list)) = (host.new_list(), host.new_list()) else {
+            return;
+        };
+        let Some((src, src_ptr)) = host.shared_buffer(128 << 10) else {
+            return;
+        };
+        let Some((rb, rb_ptr)) = host.shared_buffer(4096) else {
+            return;
+        };
+        // SAFETY: mapped buffers.
+        unsafe {
+            let p = src_ptr.cast::<u32>();
+            for i in 0..32usize {
+                p.add(i * 5).write(120 + i as u32);
+                p.add(i * 5 + 1).write(2);
+                p.add(i * 5 + 2).write(10 + i as u32);
+                p.add(i * 5 + 3).write(0);
+                p.add(i * 5 + 4).write(i as u32);
+            }
+        }
+
+        // Case 1: exact 64 KiB page boundary (2048 jobs) + partial tail (2047 jobs),
+        // exercising both exact-multiple-of-64 `run == 64` (no `costs[64]` LDS read)
+        // and partial-tail lanes (`j + lane >= end`, no OOB `jobs` root-SRV read).
+        for count in [2047usize, 2048usize] {
+            let mut last = None;
+            for i in 0..count {
+                let off = ((i % 32) * 20) as u64;
+                last = bound_before_mode(&clamps, (&src, off), None, (1, 20, 1), 7);
+                assert!(last.is_some());
+            }
+            let (dst, at) = last.unwrap();
+            clamps.clamp_end();
+            clamps.close();
+            copy_indirect_slice(&copy_list, &rb, 0, &dst, at, 20);
+            copy_list.close();
+            host.execute(&[&clamps, &copy_list]);
+            let expected_idx = ((count - 1) % 32) as u32;
+            // SAFETY: GPU work finished.
+            let got = unsafe { std::slice::from_raw_parts(rb_ptr.cast::<u32>(), 5) };
+            assert_eq!(got, [120 + expected_idx, 2, 10 + expected_idx, 0, expected_idx]);
+            clamps.reset();
+            copy_list.reset();
+        }
+
+        // Case 2: sparse reserved buffer with Tile 0 (offset 0) unmapped and
+        // Tile 1 (offset 65,536) backed with valid draw args.
+        const TILE: u64 = 65_536;
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: TILE * 2,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+        let mut sparse: Option<ID3D12Resource> = None;
+        // SAFETY: plain reserved resource creation.
+        if unsafe {
+            host.device.CreateReservedResource(
+                &desc,
+                D3D12_RESOURCE_STATE_COMMON,
+                None,
+                &mut sparse,
+            )
+        }
+        .is_err()
+        {
+            return;
+        }
+        let sparse = sparse.unwrap();
+        let heap_desc = D3D12_HEAP_DESC {
+            SizeInBytes: TILE,
+            Properties: D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_CUSTOM,
+                CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,
+                MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
+                ..Default::default()
+            },
+            Alignment: TILE,
+            Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS,
+        };
+        let mut heap: Option<ID3D12Heap> = None;
+        // SAFETY: plain heap creation for Tile 1 backing.
+        if unsafe { host.device.CreateHeap(&heap_desc, &mut heap) }.is_err() {
+            return;
+        }
+        let heap = heap.unwrap();
+        let mut init_list = host.new_list().ok();
+        let Some(init_list) = init_list.take() else {
+            return;
+        };
+        // Map ONLY Tile 1 (leave Tile 0 explicitly NULL/unmapped) via a temporary
+        // queue update on the host device so we don't depend on internal queue fields.
+        // SAFETY: plain direct command queue creation on a live device.
+        let tile_queue = unsafe {
+            host.device.CreateCommandQueue::<ID3D12CommandQueue>(&D3D12_COMMAND_QUEUE_DESC {
+                Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
+                ..Default::default()
+            })
+        };
+        let Ok(tile_queue) = tile_queue else {
+            return;
+        };
+        let coord = D3D12_TILED_RESOURCE_COORDINATE {
+            X: 1,
+            Y: 0,
+            Z: 0,
+            Subresource: 0,
+        };
+        let size = D3D12_TILE_REGION_SIZE {
+            NumTiles: 1,
+            UseBox: false.into(),
+            Width: 1,
+            Height: 1,
+            Depth: 1,
+        };
+        let range_flag = D3D12_TILE_RANGE_FLAG_NONE;
+        let heap_offset = 0u32;
+        let tile_count = 1u32;
+        // SAFETY: mapping Tile 1 of `sparse` to `heap` (Tile 0 stays unmapped),
+        // then waiting on a fence before using `sparse` on the host queue.
+        unsafe {
+            tile_queue.UpdateTileMappings(
+                &sparse,
+                1,
+                Some(&coord),
+                Some(&size),
+                &heap,
+                1,
+                Some(&range_flag),
+                Some(&heap_offset),
+                Some(&tile_count),
+                D3D12_TILE_MAPPING_FLAG_NONE,
+            );
+            let fence: ID3D12Fence = host.device.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let event = CreateEventW(None, false, false, None).unwrap();
+            tile_queue.Signal(&fence, 1).unwrap();
+            fence.SetEventOnCompletion(1, event).unwrap();
+            WaitForSingleObject(event, INFINITE);
+
+            // Populate Tile 1 at offset `TILE` (65,536) with valid draw args.
+            init_list.list.CopyBufferRegion(&sparse, TILE, &src, 0, 20 * 4);
+        }
+        init_list.close();
+        host.execute(&[&init_list]);
+
+        let (dst, at) = bound_before_mode(&clamps, (&sparse, TILE), None, (1, 20, 1), 7).unwrap();
+        clamps.clamp_end();
+        clamps.close();
+        copy_indirect_slice(&copy_list, &rb, 0, &dst, at, 20);
+        copy_list.close();
+        host.execute(&[&clamps, &copy_list]);
+
+        // SAFETY: GPU work completed.
+        let got = unsafe { std::slice::from_raw_parts(rb_ptr.cast::<u32>(), 5) };
+        assert_eq!(got, [120, 2, 10, 0, 0]);
+        clamps.reset();
+        copy_list.reset();
+        init_list.reset();
     }
 }
