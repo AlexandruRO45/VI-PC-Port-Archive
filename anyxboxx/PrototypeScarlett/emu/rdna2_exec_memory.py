@@ -43,6 +43,10 @@ LDS_HALVES = {
     **{f"ds_write_{kind}_d16_hi": ("write", kind, True) for kind in ("b8", "b16")},
 }
 HALF_BITS, HALF_MASK = 16, 0xFFFF
+# No VGPR address: LDS[LDS_BASE + {OFFSET1,OFFSET0} + M0[15:0] + TID*4] (ISA section 12.13, DS opcodes 176-177,
+# p. 204). {name: direction}
+LDS_ADD_TID = {"ds_write_addtid_b32": "write", "ds_read_addtid_b32": "read"}
+M0 = 124
 CACHE_CONTROL = frozenset({"s_dcache_inv", "s_gl1_inv", "s_dcache_wb", "buffer_gl0_inv", "buffer_gl1_inv",
                            "ds_nop"})
 OTHER = frozenset({"s_memtime", "s_memrealtime", *rdna2_exec_lanes.NAMES})
@@ -85,7 +89,7 @@ def supports(name):
     vector = VECTOR_PATTERN.match(name)
     return bool(name in CACHE_CONTROL or name in OTHER or name in ADD_TID or vector and vector.group(3) in WIDTHS
                 or VECTOR_ATOMIC.match(name) or SCALAR_PATTERN.match(name)
-                or LDS_PATTERN.match(name) or LDS_ATOMIC.match(name) or name in LDS_HALVES
+                or LDS_PATTERN.match(name) or LDS_ATOMIC.match(name) or name in LDS_HALVES or name in LDS_ADD_TID
                 or rdna2_exec_atomic.vector(name) or rdna2_exec_atomic.lds(name)
                 or rdna2_exec_atomic.lds_exchange2(name) or rdna2_exec_smem.supports(name))
 
@@ -168,6 +172,8 @@ def _lds(wave, name, word):
     if name in rdna2_exec_lanes.NAMES:
         rdna2_exec_lanes.execute(wave, name, addr, data0, vdst, offset1 << 8 | offset0)
         return
+    if name in LDS_ADD_TID:
+        return _lds_add_tid(wave, name, offset1 << 8 | offset0, data0, vdst)
     atomic = LDS_ATOMIC.match(name)
     found = LDS_PATTERN.match(name)
     extended, exchange2 = rdna2_exec_atomic.lds(name), rdna2_exec_atomic.lds_exchange2(name)
@@ -197,6 +203,16 @@ def _lds(wave, name, word):
                 wave.lds[address:address + size] = _store_bytes(wave, source, lane, size)
             else:
                 _load_into(wave, target, lane, bytes(wave.lds[address:address + size]), found.group(3))
+
+
+def _lds_add_tid(wave, name, offset, data0, vdst):
+    base = (wave.s[M0] & HALF_MASK) + offset
+    for lane in wave.active():
+        address = (base + lane * DWORD) % LDS_SIZE
+        if LDS_ADD_TID[name] == "write":
+            wave.lds[address:address + DWORD] = _store_bytes(wave, data0, lane, DWORD)
+        else:
+            _load_into(wave, vdst, lane, bytes(wave.lds[address:address + DWORD]), "b32")
 
 
 def _lds_half(wave, name, address, data0, vdst, lane):

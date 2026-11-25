@@ -46,6 +46,7 @@
 #include "../src/pipeline_profile.h"
 #include "../src/submit_phases.h"
 #include "../src/pipeline_cache_store.h"
+#include "../src/large_module_gate.h"
 #include "../src/conservative_raster.h"
 #include "../src/resource_detile.h"
 #include "../src/console_texture_layout.h"
@@ -1403,14 +1404,39 @@ bool console_format_stand_ins() {
     return on;
 }
 
-// A driver's compiler needs hundreds of MiB for a very large module; several at once exhausted host memory. Compute modules
-// over 128 KiB compile one at a time (LEONIDA_SERIAL_BIG_COMPILES=0: as many as are asked for).
-bool serial_big_compile(std::size_t spirv_bytes) {
-    static const bool serial = [] {
+// A driver's compiler needs hundreds of MiB for a very large module; several at once exhausted host memory. Large are
+// compute modules over 128 KiB and graphics pipelines of PipelineCompiles::large_spirv_bytes or more. They compile side by
+// side while their estimates fit the memory that is free (big_compile_gate). LEONIDA_SERIAL_BIG_COMPILES=1: one at a time,
+// as before there was a budget (graphics: one after another in each submission). 0: as many as are asked for.
+enum class BigCompiles { budget, serial, unlimited };
+BigCompiles big_compiles() {
+    static const BigCompiles mode = [] {
         wchar_t v[2]{};
-        return !(GetEnvironmentVariableW(L"LEONIDA_SERIAL_BIG_COMPILES", v, 2) == 1 && v[0] == L'0');
+        const DWORD n = GetEnvironmentVariableW(L"LEONIDA_SERIAL_BIG_COMPILES", v, 2);
+        if (n == 0) return BigCompiles::budget;
+        return n == 1 && v[0] == L'0' ? BigCompiles::unlimited : BigCompiles::serial;
     }();
-    return serial && spirv_bytes > 128 * 1024;
+    return mode;
+}
+bool big_compute(std::size_t spirv_bytes) { return spirv_bytes > 128 * 1024; }
+
+// Where large compiles wait for memory: one for the process, as the memory is the machine's. Never destroyed: static
+// destruction must not race the compile worker.
+leonida::LargeModuleGate& big_compile_gate() {
+    static auto* const gate = [] {
+        char text[32]{};
+        std::size_t length = 0;
+        const bool present = getenv_s(&length, text, "LEONIDA_BIG_COMPILE_BUDGET_MB") == 0 && length > 1;
+        const auto setting = leonida::large_compile_budget(present ? text : "");
+        if (!setting.valid)
+            std::fprintf(stderr, "[rt] d3d12: LEONIDA_BIG_COMPILE_BUDGET_MB=%s is not a number; not used\n", text);
+        auto budget = [fixed = setting.fixed] { return fixed ? *fixed : leonida::large_compile_budget_bytes(); };
+        std::fprintf(stderr, "[rt] d3d12: large pipelines compile side by side within %llu MiB (%s)\n",
+                     static_cast<unsigned long long>(budget() >> 20),
+                     setting.fixed ? "LEONIDA_BIG_COMPILE_BUDGET_MB" : "3/4 of the memory free now");
+        return new leonida::LargeModuleGate(std::move(budget));
+    }();
+    return *gate;
 }
 
 bool startup_cache_checkpoints_enabled() {
@@ -4696,12 +4722,10 @@ struct DeviceState {
             }
         }
         view_info.components = g::vulkan_swizzle(swizzle, channels_format);
-        // The cast: MSVC's enums are ints, and it rejects int to VkImageAspectFlags in braces as narrowing.
-        view_info.subresourceRange = {
-            VkImageAspectFlags(stencil                                   ? VK_IMAGE_ASPECT_STENCIL_BIT
-                               : (aspects & VK_IMAGE_ASPECT_DEPTH_BIT) ? VK_IMAGE_ASPECT_DEPTH_BIT
-                                                                       : VK_IMAGE_ASPECT_COLOR_BIT),
-            image.first_mip, image.mip_count, image.first_layer, image.layer_count};
+        view_info.subresourceRange = g::vulkan_subresource_range(
+            image, stencil ? VK_IMAGE_ASPECT_STENCIL_BIT
+                            : (aspects & VK_IMAGE_ASPECT_DEPTH_BIT) ? VK_IMAGE_ASPECT_DEPTH_BIT
+                                                                   : VK_IMAGE_ASPECT_COLOR_BIT);
         ImageEntry entry{dimension, 0, VK_NULL_HANDLE, VK_NULL_HANDLE, image.address};
         if (sampled) {
             const VkResult result = vk.vkCreateImageView(info.device, &view_info, nullptr, &entry.sampled);
@@ -8983,7 +9007,9 @@ public:
             const auto it = variants_.find(unbound);
             return it == variants_.end() ? VkPipeline(VK_NULL_HANDLE) : it->second;
         };
-        graphics_.large = spirv_bytes >= leonida::PipelineCompiles::large_spirv_bytes;
+        graphics_.large = spirv_bytes >= leonida::PipelineCompiles::large_spirv_bytes &&
+                          big_compiles() != BigCompiles::unlimited;
+        graphics_.estimate = leonida::large_module_estimate(spirv_bytes);
 
         if (code_stage) {
             VkDeviceSize offset = 0;
@@ -9113,6 +9139,7 @@ public:
         if (vk.vkCreatePipelineLayout(dev, &layout_info, nullptr, &pipeline_.layout) != VK_SUCCESS) return E_FAIL;
         compute_entry_ = entry;
         stage_bytes_ = spirv_bytes;
+        pipeline_.estimate = leonida::large_module_estimate(spirv_bytes);
         // The title creates hundreds of compute pipelines from job threads during startup and one of its init tasks
         // waits for all of them; some modules (wave64-emulated ray-tracing resolves, 4 MiB of SPIR-V) take the driver
         // minutes each. So the Vulkan pipeline is built on first use (build_compute): at the first dispatch that names
@@ -9148,7 +9175,7 @@ public:
                 std::unique_lock lock(pso->variants_mutex_, std::try_to_lock);  // held: another thread is compiling it
                 return lock.owns_lock() ? pso->pipeline_.pipeline : VkPipeline(VK_NULL_HANDLE);
             };
-            pipeline_.large = serial_big_compile(spirv_bytes);
+            pipeline_.large = big_compute(spirv_bytes) && big_compiles() != BigCompiles::unlimited;
         } else if (!build_compute("compute-create")) {
             return E_FAIL;
         }
@@ -9169,12 +9196,32 @@ public:
     }
 
 private:
+    using Work = leonida::LargeModuleGate::Work;
+
+    // Locks the PSO (`lock`, on variants_mutex_) for a build and, with an `estimate`, takes the build's place at the gate. A
+    // thread that waits for its place holds no PSO's lock, and one that has its place waits for none: another thread may be
+    // building that PSO, with a place of its own. Returns without a place when the PSO is `built` already.
+    template<typename Built>
+    leonida::LargeModuleGate::Ticket enter_build(std::unique_lock<std::mutex>& lock, std::uint64_t estimate, Work work,
+                                                 Built&& built) {
+        for (;;) {
+            lock.lock();
+            if (!estimate || built()) return {};
+            lock.unlock();
+            leonida::LargeModuleGate::Ticket place(big_compile_gate(), estimate, work);
+            if (lock.try_lock()) return place;
+        }
+    }
+
     // The compute pipeline, built once: by create_compute (LEONIDA_LAZY_COMPUTE=0), by the first dispatch that names
     // it (the replay layer calls ComputePipeline::build) or by the warm-up thread. Null when it cannot be built; the
     // failure is logged and not retried.
-    VkPipeline build_compute(const char* trigger) {
+    VkPipeline build_compute(const char* trigger, Work work = Work::demand) {
         CompileActivity activity(device_.active_compiles);
-        std::lock_guard lock(variants_mutex_);
+        std::unique_lock lock(variants_mutex_, std::defer_lock);
+        const bool budgeted = big_compute(stage_bytes_) && big_compiles() == BigCompiles::budget;
+        auto place = enter_build(lock, budgeted ? pipeline_.estimate : 0, work,
+                                 [this] { return pipeline_.pipeline || compute_failed_; });
         if (pipeline_.pipeline || compute_failed_) return pipeline_.pipeline;
         compute_failed_ = true;  // until the pipeline exists
         auto& vk = device_.context->vk;
@@ -9184,7 +9231,7 @@ private:
         if (!library || !entry) return VK_NULL_HANDLE;
         static std::mutex big_compile;
         std::unique_lock<std::mutex> big_lock(big_compile, std::defer_lock);
-        if (serial_big_compile(stage_bytes_)) big_lock.lock();
+        if (big_compute(stage_bytes_) && big_compiles() == BigCompiles::serial) big_lock.lock();
         auto words = library->spirv(*entry);
         if (words.empty()) {
             std::fprintf(stderr, "[rt] d3d12: %s.spv is missing or not SPIR-V\n", entry->name.c_str());
@@ -9219,6 +9266,7 @@ private:
         profile.finish(int(created));
         trace.end(trigger, entry->name.c_str(), 0, bytes, created);
         if (big_lock.owns_lock()) big_lock.unlock();
+        place.release();
         vk.vkDestroyShaderModule(dev, module, nullptr);  // Vulkan lets a module go once the pipeline exists
         const ULONGLONG took = GetTickCount64() - started;
         if (created != VK_SUCCESS || !built) {
@@ -9283,7 +9331,8 @@ private:
             queued = PipelineCompiler::instance().submit(compile_owner(), &device_, warm_bytes, [this, compute, warm, unbound] {
                 VkPipeline built{};
                 try {
-                    built = compute ? build_compute(warm ? "warmup" : "dispatch-worker")
+                    built = compute ? build_compute(warm ? "warmup" : "dispatch-worker",
+                                                    warm ? Work::speculative : Work::demand)
                                     : variant(unbound, "draw-worker");
                     if (async_replay_compile()) {
                         unsigned long long skipped = 0;
@@ -9607,7 +9656,10 @@ private:
 
     // Built on first use and kept until the PSO is released (replay may call this from any queue).
     VkPipeline variant(std::uint32_t unbound, const char* trigger) {
-        std::lock_guard lock(variants_mutex_);
+        std::unique_lock lock(variants_mutex_, std::defer_lock);
+        const bool budgeted = graphics_.large && big_compiles() == BigCompiles::budget;
+        const auto place = enter_build(lock, budgeted ? graphics_.estimate : 0, Work::demand,
+                                       [&] { return variants_.contains(unbound); });
         if (const auto it = variants_.find(unbound); it != variants_.end()) return it->second;
         const VkPipeline pipeline = build(unbound, trigger);
         if (!pipeline) {
@@ -10323,6 +10375,8 @@ TitleImage bind_title_image(DeviceState& device, const leonida::gfx10::ImageWord
         std::lock_guard lock(device.descriptor_mutex);
         if (!device.bindless) return refuse("no bindless set");
         if (device.image_entries.count(words)) return TitleImage::known;
+        if (g::has_hardware_volume_uav_slice_offset(words, image))
+            return refuse("a title-written 3D UAV with a slice offset is not supported");
         auto found = device.images_by_address.find(image.address);
         // Memory of the texture stream pool has two addresses, the CPU view's and the GPU-only alias the title hands
         // to the GPU (title_gpu_views): a T# naming either finds a texture registered under the other.
@@ -11007,6 +11061,10 @@ public:
                              threads.count);
             if (threads.count)
                 state_.context->set_pipeline_workers(std::make_unique<leonida::PipelineWorkers>(threads.count));
+            if (big_compiles() == BigCompiles::budget)
+                state_.context->set_large_compiles(
+                    [] { return big_compile_gate().budget(); },
+                    [] { return std::make_shared<leonida::LargeModuleGate::Demand>(big_compile_gate()); });
         }
         leonida::title_va_aliases().set_hooks(
             &state_,
