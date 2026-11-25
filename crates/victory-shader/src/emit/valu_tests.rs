@@ -1613,8 +1613,9 @@ fn dot4_ref(a: u32, b: u32, acc: u32) -> u32 {
 
 /// The upscaler's integer dot products, from an `ACCC` container to the
 /// host GPU: op_sel picks each multiplicand's low half, op_sel_hi its high
-/// half (a constant folded in as `sel_hi_lo(2.0)` is 0x4000), and
-/// `v_dot4c` accumulates into its destination.
+/// half (an inline constant is the f32 pattern; folded in as
+/// `sel_hi_lo(2.0)` it reads 0x4000), and `v_dot4c` accumulates into its
+/// destination.
 #[test]
 fn fspx_programs_run_with_the_hardwares_dot_products() {
     let (a, b, acc) = (0x0302_FB02u32, 0x80FF_7F01u32, 0x7FFF_FFF0u32);
@@ -1622,7 +1623,7 @@ fn fspx_programs_run_with_the_hardwares_dot_products() {
     for (v, x) in [(1, a), (2, b), (3, acc)] {
         load.extend([vop1(0x001, v, 0xFF), x]); // v_mov_b32 vN, literal
     }
-    let cases: [(Vec<u32>, u32); 4] = [
+    let cases: [(Vec<u32>, u32); 6] = [
         (
             dot4(0, vgpr(1), vgpr(2), vgpr(3), 0, 7).to_vec(),
             dot4_ref(a, b, acc),
@@ -1635,6 +1636,17 @@ fn fspx_programs_run_with_the_hardwares_dot_products() {
         (
             dot4(0, vgpr(1), vgpr(2), vgpr(3), 0b001, 0b110).to_vec(),
             dot4_ref(a.rotate_left(16), b, acc),
+        ),
+        // 1.0 at the default selection: the f32 pattern 0x3F800000, read
+        // whole.
+        (
+            dot4(0, vgpr(1), 242, vgpr(3), 0, 0b011).to_vec(),
+            dot4_ref(a, 0x3F80_0000, acc),
+        ),
+        // sel_hi_lo on an inline 4.0 (0x40800000): the halves swapped.
+        (
+            dot4(0, vgpr(1), 246, vgpr(3), 0b010, 0b101).to_vec(),
+            dot4_ref(a, 0x4080, acc),
         ),
         // v_mov_b32 v0, v3; v_dot4c_i32_i8 v0, v1, v2
         (

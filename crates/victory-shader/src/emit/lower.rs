@@ -5520,6 +5520,18 @@ impl<'a> Lower<'a> {
                     return Err("a saturating or negated dot product");
                 }
                 let mut xs = Vec::new();
+                // A host driver reads a constant dot operand's low half in
+                // both halves of its packed dot (the 5070's miss on the
+                // compiler's fold), so a dot over one is taken by hand from
+                // the byte products; the constant itself stays what the
+                // packed instructions see — the f32 pattern, through the
+                // half selection like any operand (measured on AMD across
+                // the nine constants and the selections).
+                let folded = v
+                    .src
+                    .iter()
+                    .take(2)
+                    .any(|op| matches!(op, Operand::Const(240..=248)));
                 for k in 0..2 {
                     let x = s(self, k)?;
                     let (lo, hi) = (v.opsel >> k & 1 != 0, v.opsel_hi >> k & 1 != 0);
@@ -5538,14 +5550,25 @@ impl<'a> Lower<'a> {
                 }
                 let acc = s(self, 2)?;
                 let i32_ty = self.s.t.i32;
-                let r = self.s.op(
-                    c,
-                    "dot4AddPacked.i32",
-                    Attr::ReadNone,
-                    i32_ty,
-                    163,
-                    &[acc, xs[0], xs[1]],
-                );
+                let r = if folded {
+                    let mut dot = acc;
+                    for t in 0..4u8 {
+                        let a = self.select_bits(xs[0], t, true);
+                        let b = self.select_bits(xs[1], t, true);
+                        let p = self.s.m.bin(c, Bin::Mul, a, b);
+                        dot = self.s.m.bin(c, Bin::Add, dot, p);
+                    }
+                    dot
+                } else {
+                    self.s.op(
+                        c,
+                        "dot4AddPacked.i32",
+                        Attr::ReadNone,
+                        i32_ty,
+                        163,
+                        &[acc, xs[0], xs[1]],
+                    )
+                };
                 int(self, r)
             }
             "v_mov_b32" => {
