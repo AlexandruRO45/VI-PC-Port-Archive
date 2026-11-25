@@ -186,21 +186,25 @@ fn write_if_changed(path: &Path, bytes: &[u8]) -> Result<PathBuf> {
     if std::fs::read(path).is_ok_and(|existing| existing == bytes) {
         return Ok(path.to_owned());
     }
-    // Stage beside the destination so publication stays on the same volume.
-    // Include a counter because multiple images can be prepared concurrently.
+    // Stage beside the destination so rename stays on the same volume. The
+    // process id and counter make the staging path unique across concurrent
+    // image loads (and across processes sharing this cache).
     static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let tmp = path.with_extension(format!(
-        "tmp-{}-{}",
-        std::process::id(),
-        COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    ));
-    // Open outside the cleanup block: if create_new fails, this process does
-    // not own the colliding path and must not remove another writer's file.
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&tmp)
-        .with_context(|| format!("creating {}", tmp.display()))?;
+    let (tmp, mut file) = loop {
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let candidate = path.with_extension(format!("tmp-{}-{n}", std::process::id()));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(file) => break (candidate, file),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => {
+                return Err(e).with_context(|| format!("creating {}", candidate.display()));
+            }
+        }
+    };
     let result = (|| -> Result<PathBuf> {
         use std::io::Write;
         file.write_all(bytes)
@@ -211,22 +215,32 @@ fn write_if_changed(path: &Path, bytes: &[u8]) -> Result<PathBuf> {
             // Another process may have published the same hash concurrently.
             // If so, the destination is already usable; otherwise preserve the
             // existing mapping untouched and use a distinct immutable name.
-            Err(_error) if std::fs::read(path).is_ok_and(|existing| existing == bytes) => {
-                Ok(path.to_owned())
-            }
+            // The canonical file has the content hash in its name. A differing
+            // file there is stale/corrupt; preserve it (it may be mapped) and
+            // publish this exact content under a unique immutable name.
             Err(error) => {
-                let unique = path.with_extension(format!(
-                    "{}.{}.dll",
-                    std::process::id(),
-                    COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                ));
-                match std::fs::rename(&tmp, &unique) {
-                    Ok(()) => Ok(unique),
-                    Err(_) if std::fs::read(&unique).is_ok_and(|existing| existing == bytes) => {
-                        Ok(unique)
+                if std::fs::read(path).is_ok_and(|existing| existing == bytes) {
+                    return Ok(path.to_owned());
+                }
+                loop {
+                    let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let unique =
+                        path.with_extension(format!("recovered-{}-{n}.dll", std::process::id()));
+                    match std::fs::rename(&tmp, &unique) {
+                        Ok(()) => break Ok(unique),
+                        Err(rename_error) => match std::fs::read(&unique) {
+                            Ok(existing) if existing == bytes => break Ok(unique),
+                            // A previous recovery file exists; choose a fresh
+                            // name even if Windows reports access denied rather
+                            // than AlreadyExists for the collision.
+                            Ok(_) => continue,
+                            Err(_) => {
+                                break Err(rename_error).with_context(|| {
+                                    format!("publishing image beside {}", path.display())
+                                });
+                            }
+                        },
                     }
-                    Err(_) => Err(error)
-                        .with_context(|| format!("publishing image beside {}", path.display())),
                 }
             }
         }
