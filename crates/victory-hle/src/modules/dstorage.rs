@@ -19,7 +19,7 @@
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
-use std::ffi::{CStr, c_char, c_void};
+use std::ffi::{CStr, CString, c_char, c_void};
 use std::os::windows::fs::FileExt;
 use std::os::windows::io::FromRawHandle;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
@@ -192,6 +192,8 @@ extern "system" fn create_queue(
         return E_INVALIDARG;
     };
     let name = text(desc.name);
+    // SAFETY: a NUL-terminated name from the title (null tolerated).
+    let c_name = (!desc.name.is_null()).then(|| unsafe { CStr::from_ptr(desc.name) }.to_owned());
     tracing::info!(
         source = desc.source_type,
         capacity = desc.capacity,
@@ -212,7 +214,16 @@ extern "system" fn create_queue(
     drop(lanes);
     put(
         out,
-        Instance::create(Object::new("dstorage queue", &QUEUE_VTABLE), Queue { id }),
+        Instance::create(
+            Object::new("dstorage queue", &QUEUE_VTABLE),
+            Queue {
+                id,
+                source_type: desc.source_type,
+                capacity: desc.capacity,
+                priority: desc.priority,
+                name: c_name,
+            },
+        ),
     )
 }
 
@@ -305,9 +316,13 @@ static STATUS_VTABLE: Methods<5> = Methods([
 
 // Queues.
 
-/// A queue object: its lane in the scheduler.
+/// A queue object: its lane in the scheduler and its creation description.
 struct Queue {
     id: u64,
+    source_type: u64,
+    capacity: u16,
+    priority: i8,
+    name: Option<CString>,
 }
 
 impl Drop for Queue {
@@ -577,6 +592,23 @@ impl Lanes {
         }
         lane.flush();
     }
+
+    /// Drops enqueued and waiting reads whose `(tag & mask) == value`,
+    /// returning how many were removed.
+    fn cancel(&mut self, id: u64, mask: u64, value: u64) -> usize {
+        let Some(lane) = self.lanes.get_mut(&id).filter(|l| !l.closed) else {
+            return 0;
+        };
+        let before = lane.unsubmitted.len() + lane.reads.len();
+        lane.unsubmitted.retain(|cmd| match cmd {
+            Command::Read(r) => (r.tag & mask) != value,
+            Command::Status(_) => true,
+        });
+        lane.reads.retain(|(_, r)| (r.tag & mask) != value);
+        let removed = before - (lane.unsubmitted.len() + lane.reads.len());
+        lane.flush();
+        removed
+    }
 }
 
 impl Lane {
@@ -597,6 +629,11 @@ impl Lane {
     /// Requests and status entries held, submitted or not.
     fn entries(&self) -> usize {
         self.unsubmitted.len() + self.reads.len() + self.statuses.len() + self.running.len()
+    }
+
+    /// Unsubmitted commands at which the queue submits on its own.
+    fn submits_at(&self) -> usize {
+        (self.capacity / 2).max(1)
     }
 
     /// Writes the status entries whose earlier reads have all finished.
@@ -764,7 +801,7 @@ fn queue(this: QueueRef, command: Command) {
         return;
     };
     lane.unsubmitted.push(command);
-    if lane.unsubmitted.len() >= (lane.capacity / 2).max(1) {
+    if lane.unsubmitted.len() >= lane.submits_at() {
         lanes.submit(id);
         scheduler.work.notify_all();
     }
@@ -789,6 +826,79 @@ extern "system" fn submit(this: QueueRef) {
 extern "system" fn close(this: QueueRef) {
     // SAFETY: as above.
     close_lane(unsafe { &*this }.state.id);
+}
+
+/// Cancels enqueued and waiting reads whose `(tag & mask) == value`.
+extern "system" fn cancel_by_tag(this: QueueRef, mask: u64, value: u64) {
+    // SAFETY: a queue we created and the title still holds (null tolerated).
+    let Some(q) = (unsafe { this.as_ref() }).map(|q| &q.state) else {
+        return;
+    };
+    let Some(scheduler) = scheduler() else {
+        return;
+    };
+    let removed = scheduler.lock().cancel(q.id, mask, value);
+    tracing::debug!(
+        mask = format_args!("{mask:#x}"),
+        value = format_args!("{value:#x}"),
+        removed,
+        "dstorage: cancel by tag"
+    );
+    if removed > 0 {
+        scheduler.finished.notify_all();
+    }
+}
+
+/// The 2020 `DSTORAGE_QUEUE_DESC` embedded in [`QueueInfo`], 0x18 bytes.
+#[repr(C)]
+struct QueueDesc2020 {
+    source_type: u64,
+    capacity: u16,
+    priority: i8,
+    name: *const c_char,
+}
+
+/// `DSTORAGE_QUEUE_INFO` written by `Query` (0x58), 0x20 bytes.
+#[repr(C)]
+struct QueueInfo {
+    desc: QueueDesc2020,
+    empty_slot_count: u16,
+    request_count_until_auto_submit: u16,
+}
+
+extern "system" fn query(this: QueueRef, out: *mut QueueInfo) {
+    if out.is_null() {
+        return;
+    }
+    // SAFETY: a queue we created and the title still holds (null tolerated).
+    let Some(q) = (unsafe { this.as_ref() }).map(|q| &q.state) else {
+        return;
+    };
+    let (empty_slot_count, request_count_until_auto_submit) = scheduler()
+        .and_then(|s| {
+            let lanes = s.lock();
+            let lane = lanes.lanes.get(&q.id).filter(|l| !l.closed)?;
+            let usable = lane.capacity.max(2) - 1;
+            let empty = usable.saturating_sub(lane.entries()).min(u16::MAX as usize) as u16;
+            let auto = lane
+                .submits_at()
+                .saturating_sub(lane.unsubmitted.len())
+                .min(u16::MAX as usize) as u16;
+            Some((empty, auto))
+        })
+        .unwrap_or((0, 0));
+    let info = QueueInfo {
+        desc: QueueDesc2020 {
+            source_type: q.source_type,
+            capacity: q.capacity,
+            priority: q.priority,
+            name: q.name.as_ref().map_or(std::ptr::null(), |s| s.as_ptr()),
+        },
+        empty_slot_count,
+        request_count_until_auto_submit,
+    };
+    // SAFETY: `out` is non-null and points to the caller's `DSTORAGE_QUEUE_INFO`.
+    unsafe { out.write(info) };
 }
 
 /// Reads, inflates and/or unpacks, and writes one request.
@@ -1032,11 +1142,11 @@ static QUEUE_VTABLE: Methods<12> = Methods([
     enqueue_status as *const (),  // 0x20
     missing::<5> as *const (),    // 0x28 (2020: fence signal)
     submit as *const (),          // 0x30
-    missing::<7> as *const (),    // 0x38 (2020: cancel by tag)
+    cancel_by_tag as *const (),   // 0x38
     close as *const (),           // 0x40
     missing::<9> as *const (),    // 0x48 (2020: error event)
     missing::<10> as *const (),   // 0x50 (2020: error record)
-    missing::<11> as *const (),   // 0x58 (2020: queue info)
+    query as *const (),           // 0x58
 ]);
 
 pub(crate) fn module() -> HleModule {
@@ -1630,5 +1740,255 @@ mod tests {
         }
         assert_eq!(xmem::XMemFreePhysicalPages(3, a.as_ptr()), 1);
         assert_eq!(xmem::XMemFreePhysicalPages(1, b.as_ptr()), 1);
+    }
+
+    fn cancel(queue: *mut c_void, mask: u64, value: u64) {
+        let f: extern "system" fn(*mut c_void, u64, u64) = call(queue, 0x38);
+        f(queue, mask, value);
+    }
+
+    fn query_info(queue: *mut c_void) -> QueueInfo {
+        let f: extern "system" fn(*mut c_void, *mut QueueInfo) = call(queue, 0x58);
+        let mut out = std::mem::MaybeUninit::<QueueInfo>::uninit();
+        f(queue, out.as_mut_ptr());
+        // SAFETY: `query` initializes `out` when non-null.
+        unsafe { out.assume_init() }
+    }
+
+    #[test]
+    fn queue_info_tracks_layout_counts_and_closed_state() {
+        assert_eq!(size_of::<QueueDesc2020>(), 0x18);
+        assert_eq!(std::mem::offset_of!(QueueDesc2020, capacity), 0x08);
+        assert_eq!(std::mem::offset_of!(QueueDesc2020, priority), 0x0a);
+        assert_eq!(std::mem::offset_of!(QueueDesc2020, name), 0x10);
+        assert_eq!(size_of::<QueueInfo>(), 0x20);
+        assert_eq!(std::mem::offset_of!(QueueInfo, empty_slot_count), 0x18);
+        assert_eq!(
+            std::mem::offset_of!(QueueInfo, request_count_until_auto_submit),
+            0x1a
+        );
+
+        let create: extern "system" fn(*mut c_void, *const QueueDesc, *const Guid, Out) -> HRESULT =
+            call(factory(), 0x50);
+        let mut queue = std::ptr::null_mut();
+        {
+            let temp_name = CString::new("streaming-audio").unwrap();
+            let desc = QueueDesc {
+                source_type: 1,
+                capacity: 8,
+                priority: -1,
+                name: temp_name.as_ptr(),
+                unknown: 1,
+            };
+            assert_eq!(create(factory(), &desc, std::ptr::null(), &mut queue), S_OK);
+        }
+
+        let query_raw: extern "system" fn(*mut c_void, *mut QueueInfo) = call(queue, 0x58);
+        query_raw(queue, std::ptr::null_mut());
+
+        let info = query_info(queue);
+        assert_eq!(info.desc.source_type, 1);
+        assert_eq!(info.desc.capacity, 8);
+        assert_eq!(info.desc.priority, -1);
+        // SAFETY: `Queue` owns a `CString` copy valid for the object's lifetime.
+        let name = unsafe { CStr::from_ptr(info.desc.name) };
+        assert_eq!(name, c"streaming-audio");
+        assert_eq!(info.empty_slot_count, 7);
+        assert_eq!(info.request_count_until_auto_submit, 4);
+
+        let src = pattern(32);
+        let mut dst_a = [0u8; 16];
+        let mut dst_b = [0u8; 16];
+        let array = status_array(1);
+        enqueue(
+            queue,
+            &request(
+                MEMORY_SOURCE,
+                dst_a.as_mut_ptr().cast(),
+                16,
+                src.as_ptr().cast(),
+                0,
+                16,
+            ),
+        );
+        enqueue(
+            queue,
+            &request(
+                MEMORY_SOURCE,
+                dst_b.as_mut_ptr().cast(),
+                16,
+                src[16..].as_ptr().cast(),
+                0,
+                16,
+            ),
+        );
+        enqueue_status(queue, array, 0);
+
+        let enqueued = query_info(queue);
+        assert_eq!(enqueued.empty_slot_count, 4);
+        assert_eq!(enqueued.request_count_until_auto_submit, 1);
+
+        void(queue, 0x30);
+        assert_eq!(wait(array, 0), S_OK);
+        let idle = query_info(queue);
+        assert_eq!(idle.empty_slot_count, 7);
+        assert_eq!(idle.request_count_until_auto_submit, 4);
+
+        void(queue, 0x40);
+        let closed = query_info(queue);
+        assert_eq!(closed.empty_slot_count, 0);
+        assert_eq!(closed.request_count_until_auto_submit, 0);
+        assert_eq!(closed.desc.capacity, 8);
+        // SAFETY: `Queue` is not released yet, so its owned name stays valid after `close`.
+        let closed_name = unsafe { CStr::from_ptr(closed.desc.name) };
+        assert_eq!(closed_name, c"streaming-audio");
+
+        let mut unnamed = std::ptr::null_mut();
+        let unnamed_desc = QueueDesc {
+            source_type: 0,
+            capacity: 4,
+            priority: 0,
+            name: std::ptr::null(),
+            unknown: 1,
+        };
+        assert_eq!(
+            create(factory(), &unnamed_desc, std::ptr::null(), &mut unnamed),
+            S_OK
+        );
+        assert!(query_info(unnamed).desc.name.is_null());
+        void(unnamed, 0x40);
+
+        // Status-only enqueues count down `request_count_until_auto_submit` and
+        // trigger auto-submission at the reported threshold without `Submit`.
+        for cap in [2_u16, 4, 8] {
+            let mut q = std::ptr::null_mut();
+            let d = QueueDesc {
+                source_type: 0,
+                capacity: cap,
+                priority: 0,
+                name: std::ptr::null(),
+                unknown: 1,
+            };
+            assert_eq!(create(factory(), &d, std::ptr::null(), &mut q), S_OK);
+            let expected = usize::from(cap / 2).max(1);
+            let statuses = status_array(expected as u32);
+            for step in 0..expected {
+                assert_eq!(
+                    usize::from(query_info(q).request_count_until_auto_submit),
+                    expected - step
+                );
+                if step > 0 {
+                    assert_eq!(result(statuses, 0), E_PENDING);
+                }
+                enqueue_status(q, statuses, step as u32);
+            }
+            assert_eq!(wait(statuses, 0), S_OK);
+            assert_eq!(
+                usize::from(query_info(q).request_count_until_auto_submit),
+                expected
+            );
+            void(q, 0x40);
+        }
+    }
+
+    #[test]
+    fn cancel_by_tag_drops_matching_reads_without_error() {
+        let create: extern "system" fn(*mut c_void, *const QueueDesc, *const Guid, Out) -> HRESULT =
+            call(factory(), 0x50);
+        let desc = QueueDesc {
+            source_type: 1,
+            capacity: 8,
+            priority: 0,
+            name: c"cancel".as_ptr(),
+            unknown: 1,
+        };
+        let mut queue = std::ptr::null_mut();
+        assert_eq!(create(factory(), &desc, std::ptr::null(), &mut queue), S_OK);
+        let array = status_array(2);
+
+        let src = pattern(64);
+        let mut buffers = [[0xaa_u8; 16]; 4];
+        let [d0, d1, d2, d3] = buffers.each_mut().map(|b| b.as_mut_ptr().cast());
+        let tagged = |dst: *mut c_void, off: usize, tag: u64| {
+            let mut r = request(MEMORY_SOURCE, dst, 16, src[off..].as_ptr().cast(), 0, 16);
+            r.tag = tag;
+            r
+        };
+
+        enqueue(queue, &tagged(d0, 0, 0x1001));
+        enqueue(queue, &tagged(d1, 16, 0x1002));
+        enqueue(queue, &tagged(d2, 32, 0x2001));
+        assert_eq!(query_info(queue).empty_slot_count, 4);
+
+        cancel(queue, 0, 1); // matches nothing
+        assert_eq!(query_info(queue).empty_slot_count, 4);
+
+        cancel(queue, 0xff, 0x01); // drops 0x1001 and 0x2001
+        let after_cancel = query_info(queue);
+        assert_eq!(after_cancel.empty_slot_count, 6);
+        assert_eq!(after_cancel.request_count_until_auto_submit, 3);
+
+        enqueue_status(queue, array, 0);
+        void(queue, 0x30);
+        assert_eq!(wait(array, 0), S_OK);
+        assert_eq!(buffers[0], [0xaa; 16]);
+        assert_eq!(buffers[1], src[16..32]);
+        assert_eq!(buffers[2], [0xaa; 16]);
+
+        enqueue(queue, &tagged(d3, 48, 0x55));
+        enqueue_status(queue, array, 1);
+        cancel(queue, 0, 0); // cancels every unsubmitted read
+        void(queue, 0x30);
+        assert_eq!(wait(array, 1), S_OK);
+        assert_eq!(buffers[3], [0xaa; 16]);
+
+        void(queue, 0x40);
+        cancel(queue, 0, 0); // closed queue: no-op
+
+        // Submitted-not-started reads in `Lanes`: cancelling flushes blocked statuses.
+        let mut l = lanes(STAGING);
+        l.lanes.insert(0, Lane::new(0, 64));
+        let raw_array = status_array(2).cast::<Instance<StatusArray>>();
+        let push_tagged = |l: &mut Lanes, tag: u64| {
+            let mut r = request(0, std::ptr::null_mut(), 0, std::ptr::null(), 0, 0);
+            r.tag = tag;
+            l.lanes
+                .get_mut(&0)
+                .unwrap()
+                .unsubmitted
+                .push(Command::Read(r));
+        };
+        let push_status = |l: &mut Lanes, index: u32| {
+            // SAFETY: an array we created.
+            let entries = unsafe { &(*raw_array).state.entries };
+            entries[index as usize].store(E_PENDING, Ordering::Release);
+            add_ref_instance(raw_array);
+            l.lanes
+                .get_mut(&0)
+                .unwrap()
+                .unsubmitted
+                .push(Command::Status(Status {
+                    array: raw_array,
+                    index,
+                }));
+        };
+
+        push_tagged(&mut l, 0xaa);
+        push_tagged(&mut l, 0xbb);
+        push_status(&mut l, 0);
+        l.submit(0);
+        let running = l.start().unwrap();
+        assert_eq!(running.request.tag, 0xaa);
+        assert_eq!(l.cancel(0, !0, 0xbb), 1);
+        assert_eq!(result(raw_array.cast(), 0), E_PENDING);
+        l.finish(&running, Ok(()));
+        assert_eq!(result(raw_array.cast(), 0), S_OK);
+
+        push_tagged(&mut l, 0xcc);
+        push_status(&mut l, 1);
+        l.submit(0);
+        assert_eq!(result(raw_array.cast(), 1), E_PENDING);
+        assert_eq!(l.cancel(0, !0, 0xcc), 1);
+        assert_eq!(result(raw_array.cast(), 1), S_OK);
     }
 }
