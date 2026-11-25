@@ -1041,6 +1041,32 @@ mod tests {
     }
 
     #[test]
+    fn compressed_non_power_of_two_mip_chain_uses_texel_extent() {
+        let desc = TextureDesc {
+            dimension: Dimension::Tex2d,
+            width: 7,
+            height: 5,
+            depth_or_array: 1,
+            mips: 0,
+            format: 98, // BC7_UNORM
+            samples: 1,
+            swizzle: Swizzle::LINEAR,
+        };
+        let automatic = Texture::new(&desc).unwrap();
+        assert_eq!(automatic.planes[0].layout.mips.len(), 3);
+        assert_eq!(
+            Texture::new(&TextureDesc { mips: 3, ..desc }),
+            Ok(automatic)
+        );
+        for mips in [4, u32::MAX] {
+            assert_eq!(
+                Texture::new(&TextureDesc { mips, ..desc }),
+                Err(Error::Invalid)
+            );
+        }
+    }
+
+    #[test]
     fn depth_stencil_is_two_planes() {
         let t = Texture::new(&TextureDesc {
             dimension: Dimension::Tex2d,
