@@ -596,12 +596,15 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
     }
 }
 
-/// The start of a present plane: frame token, then the plane's resources.
+/// The start of a present plane: frame token, then the plane's resources,
+/// then the source rectangle shown (left, top, right, bottom; null for the
+/// whole resource). The record is 0x48 bytes; the rest is not read.
 #[repr(C)]
 pub(crate) struct Plane {
     token: u64,
     count: u32,
     resources: *const This,
+    crop: *const [i32; 4],
 }
 /// Submission tagged with the frame it belongs to `(count, lists, frame
 /// token, flags)`; frames are paced elsewhere, so it runs as a plain one.
@@ -836,6 +839,14 @@ extern "system" fn present(
         && let Some(texture) = crate::resource::host_resource(resource)
         && let Some(host) = crate::host::host()
     {
+        // We show the whole resource: say when the title asks for part of
+        // it (or for more than one plane), since rows past its rectangle
+        // are then not part of the picture.
+        // SAFETY: the plane record's rectangle, if any, is valid for the call.
+        let crop = unsafe { plane.crop.as_ref() }.copied();
+        // SAFETY: a live resource.
+        let desc = unsafe { texture.GetDesc() };
+        note_plane(planes, crop, (desc.Width, desc.Height));
         const COPY_SOURCE: u32 = 0x800;
         let state = crate::resource::host_transition(resource, COPY_SOURCE)
             .map_or(COPY_SOURCE, |(_, before)| before);
@@ -850,6 +861,26 @@ extern "system" fn present(
     let _ = (planes, plane_parameters);
     S_OK
 }
+/// Logs the planes presented and the first one's source rectangle and size
+/// whenever they change.
+#[cfg(windows)]
+fn note_plane(planes: u32, crop: Option<[i32; 4]>, size: (u64, u32)) {
+    type Shown = Option<(u32, Option<[i32; 4]>, (u64, u32))>;
+    static LAST: std::sync::Mutex<Shown> = std::sync::Mutex::new(None);
+    let now = Some((planes, crop, size));
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    if *last != now {
+        *last = now;
+        tracing::info!(
+            planes,
+            ?crop,
+            width = size.0,
+            height = size.1,
+            "presented: the first plane's source rectangle (left, top, right, bottom) and resource size; the whole resource is shown"
+        );
+    }
+}
+
 /// Diagnostics: logs a presented frame that is black after one that was
 /// not, with what was presented and how many draws ran since.
 #[cfg(all(windows, feature = "diagnostics"))]
