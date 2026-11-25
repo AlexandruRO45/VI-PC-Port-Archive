@@ -88,9 +88,13 @@ cargo xtask agility    # Microsoft.Direct3D.D3D12 1.620.2 into the cache folder,
 ```
 
 The log line `host D3D12 runtime` names the runtime in use and its shader
-model. On Windows 11 the step is optional (without the folder the system's
-runtime is used). Tried on Windows 10 22H2 with an RX 7900 XTX: shader model
-6.9 and mesh shaders with the SDK, 6.5 without.
+model. The step is not optional once the executables export the two symbols:
+with the exports and no `D3D12\D3D12Core.dll` beside the executable,
+`D3D12CreateDevice` fails with `0x887E0003` (`D3D12_ERROR_INVALID_REDIST`)
+and there is no device at all; it does not fall back to the system's runtime
+(checked on Windows 10 19045; Windows 11 not checked). Tried on Windows 10
+22H2 with an RX 7900 XTX: shader model 6.9 and mesh shaders with the SDK, 6.5
+without.
 
 Everything below this line is upstream VIctory's own README, unchanged; its
 status section describes upstream, not this fork.
