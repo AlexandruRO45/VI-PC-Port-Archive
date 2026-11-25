@@ -838,6 +838,11 @@ fn memory_at(address: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use windows_sys::Win32::System::Diagnostics::Debug::{
+        EXCEPTION_RECORD, RtlCaptureContext, RtlCaptureStackBackTrace,
+    };
+
     #[test]
     fn concurrent_crash_records_stay_together() {
         const THREADS: usize = 8;
@@ -880,11 +885,6 @@ mod tests {
         }
         assert!(seen.is_empty());
     }
-
-    use super::*;
-    use windows_sys::Win32::System::Diagnostics::Debug::{
-        EXCEPTION_RECORD, RtlCaptureContext, RtlCaptureStackBackTrace,
-    };
 
     /// What [`capture_frames`] saw: our [`unwind`], then the system's walk.
     type Captured = (Vec<u64>, Vec<usize>);
