@@ -56,7 +56,7 @@ pub fn load(prepared: &PreparedImage, dir: &Path) -> Result<LoadedImage> {
     victory_core::ensure_outside_repo(dir)?;
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     let path = dir.join(prepared.file_name());
-    write_if_changed(&path, &prepared.bytes)?;
+    let path = write_if_changed(&path, &prepared.bytes)?;
 
     let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
     // SAFETY: `wide` is a NUL-terminated path. The image has no entry point
@@ -82,7 +82,14 @@ pub fn load(prepared: &PreparedImage, dir: &Path) -> Result<LoadedImage> {
     // A DLL indexes its TLS properly; only an exe assumes index 0.
     if !loaded.info.is_dll() {
         // SAFETY: just mapped, and no title code has run.
-        unsafe { crate::tls::redirect(loaded.base(), &loaded.info) }?;
+        if let Err(error) = unsafe { crate::tls::redirect(loaded.base(), &loaded.info) } {
+            // Redirect can fail after the OS has mapped the image. It is not
+            // registered with the title-thread tracker yet, so it is safe to
+            // release the mapping on this startup error path.
+            // SAFETY: no title code has run and no other code owns the module.
+            unsafe { FreeLibrary(loaded.module) };
+            return Err(error).context("redirecting the image TLS index");
+        }
     }
     tracing::info!(
         base = format_args!("{:#x}", loaded.base()),
@@ -182,14 +189,73 @@ impl ImportResolver for WithTitleDlls<'_> {
     }
 }
 
-fn write_if_changed(path: &Path, bytes: &[u8]) -> Result<()> {
+fn write_if_changed(path: &Path, bytes: &[u8]) -> Result<PathBuf> {
     if std::fs::read(path).is_ok_and(|existing| existing == bytes) {
-        return Ok(());
+        return Ok(path.to_owned());
     }
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, bytes).with_context(|| format!("writing {}", tmp.display()))?;
-    std::fs::rename(&tmp, path).with_context(|| format!("renaming to {}", path.display()))?;
-    Ok(())
+    // Stage beside the destination so rename stays on the same volume. The
+    // process id and counter make the staging path unique across concurrent
+    // image loads (and across processes sharing this cache).
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let (tmp, mut file) = loop {
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let candidate = path.with_extension(format!("tmp-{}-{n}", std::process::id()));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(file) => break (candidate, file),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => {
+                return Err(e).with_context(|| format!("creating {}", candidate.display()));
+            }
+        }
+    };
+    let result = (|| -> Result<PathBuf> {
+        use std::io::Write;
+        file.write_all(bytes)
+            .with_context(|| format!("writing {}", tmp.display()))?;
+        drop(file);
+        match std::fs::rename(&tmp, path) {
+            Ok(()) => Ok(path.to_owned()),
+            // Another process may have published the same hash concurrently.
+            // If so, the destination is already usable; otherwise preserve the
+            // existing mapping untouched and use a distinct immutable name.
+            // The canonical file has the content hash in its name. A differing
+            // file there is stale/corrupt; preserve it (it may be mapped) and
+            // publish this exact content under a unique immutable name.
+            Err(_error) => {
+                if std::fs::read(path).is_ok_and(|existing| existing == bytes) {
+                    return Ok(path.to_owned());
+                }
+                loop {
+                    let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let unique =
+                        path.with_extension(format!("recovered-{}-{n}.dll", std::process::id()));
+                    match std::fs::rename(&tmp, &unique) {
+                        Ok(()) => break Ok(unique),
+                        Err(rename_error) => match std::fs::read(&unique) {
+                            Ok(existing) if existing == bytes => break Ok(unique),
+                            // A previous recovery file exists; choose a fresh
+                            // name even if Windows reports access denied rather
+                            // than AlreadyExists for the collision.
+                            Ok(_) => continue,
+                            Err(_) => {
+                                break Err(rename_error).with_context(|| {
+                                    format!("publishing image beside {}", path.display())
+                                });
+                            }
+                        },
+                    }
+                }
+            }
+        }
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
 }
 
 impl LoadedImage {
