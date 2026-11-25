@@ -497,6 +497,9 @@ struct Lower<'a> {
     handles: HashMap<(usize, Site, u8, bool, (u32, u32)), V>,
     /// Blocks splitting the edge from one IR block to another.
     edges: HashMap<(usize, usize), usize>,
+    /// Per-loop merge blocks for branches leaving nested loops, keyed by
+    /// (loop header, ultimate target).
+    exit_chains: HashMap<(usize, usize), usize>,
     /// Per IR block: a `done` export is behind every lane entering it.
     exported: Vec<bool>,
     /// Reverse-postorder index per IR block.
@@ -1310,6 +1313,7 @@ impl<'a> Lower<'a> {
             interps: x.io.interps.iter().map(|(s, i)| (*s, i)).collect(),
             handles: HashMap::new(),
             edges: HashMap::new(),
+            exit_chains: HashMap::new(),
             exported: vec![false; p.blocks.len()],
             rpo: vec![usize::MAX; p.blocks.len()],
             tail: vec![None; p.blocks.len()],
@@ -12756,19 +12760,66 @@ impl<'a> Lower<'a> {
     /// The DXIL block a branch from IR block `from` to `to` goes to.
     fn edge(&mut self, from: usize, to: usize) -> usize {
         let target = self.block[to].expect("reachable");
+        // Back edges stay as they are: the exiting block is the latch.
+        if self.rpo[to] <= self.rpo[from] {
+            return target;
+        }
+        let chained = self.exit_chain(from, to);
+        if chained != target {
+            return chained;
+        }
         let preds = self.x.p.blocks[to]
             .preds
             .iter()
             .filter(|&&q| self.block[q].is_some())
             .count();
-        // Back edges stay as they are: the exiting block is the latch.
-        if preds < 2 || self.rpo[to] <= self.rpo[from] {
+        if preds < 2 {
             return target;
         }
         let e = self.s.m.new_block();
         self.s.m.terminate(e, Term::Br(target));
         self.edges.insert((from, to), e);
         e
+    }
+
+    /// A branch leaving nested loops goes through one merge block per loop
+    /// it leaves, innermost first. dxil-spirv's structurizer misplaces its
+    /// join ladders when an inner loop's exit targets a block outside an
+    /// enclosing loop (a multi-level break): Mesa then rejects the SPIR-V
+    /// ("branches to the loop construct, but not to the loop header") and
+    /// RADV dereferences the null NIR. DXC chains its breaks the same way.
+    fn exit_chain(&mut self, from: usize, to: usize) -> usize {
+        let target = self.block[to].expect("reachable");
+        if self.rpo[to] <= self.rpo[from] {
+            return target;
+        }
+        // Innermost loop enclosing `from` that `to` leaves.
+        let Some(h) = self
+            .loop_bodies
+            .iter()
+            .filter(|(_, body)| body.contains(&from) && !body.contains(&to))
+            .map(|(h, body)| (*h, body.len()))
+            .min_by_key(|(_, len)| *len)
+            .map(|(h, _)| h)
+        else {
+            return target;
+        };
+        if let Some(&m) = self.exit_chains.get(&(h, to)) {
+            return m;
+        }
+        // Continue from the loop's preheader: outside this loop, inside
+        // whatever encloses it, so the next merge lands one level out.
+        let pre = self.x.p.blocks[h]
+            .preds
+            .iter()
+            .copied()
+            .find(|&q| self.block[q].is_some() && self.rpo[q] < self.rpo[h])
+            .unwrap_or(h);
+        let next = self.exit_chain(pre, to);
+        let m = self.s.m.new_block();
+        self.s.m.terminate(m, Term::Br(next));
+        self.exit_chains.insert((h, to), m);
+        m
     }
 
     /// A dword a scalar load writes, where the load is a descriptor the
