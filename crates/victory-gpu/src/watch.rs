@@ -1006,6 +1006,20 @@ mod tests {
         unsafe { ((view + 200) as *mut u32).write_volatile(9) };
         let (_, found) = writes(view, view + PAGE, true).expect("view memory");
         assert!(found.iter().any(|&(p, at)| p == page && at > now), "{found:?}");
+        // Across two title views of the section (64 KiB each, as the heap's
+        // often are): written in two parts.
+        crate::title_memory_remapped(view, 2 * BLOCK);
+        crate::inplace::title_memory_view(view, BLOCK, section, 0);
+        crate::inplace::title_memory_view(view + BLOCK, BLOCK, section, BLOCK as u64);
+        let across = *b"across two views";
+        let at = view + BLOCK - 8;
+        let started = std::time::Instant::now();
+        while crate::host::write_unseen(at, across.as_ptr(), across.len()).is_none() {
+            assert!(started.elapsed().as_secs() < 5, "never written across the views");
+            std::thread::yield_now();
+        }
+        // SAFETY: our view.
+        assert_eq!(unsafe { std::slice::from_raw_parts(at as *const u8, across.len()) }, &across);
         // Not a view of a section we know: written as before.
         let mut plain = [0u8; 16];
         assert!(crate::host::write_unseen(plain.as_mut_ptr() as usize, bytes.as_ptr(), 4).is_none());
