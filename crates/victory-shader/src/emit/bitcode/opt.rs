@@ -451,6 +451,51 @@ impl Module {
                     (Bin::Or, _, Some(m)) if m == all => Some(b),
                     (Bin::Or, Some(m), _) if m == all => Some(a),
                     (Bin::And | Bin::Or, _, _) if a == b => Some(a),
+                    (Bin::And | Bin::Or | Bin::Xor, _, _) => {
+                        // Combine two constant masks of the same integer
+                        // operation. Both operations are bitwise, so this
+                        // does not change arithmetic or lane semantics.
+                        let (inner, outer_mask) = match (ka, kb) {
+                            (None, Some(k)) => (a, k),
+                            (Some(k), None) => (b, k),
+                            _ => return None,
+                        };
+                        let V::Inst(j) = inner else { return None };
+                        let Op::Bin(inner_op, x, y) = self.insts[j as usize].op else {
+                            return None;
+                        };
+                        if inner_op != op {
+                            return None;
+                        }
+                        let (value, inner_mask) = match (self.int_k(x), self.int_k(y)) {
+                            (None, Some((_, k))) => (x, k),
+                            (Some((_, k)), None) => (y, k),
+                            _ => return None,
+                        };
+                        let combined = match op {
+                            Bin::And => inner_mask & outer_mask,
+                            Bin::Or => inner_mask | outer_mask,
+                            Bin::Xor => inner_mask ^ outer_mask,
+                            _ => unreachable!(),
+                        };
+                        if combined == inner_mask {
+                            return Some(inner);
+                        }
+                        if (op == Bin::And && combined == all)
+                            || (matches!(op, Bin::Or | Bin::Xor) && combined == 0)
+                        {
+                            return Some(value);
+                        }
+                        let k = self.k(ty, bits, combined);
+                        if (op == Bin::And && combined == 0)
+                            || (op == Bin::Or && combined == all)
+                        {
+                            return Some(k);
+                        }
+                        self.insts[i as usize].op = Op::Bin(op, value, k);
+                        *changed = true;
+                        None
+                    }
                     _ => None,
                 }
             }
@@ -1304,6 +1349,38 @@ mod tests {
         let minus4 = m.i32(-4i32 as u32);
         let stores = stores(&m, b);
         assert_eq!(stores, [vec![x, four], vec![minus4, wide]]);
+        m.write();
+    }
+
+    #[test]
+    fn nested_integer_masks_fold_without_reordering_other_operations() {
+        let Kit { mut m, b, reads, writes, .. } = kit();
+        let (one, k15, k51, k3, k63, k60) =
+            (m.i32(1), m.i32(15), m.i32(51), m.i32(3), m.i32(63), m.i32(60));
+        let x = m.call(b, reads, vec![one, one]);
+        // Constant masks can be on either side.
+        let inner_and = m.bin(b, Bin::And, x, k15);
+        let and = m.bin(b, Bin::And, k51, inner_and);
+        let inner_or = m.bin(b, Bin::Or, k15, x);
+        let or = m.bin(b, Bin::Or, inner_or, k51);
+        let inner_xor = m.bin(b, Bin::Xor, x, k15);
+        let xor = m.bin(b, Bin::Xor, k51, inner_xor);
+        let cancelled = m.bin(b, Bin::Xor, inner_xor, k15);
+        let mixed = m.bin(b, Bin::Or, inner_and, k51);
+        m.call(b, writes, vec![and, or]);
+        m.call(b, writes, vec![xor, cancelled]);
+        m.call(b, writes, vec![mixed, mixed]);
+        m.terminate(b, Term::Ret);
+        m.optimise(FOLD | DEAD);
+        for (v, op, constant) in [(and, Bin::And, k3), (or, Bin::Or, k63), (xor, Bin::Xor, k60)] {
+            let V::Inst(i) = v else { panic!("expected instruction") };
+            assert!(matches!(m.insts[i as usize].op, Op::Bin(actual, a, c)
+                if actual == op && a == x && c == constant));
+        }
+        let V::Inst(i) = mixed else { panic!("expected instruction") };
+        assert!(matches!(m.insts[i as usize].op, Op::Bin(Bin::Or, a, c)
+            if a == inner_and && c == k51));
+        assert_eq!(stores(&m, b), [vec![and, or], vec![xor, x], vec![mixed, mixed]]);
         m.write();
     }
 
