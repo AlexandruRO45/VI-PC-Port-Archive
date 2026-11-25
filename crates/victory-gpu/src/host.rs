@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WAIT_OBJECT_0, WPARAM};
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
 use windows::Win32::Graphics::Direct3D::{
     D3D_FEATURE_LEVEL_12_0, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST, ID3DBlob,
@@ -1182,17 +1182,18 @@ impl Host {
 
     /// Records and queues staging-to-card copies. The title command lists
     /// follow on the same direct queue, so no intermediate fence is needed.
-    fn copy_up_cards(&self, copies: &[crate::shadow::CardCopy]) -> u64 {
+    /// Errors leave the card side older than what the title lists would read:
+    /// the caller ends the run ([`fail`]).
+    fn copy_up_cards(&self, copies: &[crate::shadow::CardCopy]) -> Result<u64, String> {
         if copies.is_empty() {
-            return 0;
+            return Ok(0);
         }
         let mut slot = self.card_commands.lock().unwrap_or_else(|e| e.into_inner());
         let Some(commands) = slot.as_mut() else {
-            return 0;
+            return Err("up: no copy lists".into());
         };
         if let Err(error) = commands.up.begin() {
-            tracing::warn!(%error, "card-side copy-up list did not reset");
-            return 0;
+            return Err(format!("up: the list did not reset: {error}"));
         }
         for copy in copies {
             let Some(staging) = copy.shadow.staging.as_ref() else {
@@ -1211,8 +1212,7 @@ impl Host {
             }
         }
         let Some(list) = commands.up.close() else {
-            tracing::warn!("card-side copy-up list did not close");
-            return 0;
+            return Err("up: the list did not close".into());
         };
         // SAFETY: a closed list; later title lists run on this same queue.
         unsafe { self.queue.ExecuteCommandLists(&[Some(list)]) };
@@ -1221,7 +1221,7 @@ impl Host {
             copy.clear_stale();
         }
         CARD_COPY_BYTES[0].fetch_add(bytes, Ordering::Relaxed);
-        bytes
+        Ok(bytes)
     }
 
     /// Records staging-side downloads for GPU-written pages and waits before
@@ -1230,17 +1230,16 @@ impl Host {
         &self,
         copies: &[crate::shadow::CardCopy],
         submitted: &mut u64,
-    ) -> u64 {
+    ) -> Result<u64, String> {
         if copies.is_empty() {
-            return 0;
+            return Ok(0);
         }
         let mut slot = self.card_commands.lock().unwrap_or_else(|e| e.into_inner());
         let Some(commands) = slot.as_mut() else {
-            return 0;
+            return Err("down: no copy lists".into());
         };
         if let Err(error) = commands.down.begin() {
-            tracing::warn!(%error, "card-side copy-down list did not reset");
-            return 0;
+            return Err(format!("down: the list did not reset: {error}"));
         }
         for copy in copies {
             let Some(staging) = copy.shadow.staging.as_ref() else {
@@ -1258,8 +1257,7 @@ impl Host {
             }
         }
         let Some(list) = commands.down.close() else {
-            tracing::warn!("card-side copy-down list did not close");
-            return 0;
+            return Err("down: the list did not close".into());
         };
         *submitted += 1;
         // SAFETY: a closed direct list and our fence/event.
@@ -1269,16 +1267,18 @@ impl Host {
                 .queue
                 .Signal(&self.fence, *submitted)
                 .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
-            match waited {
-                Ok(()) => {
-                    WaitForSingleObject(self.event, INFINITE);
-                }
-                Err(error) => tracing::warn!(%error, "card-side copy-down not waited for"),
+            // The CPU copy-back reads the system-memory side next: it must not
+            // run before the download has.
+            if let Err(error) = waited {
+                return Err(format!("down: not waited for: {error}"));
+            }
+            if WaitForSingleObject(self.event, INFINITE) != WAIT_OBJECT_0 {
+                return Err(format!("down: the wait failed: {}", std::io::Error::last_os_error()));
             }
         }
         let bytes: u64 = copies.iter().map(|copy| copy.len).sum();
         CARD_COPY_BYTES[1].fetch_add(bytes, Ordering::Relaxed);
-        bytes
+        Ok(bytes)
     }
 
     /// Whether the host runs mesh shaders at shader model 6.6 (translated
@@ -1519,7 +1519,11 @@ impl Host {
         };
         let mut removed_in = None;
         if !card_uploads.is_empty() {
-            self.copy_up_cards(&card_uploads);
+            // Title lists reading an older card side would compute something
+            // else than the console: the run ends, as for a removed device.
+            if let Err(error) = self.copy_up_cards(&card_uploads) {
+                fail(format_args!("card-side copy {error}"));
+            }
         }
         for (i, group) in groups.iter().enumerate() {
             *submitted += 1;
@@ -1665,7 +1669,11 @@ impl Host {
             }
             let downloads = crate::shadow::card_downloads(pages);
             if !downloads.is_empty() {
-                self.copy_down_cards(&downloads, &mut submitted);
+                // Copy-back would put older bytes into title memory and the
+                // title be told the work is done: the run ends instead.
+                if let Err(error) = self.copy_down_cards(&downloads, &mut submitted) {
+                    fail(format_args!("card-side copy {error}"));
+                }
             }
         }
         crate::shadow::copy_back_marks(&withheld, withholding);
