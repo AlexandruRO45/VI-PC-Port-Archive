@@ -129,10 +129,8 @@ impl Lower<'_> {
                 let (k, dynamic) = self.built_offset(src)?;
                 // A root view is title memory there (bounds-checked); a BVH
                 // larger than 2 GiB has node offsets a 32-bit shift cannot
-                // hold, so the shift and the adds happen in 64 bits. (Before
-                // this the offset was shifted in 32 bits and zero-extended,
-                // which also turned a negative offset into one about 4 GiB
-                // too large.)
+                // hold, so the shift and the adds happen in 64 bits, as the
+                // explicit-descriptor path below does.
                 match self.root_address(src) {
                     Some((root_lo, root_hi)) => {
                         self.s.flags |= super::flags::INT64;
