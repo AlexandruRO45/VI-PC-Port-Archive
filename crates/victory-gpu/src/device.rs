@@ -233,6 +233,21 @@ extern "system" fn node_count(_: This) -> u32 {
     1
 }
 
+/// `MakeResident` and `Evict` `(count, objects)`: our objects are always
+/// where the title left them, and the host pages its own.
+extern "system" fn residency(_: This, count: u32, objects: *const This) -> HRESULT {
+    if count > 0 && objects.is_null() {
+        E_INVALIDARG
+    } else {
+        S_OK
+    }
+}
+
+/// `SetStablePowerState(enable)`: the host's clocks are its own business.
+extern "system" fn stable_power_state(_: This, _enable: i32) -> HRESULT {
+    S_OK
+}
+
 /// Feature query 2: the highest of the requested feature levels we support.
 #[repr(C)]
 struct FeatureLevels {
@@ -507,10 +522,13 @@ static FUNCTIONS: Table<160> = {
     f[27] = resource::create_committed as *const (); // 0xd8
     f[28] = resource::create_heap as *const (); // 0xe0
     f[29] = resource::create_placed as *const (); // 0xe8
+    f[34] = residency as *const (); // 0x110 make resident
+    f[35] = residency as *const (); // 0x118 evict
     f[36] = fence::create as *const (); // 0x120
     f[37] = removed_reason as *const (); // 0x128
     f[38] = resource::copyable_footprints as *const (); // 0x130
     f[39] = query::create as *const (); // 0x138
+    f[40] = stable_power_state as *const (); // 0x140
     f[41] = signature::create as *const (); // 0x148
     f[48] = queue::create_x as *const (); // 0x180
     f[61] = descriptor::create_sampler_x as *const (); // 0x1e8
@@ -690,6 +708,27 @@ mod tests {
         let device = device();
         let reason = slot::<extern "system" fn(This) -> HRESULT>(device, 0x128);
         assert_eq!(reason(device), S_OK);
+    }
+
+    /// The PC device methods between creating a placed resource and a
+    /// fence, and the one after creating a query heap, at their PC slots.
+    #[test]
+    fn residency_and_power_state_succeed_as_on_pc() {
+        type Residency = extern "system" fn(This, u32, *const This) -> HRESULT;
+        let device = device();
+        let mut fence = std::ptr::null();
+        let fence_iid = &crate::fence::FENCE_IIDS[0];
+        assert_eq!(fence::create(device, 0, 0, fence_iid, &mut fence), S_OK);
+        for offset in [0x110, 0x118] {
+            let call = slot::<Residency>(device, offset);
+            assert_eq!(call(device, 1, &fence), S_OK, "{offset:#x}");
+            assert_eq!(call(device, 0, std::ptr::null()), S_OK, "{offset:#x}");
+            assert_eq!(call(device, 1, std::ptr::null()), E_INVALIDARG);
+        }
+        let stable = slot::<extern "system" fn(This, i32) -> HRESULT>(device, 0x140);
+        assert_eq!(stable(device, 1), S_OK);
+        assert_eq!(stable(device, 0), S_OK);
+        slot::<extern "system" fn(This) -> u32>(fence, 0x10)(fence);
     }
 
     type Check = extern "system" fn(This, u32, *mut c_void, u32) -> HRESULT;
