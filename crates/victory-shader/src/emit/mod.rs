@@ -273,8 +273,8 @@ pub struct UserData {
 /// Translates the vertex, pixel, compute or mesh program of a console
 /// shader container.
 thread_local! {
-    /// Whether this thread's translation may take the wave-wide form
-    /// ([`with_wave_wide`]).
+    // Whether this thread's translation may take the wave-wide form
+    // ([`with_wave_wide`]).
     static WIDE_HERE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
