@@ -115,6 +115,19 @@ impl Shader {
                 let (done, cached) = translate(&self.container);
                 let ms = started.elapsed().as_millis() as u64;
                 let (user_ms, kernel_ms) = thread_cpu_since(cpu);
+                #[cfg(feature = "diagnostics")]
+                if dump_dxil(&self.hash)
+                    && let Ok(t) = &done
+                {
+                    let dir = std::env::var_os("VICTORY_DUMP_DIR")
+                        .map(std::path::PathBuf::from)
+                        .unwrap_or_else(std::env::temp_dir);
+                    let path = dir.join(format!("{}-{}.dxil", self.stage, self.hash));
+                    match std::fs::write(&path, &t.host.dxil) {
+                        Ok(()) => tracing::info!(path = %path.display(), "DXIL dumped"),
+                        Err(e) => tracing::warn!(error = %e, "DXIL not dumped"),
+                    }
+                }
                 match &done {
                     Ok(t) => tracing::info!(
                         stage = self.stage,
@@ -142,6 +155,24 @@ impl Shader {
             })
             .as_ref()
     }
+}
+
+/// Whether `VICTORY_DUMP_DXIL` (comma-separated 16-digit hash prefixes) names
+/// this shader: its translated DXIL is written beside `VICTORY_DUMP_DIR` (or
+/// the temporary folder), to look at with a disassembler.
+#[cfg(all(windows, feature = "diagnostics"))]
+fn dump_dxil(hash: &str) -> bool {
+    static LIST: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    LIST.get_or_init(|| {
+        std::env::var("VICTORY_DUMP_DXIL")
+            .unwrap_or_default()
+            .split(',')
+            .map(|h| h.trim().to_ascii_lowercase())
+            .filter(|h| !h.is_empty())
+            .collect()
+    })
+    .iter()
+    .any(|h| h == hash)
 }
 
 /// This thread's processor time so far, user and kernel, in 100 ns units.
