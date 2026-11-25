@@ -404,6 +404,11 @@ enum MaskData {
 /// What a value holding a lane mask read as a number stops with.
 const LANE_MASK: Why = "a lane mask read as data";
 
+/// Why the console flow in halves refuses a compute program's sample with
+/// implicit derivatives (`image_sample`, `image_sample_b`).
+pub(crate) const IMPLICIT_SAMPLE_IN_HALVES: Why =
+    "an implicit-derivative sample in the console flow on a host without 64-lane waves";
+
 /// Instructions that read a lane mask (not EXEC implicitly, not a lane's
 /// bit) as a number.
 fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
@@ -8138,6 +8143,16 @@ impl<'a> Lower<'a> {
             "image_get_resinfo" => (72, false),
             _ => return Err(name),
         };
+        // A compute program's sample with implicit derivatives has no valid
+        // DXIL form yet: the module fails validation ("an operation that is
+        // incompatible with the shader stage", #201). Drivers take such a
+        // module in the per-lane form; in the console flow in halves, with
+        // group barriers in its loops and branches, a title run lost its
+        // device in two of them. Such a program stops here until the sample
+        // has a valid form.
+        if matches!(op, 60 | 61) && !self.s.pixel && self.console_cf && self.split {
+            return Err(IMPLICIT_SAMPLE_IN_HALVES);
+        }
         if op == 72 {
             // Width, height, depth or layers, levels (per dmask) of the level
             // in the first address: DXIL's dimensions; a channel DXIL leaves
