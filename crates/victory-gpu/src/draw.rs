@@ -1818,7 +1818,7 @@ fn readable(list: &HostList, u: &UsedResource, view: &View, marked: bool) {
             if let Some(t) = crate::resource::host_resource(*resource as This) {
                 // SAFETY: a live resource.
                 let d = unsafe { t.GetDesc() };
-                if d.Flags.0 & 7 == 0 {
+                if d.Flags.0 & 7 == 0 && crate::capture::listed(crate::queue::presented() + 1) {
                     tracing::debug!(
                         resource = format_args!("{resource:#x}"),
                         ?d,
