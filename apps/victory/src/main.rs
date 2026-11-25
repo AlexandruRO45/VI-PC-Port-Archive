@@ -5,6 +5,7 @@
 
 mod census;
 mod gui;
+mod gui_ui;
 mod inspect;
 mod prebuild;
 mod run;

@@ -78,9 +78,13 @@ target\release\victory.exe translate --cache --pipelines <game dir>\shaders.rpf 
 target\release\victory.exe run <game dir>\<the title's exe> --execute
 ```
 
-On Windows, `victory gui` opens a file picker for a local executable and starts
-the same offline `run --execute` path. The picker is implemented in Rust and
-downloads no assets.
+On Windows, `victory gui` opens VIctory's desktop library with Library,
+Activity, and Settings screens. Select a local executable there to start the
+existing offline `run --execute` path. The Python/QML interface and synthetic
+skyline are embedded in the Rust binary and extracted under
+`%LOCALAPPDATA%\victory\launcher`; the launcher makes no network requests or
+downloads artwork. See [the launcher setup](apps/victory/launcher/README.md)
+for its Python and PySide6 requirement.
 
 The `translate --cache` step (minutes; again after a change of the shader
 translator) translates every shader the title can ask for into the cache
