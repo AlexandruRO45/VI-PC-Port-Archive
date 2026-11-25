@@ -717,6 +717,17 @@ pub fn title_memory_remapped(at: usize, len: usize) {
             bump_region_epochs(at, end);
         }
     }
+    {
+        let first = at.div_ceil(PAGE);
+        let last = end / PAGE;
+        if first < last {
+            let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+            let stale: Vec<usize> = j.written.range(first..last).map(|(&p, _)| p).collect();
+            for page in stale {
+                j.written.remove(&page);
+            }
+        }
+    }
     crate::shadow::remapped(at as u64, end as u64);
     crate::resource::evict_placed_textures(at as u64, end as u64);
     crate::descriptor::host::bindless_memory_changed(at as u64, end as u64);
@@ -1013,6 +1024,42 @@ mod tests {
             )
             .is_none()
         );
+        title_memory_remapped(p, 4 * PAGE);
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+    }
+
+    /// Unmapping or remapping a range clears its stale write-journal entries
+    /// so a fresh allocation at the same virtual address starts clean.
+    #[test]
+    fn remapped_memory_clears_stale_write_journal() {
+        // SAFETY: a fresh write-watched allocation, freed at the end.
+        let p = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                2 * PAGE,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+        } as usize;
+        assert_ne!(p, 0);
+        let (start, end) = (p, p + 2 * PAGE);
+        // SAFETY: committed page of ours.
+        unsafe { (p as *mut u8).write(1) };
+        let (first_write, written) = writes(start, end, false).expect("watched");
+        assert_eq!(written, [(p / PAGE, first_write)]);
+
+        title_memory_remapped(p, 2 * PAGE);
+        let (_, after_remap) = writes(start, end, false).expect("watched");
+        assert!(after_remap.is_empty());
+
+        // SAFETY: committed page of ours.
+        unsafe { ((p + PAGE) as *mut u8).write(2) };
+        let (second_write, written) = writes(start, end, false).expect("watched");
+        assert!(second_write > first_write);
+        assert_eq!(written, [(p / PAGE + 1, second_write)]);
+
+        title_memory_remapped(p, 2 * PAGE);
         // SAFETY: our allocation.
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
     }
