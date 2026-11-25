@@ -691,6 +691,25 @@ pub(crate) fn warp_turn() -> std::sync::MutexGuard<'static, ()> {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn texture_uploads_share_a_chunk_at_aligned_offsets() {
+        use windows::core::Interface;
+
+        let Some(host) = super::host() else {
+            return; // no host GPU
+        };
+        let list = host.new_list().unwrap();
+        let (_, start) = list.scratch(32).unwrap();
+        let (first, first_offset, first_data) = list.upload(32).unwrap();
+        let (second, second_offset, second_data) = list.upload(32).unwrap();
+
+        assert_eq!(first.as_raw(), second.as_raw());
+        assert_eq!((first_offset, second_offset), (512, 1024));
+        assert_eq!(first_data as usize - start as usize, first_offset as usize);
+        assert_eq!(second_data as usize - start as usize, second_offset as usize);
+        list.close();
+    }
+
+    #[test]
     fn sparse_copies_preserve_islands_and_observe_remaps() {
         use windows_sys::Win32::System::Memory::*;
         const N: usize = 5 << 16;
@@ -1523,7 +1542,7 @@ impl Drop for Counted {
 /// A chunk of upload memory for lists' scratch data: the buffer, its
 /// mapping and its host GPU address.
 struct Chunk {
-    _buffer: ID3D12Resource,
+    buffer: ID3D12Resource,
     data: usize,
     gpu: u64,
 }
@@ -1622,7 +1641,7 @@ fn take_chunk(host: &Host, size: u64) -> Option<Chunk> {
     ALIVE[1].fetch_add(1, Ordering::Relaxed);
     ALIVE[2].fetch_add(size, Ordering::Relaxed);
     Some(Chunk {
-        _buffer: buffer,
+        buffer,
         data: data as usize,
         gpu,
     })
@@ -3529,6 +3548,9 @@ struct Deferred {
     /// descriptor heaps): the title may release its objects before it
     /// submits the list.
     kept: Vec<windows::core::IUnknown>,
+    /// Pipeline and root-signature pairs already retained by this recording.
+    /// Keeping both objects alive prevents their addresses from being reused.
+    bound_pipelines: std::collections::HashSet<(usize, usize)>,
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
@@ -3575,6 +3597,7 @@ impl Deferred {
         self.copies.clear();
         self.uploads.clear();
         self.kept.clear();
+        self.bound_pipelines.clear();
         self.refreshed.clear();
         self.textures.clear();
         self.staging_copies.clear();
@@ -8803,12 +8826,21 @@ impl HostList {
             && self.twins.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
     }
 
-    /// Notes a pipeline the list binds.
-    pub(crate) fn used_pipeline(&self, name: &str) {
-        let mut pipelines = self.pipelines.lock().unwrap_or_else(|e| e.into_inner());
-        if !pipelines.contains(name) {
-            pipelines.insert(name.to_owned());
+    /// Records a binding and retains the pipeline and its root signature
+    /// once until reset. A title can release either before submitting.
+    pub(crate) fn keep_pipeline(&self, pipeline: &crate::pipeline::host::HostPipeline) {
+        let mut deferred = self.deferred();
+        let key = (pipeline.pso.as_raw() as usize, pipeline.root.as_raw() as usize);
+        if !deferred.bound_pipelines.insert(key) {
+            return;
         }
+        deferred.kept.push(pipeline.pso.clone().into());
+        deferred.kept.push(pipeline.root.clone().into());
+        drop(deferred);
+        self.pipelines
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(pipeline.name.clone());
     }
 
     fn deferred(&self) -> std::sync::MutexGuard<'_, Deferred> {
@@ -8889,34 +8921,40 @@ impl HostList {
         self.deferred().writes.push((dst as usize, what, bytes));
     }
 
-    /// A mapped upload buffer of `size` bytes, alive until the list is
-    /// reset.
-    ///
-    /// shortcut: one buffer per copy; pool them once uploads are frequent.
-    pub(crate) fn upload(&self, host: &Host, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
-        let (buffer, data) = host.upload_buffer(size)?;
-        name(&buffer, || format!("list upload {size:#x}"));
-        self.deferred().hold_upload(buffer.clone(), size);
-        Some((buffer, data))
+    /// Mapped upload memory for a placed texture footprint. The resource,
+    /// 512-byte-aligned offset and CPU pointer stay valid until reset.
+    pub(crate) fn upload(&self, size: u64) -> Option<(ID3D12Resource, u64, *mut u8)> {
+        let alignment = u64::from(D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT);
+        self.scratch_in(size, alignment, |buffer, offset, _, data| (buffer.clone(), offset, data))
     }
 
     /// `len` bytes of upload memory (256-byte aligned) until the list is
     /// reset: the host GPU address and the CPU pointer.
     pub(crate) fn scratch(&self, len: u64) -> Option<(u64, *mut u8)> {
+        self.scratch_in(len, 256, |_, _, gpu, data| (gpu, data))
+    }
+
+    fn scratch_in<R>(
+        &self,
+        len: u64,
+        alignment: u64,
+        use_range: impl FnOnce(&ID3D12Resource, u64, u64, *mut u8) -> R,
+    ) -> Option<R> {
         let host = host()?;
         let mut s = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
-        let len = len.max(1).next_multiple_of(256);
+        let len = len.max(1).checked_next_multiple_of(256)?;
         if len > SCRATCH_CHUNK {
             let (buffer, data) = host.upload_buffer(len)?;
             name(&buffer, || format!("list scratch {len:#x}"));
             // SAFETY: a live buffer.
             let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+            let result = use_range(&buffer, 0, gpu, data);
             self.deferred().hold_upload(buffer, len);
-            return Some((gpu, data));
+            return Some(result);
         }
         // The chunk in use while `len` fits in what is left of it, else the
         // next one (a list's first chunk may be a small one).
-        while s.current < s.chunks.len() && s.used + len > s.chunks[s.current].1 {
+        while s.current < s.chunks.len() && s.used.next_multiple_of(alignment) + len > s.chunks[s.current].1 {
             (s.current, s.used) = (s.current + 1, 0);
         }
         if s.current == s.chunks.len() {
@@ -8929,10 +8967,12 @@ impl HostList {
             s.chunks.push((chunk, size));
             s.used = 0;
         }
-        let (data, gpu) = (s.chunks[s.current].0.data, s.chunks[s.current].0.gpu);
-        let at = s.used;
-        s.used += len;
-        Some((gpu + at, (data + at as usize) as *mut u8))
+        let chunk = &s.chunks[s.current].0;
+        let at = s.used.next_multiple_of(alignment);
+        let data = (chunk.data + at as usize) as *mut u8;
+        let result = use_range(&chunk.buffer, at, chunk.gpu + at, data);
+        s.used = at + len;
+        Some(result)
     }
 
     /// The bytes of scratch chunks the list holds now (after a reset:
