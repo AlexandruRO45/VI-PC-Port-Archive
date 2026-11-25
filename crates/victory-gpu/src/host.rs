@@ -7677,17 +7677,26 @@ impl Meter {
 }
 
 impl Host {
-    /// Shows `texture`, which is in `state` (a host state) and stays in it,
-    /// as frame `frame` (saved if captures are on). `None` if nothing was
-    /// shown; else, in diagnostics builds, whether the frame was black.
-    pub(crate) fn present(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {
+    /// Shows `source` as frame `frame` and leaves it in `COPY_SOURCE`.
+    /// Returns `None` if nothing was shown and, in diagnostics builds,
+    /// whether the frame was black otherwise.
+    pub(crate) fn present(
+        &self,
+        source: &std::sync::Arc<crate::resource::HostTexture>,
+        frame: u64,
+    ) -> Option<bool> {
         let showing = std::time::Instant::now();
-        let shown = self.present_now(texture, state, frame);
+        let shown = self.present_now(source, frame);
         crate::framelog::add(crate::framelog::T::PresentShowUs, showing.elapsed().as_micros() as u64);
         shown
     }
 
-    fn present_now(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {
+    fn present_now(
+        &self,
+        source: &std::sync::Arc<crate::resource::HostTexture>,
+        frame: u64,
+    ) -> Option<bool> {
+        let texture = &source.texture;
         // SAFETY: a live resource.
         let desc = unsafe { texture.GetDesc() };
         let Some(format) = swap_format(desc.Format) else {
@@ -7732,7 +7741,6 @@ impl Host {
                 }
             }
         }
-        let state = D3D12_RESOURCE_STATES(state as i32);
         // SAFETY: our swap chain, list and a live source texture.
         unsafe {
             let index = p.swap_chain.GetCurrentBackBufferIndex();
@@ -7762,15 +7770,15 @@ impl Host {
                 None => &p.copy,
             };
             copy.reset();
+            // The submission prelude transitions the source in queue order.
+            // The copy list keeps it alive until the list can be reset.
+            copy.settle(source, D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32);
             let list = &copy.list;
-            list.ResourceBarrier(&[
-                transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE),
-                transition(
-                    &back,
-                    D3D12_RESOURCE_STATE_PRESENT,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                ),
-            ]);
+            list.ResourceBarrier(&[transition(
+                &back,
+                D3D12_RESOURCE_STATE_PRESENT,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+            )]);
             list.CopyResource(&back, texture);
             #[cfg(feature = "diagnostics")]
             let capture = crate::capture::wanted(frame)
@@ -7780,14 +7788,11 @@ impl Host {
             let probe = if slot.is_some() { None } else { crate::capture::probe(&self.device, list, texture) };
             #[cfg(not(feature = "diagnostics"))]
             let _ = frame;
-            list.ResourceBarrier(&[
-                transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state),
-                transition(
-                    &back,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                    D3D12_RESOURCE_STATE_PRESENT,
-                ),
-            ]);
+            list.ResourceBarrier(&[transition(
+                &back,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                D3D12_RESOURCE_STATE_PRESENT,
+            )]);
             copy.close();
             match slot {
                 Some(i) => {
