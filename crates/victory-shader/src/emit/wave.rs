@@ -135,6 +135,23 @@ pub(crate) struct Section {
     pub reasons: HashMap<Value, &'static str>,
 }
 
+/// The reason a value a whole-wave section cannot shape is refused with: the
+/// step that stopped the simulation, with the category kept, so a report does
+/// not read as an unimplemented instruction of the same name. One string per
+/// instruction name, made once.
+fn section_step(name: &'static str) -> &'static str {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static NAMES: OnceLock<Mutex<HashMap<&'static str, &'static str>>> = OnceLock::new();
+    let mut names = NAMES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    names
+        .entry(name)
+        .or_insert_with(|| Box::leak(format!("a whole-wave section step: {name}").into_boxed_str()))
+}
+
 /// Every whole-wave section of `block`, by start index.
 pub(crate) fn sections(p: &Program, block: usize) -> HashMap<usize, Section> {
     let insts = &p.blocks[block].insts;
@@ -177,7 +194,7 @@ pub(crate) fn sections(p: &Program, block: usize) -> HashMap<usize, Section> {
         for inst in &insts[i + 1..end] {
             for &(_, w) in &inst.writes {
                 if !shapes.contains_key(&w) {
-                    reasons.insert(w, inst.name());
+                    reasons.insert(w, section_step(inst.name()));
                 }
             }
         }
@@ -355,7 +372,7 @@ fn simulate(
                 .then(|| constant(inst))
                 .flatten();
             let Some(k) = lo else {
-                return (shapes(vec, uni, wave), Some(name));
+                return (shapes(vec, uni, wave), Some(section_step(name)));
             };
             exec = (if name == "s_mov_b64" {
                 k
@@ -370,7 +387,7 @@ fn simulate(
                 .then(|| constant(inst))
                 .flatten()
             else {
-                return (shapes(vec, uni, wave), Some(name));
+                return (shapes(vec, uni, wave), Some(section_step(name)));
             };
             exec = ((exec & 0xFFFF_FFFF) | ((k & 0xFFFF_FFFF) << 32)) & all;
             continue;
@@ -995,6 +1012,22 @@ mod tests {
         let sec = &sections(&p, 0)[&0];
         assert_eq!(sec.shapes.get(&v2_val), Some(&Shape::K(7)));
         assert_eq!(sec.shapes.get(&v3_val), Some(&Shape::K(7)));
+    }
+
+    /// A value a whole-wave section cannot shape is refused with the step it
+    /// stopped at *and* the category (#2365 review): the report must not read
+    /// as an unimplemented `s_not_b32`.
+    #[test]
+    fn a_section_step_keeps_its_category() {
+        let w = [
+            sop1(0, 0x3D, 193),    // s_or_saveexec_b64 s0, -1
+            vop1(1, 0x01, 135),    // v_mov_b32 v1, 7
+            sop1(EXEC, 0x07, 193), // s_not_b32 exec, -1: not a constant set
+            sop1(EXEC, 0x03, 0),   // s_mov_b32 exec, s0: the section ends
+        ];
+        let p = build(&w, false);
+        let sec = &sections(&p, 0)[&0];
+        assert_eq!(sec.ended, Some("a whole-wave section step: s_not_b32"));
     }
 
     #[test]
