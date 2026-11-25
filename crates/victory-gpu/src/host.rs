@@ -1623,8 +1623,9 @@ enum Step {
     Run(Box<dyn Fn() + Send>),
     /// Work that writes host memory only.
     Host(Box<dyn Fn() + Send>),
-    /// Shaders write a range (address, bytes) of a buffer's host copy.
-    GpuWrite(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
+    /// Shaders write a range (address, bytes) of a buffer's host copy;
+    /// the narrowest store of the shaders that may.
+    GpuWrite(std::sync::Arc<crate::shadow::Shadow>, usize, usize, crate::pipeline::StoreWidth),
     /// Brings a texture's staging buffer up to date: once per submission,
     /// whichever lists sample it, until a `Copy` or `Run` intervenes.
     Texture(std::sync::Arc<crate::texture::Staging>),
@@ -2767,7 +2768,7 @@ fn declared_writes(runs: &[&HostList]) -> Vec<Declared> {
     let mut back: Vec<Declared> = Vec::new();
     for list in runs {
         for step in &list.deferred().copies {
-            if let Step::GpuWrite(shadow, address, len) = step
+            if let Step::GpuWrite(shadow, address, len, _) = step
                 && !shadow.in_place()
             {
                 let range = (*address, *address + *len);
@@ -2822,14 +2823,14 @@ fn in_place_writes(runs: &[&HostList]) -> Vec<(usize, usize)> {
 /// With residents (`crate::resident`): the ranges the shaders of `runs`
 /// may write in residents, each with its resident, and the title memory
 /// they may write in arenas directly (buffers and windows in place).
-fn resident_writes(runs: &[&HostList]) -> (Vec<(std::sync::Arc<crate::resident::Resident>, u64, u64)>, Vec<(u64, u64)>) {
+fn resident_writes(runs: &[&HostList]) -> (Vec<crate::resident::Declared>, Vec<(u64, u64)>) {
     let (mut declared, mut in_place) = (Vec::new(), Vec::new());
     for list in runs {
         for step in &list.deferred().copies {
-            if let Step::GpuWrite(shadow, address, len) = step {
+            if let Step::GpuWrite(shadow, address, len, width) = step {
                 let range = (*address as u64, (*address + *len) as u64);
                 match shadow.in_resident() {
-                    Some(resident) => declared.push((resident.clone(), range.0, range.1)),
+                    Some(resident) => declared.push(crate::resident::Declared { resident: resident.clone(), from: range.0, to: range.1, width: *width }),
                     None if shadow.in_place() => in_place.push(range),
                     None => {}
                 }
@@ -2844,7 +2845,7 @@ fn in_place_ranges<'a>(steps: impl IntoIterator<Item = &'a Step>) -> Vec<(usize,
     let mut ranges: Vec<(usize, usize)> = steps
         .into_iter()
         .filter_map(|step| match step {
-            Step::GpuWrite(shadow, address, len) if shadow.in_place() => Some((*address, *address + *len)),
+            Step::GpuWrite(shadow, address, len, _) if shadow.in_place() => Some((*address, *address + *len)),
             _ => None,
         })
         .collect();
@@ -2884,10 +2885,10 @@ mod in_place_tests {
             let copy = crate::shadow::Shadow::test_copy(buffer.unwrap(), 0x7_0000_0000, 1 << 16);
             let s = start as usize;
             let steps = [
-                Step::GpuWrite(in_place.clone(), s + 0x1000, 0x100),
-                Step::GpuWrite(copy.clone(), 0x7_0000_0000, 0x100),
-                Step::GpuWrite(in_place.clone(), s + 0x1080, 0x200),
-                Step::GpuWrite(in_place.clone(), s + 0x8000, 0x10),
+                Step::GpuWrite(in_place.clone(), s + 0x1000, 0x100, crate::pipeline::StoreWidth::Bytes),
+                Step::GpuWrite(copy.clone(), 0x7_0000_0000, 0x100, crate::pipeline::StoreWidth::Bytes),
+                Step::GpuWrite(in_place.clone(), s + 0x1080, 0x200, crate::pipeline::StoreWidth::Bytes),
+                Step::GpuWrite(in_place.clone(), s + 0x8000, 0x10, crate::pipeline::StoreWidth::Bytes),
             ];
             let ranges = in_place_ranges(&steps);
             assert_eq!(ranges, [(s + 0x1000, s + 0x1280), (s + 0x8000, s + 0x8010)]);
@@ -3282,7 +3283,7 @@ impl Host {
         let mut declared: Vec<(Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)> = Vec::new();
         for list in runs {
             for step in &list.deferred().copies {
-                if let Step::GpuWrite(shadow, address, len) = step
+                if let Step::GpuWrite(shadow, address, len, _) = step
                     && shadow.carded()
                 {
                     let range = (*address, *address + *len);
@@ -4347,30 +4348,50 @@ impl Host {
         // Residents (`crate::resident`): the pages that go up to them run
         // ahead of the lists, the merge of what the lists' shaders write in
         // them after the lists, both on this queue before the fence's signal.
+        // SAFETY: a plain query.
+        let completed = unsafe { self.fence.GetCompletedValue() };
         let resident = if crate::resident::on() {
             let (declared, in_place) = resident_writes(runs);
-            // SAFETY: a plain query.
-            let completed = unsafe { self.fence.GetCompletedValue() };
             crate::resident::prepare(&self.device, completed, &declared, &in_place)
         } else {
             crate::resident::Prepared::default()
         };
+        // The card's time for the parts of a submission sent ahead
+        // (`crate::cardtime`): stamps of ours around the upload, the lists
+        // and the merge, inside the same calls.
+        let timed = late && crate::cardtime::on();
+        if timed {
+            crate::cardtime::begin(&self.device, &self.queue, completed);
+        }
+        let stamp = |mark, resolve| if timed { crate::cardtime::stamp(&self.device, completed, mark, resolve) } else { None };
         if let Some(upload) = &resident.upload {
-            // SAFETY: a closed list of ours.
-            unsafe { self.queue.ExecuteCommandLists(&[Some(upload.clone())]) };
+            let call = [stamp(crate::cardtime::Mark::UploadBegin, false), Some(upload.clone()), stamp(crate::cardtime::Mark::UploadEnd, false)];
+            let call: Vec<Option<ID3D12CommandList>> = call.into_iter().filter(Option::is_some).collect();
+            // SAFETY: closed lists of ours.
+            unsafe { self.queue.ExecuteCommandLists(&call) };
         }
         let prepared = std::time::Instant::now();
         if late {
             *submitted += 1;
+            if timed {
+                lists.insert(0, stamp(crate::cardtime::Mark::TitleBegin, false));
+                lists.push(stamp(crate::cardtime::Mark::TitleEnd, resident.merge.is_none()));
+                lists.retain(Option::is_some);
+            }
             // SAFETY: closed lists; the fence is ours.
             let signalled = unsafe {
                 self.queue.ExecuteCommandLists(&lists);
                 if let Some(merge) = &resident.merge {
-                    self.queue.ExecuteCommandLists(&[Some(merge.clone())]);
+                    let call = [stamp(crate::cardtime::Mark::MergeBegin, false), Some(merge.clone()), stamp(crate::cardtime::Mark::MergeEnd, true)];
+                    let call: Vec<Option<ID3D12CommandList>> = call.into_iter().filter(Option::is_some).collect();
+                    self.queue.ExecuteCommandLists(&call);
                 }
                 self.queue.Signal(&self.fence, *submitted)
             };
             crate::resident::sent(*submitted);
+            if timed {
+                crate::cardtime::sent(*submitted);
+            }
             self.card_sent();
             if let Err(e) = signalled {
                 fail(format_args!("a submission sent ahead could not be followed by a signal ({e})"));
@@ -5300,10 +5321,11 @@ impl HostList {
         shadow: &std::sync::Arc<crate::shadow::Shadow>,
         address: usize,
         len: usize,
+        width: crate::pipeline::StoreWidth,
     ) {
         self.deferred()
             .copies
-            .push(Step::GpuWrite(shadow.clone(), address, len));
+            .push(Step::GpuWrite(shadow.clone(), address, len, width));
     }
 
     /// A read back: once the list has run, `rows` rows of `row` bytes go
@@ -5523,7 +5545,7 @@ impl HostList {
                     }
                     continue;
                 }
-                Step::GpuWrite(shadow, address, len) => {
+                Step::GpuWrite(shadow, address, len, _) => {
                     // The shaders start from the title's data: this copy's
                     // pending refresh first. The other copies' wait for
                     // the next flush of all (flushing all of them at every
@@ -6093,6 +6115,7 @@ impl Meter {
         late_line(frames);
         card_clock_line(frames, ms);
         crate::resident::line(frames);
+        crate::cardtime::line(frames);
         crate::shadow::back_line(frames);
         crate::shadow::placement_line();
         {

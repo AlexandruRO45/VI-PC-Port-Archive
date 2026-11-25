@@ -66,8 +66,10 @@ struct Memory {
     /// Buffer, its mapping, its GPU address.
     directory: (ID3D12Resource, *mut u32, u64),
     faults: (ID3D12Resource, *mut u32, u64),
-    /// Copy `n` is `copies[n - 1]`.
-    copies: Vec<Arc<Shadow>>,
+    /// Copy `n` is `copies[n - 1]`; `None`: numbered again ([`Memory::retarget`]).
+    copies: Vec<Option<Arc<Shadow>>>,
+    /// `crate::resident::generation` at the last [`Memory::retarget`].
+    generation: u64,
     /// Per host view heap (by address): the first slot of its run, and how
     /// many copies have their view there.
     heaps: HashMap<usize, (u32, u32)>,
@@ -126,6 +128,7 @@ impl Memory {
             directory: make(u64::from(MEMORY_PAGES) * 2, "directory")?,
             faults: make(u64::from(MEMORY_FAULTS), "faults")?,
             copies: Vec::new(),
+            generation: 0,
             heaps: HashMap::new(),
             frame: u64::MAX,
             refused: Default::default(),
@@ -170,10 +173,10 @@ impl Memory {
         if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
             return;
         }
-        let n = match self.copies.iter().position(|c| Arc::ptr_eq(c, &shadow)) {
+        let n = match self.copies.iter().position(|c| c.as_ref().is_some_and(|c| Arc::ptr_eq(c, &shadow))) {
             Some(n) => n,
             None if self.copies.len() < COPIES as usize => {
-                self.copies.push(shadow.clone());
+                self.copies.push(Some(shadow.clone()));
                 let n = self.copies.len() - 1;
                 // Every page the copy holds whole, not only the one asked
                 // for: a structure is more than 64 KiB.
@@ -209,6 +212,57 @@ impl Memory {
         unsafe {
             entry.add(1).write_volatile(offset);
             entry.write_volatile(n as u32 + 1);
+        }
+    }
+
+    /// After buffers were retargeted (`crate::resident::retargeted`): each
+    /// numbered copy that is a buffer no table hands out any more (in a
+    /// resident replaced or gone, or a window in place a resident took
+    /// over) gets the copy handed out now under a new number, and its pages
+    /// in the directory name that one (the offset first, then the number).
+    /// The old number is not used again: lists recorded with it may still
+    /// run, and the old copy is held until they have (Stage 2 latency
+    /// plan, B1: a numbered copy kept its resident for the whole run).
+    fn retarget(&mut self) {
+        let now = crate::resident::generation();
+        if self.generation == now {
+            return;
+        }
+        self.generation = now;
+        for n in 0..self.copies.len() {
+            let Some(old) = self.copies[n].clone() else { continue };
+            let stale = old.in_resident().map_or_else(|| crate::resident::was_replaced(&old.buffer), |r| !crate::resident::registered(r));
+            if !stale {
+                continue;
+            }
+            let (first, len) = old.span();
+            let Some(new) = crate::shadow::find(first, len.max(1)).filter(|s| !Arc::ptr_eq(s, &old) && s.offset_in(first).is_some() && s.left(first) >= len) else {
+                continue;
+            };
+            let m = match self.copies.iter().position(|c| c.as_ref().is_some_and(|c| Arc::ptr_eq(c, &new))) {
+                Some(m) => m,
+                None if self.copies.len() < COPIES as usize => {
+                    self.copies.push(Some(new.clone()));
+                    self.copies.len() - 1
+                }
+                None => continue,
+            };
+            let mut at = first & !(PAGE - 1);
+            while at < first + len && at / PAGE < u64::from(MEMORY_PAGES) - 1 {
+                // SAFETY: inside the directory's mapping.
+                let entry = unsafe { self.directory.1.add((at / PAGE) as usize * 2) };
+                // SAFETY: as above; the offset first.
+                unsafe {
+                    if entry.read() == n as u32 + 1 && new.offset_in(at).is_some() {
+                        entry.add(1).write_volatile(entry_offset(&new, at));
+                        entry.write_volatile(m as u32 + 1);
+                    }
+                }
+                at += PAGE;
+            }
+            self.copies[n] = None;
+            crate::host::retire(old);
+            crate::resident::copy_renumbered();
         }
     }
 
@@ -276,6 +330,9 @@ pub(crate) fn ready(
         m.take_faults();
     }
     let numbered = m.copies.len();
+    if crate::resident::on() {
+        m.retarget();
+    }
     for &address in addresses {
         m.name(address);
     }
@@ -304,7 +361,11 @@ pub(crate) fn ready(
         }
     };
     for (n, shadow) in m.copies.iter().enumerate().skip(made as usize) {
-        heap.raw_uav_at(base + 1 + n as u32, &shadow.buffer, 0, view_bytes(shadow));
+        match shadow {
+            Some(shadow) => heap.raw_uav_at(base + 1 + n as u32, &shadow.buffer, 0, view_bytes(shadow)),
+            // Numbered again before this heap had it: no page names it.
+            None => heap.null_raw_uav_at(base + 1 + n as u32),
+        }
     }
     m.heaps.insert(key, (base, m.copies.len() as u32));
     // Once per list, and for copies numbered since: the builder alone
@@ -316,6 +377,7 @@ pub(crate) fn ready(
     let first_read = list.first_use(READ);
     let first_write = writes && list.first_use(WRITE);
     for (n, shadow) in m.copies.iter().enumerate() {
+        let Some(shadow) = shadow else { continue };
         let (start, len) = shadow.span();
         if first_read || n >= numbered {
             shadow.refresh(list, start, len);

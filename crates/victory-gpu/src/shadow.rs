@@ -2112,9 +2112,15 @@ pub(crate) fn let_go_idle() {
         let idle: Vec<(u64, u64)> = map
             .iter()
             .filter(|(_, s)| {
+                // A window in a resident shares `R` with it and with every
+                // other buffer in it: nothing tells whether a slot shows
+                // the window, and none needs to (a slot shows `R`, the
+                // next ask finds the same resident; if the resident goes
+                // with its last window, slots showing `R` are made again,
+                // `crate::resident::retargeted`).
                 Arc::strong_count(s) == 1
                     && crate::host::long_ago(s.used.load(Ordering::Relaxed), idle_ms, IDLE_FRAMES)
-                    && crate::host::references(&s.buffer) == 1
+                    && ((s.resident.is_some() && crate::resident::one_owner()) || crate::host::references(&s.buffer) == 1)
             })
             .map(|(key, _)| *key)
             .collect();
@@ -2285,6 +2291,38 @@ impl Shadow {
         shadow
     }
 
+    /// A window of title memory `[start, start + len)` in `resident`, in
+    /// the table of windows (tests of retargeting).
+    #[cfg(test)]
+    pub(crate) fn resident_window(resident: Arc<crate::resident::Resident>, start: u64, len: u64) -> Arc<Shadow> {
+        let bias = start - resident.start();
+        let mut window = Shadow::resident(resident, bias, start, len);
+        window.window = true;
+        let window = Arc::new(window);
+        LOOSE.lock().unwrap_or_else(|e| e.into_inner()).insert((start, len), window.clone());
+        window
+    }
+
+    /// Whether the table of windows holds `shadow` (tests).
+    #[cfg(test)]
+    pub(crate) fn in_windows(shadow: &Arc<Shadow>) -> bool {
+        LOOSE.lock().unwrap_or_else(|e| e.into_inner()).values().any(|s| Arc::ptr_eq(s, shadow))
+    }
+
+    /// What kind of host memory it is, in a few words (draw-time probe).
+    pub(crate) fn describe(&self) -> String {
+        let kind = if let Some((r, bias)) = &self.resident {
+            format!("resident {:#x}+{:#x} ({} MB, bias {bias:#x})", r.start(), r.bytes(), r.bytes() >> 20)
+        } else if self.place.is_some() {
+            "in place".to_owned()
+        } else if self.card.is_some() {
+            "card copy".to_owned()
+        } else {
+            "copy in system memory".to_owned()
+        };
+        format!("{kind}, title {:#x}+{:#x}{}", self.start, self.len, if self.window { ", a window" } else { "" })
+    }
+
     /// The resident it is in (`crate::resident`), if it is.
     pub(crate) fn in_resident(&self) -> Option<&Arc<crate::resident::Resident>> {
         self.resident.as_ref().map(|(r, _)| r)
@@ -2316,6 +2354,12 @@ impl Shadow {
     /// before the submission (a copy per declared range and submission);
     /// a GPU-side dirty mask would save that if big ranges make it slow.
     pub(crate) fn gpu_writes(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
+        self.gpu_writes_as(list, address, len, WIDTH.get());
+    }
+
+    /// [`Shadow::gpu_writes`] by shaders whose narrowest store through the
+    /// range is `width`.
+    pub(crate) fn gpu_writes_as(self: &Arc<Self>, list: &HostList, address: u64, len: u64, width: crate::pipeline::StoreWidth) {
         // In place the shaders write title memory itself: no snapshot, no
         // compare, nothing to copy back ([`Shadow::writing`] does nothing).
         // The range is still declared: until the submission has run, title
@@ -2327,7 +2371,7 @@ impl Shadow {
         // inside this one with a copy of its own, a texture in it) is not
         // told: the card's writes are not seen by write watching.
         let len = len.min(self.left(address));
-        list.defer_gpu_write(self, address as usize, len as usize);
+        list.defer_gpu_write(self, address as usize, len as usize, width);
     }
 
     /// Whether this is title memory in place (`crate::inplace`) or in a
@@ -3544,6 +3588,7 @@ pub(crate) fn find_any(address: u64, len: u64) -> Option<Arc<Shadow>> {
 }
 
 fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
+    retarget_tables();
     let end = address.checked_add(len.max(1))?;
     let mut map = buffers();
     let key = map
@@ -3781,7 +3826,40 @@ fn longest_tail(windows: impl Iterator<Item = (u64, u64)>, address: u64, end: u6
 /// Copies of title memory outside buffers, by (start, length).
 static LOOSE: Mutex<BTreeMap<(u64, u64), Arc<Shadow>>> = Mutex::new(BTreeMap::new());
 
+/// After a resident is replaced, forgotten or gone (`crate::resident::
+/// retargeted`): what both tables hold of residents no longer registered
+/// is let go, so the next ask finds the one registered now (Stage 2
+/// latency plan, B1). A union made through one table let go of that
+/// table's buffers only; the other's kept the old resident alive, taking
+/// uploads and merges every submission (33-43 such a run, 176 MB of the
+/// 577 MB compared per frame). Takes each table's lock alone: called
+/// before either is taken.
+pub(crate) fn retarget_tables() {
+    static SEEN: AtomicU64 = AtomicU64::new(0);
+    let now = crate::resident::generation();
+    let seen = SEEN.load(Ordering::Acquire);
+    if seen == now || SEEN.compare_exchange(seen, now, Ordering::AcqRel, Ordering::Relaxed).is_err() {
+        return;
+    }
+    let stale = |s: &Shadow| s.in_resident().is_some_and(|r| !crate::resident::registered(r));
+    let mut gone: Vec<Arc<Shadow>> = Vec::new();
+    {
+        let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+        let keys: Vec<(u64, u64)> = map.iter().filter(|(_, s)| stale(s)).map(|(k, _)| *k).collect();
+        gone.extend(keys.into_iter().filter_map(|k| map.remove(&k)));
+    }
+    for entry in buffers().values_mut() {
+        if entry.shadow.as_deref().is_some_and(stale) {
+            gone.extend(entry.shadow.take());
+        }
+    }
+    for shadow in gone {
+        crate::host::retire(shadow);
+    }
+}
+
 fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Shadow>> {
+    retarget_tables();
     let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
     let (cell, _) = window_of(address, end, WINDOW);
     let named = window_of(address, end, if unsized_ask { WINDOW } else { window() });
@@ -4009,6 +4087,10 @@ fn hot_window(map: &mut BTreeMap<(u64, u64), Arc<Shadow>>, key: (u64, u64)) -> A
     window.window = true;
     window.used.store(shadow.used.load(Ordering::Relaxed), Ordering::Relaxed);
     let window = Arc::new(window);
+    // shortcut: slots that show the window in place (the arena's buffer,
+    // which every window in the part shares) go on showing it: their reads
+    // and writes are the title's memory, right but over the bus, and what
+    // they write does not reach `R`.
     crate::host::retire(map.insert(key, window.clone()));
     window
 }
@@ -4226,4 +4308,32 @@ pub(crate) fn near(va: u64) -> String {
         ));
     }
     text
+}
+
+thread_local! {
+    /// The narrowest store of the shader whose views are walked now
+    /// (`crate::pipeline::StoreWidth`): what [`Shadow::gpu_writes`] tells
+    /// the merge of a resident. Bytes outside a stage's walk ([`writer`]).
+    static WIDTH: std::cell::Cell<crate::pipeline::StoreWidth> = const { std::cell::Cell::new(crate::pipeline::StoreWidth::Bytes) };
+}
+
+/// While the value lives, writes declared on this thread are by a shader
+/// whose narrowest store is `width`; after, by one not known.
+pub(crate) fn writer(width: crate::pipeline::StoreWidth) -> Writer {
+    WIDTH.set(width);
+    Writer(())
+}
+
+/// The narrowest store of the shader whose views are walked now ([`writer`]).
+pub(crate) fn writer_width() -> crate::pipeline::StoreWidth {
+    WIDTH.get()
+}
+
+/// See [`writer`].
+pub(crate) struct Writer(());
+
+impl Drop for Writer {
+    fn drop(&mut self) {
+        WIDTH.set(crate::pipeline::StoreWidth::Bytes);
+    }
 }
