@@ -116,6 +116,26 @@ fn inline_f16(c: u8) -> u32 {
     ][usize::from(c - 240)]
 }
 
+/// The 64-bit value of a GFX10 inline constant on an `f64` operand: integers
+/// sign-extend to 64 bits; float constants 240..=248 give IEEE-754 doubles.
+fn inline_f64(code: u8) -> Option<u64> {
+    let double = |f: f64| Some(f.to_bits());
+    match code {
+        128..=192 => Some(u64::from(u32::from(code) - 128)),
+        193..=208 => Some(i64::from(192 - i32::from(code)) as u64),
+        240 => double(0.5),
+        241 => double(-0.5),
+        242 => double(1.0),
+        243 => double(-1.0),
+        244 => double(2.0),
+        245 => double(-2.0),
+        246 => double(4.0),
+        247 => double(-4.0),
+        248 => double(1.0 / std::f64::consts::TAU),
+        _ => None,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Numeric {
     Unorm,
@@ -287,6 +307,8 @@ struct Lower<'a> {
     sections: HashMap<usize, HashMap<usize, super::wave::Section>>,
     /// Values written in a section that code outside it reads.
     section_out: HashSet<Value>,
+    /// Lowered `(lo, hi)` dwords of 64-bit wave sums, by section and source.
+    wide_sums: HashMap<(usize, usize, Value, Value, Value), (V, V)>,
     /// The program's constant table (the code from the first byte read
     /// through `s_getpc_b64` on): global, first byte, dwords.
     code_table: Option<(V, u32, u32)>,
@@ -1548,6 +1570,7 @@ impl<'a> Lower<'a> {
             cur_ir: 0,
             sections: HashMap::new(),
             section_out: HashSet::new(),
+            wide_sums: HashMap::new(),
             code_table: None,
             counters: HashMap::new(),
             abort: None,
@@ -1756,7 +1779,7 @@ impl<'a> Lower<'a> {
             let val = if self.section_out.contains(&w) {
                 let shape = self.sections[&b][&start].shapes.get(&w).copied();
                 let own = self.own_bits.totals.contains(&w);
-                match shape.ok_or(UNKNOWN).and_then(|sh| self.shape(sh, own)) {
+                match shape.ok_or(UNKNOWN).and_then(|sh| self.shape(sh, own, (b, start))) {
                     Ok(x) => Val::I32(x),
                     Err(why) => Val::Missing(why),
                 }
@@ -1775,12 +1798,18 @@ impl<'a> Lower<'a> {
     /// `own`: a wave OR that only steers a loop over each lane's own bits
     /// ([`super::own_bits`]); where two host waves cannot exchange their halves' ORs it is
     /// this host wave's.
-    fn shape(&mut self, shape: super::wave::Shape, own: bool) -> Result<V, Why> {
+    fn shape(
+        &mut self,
+        shape: super::wave::Shape,
+        own: bool,
+        sec: (usize, usize),
+    ) -> Result<V, Why> {
         use super::wave::{Op, Shape};
         let (op, src, mask, ident, prefix) = match shape {
             Shape::K(k) => return Ok(self.s.m.i32(k)),
             Shape::Value(v) => return self.i32_of(v),
             Shape::Active(op, src, mask, ident) => (op, src, mask, ident, None),
+            Shape::WideAdd(lo, hi, mask, part) => return self.wide_sum(sec, lo, hi, mask, part),
             Shape::Masked(src, mask, ident) => {
                 let c = self.cur;
                 let &m = self
@@ -1944,6 +1973,62 @@ impl<'a> Lower<'a> {
             r
         };
         Ok(if float { self.as_int(r) } else { r })
+    }
+
+    fn wide_sum(
+        &mut self,
+        sec: (usize, usize),
+        lo_v: Value,
+        hi_v: Value,
+        mask: Value,
+        part: u8,
+    ) -> Result<V, Why> {
+        let key = (sec.0, sec.1, lo_v, hi_v, mask);
+        if let Some(&(lo, hi)) = self.wide_sums.get(&key) {
+            return Ok(if part == 0 { lo } else { hi });
+        }
+        if self.mask_data == MaskData::None {
+            return Err("a wave sum in a mesh shader");
+        }
+        let &m = self
+            .x
+            .st
+            .masks
+            .get(&mask)
+            .ok_or("a wave reduction's untracked mask")?;
+        let c = self.cur;
+        let on = self.boolean(m, c)?;
+        let (x_lo, x_hi) = (self.i32_of(lo_v)?, self.i32_of(hi_v)?);
+        let x = self.make_double(x_lo, x_hi);
+        let zero = self.s.m.f64(0);
+        let arg = self.s.m.select(c, on, x, zero);
+        self.s.flags |= flags::WAVE_OPS | flags::DOUBLE;
+        let (k0, kz) = (self.s.m.i8(0), self.s.m.i8(0));
+        let f64t = self.s.m.double();
+        let r = self
+            .s
+            .op(c, "waveActiveOp.f64", Attr::NoUnwind, f64t, 119, &[arg, k0, kz]);
+        let r = if self.local || self.exchange.as_ref().is_some_and(|e| e.1) {
+            r
+        } else if self.exchange.is_some() {
+            if !self.all_lanes(self.cur_ir) {
+                need(self.cur_ir);
+                return Err("a wave reduction where not every lane runs");
+            }
+            let (r_lo, r_hi) = self.split_double(r);
+            let c = self.cur;
+            let (lo0, hi0) = self.exchange_halves(c, r_lo);
+            let c = self.cur;
+            let (lo1, hi1) = self.exchange_halves(c, r_hi);
+            let a = self.make_double(lo0, lo1);
+            let b = self.make_double(hi0, hi1);
+            self.s.m.bin(self.cur, Bin::Add, a, b)
+        } else {
+            r
+        };
+        let pair = self.split_double(r);
+        self.wide_sums.insert(key, pair);
+        Ok(if part == 0 { pair.0 } else { pair.1 })
     }
 
     /// The sum of two 16-bit floats (the low halves of `a` and `b`) as the console's
@@ -3862,6 +3947,85 @@ impl<'a> Lower<'a> {
         {
             self.floats.insert(new, f);
         }
+        Ok(())
+    }
+
+    fn make_double(&mut self, lo: V, hi: V) -> V {
+        self.s.flags |= flags::DOUBLE;
+        let f64t = self.s.m.double();
+        self.s
+            .op(self.cur, "makeDouble.f64", Attr::ReadNone, f64t, 101, &[lo, hi])
+    }
+
+    fn split_double(&mut self, x: V) -> (V, V) {
+        let pair = self
+            .s
+            .m
+            .named_struct("dx.types.splitdouble", vec![self.s.t.i32; 2]);
+        let r = self
+            .s
+            .op(self.cur, "splitDouble.f64", Attr::ReadNone, pair, 102, &[x]);
+        (self.s.m.extract(self.cur, r, 0), self.s.m.extract(self.cur, r, 1))
+    }
+
+    /// A 64-bit float source (register pair, inline constant, or high-dword
+    /// literal) with its abs/neg modifiers.
+    fn f64_src(&mut self, inst: &Inst, k: usize) -> Result<V, Why> {
+        let Fields::Valu(v) = &inst.fields else {
+            unreachable!()
+        };
+        if v.sdwa.is_some() || v.dpp.is_some() {
+            return Err("64-bit float operand modifiers");
+        }
+        self.s.flags |= flags::DOUBLE;
+        let f64t = self.s.m.double();
+        let op = *v.src.get(k).ok_or("a missing operand")?;
+        let pair = |l: &mut Self, r: Reg, r1: Reg| -> Result<V, Why> {
+            let lo = l.i32_of(inst.read(r).ok_or("an unread operand")?)?;
+            let hi = l.i32_of(inst.read(r1).ok_or("an unread operand")?)?;
+            Ok(l.make_double(lo, hi))
+        };
+        let mut f = match op {
+            Operand::Scalar { code: NULL, .. } => self.s.m.f64(0),
+            Operand::Vector { reg, .. } => pair(self, Reg::V(reg), Reg::V(reg + 1))?,
+            Operand::Scalar { code, .. } => pair(self, Reg::S(code), Reg::S(code + 1))?,
+            Operand::Const(c) => inline_f64(c)
+                .map(|bits| self.s.m.f64(bits))
+                .ok_or("a special operand (vccz, execz, scc, lds_direct)")?,
+            // GFX10 places 32-bit literals on 64-bit float operands in the high dword.
+            Operand::Literal(x) => self.s.m.f64(u64::from(x) << 32),
+            Operand::Attr { .. } => return Err("an attribute operand"),
+        };
+        if v.abs >> k & 1 != 0 {
+            f = self.s.op(self.cur, "unary.f64", Attr::ReadNone, f64t, 6, &[f]);
+        }
+        if v.neg >> k & 1 != 0 {
+            let z = self.s.m.f64(0x8000_0000_0000_0000);
+            f = self.s.m.bin(self.cur, Bin::Sub, z, f);
+        }
+        Ok(f)
+    }
+
+    fn write_f64(&mut self, inst: &Inst, f: V, guard: Option<V>) -> Result<(), Why> {
+        let Fields::Valu(v) = &inst.fields else {
+            unreachable!()
+        };
+        let mut f = f;
+        if v.omod != 0 {
+            let factor = [1.0f64, 2.0, 4.0, 0.5][usize::from(v.omod)];
+            let k = self.s.m.f64(factor.to_bits());
+            f = self.s.m.bin(self.cur, Bin::Mul, f, k);
+        }
+        if v.clamp {
+            let f64t = self.s.m.double();
+            f = self.s.op(self.cur, "unary.f64", Attr::ReadNone, f64t, 7, &[f]);
+        }
+        let Some(Operand::Vector { reg, .. }) = v.dst else {
+            return Err("a 64-bit result");
+        };
+        let (lo, hi) = self.split_double(f);
+        self.write(inst, Reg::V(reg), lo, guard);
+        self.write(inst, Reg::V(reg + 1), hi, guard);
         Ok(())
     }
 
@@ -6997,6 +7161,47 @@ impl<'a> Lower<'a> {
                 };
                 let r = self.s.m.cast(c, op, a, self.s.t.f32);
                 float(self, r)
+            }
+            "v_add_f64" | "v_mul_f64" => {
+                let (a, bb) = (self.f64_src(inst, 0)?, self.f64_src(inst, 1)?);
+                let op = if name == "v_add_f64" { Bin::Add } else { Bin::Mul };
+                let r = self.s.m.bin(c, op, a, bb);
+                self.write_f64(inst, r, guard)
+            }
+            "v_cvt_f32_f64" => {
+                let a = self.f64_src(inst, 0)?;
+                let r = self.s.m.cast(c, Cast::FpTrunc, a, self.s.t.f32);
+                float(self, r)
+            }
+            "v_cvt_f64_f32" => {
+                let a = f(self, 0)?;
+                self.s.flags |= flags::DOUBLE;
+                let f64t = self.s.m.double();
+                let r = self.s.m.cast(c, Cast::FpExt, a, f64t);
+                self.write_f64(inst, r, guard)
+            }
+            "v_cvt_i32_f64" | "v_cvt_u32_f64" => {
+                let a = self.f64_src(inst, 0)?;
+                self.s.flags |= flags::DOUBLE_EXT;
+                let op = if name == "v_cvt_u32_f64" {
+                    Cast::FpToUi
+                } else {
+                    Cast::FpToSi
+                };
+                let r = self.s.m.cast(c, op, a, self.s.t.i32);
+                int(self, r)
+            }
+            "v_cvt_f64_i32" | "v_cvt_f64_u32" => {
+                let a = s(self, 0)?;
+                self.s.flags |= flags::DOUBLE | flags::DOUBLE_EXT;
+                let f64t = self.s.m.double();
+                let op = if name == "v_cvt_f64_i32" {
+                    Cast::SiToFp
+                } else {
+                    Cast::UiToFp
+                };
+                let r = self.s.m.cast(c, op, a, f64t);
+                self.write_f64(inst, r, guard)
             }
             "v_fma_mix_f32" | "v_fma_mixlo_f16" | "v_fma_mixhi_f16" => {
                 // Each source is f32, or with op_sel_hi the low (op_sel: high)

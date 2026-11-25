@@ -112,6 +112,14 @@ pub(crate) enum Sym {
         ident: u32,
         lanes: u64,
     },
+    /// Word `part` (0 low, 1 high) of an `f64` sum over `lanes` of `mask ? (lo, hi) : +0.0`.
+    Wide {
+        lo: Value,
+        hi: Value,
+        mask: Value,
+        lanes: u64,
+        part: u8,
+    },
 }
 
 /// What a value a section leaves holds in every lane.
@@ -123,6 +131,8 @@ pub(crate) enum Shape {
     Masked(Value, Value, u32),
     /// `op` over every lane.
     Active(Op, Value, Value, u32),
+    /// Word `part` (0 low, 1 high) of an `f64` sum over every lane.
+    WideAdd(Value, Value, Value, u8),
     /// `op` over the lanes below (`inclusive`: and including) each lane.
     Prefix(Op, Value, Value, u32, bool),
 }
@@ -257,6 +267,80 @@ fn combine(op: Op, a: Sym, b: Sym) -> Sym {
     }
 }
 
+fn combine_wide(al: Sym, ah: Sym, bl: Sym, bh: Sym) -> (Sym, Sym) {
+    enum Term {
+        Zero,
+        Sum {
+            lo: Value,
+            hi: Value,
+            mask: Value,
+            lanes: u64,
+        },
+        Other,
+    }
+    let term = |lo: Sym, hi: Sym| match (lo, hi) {
+        (Sym::K(0), Sym::K(0)) => Term::Zero,
+        (
+            Sym::Red {
+                op: None,
+                src: sl,
+                mask: ml,
+                ident: 0,
+                lanes: ll,
+            },
+            Sym::Red {
+                op: None,
+                src: sh,
+                mask: mh,
+                ident: 0,
+                lanes: lh,
+            },
+        ) if (ml, ll) == (mh, lh) => Term::Sum {
+            lo: sl,
+            hi: sh,
+            mask: ml,
+            lanes: ll,
+        },
+        (
+            Sym::Wide {
+                lo: sl,
+                hi: sh,
+                mask: ml,
+                lanes: ll,
+                part: 0,
+            },
+            Sym::Wide {
+                lo: sl2,
+                hi: sh2,
+                mask: mh,
+                lanes: lh,
+                part: 1,
+            },
+        ) if (sl, sh, ml, ll) == (sl2, sh2, mh, lh) => Term::Sum {
+            lo: sl,
+            hi: sh,
+            mask: ml,
+            lanes: ll,
+        },
+        _ => Term::Other,
+    };
+    let make = |lo, hi, mask, lanes| {
+        (
+            Sym::Wide { lo, hi, mask, lanes, part: 0 },
+            Sym::Wide { lo, hi, mask, lanes, part: 1 },
+        )
+    };
+    match (term(al, ah), term(bl, bh)) {
+        (Term::Zero, Term::Sum { lo, hi, mask, lanes })
+        | (Term::Sum { lo, hi, mask, lanes }, Term::Zero) => make(lo, hi, mask, lanes),
+        (
+            Term::Sum { lo, hi, mask, lanes: la },
+            Term::Sum { lo: lo2, hi: hi2, mask: m2, lanes: lb },
+        ) if (lo, hi, mask) == (lo2, hi2, m2) && la & lb == 0 => make(lo, hi, mask, la | lb),
+        _ => (Sym::Unknown, Sym::Unknown),
+    }
+}
+
 fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
     let all = if wave == 64 {
         u64::MAX
@@ -298,12 +382,27 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
             exec = ((exec & 0xFFFF_FFFF) | ((k & 0xFFFF_FFFF) << 32)) & all;
             continue;
         }
-        if let Fields::Sop { src, .. } = &inst.fields {
+        if let Fields::Sop { dst, src, .. } = &inst.fields {
             if name.starts_with("s_and_b")
                 && src.iter().any(|o| matches!(*o, Operand::Scalar { code, .. } if inst.read(Reg::S(code)).is_some_and(|v| masked.contains(&v))))
                 && let Some(&(_, w)) = inst.writes.iter().find(|w| matches!(w.0, Reg::S(_)))
             {
                 masked.push(w);
+            }
+            if matches!(name, "s_mov_b32" | "s_mov_b64")
+                && let Some(&Operand::Scalar { code: sc, .. }) = src.first()
+                && sc != NULL
+                && let Some(&Operand::Scalar { code: dc, .. }) = dst.as_ref()
+            {
+                let count = if name == "s_mov_b64" { 2 } else { 1 };
+                for k in 0..count {
+                    if let (Some(rv), Some(wv)) =
+                        (inst.read(Reg::S(sc + k)), inst.write(Reg::S(dc + k)))
+                        && let Some(&s) = uni.get(&rv)
+                    {
+                        uni.insert(wv, s);
+                    }
+                }
             }
             for &(_, w) in &inst.writes {
                 uni.entry(w).or_insert(Sym::Unknown);
@@ -365,6 +464,61 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
             }
             continue;
         };
+        if name == "v_add_f64"
+            && let (Some(dst_lo), Some(dst_hi)) =
+                (inst.write(Reg::V(dreg)), inst.write(Reg::V(dreg + 1)))
+        {
+            let reg_lanes = |reg: Reg| -> Vec<Sym> {
+                match (reg, inst.read(reg)) {
+                    (Reg::V(_), Some(x)) => vec
+                        .get(&x)
+                        .cloned()
+                        .unwrap_or_else(|| vec![Sym::Own(x); wave as usize]),
+                    (Reg::S(_), Some(x)) => {
+                        vec![uni.get(&x).copied().unwrap_or(Sym::Uni(x)); wave as usize]
+                    }
+                    _ => vec![Sym::Unknown; wave as usize],
+                }
+            };
+            let pair_lanes = |k: usize| -> (Vec<Sym>, Vec<Sym>) {
+                match v.src.get(k) {
+                    Some(&Operand::Vector { reg, .. }) => {
+                        (reg_lanes(Reg::V(reg)), reg_lanes(Reg::V(reg + 1)))
+                    }
+                    Some(&Operand::Scalar { code, .. }) if code != NULL => {
+                        (reg_lanes(Reg::S(code)), reg_lanes(Reg::S(code + 1)))
+                    }
+                    Some(&Operand::Scalar { code: NULL, .. } | &Operand::Const(128)) => (
+                        vec![Sym::K(0); wave as usize],
+                        vec![Sym::K(0); wave as usize],
+                    ),
+                    _ => (
+                        vec![Sym::Unknown; wave as usize],
+                        vec![Sym::Unknown; wave as usize],
+                    ),
+                }
+            };
+            let old_lo = reg_lanes(Reg::V(dreg));
+            let old_hi = reg_lanes(Reg::V(dreg + 1));
+            let (al, ah) = pair_lanes(0);
+            let (bl, bh) = pair_lanes(1);
+            let mut out_lo = Vec::with_capacity(wave as usize);
+            let mut out_hi = Vec::with_capacity(wave as usize);
+            for l in 0..wave as usize {
+                if modifiers || v.dpp.is_some() || exec >> l & 1 == 0 {
+                    let keep = exec >> l & 1 == 0;
+                    out_lo.push(if keep { old_lo[l] } else { Sym::Unknown });
+                    out_hi.push(if keep { old_hi[l] } else { Sym::Unknown });
+                } else {
+                    let (rl, rh) = combine_wide(al[l], ah[l], bl[l], bh[l]);
+                    out_lo.push(rl);
+                    out_hi.push(rh);
+                }
+            }
+            vec.insert(dst_lo, out_lo);
+            vec.insert(dst_hi, out_hi);
+            continue;
+        }
         let Some(dst) = inst.write(Reg::V(dreg)) else {
             continue;
         };
@@ -560,6 +714,13 @@ fn shapes(
             ident,
             lanes,
         } if lanes == all => Some(Shape::Active(op, src, mask, ident)),
+        Sym::Wide {
+            lo,
+            hi,
+            mask,
+            lanes,
+            part,
+        } if lanes == all => Some(Shape::WideAdd(lo, hi, mask, part)),
         _ => None,
     };
     for (v, s) in uni {
@@ -603,6 +764,13 @@ fn per_lane(lanes: &[Sym], all: u64) -> Option<Shape> {
                 ident,
                 lanes,
             } if lanes == all => Some(Shape::Active(op, src, mask, ident)),
+            Sym::Wide {
+                lo,
+                hi,
+                mask,
+                lanes,
+                part,
+            } if lanes == all => Some(Shape::WideAdd(lo, hi, mask, part)),
             _ => None,
         };
     }

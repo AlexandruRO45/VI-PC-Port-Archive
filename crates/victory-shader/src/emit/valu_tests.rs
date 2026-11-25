@@ -1264,3 +1264,238 @@ fn v_cmp_class_f16_matches_rdna2() {
         );
     });
 }
+
+#[test]
+fn f64_arith_and_conversions_validate_and_match_ieee() {
+    // s0..s1 = double a (lo, hi), s2 = f32 x, s3 = i32 y; copied into v1..v4 by build_valu_cs.
+    // Compute:
+    //   v[6:7] = v[1:2] + lit(0x3FF8_0000) (= +1.5_f64)   [v_add_f64, 32-bit literal in hi dword]
+    //   v[6:7] = abs(v[6:7]) * -0.5_f64                  [v_mul_f64, abs src0, inline const -0.5 (241)]
+    //   v0     = f32(v[6:7])                             [v_cvt_f32_f64]
+    let [add_w0, add_w1] = vop3(0x164, 6, vgpr(1), 255, 0);
+    let [mul_w0, mul_w1] = vop3_mod(0x165, 6, vgpr(6), 241, 0, 1, 0, 0, false);
+    let add_mul_cvt = build_valu_cs(&[
+        add_w0,
+        add_w1,
+        0x3FF8_0000, // 1.5_f64 (upper 32 bits)
+        mul_w0,
+        mul_w1,
+        vop1(0x00F, 0, vgpr(6)), // v_cvt_f32_f64 v0, v[6:7]
+    ]);
+
+    let cases: &[(f64, f32)] = &[
+        (0.0, -0.75),
+        (2.5, -2.0),
+        (-4.5, -1.5),
+        (1e10, -5e9),
+        // Sub-f32 precision preserved before truncation: 1e7 + 0.5 + 1.5 = 1e7 + 2 -> *( -0.5 )
+        (16_777_218.5, -8_388_610.0),
+    ];
+    let inputs: Vec<[u32; 4]> = cases
+        .iter()
+        .map(|&(a, _)| {
+            let bits = a.to_bits();
+            [bits as u32, (bits >> 32) as u32, 0, 0]
+        })
+        .collect();
+    run_cases(&add_mul_cvt, &inputs, |backend, i, _, got| {
+        let want = cases[i].1.to_bits();
+        assert_eq!(
+            got, want,
+            "{backend}: f64 case {i}: got {} ({got:#x}), want {} ({want:#x})",
+            f32::from_bits(got),
+            cases[i].1
+        );
+    });
+
+    // Round-trip scalar/vector conversions and neg/omod/clamp:
+    //   v[6:7] = f64(v3 as f32)               [v_cvt_f64_f32]
+    //   v[6:7] = (-v[6:7] + 1.0) * 2.0 clamp  [v_add_f64 neg0=1, inline 1.0 (242), omod=1 (*2), clamp=1]
+    //   v[8:9] = f64(v4 as i32)               [v_cvt_f64_i32]
+    //   v0     = i32(v[6:7]) + (u32(v[8:9]) << 8)
+    let [neg_w0, neg_w1] = vop3_mod(0x164, 6, vgpr(6), 242, 0, 0, 1, 1, true);
+    let cvt_roundtrip = build_valu_cs(&[
+        vop1(0x010, 6, vgpr(3)), // v_cvt_f64_f32 v[6:7], v3
+        neg_w0,
+        neg_w1,
+        vop1(0x004, 8, vgpr(4)), // v_cvt_f64_i32 v[8:9], v4
+        vop1(0x003, 0, vgpr(6)), // v_cvt_i32_f64 v0, v[6:7]
+        vop1(0x015, 5, vgpr(8)), // v_cvt_u32_f64 v5, v[8:9]
+        vop2(0x1A, 5, 0x88, 5),  // v_lshlrev_b32 v5, 8, v5
+        vop2(0x25, 0, vgpr(0), 5), // v_add_nc_u32 v0, v0, v5
+    ]);
+    let rt_cases: &[([u32; 4], u32)] = &[
+        // v3 = 0.0 -> (-0 + 1) * 2 = 2 -> clamp -> 1; v4 = 7 -> u32(7) = 7
+        ([0, 0, 0.0f32.to_bits(), 7], 1 | (7 << 8)),
+        // v3 = -0.25 -> (0.25 + 1.0) * 2 = 2.5 -> clamp -> 1; v4 = -5 -> u32(-5) = 0
+        ([0, 0, (-0.25f32).to_bits(), (-5i32) as u32], 1),
+        // v3 = 1.5 -> (-1.5 + 1.0) * 2 = -1.0 -> clamp -> 0; v4 = 42 -> u32(42) = 42
+        ([0, 0, 1.5f32.to_bits(), 42], 42 << 8),
+    ];
+    let rt_in: Vec<[u32; 4]> = rt_cases.iter().map(|c| c.0).collect();
+    run_cases(&cvt_roundtrip, &rt_in, |backend, i, _, got| {
+        let want = rt_cases[i].1;
+        assert_eq!(got, want, "{backend}: f64 convert case {i}: got {got:#x}, want {want:#x}");
+    });
+}
+
+#[test]
+fn f64_wave_reduction_executes_on_gpu() {
+    // 64 threads (one console wave64 lowered for wave32 hosts): threads with v0 < s0
+    // contribute (v0 + 1) as f64; whole-wave DPP/permlane/readlane/v_add_f64 sum
+    // folds to waveActiveOp.f64 + cross-half exchange, then v_cvt_f32_f64 -> UAV[0].
+    let mut words = vec![
+        s_mov_b32(5, 0x80),
+    ];
+    words.extend_from_slice(&s_load_dwordx4(8, 4));
+    words.extend_from_slice(&[
+        0x4A0A_0081,             // v_add_nc_u32 v5, 1, v0
+        vop1(0x016, 6, vgpr(5)), // v_cvt_f64_u32 v[6:7], v5
+        0x7D88_0000,             // v_cmp_gt_u32 vcc, s0, v0
+        0xBE9E_246A,             // s_and_saveexec_b64 s[30:31], vcc
+        0xBE84_25C1,             // s_or_saveexec_b64 s[4:5], -1
+        0x7E04_0280,             // v_mov_b32 v2, 0
+        0x7E06_0280,             // v_mov_b32 v3, 0
+    ]);
+    words.extend_from_slice(&vop3(0x101, 2, vgpr(2), vgpr(6), sgpr(4))); // v_cndmask_b32 v2, v2, v6, s[4:5]
+    words.extend_from_slice(&vop3(0x101, 3, vgpr(3), vgpr(7), sgpr(4))); // v_cndmask_b32 v3, v3, v7, s[4:5]
+    for dpp_w1 in [0xDE54_C100u32, 0x9360_1200, 0x0009_2400] {
+        words.extend_from_slice(&[
+            0x7E08_02E9, dpp_w1 | 2, // v_mov_b32 v4, v2 dpp8:...
+            0x7E0A_02E9, dpp_w1 | 3, // v_mov_b32 v5, v3 dpp8:...
+        ]);
+        words.extend_from_slice(&vop3(0x164, 2, vgpr(4), vgpr(2), 0));
+    }
+    words.extend_from_slice(&[
+        0x7E08_02FA, 0xFF09_4002, // v_mov_b32 v4, v2 row_mirror bound_ctrl:1
+        0x7E0A_02FA, 0xFF09_4003, // v_mov_b32 v5, v3 row_mirror bound_ctrl:1
+    ]);
+    words.extend_from_slice(&vop3(0x164, 2, vgpr(4), vgpr(2), 0));
+    words.extend_from_slice(&[
+        0xD778_0004, 0x0201_0102, // v_permlanex16_b32 v4, v2, 0, 0
+        0xD778_0005, 0x0201_0103, // v_permlanex16_b32 v5, v3, 0, 0
+    ]);
+    words.extend_from_slice(&vop3(0x164, 2, vgpr(4), vgpr(2), 0));
+    words.extend_from_slice(&[
+        0xD760_0006, 0x0001_4102, // v_readlane_b32 s6, v2, 32
+        0xD760_0007, 0x0001_4103, // v_readlane_b32 s7, v3, 32
+    ]);
+    words.extend_from_slice(&vop3(0x164, 2, sgpr(6), vgpr(2), 0));
+    words.extend_from_slice(&[
+        0xD760_0006, 0x0001_0102, // v_readlane_b32 s6, v2, 0
+        0xD760_0007, 0x0001_0103, // v_readlane_b32 s7, v3, 0
+        0xBE8C_0306,              // s_mov_b32 s12, s6
+        0xBE8D_0307,              // s_mov_b32 s13, s7
+        0xBEFE_0404,              // s_mov_b64 exec, s[4:5]
+        0xBEFE_041E,              // s_mov_b64 exec, s[30:31]
+        vop1(0x00F, 0, sgpr(12)), // v_cvt_f32_f64 v0, s[12:13]
+    ]);
+    words.extend_from_slice(&buffer_store_dword(0, 8, 0));
+    words.push(S_ENDPGM);
+
+    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: true,
+        vgprs: 16,
+        layout: vec![
+            RootParam {
+                root: RootType::Constants,
+                table_offset_dwords: 0,
+                sgprs: 4,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            },
+            RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 4,
+                slot: 1,
+            },
+        ],
+        used: vec![UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 4,
+            slot: 1,
+        }],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 5 << 1,
+            threads: [64, 1, 1],
+        }),
+        code,
+    };
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res =
+        resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let was = super::lower::TEST_HOST_WAVE.replace(Some(32));
+    let lowered = lower::lower(&lower::Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+    });
+    super::lower::TEST_HOST_WAVE.set(was);
+    let lowered = lowered.expect("lower");
+    let shader = HostShader {
+        stage: HwStage::Cs,
+        dxil: lowered.dxil,
+        user_data: lowered.user_data,
+        samplers: lowered.samplers,
+        static_samplers: Vec::new(),
+        root_cbvs: lowered.root_cbvs,
+        root_srvs: lowered.root_srvs,
+        root_uavs: lowered.root_uavs,
+        root_indexed_views: res.root_indexed_views,
+    };
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; not run");
+        return;
+    };
+    let Ok((root, pso)) = host.compute_pipeline(&shader) else {
+        eprintln!("hardware device refused wave64-as-32 f64 reduction pipeline; not run");
+        return;
+    };
+    for cutoff in [1u32, 17, 32, 40, 64] {
+        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        for u in &shader.user_data {
+            if let (RootType::Constants, 0, 0) = (u.root, u.slot, u.dword) {
+                ud[u.index as usize] = cutoff;
+            }
+        }
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &[View::RawUav(1)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("dispatch failed: {e}"));
+        let want = ((cutoff * (cutoff + 1)) / 2) as f32;
+        let got = f32::from_bits(out[0][0]);
+        assert_eq!(got, want, "cutoff {cutoff}: got {got}, want {want}");
+    }
+}
