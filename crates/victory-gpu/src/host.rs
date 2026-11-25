@@ -1801,6 +1801,12 @@ static QUEUE_ORDER: Mutex<u64> = Mutex::new(0);
 /// copies' pieces, microseconds of landing in all.
 static RELAY_STATS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
 
+/// Diagnostics-only counts: completed late fences that skipped event
+/// registration, late fence checks, relay scans, and the entries after the
+/// first unfinished flight that did not need to be inspected.
+#[cfg(feature = "diagnostics")]
+static SYNC_SCAN_STATS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
 /// Of the line's things in order (a flight: the value signalled on the
 /// host's fence behind it; a write or a signal behind a flight: `None`):
 /// how many, from the front, can be landed when the card has reached
@@ -2388,6 +2394,13 @@ fn relay_worker() {
                     Late::Run(flight) => Some(flight.fence),
                     _ => None,
                 }), completed);
+                #[cfg(feature = "diagnostics")]
+                {
+                    SYNC_SCAN_STATS[2].fetch_add(1, Ordering::Relaxed);
+                    // The first unfinished flight itself was inspected.
+                    let unvisited = line.line.len().saturating_sub(n.saturating_add(1));
+                    SYNC_SCAN_STATS[3].fetch_add(unvisited as u64, Ordering::Relaxed);
+                }
                 if n == 0 {
                     // The first thing is a flight the card has not run.
                     let Late::Run(flight) = &line.line[0] else {
@@ -2473,6 +2486,15 @@ fn relay_hand_back(back: &[Declared]) {
 fn late_line(frames: f64) {
     if !late() {
         return;
+    }
+    #[cfg(feature = "diagnostics")]
+    {
+        let [skipped, checks, scans, unvisited] =
+            SYNC_SCAN_STATS.each_ref().map(|s| s.swap(0, Ordering::Relaxed));
+        tracing::info!(
+            skipped, checks, scans, unvisited, frames,
+            "GPU sync optimization counts since the last frame-rate line"
+        );
     }
     let s: Vec<f64> = LATE_STATS.iter().map(|s| s.swap(0, Ordering::Relaxed) as f64 / frames).collect();
     tracing::info!(
@@ -3776,7 +3798,13 @@ impl Host {
                 unsafe {
                     // The late helper may already have waited for this value.
                     // Only register an event if the host has not reached it.
-                    if !fence_reached(self.fence.GetCompletedValue(), *submitted) {
+                    let reached = fence_reached(self.fence.GetCompletedValue(), *submitted);
+                    #[cfg(feature = "diagnostics")]
+                    {
+                        SYNC_SCAN_STATS[0].fetch_add(u64::from(reached), Ordering::Relaxed);
+                        SYNC_SCAN_STATS[1].fetch_add(1, Ordering::Relaxed);
+                    }
+                    if !reached {
                         match self.fence.SetEventOnCompletion(*submitted, self.event) {
                             Ok(()) => {
                                 working(false);
