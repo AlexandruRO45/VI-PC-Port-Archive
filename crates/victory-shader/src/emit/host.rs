@@ -24,6 +24,7 @@ static STRIDE_TABLES: std::sync::Mutex<Vec<(usize, u32)>> = std::sync::Mutex::ne
 /// The root parameter of `root`'s view-stride table, if `binds` (the
 /// parameters a test binds) leaves it out: such a test gets a table of
 /// zeros, as the host's holds for views on 16 bytes (no bytes skipped).
+#[cfg(test)]
 fn stride_table(root: &ID3D12RootSignature, binds: impl Iterator<Item = u32>) -> Option<u32> {
     let known = STRIDE_TABLES.lock().unwrap_or_else(|e| e.into_inner());
     let &(_, param) = known.iter().find(|&&(r, _)| r == root.as_raw() as usize)?;
