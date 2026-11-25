@@ -1877,6 +1877,8 @@ impl State {
         indexed: &[RootIndexedView],
         compute: bool,
     ) -> Vec<(u8, u32)> {
+        #[cfg(feature = "diagnostics")]
+        let heading = std::time::Instant::now();
         let tables = |u: &&UsedResource| u.root == RootType::Table;
         let mut fresh: Vec<u8> = used
             .iter()
@@ -1910,8 +1912,15 @@ impl State {
         for u in used.iter().filter(tables) {
             if !fresh.contains(&u.slot) {
                 self.table_entry(list, u, compute);
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::TableEntries, 1);
             }
         }
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(
+            crate::copystat::C::TableHeadNs,
+            heading.elapsed().as_nanos() as u64,
+        );
         let mut made = Vec::new();
         for slot in fresh {
             let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
