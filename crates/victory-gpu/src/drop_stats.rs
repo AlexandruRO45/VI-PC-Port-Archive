@@ -11,6 +11,7 @@ pub(crate) enum Reason {
     PipelinePending,
     ShaderTranslation,
     PipelineRefused,
+    #[cfg(feature = "diagnostics")]
     ShaderSkipped,
     PipelineKind,
     Bind(&'static str),
