@@ -1638,11 +1638,10 @@ struct CardWork {
     areas: CardAreas,
     /// Whether a plan looks never done with.
     overdue: CardOverdue,
-    /// [`CARD_PATCH`], if it compiled: root signature and pipeline.
+    /// [`CARD_PATCH`], if it compiled: root signature and pipeline. (The
+    /// buffers of a plan's patches are in [`PATCH_POOL`] while no plan
+    /// holds them.)
     patch: Option<(ID3D12RootSignature, ID3D12PipelineState)>,
-    /// Buffers in the PC's memory for a plan's patches (buffer, mapping),
-    /// not in use: a plan takes one and gives it back with its lists.
-    patch_pool: PatchPool<(ID3D12Resource, usize)>,
 }
 
 // SAFETY: D3D12 objects (free-threaded) and persistent mappings, used only
@@ -2843,15 +2842,30 @@ const REHASH_JOIN_FROM: usize = 512;
 /// of patches there was no memory for.
 static CARD_PATCHED: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
 
-/// A buffer in the PC's memory for a plan's patches: the buffer, its
-/// mapping, its bytes.
-type PatchBuffer = (ID3D12Resource, usize, u64);
+/// A buffer in the PC's memory for a plan's patches: the buffer and its
+/// mapping.
+struct PatchMemory(ID3D12Resource, usize);
+
+// SAFETY: a D3D12 buffer (free-threaded) and its persistent mapping, which
+// only the submitting thread writes, while no plan holds the buffer.
+unsafe impl Send for PatchMemory {}
+
+/// A buffer for a plan's patches and its bytes.
+type PatchBuffer = (PatchMemory, u64);
+
+/// The buffers of patches no plan holds ([`PatchPool`]). Of its own lock:
+/// a plan's buffer is chosen outside the card's work and the queue's order,
+/// which the relay's thread takes too, and one made for it is made outside
+/// any lock.
+static PATCH_POOL: Mutex<PatchPool<PatchMemory>> = Mutex::new(PatchPool::new());
 
 /// Buffers for plans' patches that no plan holds, for later plans: each
 /// with its bytes and the count of plans when it was given back, in the
-/// order they were. A plan takes the smallest that holds its patches, so
-/// that a few patches do not pin a big buffer while their flight is in the
-/// air (each plan held one of 1 MiB or more, and up to 128 lists are in the
+/// order they were. A plan takes the smallest that holds its patches and is
+/// not more than four times the buffer one made for them would be (their
+/// bytes' next power of two: up to about eight times their bytes), so that
+/// a few patches do not pin a big buffer while their flight is in the air
+/// (each plan held one of 1 MiB or more, and up to 128 lists are in the
 /// air). Kept: the ones given back last, at most [`PATCH_POOL_MOST`] bytes
 /// of them, and none that no plan took for [`PATCH_POOL_AGE`] plans.
 struct PatchPool<T> {
@@ -2861,11 +2875,57 @@ struct PatchPool<T> {
 
 impl<T> Default for PatchPool<T> {
     fn default() -> Self {
-        PatchPool { free: Vec::new(), plans: 0 }
+        Self::new()
     }
 }
 
 impl<T> PatchPool<T> {
+    const fn new() -> Self {
+        PatchPool { free: Vec::new(), plans: 0 }
+    }
+
+    /// The buffer that holds a submission's room for patches (`most`
+    /// bytes, [`Host::patch_reserve`]): one kept of that size or more, else
+    /// one made (`make`, outside the pool's lock).
+    fn reserve(pool: &Mutex<Self>, most: u64, make: impl FnOnce(u64) -> Option<T>) -> Option<(T, u64)> {
+        let kept = pool.lock().unwrap_or_else(|e| e.into_inner()).take(most, u64::MAX);
+        kept.or_else(|| make(most).map(|buffer| (buffer, most)))
+    }
+
+    /// The buffer for a plan's `bytes` of patches ([`Host::patch_buffer`]),
+    /// chosen before the submission's `reserve` goes back to the pool: the
+    /// smallest kept that holds them and is at most four times `want` (the
+    /// buffer one made for them would be: their bytes' next power of two,
+    /// [`PATCH_LEAST`] at least), else one of `want` made (`make`, outside
+    /// the pool's lock); without memory, the reserve if it holds them, else
+    /// the biggest of the reserve and those kept (the caller sends the
+    /// ranges past its room by copies). The reserve goes back to the pool
+    /// after the choice, unless taken.
+    ///
+    /// Given back first, the reserve (16 MiB) lay in the window of a plan
+    /// of 2 to 8 MiB of patches, which took it into the air, and the next
+    /// submission made another while it flew: eight such plans in the air
+    /// held and made 128 MiB, against 32 held and 48 made this way.
+    fn for_plan(pool: &Mutex<Self>, bytes: u64, reserve: Option<(T, u64)>, make: impl FnOnce(u64) -> Option<T>) -> Option<(T, u64)> {
+        let want = bytes.next_power_of_two().max(PATCH_LEAST);
+        let kept = pool.lock().unwrap_or_else(|e| e.into_inner()).take(bytes, want.saturating_mul(4));
+        let chosen = kept.or_else(|| make(want).map(|buffer| (buffer, want)));
+        let mut pool = pool.lock().unwrap_or_else(|e| e.into_inner());
+        let (chosen, spare) = match (chosen, reserve) {
+            (Some(chosen), reserve) => (Some(chosen), reserve),
+            (None, Some(reserve)) if reserve.1 >= bytes => (Some(reserve), None),
+            (None, reserve) => match (pool.take_biggest(), reserve) {
+                (Some(kept), Some(reserve)) if reserve.1 > kept.1 => (Some(reserve), Some(kept)),
+                (Some(kept), reserve) => (Some(kept), reserve),
+                (None, reserve) => (reserve, None),
+            },
+        };
+        if let Some((buffer, size)) = spare {
+            pool.give_back(buffer, size);
+        }
+        chosen
+    }
+
     /// The smallest buffer kept of `least` bytes or more, and of `most` or
     /// fewer.
     fn take(&mut self, least: u64, most: u64) -> Option<(T, u64)> {
@@ -3175,6 +3235,117 @@ fn rehash_runs() -> bool {
 /// dispatches, about 5 GB read on the card).
 fn rehash_joined(patches: bool, ranges: usize) -> bool {
     rehash_runs() || patches || ranges > REHASH_JOIN_FROM
+}
+
+/// How the pieces a send touched of a copy in the card's memory are hashed
+/// again after it ([`Host::card_before`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Rehash {
+    /// Not at all: the copy has no hashes yet (no shader writes declared).
+    No,
+    /// Every piece of the copy: its hashes were just made.
+    Whole,
+    /// The pieces of the ranges sent.
+    Ranges,
+}
+
+/// One copy's part of a send to copies in the card's memory, as
+/// [`plan_send`] takes it.
+struct SendCopy<'a> {
+    /// What `card_dirty` took of it: offsets, in order and apart.
+    ranges: &'a [(usize, usize)],
+    /// Whether its short ranges may go as patches ([`card_patchable`]).
+    patchable: bool,
+    /// The title memory it is a copy of (start, bytes): where its pieces lie.
+    span: (usize, usize),
+    rehash: Rehash,
+}
+
+/// A send to copies in the card's memory, planned before the queue's order
+/// and the card's work are taken ([`plan_send`]).
+struct SendPlan<B> {
+    /// Per copy: the ranges that go up by a copy each, and those that go
+    /// as patches.
+    splits: Vec<(Vec<(usize, usize)>, Vec<(usize, usize)>)>,
+    /// The patches of all the copies, and per copy where its own lie.
+    patches: Vec<[u32; 3]>,
+    patched_at: Vec<std::ops::Range<usize>>,
+    /// The buffer the patches go up in and its bytes; `None` without any.
+    buffer: Option<(B, u64)>,
+    /// Per copy: the runs of pieces hashed again after the send.
+    hashes: Vec<Vec<crate::shadow::CardSpan>>,
+}
+
+/// What [`Host::card_before`] makes of a send before it takes the queue's
+/// order and the card's work, per copy: the ranges that go by a copy each
+/// and those that go as patches ([`CARD_PATCH`]: the short ones of a copy
+/// that takes them, [`crate::shadow::card_split`]), the buffer the patches
+/// go in, the patches, and the runs of pieces hashed again after the send
+/// (joined, each piece once, with `patching`, the patch compiled, or past
+/// [`REHASH_JOIN_FROM`] ranges: [`rehash_joined`]). Both used to be made
+/// under those locks, which the relay's fetches wait for: the hash runs of
+/// a send of 1.4 million short ranges took 10-12 ms.
+///
+/// `buffer_for(bytes)` is the buffer for that many bytes of patches
+/// ([`Host::patch_buffer`]): asked once, and only if some range goes as
+/// patches. One that holds fewer than all of them (there was no memory for
+/// more) takes as many as it holds, in the copies' order, and the short
+/// ranges past it go by copies. One no patch went in (the ranges were cut
+/// to the copy's mapping) goes to `give_back`. `patches_of(i, ranges, out)`
+/// appends copy `i`'s patches of `ranges` (`Shadow::card_patches`).
+fn plan_send<B>(
+    copies: &[SendCopy<'_>],
+    patching: bool,
+    buffer_for: impl FnOnce(u64) -> Option<(B, u64)>,
+    give_back: impl FnOnce((B, u64)),
+    mut patches_of: impl FnMut(usize, &[(usize, usize)], &mut Vec<[u32; 3]>),
+) -> SendPlan<B> {
+    let split = |room: usize| -> (Vec<(Vec<(usize, usize)>, Vec<(usize, usize)>)>, usize) {
+        let mut left = room;
+        let split = copies.iter().map(|c| crate::shadow::card_split(c.ranges, c.patchable, &mut left)).collect();
+        (split, room - left)
+    };
+    let (mut splits, dwords) = split(usize::MAX);
+    let mut buffer = None;
+    if dwords > 0 {
+        buffer = buffer_for(dwords as u64 * 12);
+        // Without memory for all of them: as many as the buffer holds,
+        // the short ranges past it by copies.
+        let held = buffer.as_ref().map_or(0, |b| (b.1 / 12) as usize);
+        if held < dwords {
+            splits = split(held).0;
+        }
+    }
+    let mut patches = Vec::new();
+    let patched_at = splits
+        .iter()
+        .enumerate()
+        .map(|(i, (_, short))| {
+            let first = patches.len();
+            patches_of(i, short, &mut patches);
+            first..patches.len()
+        })
+        .collect();
+    if patches.is_empty()
+        && let Some(unused) = buffer.take()
+    {
+        give_back(unused);
+    }
+    let hashes = copies
+        .iter()
+        .map(|c| match c.rehash {
+            Rehash::No => Vec::new(),
+            Rehash::Whole => crate::shadow::card_hash_runs(c.span, c.ranges, true, false),
+            Rehash::Ranges => crate::shadow::card_hash_runs(c.span, c.ranges, false, rehash_joined(patching, c.ranges.len())),
+        })
+        .collect();
+    SendPlan {
+        splits,
+        patches,
+        patched_at,
+        buffer,
+        hashes,
+    }
 }
 
 /// Since the last frame-rate line, of our own passes over copies in the
@@ -4230,9 +4401,18 @@ pub(crate) fn staging_wait(in_flight: u64) {
 /// the submission's patches ([`Host::patch_reserve`]), taken before any
 /// run is put in, for [`Host::card_before`].
 fn stale_under_flights(host: &Host, runs: &[&HostList], reserve: &mut Option<PatchBuffer>) -> bool {
+    let spans = refreshed_under_flights(runs);
+    if late_exact() {
+        return put_in_under_flights(&spans, reserve, || host.patch_reserve());
+    }
+    spans.iter().any(|(shadow, from, to)| shadow.stale_under_writes(*from, *to - *from))
+}
+
+/// Per copy that shaders of flights in the air may be writing, the span of
+/// what `runs` refresh of it (title addresses: a flush brings that much up
+/// to date at most).
+fn refreshed_under_flights(runs: &[&HostList]) -> Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> {
     use std::sync::Arc;
-    // Per copy, the span of what is refreshed (a flush brings that much
-    // up to date at most).
     let mut spans: Vec<(Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
     for list in runs {
         for step in &list.deferred().copies {
@@ -4246,25 +4426,31 @@ fn stale_under_flights(host: &Host, runs: &[&HostList], reserve: &mut Option<Pat
             }
         }
     }
-    if late_exact() {
-        // The title's bytes are put in beside the flights' writes; a
-        // settle is still due where that could not be done. What goes up
-        // to copies in the card's memory is held to a submission's room:
-        // 512 long runs, each a copy of its own there, and the short ones
-        // as dword patches ([`CARD_PATCH`]) while 16 MiB of patches last
-        // (the bus scene of run dd56178 put in 20-80 thousand runs of
-        // about 3 bytes a frame under flights, and still settled for title
-        // memory changed under them about twice a frame: 75 ms of waiting
-        // for the card). The buffer the patches go up in is taken first:
-        // without memory for it the short runs take copies too, and past
-        // 512 a settle is due, as before the patches.
-        if reserve.is_none() && spans.iter().any(|(shadow, ..)| shadow.carded()) {
-            *reserve = host.patch_reserve();
-        }
-        let mut room = crate::shadow::Room::new(reserve.is_some());
-        return spans.iter().any(|(shadow, from, to)| shadow.merge_under_writes(*from, *to - *from, &mut room));
+    spans
+}
+
+/// [`late_exact`]: the title's bytes are put in beside the flights' writes
+/// in `spans` (per copy, title addresses); whether a settle is still due,
+/// where that could not be done. What goes up to copies in the card's
+/// memory is held to a submission's room: 512 long runs, each a copy of its
+/// own there, and the short ones as dword patches ([`CARD_PATCH`]) while
+/// 16 MiB of patches last (the bus scene of run dd56178 put in 20-80
+/// thousand runs of about 3 bytes a frame under flights, and still settled
+/// for title memory changed under them about twice a frame: 75 ms of
+/// waiting for the card). The buffer the patches go up in, the `reserve`,
+/// is taken first (`take_reserve`, [`Host::patch_reserve`]) where a copy in
+/// the card's memory is among those refreshed: without it the short runs
+/// take copies too, and past 512 a settle is due, as before the patches.
+fn put_in_under_flights<B>(
+    spans: &[(std::sync::Arc<crate::shadow::Shadow>, usize, usize)],
+    reserve: &mut Option<B>,
+    take_reserve: impl FnOnce() -> Option<B>,
+) -> bool {
+    if reserve.is_none() && spans.iter().any(|(shadow, ..)| shadow.carded()) {
+        *reserve = take_reserve();
     }
-    spans.iter().any(|(shadow, from, to)| shadow.stale_under_writes(*from, *to - *from))
+    let mut room = crate::shadow::Room::new(reserve.is_some());
+    spans.iter().any(|(shadow, from, to)| shadow.merge_under_writes(*from, *to - *from, &mut room))
 }
 
 /// A fence signal on a queue ([`late`]): goes behind the flights in the
@@ -4714,13 +4900,19 @@ fn late_line(frames: f64) {
 
 #[cfg(test)]
 mod patch_tests {
-    use super::{PATCH_POOL_AGE, PATCH_POOL_MOST, PatchPool, REHASH_JOIN_FROM, rehash_joined, rehash_runs};
+    use super::{
+        CARD_PATCH_BYTES_MOST, PATCH_LEAST, PATCH_POOL_AGE, PATCH_POOL_MOST, PatchPool, REHASH_JOIN_FROM, Rehash, SendCopy, plan_send,
+        rehash_joined, rehash_runs,
+    };
+    use std::cell::Cell;
+    use std::sync::Mutex;
 
     /// Buffers of patches kept for later plans: a plan gets the smallest
-    /// that holds its patches and none four times their size, so a few
-    /// patches do not pin the 16 MiB the merge's room took; the pool keeps
-    /// at most 64 MiB, the buffers given back last, and lets go of one no
-    /// plan took for 256 plans.
+    /// that holds its patches within the window it is given (four times
+    /// the buffer one made for them would be, [`PatchPool::for_plan`]), so
+    /// a few patches do not pin the 16 MiB the merge's room took; the pool
+    /// keeps at most 64 MiB, the buffers given back last, and lets go of
+    /// one no plan took for 256 plans.
     #[test]
     fn the_pool_gives_the_smallest_buffer_that_holds_and_lets_go_of_old_ones() {
         const K: u64 = 1 << 10;
@@ -4757,6 +4949,242 @@ mod patch_tests {
         assert_eq!(pool.bytes(), 0);
     }
 
+    /// Review: `Host::patch_reserve` and `Host::patch_buffer` (the pool's
+    /// `reserve` and `for_plan`), for 8 submissions in the air whose plans
+    /// take 2.5 MiB of patches each (about 218 thousand dwords; the bus
+    /// scene put in 20-80 thousand runs a frame). The reserve went back to
+    /// the pool first and lay in the window a plan takes from ([bytes, 4 *
+    /// next power of two]), so each plan took the 16 MiB reserve and the
+    /// next submission made a new one: 128 MiB held and made. Chosen before
+    /// the reserve goes back, each plan makes 4 MiB and the one reserve
+    /// goes round: 32 MiB held, 48 made.
+    #[test]
+    fn rv_a_plan_of_a_few_mib_does_not_take_the_16_mib_reserve() {
+        let most = CARD_PATCH_BYTES_MOST as u64;
+        let bytes: u64 = 5 << 19;
+        let want = bytes.next_power_of_two().max(PATCH_LEAST);
+        let pool = Mutex::new(PatchPool::<u32>::new());
+        let (made, names) = (Cell::new(0u64), Cell::new(0u32));
+        let make = |size: u64| {
+            made.set(made.get() + size);
+            names.set(names.get() + 1);
+            Some(names.get())
+        };
+        let mut in_air: Vec<(u32, u64)> = Vec::new();
+        for _ in 0..8 {
+            // patch_reserve, before the merge; patch_buffer, for the plan.
+            let reserve = PatchPool::reserve(&pool, most, make);
+            in_air.push(PatchPool::for_plan(&pool, bytes, reserve, make).expect("a buffer"));
+            pool.lock().unwrap().plan();
+        }
+        let pinned: u64 = in_air.iter().map(|b| b.1).sum();
+        assert_eq!(
+            (pinned >> 20, made.get() >> 20),
+            ((8 * want) >> 20, (most + 8 * want) >> 20),
+            "MiB held by the plans in the air, MiB made"
+        );
+        assert_eq!(pool.lock().unwrap().bytes(), most, "the reserve is back, alone");
+    }
+
+    /// The same over the window that held the reserve, plans of 2 to 8 MiB
+    /// of patches: each of eight in the air has a buffer made for it (the
+    /// next power of two of its bytes), never the reserve, and one reserve
+    /// goes round.
+    #[test]
+    fn plans_of_two_to_eight_mib_leave_the_reserve_alone() {
+        const M: u64 = 1 << 20;
+        let most = CARD_PATCH_BYTES_MOST as u64;
+        for bytes in [2 * M + 12, 5 * M / 2, 3 * M, 4 * M, 4 * M + 12, 6 * M, 8 * M] {
+            let want = bytes.next_power_of_two().max(PATCH_LEAST);
+            let pool = Mutex::new(PatchPool::<u32>::new());
+            let (made, names) = (Cell::new(0u64), Cell::new(0u32));
+            let make = |size: u64| {
+                made.set(made.get() + size);
+                names.set(names.get() + 1);
+                Some(names.get())
+            };
+            let (mut reserves, mut in_air) = (Vec::new(), Vec::new());
+            for _ in 0..8 {
+                let reserve = PatchPool::reserve(&pool, most, make).expect("a reserve");
+                reserves.push(reserve.0);
+                in_air.push(PatchPool::for_plan(&pool, bytes, Some(reserve), make).expect("a buffer"));
+                pool.lock().unwrap().plan();
+            }
+            assert!(in_air.iter().all(|b| b.1 == want && !reserves.contains(&b.0)), "{bytes} bytes: {in_air:?}");
+            assert_eq!(made.get(), most + 8 * want, "{bytes} bytes: one reserve and eight plans made");
+            reserves.dedup();
+            assert_eq!(reserves.len(), 1, "{bytes} bytes: one reserve goes round");
+        }
+    }
+
+    /// A plan's buffer is chosen before the submission's reserve goes back
+    /// ([`PatchPool::for_plan`]): one kept in its window, else one made;
+    /// without memory the reserve if it holds the patches, else the biggest
+    /// of the reserve and those kept; and nothing without either. The
+    /// reserve goes back unless taken.
+    #[test]
+    fn a_plans_buffer_is_chosen_before_the_reserve_goes_back() {
+        const M: u64 = 1 << 20;
+        let most = CARD_PATCH_BYTES_MOST as u64;
+        let none = |_: u64| -> Option<u32> { None };
+        let made = |size: u64| -> Option<u32> { Some(1000 + (size >> 20) as u32) };
+        let kept = |pool: &Mutex<PatchPool<u32>>| {
+            let mut sizes: Vec<(u32, u64)> = pool.lock().unwrap().free.iter().map(|b| (b.0, b.1)).collect();
+            sizes.sort_unstable();
+            sizes
+        };
+        // A kept buffer in the window ([3 MiB, 16 MiB] for 3 MiB): the
+        // smallest; the reserve goes back.
+        let pool = Mutex::new(PatchPool::new());
+        pool.lock().unwrap().give_back(1, 8 * M);
+        pool.lock().unwrap().give_back(2, 5 * M);
+        assert_eq!(PatchPool::for_plan(&pool, 3 * M, Some((9, most)), made), Some((2, 5 * M)));
+        assert_eq!(kept(&pool), [(1, 8 * M), (9, most)]);
+        // None in the window: one made, of the next power of two.
+        let pool = Mutex::new(PatchPool::new());
+        pool.lock().unwrap().give_back(1, 32 * M);
+        assert_eq!(PatchPool::for_plan(&pool, 3 * M, Some((9, most)), made), Some((1004, 4 * M)));
+        assert_eq!(kept(&pool), [(1, 32 * M), (9, most)]);
+        // No memory: the reserve, which holds them.
+        let pool = Mutex::new(PatchPool::new());
+        pool.lock().unwrap().give_back(1, 32 * M);
+        assert_eq!(PatchPool::for_plan(&pool, 3 * M, Some((9, most)), none), Some((9, most)));
+        assert_eq!(kept(&pool), [(1, 32 * M)]);
+        // No memory and more patches than the reserve holds: the biggest
+        // kept, if bigger (none holds them: the rest go by copies); the
+        // reserve goes back.
+        let pool = Mutex::new(PatchPool::new());
+        pool.lock().unwrap().give_back(1, 18 * M);
+        assert_eq!(PatchPool::for_plan(&pool, 20 * M, Some((9, most)), none), Some((1, 18 * M)));
+        assert_eq!(kept(&pool), [(9, most)]);
+        // The reserve, if it is the biggest; what was kept stays.
+        let pool = Mutex::new(PatchPool::new());
+        pool.lock().unwrap().give_back(1, 2 * M);
+        assert_eq!(PatchPool::for_plan(&pool, 20 * M, Some((9, most)), none), Some((9, most)));
+        assert_eq!(kept(&pool), [(1, 2 * M)]);
+        // Neither memory nor anything kept or reserved: none.
+        let pool = Mutex::new(PatchPool::new());
+        assert_eq!(PatchPool::for_plan(&pool, 3 * M, None, none), None);
+        // A few patches: 64 KiB at least, and the reserve back.
+        let pool = Mutex::new(PatchPool::new());
+        assert_eq!(PatchPool::for_plan(&pool, 300, Some((9, most)), |size| Some(size as u32)), Some((PATCH_LEAST as u32, PATCH_LEAST)));
+        assert_eq!(kept(&pool), [(9, most)]);
+        // The reserve: kept if there is one of its size or more, else made.
+        assert_eq!(PatchPool::reserve(&pool, most, none), Some((9, most)));
+        assert_eq!(PatchPool::reserve(&pool, most, made), Some((1016, most)));
+        assert_eq!(PatchPool::reserve(&pool, most, none), None);
+    }
+
+    /// Ranges of three copies, offsets in order and apart, as `card_dirty`
+    /// takes them, and the CPU side's bytes of each.
+    fn three_copies() -> ([Vec<(usize, usize)>; 3], [Vec<u8>; 3]) {
+        use super::CARD_PATCH_RUN;
+        // Copy 0: short ranges (dwords 1, 1 and 64: 255 bytes from byte 1
+        // of a dword) and a long one. Copy 1: short ranges of a copy that
+        // takes no patches. Copy 2: nothing sent, its hashes just made.
+        let ranges = [
+            vec![(0, 3), (8, 8 + CARD_PATCH_RUN + 44), (400, 403), (1001, 1256)],
+            vec![(0, 1), (16, 20)],
+            vec![],
+        ];
+        let data = [0u8, 1, 2].map(|c| (0..4096u32).map(|i| (i * 7 + u32::from(c) * 31 + 5) as u8).collect());
+        (ranges, data)
+    }
+
+    fn copies_of<'a>(ranges: &'a [Vec<(usize, usize)>; 3]) -> [SendCopy<'a>; 3] {
+        let span = |c: usize| (0x10_0000 * (c + 1) + 0x1f00, 4096 + 65536 * c);
+        [
+            SendCopy {
+                ranges: &ranges[0],
+                patchable: true,
+                span: span(0),
+                rehash: Rehash::Ranges,
+            },
+            SendCopy {
+                ranges: &ranges[1],
+                patchable: false,
+                span: span(1),
+                rehash: Rehash::No,
+            },
+            SendCopy {
+                ranges: &ranges[2],
+                patchable: true,
+                span: span(2),
+                rehash: Rehash::Whole,
+            },
+        ]
+    }
+
+    /// A send is planned before the queue's order and the card's work are
+    /// taken (`plan_send`): the short ranges of a copy that takes patches
+    /// go as patches, in a buffer asked once for all of them, the rest by
+    /// copies; each copy's patches lie where `patched_at` says; and the
+    /// runs of pieces hashed again are joined with the patch (none for a
+    /// copy without hashes, all of one whose hashes were just made).
+    #[test]
+    fn a_send_is_planned_before_the_locks() {
+        let (ranges, data) = three_copies();
+        let copies = copies_of(&ranges);
+        let asked = Cell::new(0u64);
+        let plan = plan_send(
+            &copies,
+            true,
+            |bytes| {
+                asked.set(bytes);
+                Some((7u32, bytes))
+            },
+            |_| panic!("the buffer holds patches"),
+            |i, short, out| crate::shadow::dword_patches(short, &data[i], out),
+        );
+        assert_eq!(asked.get(), (1 + 1 + 64) * 12, "one buffer for every short range's dwords");
+        assert_eq!(plan.splits[0], (vec![ranges[0][1]], vec![ranges[0][0], ranges[0][2], ranges[0][3]]));
+        assert_eq!(plan.splits[1], (ranges[1].clone(), vec![]), "no patches for a copy that takes none");
+        assert_eq!(plan.splits[2], (vec![], vec![]));
+        let mut wanted = Vec::new();
+        crate::shadow::dword_patches(&plan.splits[0].1, &data[0], &mut wanted);
+        assert_eq!(plan.patches, wanted);
+        assert_eq!(plan.patched_at, [0..wanted.len(), wanted.len()..wanted.len(), wanted.len()..wanted.len()]);
+        assert_eq!(plan.buffer, Some((7, 66 * 12)));
+        assert_eq!(plan.hashes[0], crate::shadow::card_hash_runs(copies[0].span, &ranges[0], false, true));
+        assert!(plan.hashes[0].len() < ranges[0].len(), "joined with the patch");
+        assert!(plan.hashes[1].is_empty(), "a copy without hashes");
+        assert_eq!(plan.hashes[2], crate::shadow::card_hash_runs(copies[2].span, &[], true, false));
+        // Without the patch: one run per range (unless the switch joins them).
+        let plan = plan_send(&copies, false, |bytes| Some((7u32, bytes)), |_| {}, |i, short, out| {
+            crate::shadow::dword_patches(short, &data[i], out)
+        });
+        assert_eq!(plan.hashes[0], crate::shadow::card_hash_runs(copies[0].span, &ranges[0], false, rehash_joined(false, 4)));
+    }
+
+    /// A buffer that holds fewer patches than the short ranges make (there
+    /// was no memory for more) takes as many as it holds, and the short
+    /// ranges past it go by copies; with no buffer at all every range goes
+    /// by a copy. A buffer no patch went in goes back. No short range, no
+    /// buffer asked for.
+    #[test]
+    fn short_ranges_past_the_plans_buffer_go_by_copies() {
+        let (ranges, data) = three_copies();
+        let copies = copies_of(&ranges);
+        let patches_of = |i: usize, short: &[(usize, usize)], out: &mut Vec<[u32; 3]>| crate::shadow::dword_patches(short, &data[i], out);
+        // Room for two dwords: the first two short ranges.
+        let plan = plan_send(&copies, true, |_| Some((7u32, 2 * 12)), |_| panic!("it holds patches"), patches_of);
+        assert_eq!(plan.splits[0], (vec![ranges[0][1], ranges[0][3]], vec![ranges[0][0], ranges[0][2]]));
+        assert!(plan.patches.len() * 12 <= 2 * 12, "{} patches in a buffer of 2", plan.patches.len());
+        assert_eq!(plan.buffer, Some((7, 24)));
+        // No buffer: all by copies.
+        let plan = plan_send(&copies, true, |_| None::<(u32, u64)>, |_| panic!("no buffer"), patches_of);
+        assert_eq!(plan.splits[0], (ranges[0].clone(), vec![]));
+        assert!(plan.patches.is_empty() && plan.buffer.is_none());
+        // A buffer no patch went in (the ranges were cut away) goes back.
+        let given = Cell::new(None);
+        let plan = plan_send(&copies, true, |bytes| Some((7u32, bytes)), |b| given.set(Some(b)), |_, _, _| {});
+        assert_eq!((plan.buffer, given.get()), (None, Some((7, 66 * 12))));
+        // No short range: no buffer asked for.
+        let long = [vec![ranges[0][1]], vec![], vec![]];
+        let plan = plan_send(&copies_of(&long), true, |_| -> Option<(u32, u64)> { panic!("no patches") }, |_| {}, patches_of);
+        assert_eq!(plan.splits[0], (long[0].clone(), vec![]));
+    }
+
     /// The pieces hashed again after ranges went up are hashed in joined
     /// runs with patches, or with more than 512 ranges, whatever
     /// `VICTORY_CARD_REHASH_RUNS` says; else as it says.
@@ -4765,6 +5193,406 @@ mod patch_tests {
         assert!(rehash_joined(true, 1));
         assert!(rehash_joined(false, REHASH_JOIN_FROM + 1));
         assert_eq!(rehash_joined(false, REHASH_JOIN_FROM), rehash_runs());
+    }
+}
+
+/// Copies in the card's memory through the host's own path, on the host
+/// GPU (the software adapter where there is no card): title bytes put in
+/// under flights' writes (`put_in_under_flights`, `Shadow::merge_under_writes`),
+/// the sends that take them up by copies and patches and hash their pieces
+/// again (`Host::card_before`, numbered in the queue's order with the
+/// relay), what the card side then holds, and a merge of the relay that
+/// leaves out the title bytes a fetch ran ahead of (`Shadow::card_merge_relay`).
+#[cfg(test)]
+mod card_path_tests {
+    use super::{
+        CARD_PATCHED, CARD_PATCHES, CARD_WORK, CardPlan, Host, PatchBuffer, QUEUE_ORDER, late_exact, put_in_under_flights,
+        refreshed_under_flights, stale_under_flights,
+    };
+    use crate::shadow::{Room, Shadow};
+    use crate::watch::PAGE;
+    use std::sync::atomic::Ordering;
+    use std::sync::{Arc, Mutex};
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
+    use windows::core::Interface;
+
+    /// One at a time: they count the merge's statistics and number sends in
+    /// the queue's order, both the process's.
+    static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
+
+    /// Title memory as the runtime reserves it: write-watched, on a 64 KiB
+    /// line. Never given back: the write watch's journal remembers its
+    /// pages as written for good, and memory another test made at the same
+    /// address would show them written (`watch`'s own tests expect a fresh
+    /// region to show none, and failed so, now and then, while these freed
+    /// theirs).
+    struct TitleMemory {
+        at: *mut u8,
+        len: usize,
+    }
+
+    impl TitleMemory {
+        fn new(len: usize) -> TitleMemory {
+            use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+            const MEM_WRITE_WATCH: u32 = 0x20_0000;
+            // SAFETY: a fresh private region of our own.
+            let at = unsafe { VirtualAlloc(std::ptr::null(), len, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) };
+            assert!(!at.is_null() && (at as usize).is_multiple_of(PAGE), "write-watched memory on a 64 KiB line");
+            TitleMemory { at: at.cast(), len }
+        }
+
+        fn address(&self) -> usize {
+            self.at as usize
+        }
+
+        fn bytes(&self) -> Vec<u8> {
+            // SAFETY: our committed region.
+            unsafe { std::slice::from_raw_parts(self.at, self.len) }.to_vec()
+        }
+
+        fn write(&self, at: usize, bytes: &[u8]) {
+            assert!(at + bytes.len() <= self.len);
+            // SAFETY: inside our committed region.
+            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.at.add(at), bytes.len()) };
+        }
+    }
+
+    /// Until the host's queue has run what is on it (a fence of our own).
+    fn wait_for_queue(host: &Host) {
+        // SAFETY: a fence of our own; a null event makes the call wait.
+        unsafe {
+            let fence: ID3D12Fence = host.device.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            host.queue.Signal(&fence, 1).unwrap();
+            fence.SetEventOnCompletion(1, HANDLE::default()).unwrap();
+        }
+    }
+
+    /// The plan's compare runs, as it does after a submission's lists, and
+    /// the queue is waited for.
+    fn compare_and_wait(host: &Host, plan: &CardPlan) {
+        if let Some(check) = &plan.check {
+            // SAFETY: a closed list of ours.
+            unsafe { host.queue.ExecuteCommandLists(&[Some(check.clone())]) };
+        }
+        wait_for_queue(host);
+    }
+
+    /// The pieces the plan's compare found differing from their hashes,
+    /// and whether it compared every declared range.
+    fn flagged(plan: &CardPlan) -> (usize, bool) {
+        let work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
+        let work = work.as_ref().expect("the card's work");
+        // SAFETY: the compare's results, which it wrote; it has run.
+        let differs = unsafe { std::slice::from_raw_parts(work.differs.1 as *const u32, (work.differs.2 / 4) as usize) };
+        let flagged = plan
+            .ranges
+            .iter()
+            .filter(|r| r.compared)
+            .map(|r| (0..r.span.pieces).filter(|&p| differs[(r.at + p) as usize] != 0).count())
+            .sum();
+        (flagged, !plan.ranges.is_empty() && plan.ranges.iter().all(|r| r.compared))
+    }
+
+    /// What the card side of `shadow` holds, read back.
+    fn card_side(host: &Host, shadow: &Shadow) -> Vec<u8> {
+        let (_, _, size) = shadow.card_sides().expect("a copy in the card's memory");
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_READBACK,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: size,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+        let mut readback: Option<ID3D12Resource> = None;
+        // SAFETY: a plain read-back buffer.
+        unsafe {
+            host.device
+                .CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut readback)
+                .unwrap();
+        }
+        let readback = readback.unwrap();
+        let (allocator, list) = host.make_prelude().expect("a list");
+        // SAFETY: our own list and buffers; the card side's last list has
+        // run (its state decayed to common).
+        unsafe {
+            allocator.Reset().unwrap();
+            list.Reset(&allocator, None).unwrap();
+            list.CopyBufferRegion(&readback, 0, &shadow.buffer, 0, size);
+            list.Close().unwrap();
+            host.queue.ExecuteCommandLists(&[Some(list.cast::<ID3D12CommandList>().unwrap())]);
+        }
+        wait_for_queue(host);
+        let mut data = std::ptr::null_mut();
+        // SAFETY: the copy has run; the buffer holds `size` bytes.
+        unsafe {
+            readback.Map(0, Some(&D3D12_RANGE { Begin: 0, End: size as usize }), Some(&mut data)).unwrap();
+            std::slice::from_raw_parts(data.cast::<u8>(), size as usize).to_vec()
+        }
+    }
+
+    /// A copy in the card's memory of four pages, whose shaders write all
+    /// of it, through two sends with the relay's numbering:
+    ///
+    /// - the first takes the copy whole (one range, a copy) and hashes every
+    ///   piece; the queue's order goes up by one, `card_dirty` notes the
+    ///   range with that number, the card side holds the title's bytes, and
+    ///   the compare after it finds every piece as hashed;
+    /// - the title then writes pages 1 and 2, which flights' shaders may be
+    ///   writing (declared over each other, the higher first): 600 runs of
+    ///   3 bytes and two long ones in page 1, a long one in page 2. Without
+    ///   a buffer for patches (`Room::new(false)`) page 1's 602 runs are
+    ///   past the 512 copies: a settle is due, counted as such, and nothing
+    ///   of the page goes in; past the room's patches likewise; with the
+    ///   reserve every run goes in, and no settle is due;
+    /// - the second send takes them up: 600 dword patches and 3 copies, the
+    ///   order one more, the card side the title's bytes, and the compare
+    ///   finds the pieces sent to hashed again (the hash runs, made before
+    ///   the locks, held them);
+    /// - a merge of bytes fetched between the two sends leaves the second
+    ///   send's title bytes out, and takes a shader's bytes beside them.
+    #[test]
+    fn title_bytes_put_in_under_flights_go_up_by_copies_and_patches() {
+        let Some(host) = super::host() else {
+            return; // no host GPU here
+        };
+        if !crate::shadow::cards() || !host.card_ready() {
+            return;
+        }
+        let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        // No submission meanwhile: each takes every listed copy's notes.
+        let _submitting = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(CARD_PATCHES.load(Ordering::Relaxed), "the patch compiles");
+        const LEN: usize = 4 * PAGE;
+        let title = TitleMemory::new(LEN);
+        let p0: Vec<u8> = (0..LEN).map(|i| (i * 13 + i / 4093) as u8).collect();
+        title.write(0, &p0);
+        let shadow = Shadow::on_card_for_test(host, title.address(), LEN, true).expect("a copy in the card's memory");
+        let writes = host.new_list().expect("a host list");
+        shadow.gpu_writes(&writes, title.address() as u64, LEN as u64);
+        writes.close();
+
+        // The first send: the copy took title memory, and goes up whole.
+        // (Each send's lists are waited for before anything is checked: a
+        // check that fails then drops nothing the card still uses.)
+        shadow.refresh_for_test(0, &p0);
+        let order = *QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner());
+        let plan = host.card_before(&[&writes], false, None, true).expect("a send");
+        compare_and_wait(host, &plan);
+        assert_eq!((plan.sent_as, *QUEUE_ORDER.lock().unwrap()), (order + 1, order + 1), "a send in the queue's order");
+        let (unsent, sent) = shadow.notes_for_test();
+        assert!(unsent.is_empty(), "taken");
+        assert_eq!(sent.last(), Some(&(order + 1, vec![(0, LEN)])), "noted with the send's number");
+        assert_eq!(flagged(&plan), (0, true), "every piece as hashed");
+        host.card_done(plan);
+        assert!(card_side(host, &shadow) == p0, "the card side holds the title's bytes");
+        // Nothing to send, nothing declared: no send, and no number.
+        assert!(host.card_before(&[], false, None, true).is_none());
+        assert_eq!(*QUEUE_ORDER.lock().unwrap(), order + 1, "only sends that take ranges are numbered");
+
+        // The title writes what flights' shaders may be writing.
+        shadow.writing(title.address() + 2 * PAGE - 300, PAGE + 300);
+        shadow.writing(title.address() + PAGE, PAGE);
+        let mut p1 = p0.clone();
+        let mut change = |at: usize, n: usize| p1[at..at + n].iter_mut().for_each(|b| *b ^= 0x5a);
+        for i in 0..600 {
+            change(PAGE + 64 * i + 1, 3);
+        }
+        change(PAGE + 40_000, 300);
+        change(PAGE + 50_000, 1000);
+        change(2 * PAGE + 10, 400);
+        title.write(0, &p1);
+        let spans = vec![(shadow.clone(), title.address(), title.address() + LEN)];
+        // Without patches: past the copies, a settle is due.
+        let _ = crate::shadow::unmerged_stats();
+        assert!(put_in_under_flights(&spans, &mut None::<()>, || None), "602 runs, 512 copies: a settle is due");
+        let [_, _, over_copies, over_runs, _, over_patches] = crate::shadow::unmerged_stats();
+        assert_eq!((over_copies, over_runs, over_patches), (1, 602, 0), "counted past the copies");
+        assert!(shadow.cpu_side_for_test() == p0, "nothing of the page went in");
+        assert!(shadow.notes_for_test().0.is_empty(), "nor was noted");
+        // Past the room's patches.
+        let mut room = Room::new(true);
+        room.patches = Some(10);
+        assert!(shadow.merge_under_writes(title.address(), LEN, &mut room), "past the patches: a settle is due");
+        let [_, _, over_copies, _, _, over_patches] = crate::shadow::unmerged_stats();
+        assert_eq!((over_copies, over_patches), (0, 1), "counted past the patches");
+        // With the reserve: all of it goes in.
+        let mut reserve: Option<PatchBuffer> = None;
+        assert!(!put_in_under_flights(&spans, &mut reserve, || host.patch_reserve()), "no settle");
+        assert!(reserve.is_some(), "the buffer for the patches was taken first");
+        assert!(shadow.cpu_side_for_test() == p1, "the title's bytes are in the CPU side");
+        assert_eq!(shadow.notes_for_test().0.len(), 603, "and noted, run by run");
+
+        // The second send.
+        let before = CARD_PATCHED.each_ref().map(|c| c.load(Ordering::Relaxed));
+        let plan = host.card_before(&[&writes], false, reserve, true).expect("a send");
+        compare_and_wait(host, &plan);
+        let after = CARD_PATCHED.each_ref().map(|c| c.load(Ordering::Relaxed));
+        assert_eq!((after[0] - before[0], after[3] - before[3]), (600, 3), "600 dword patches, 3 copies");
+        assert!(plan.patches.is_some(), "in the plan's buffer");
+        assert_eq!((plan.sent_as, *QUEUE_ORDER.lock().unwrap()), (order + 2, order + 2), "one more send");
+        let (unsent, sent) = shadow.notes_for_test();
+        assert!(unsent.is_empty());
+        assert_eq!(sent.last().map(|s| (s.0, s.1.len())), Some((order + 2, 603)), "noted with its number");
+        assert_eq!(flagged(&plan), (0, true), "the pieces sent to were hashed again");
+        host.card_done(plan);
+        assert!(card_side(host, &shadow) == p1, "the card side holds the title's new bytes");
+
+        // A fetch that ran between the two sends: the card held the first
+        // send's bytes there, and a flight's shader wrote beside them.
+        let mut fetched = p0.clone();
+        for i in 0..100 {
+            fetched[PAGE + 64 * i + 33] ^= 0xa5;
+        }
+        let mut scratch = Vec::new();
+        assert!(shadow.card_merge_relay(PAGE, &fetched[PAGE..2 * PAGE], order + 1, &mut scratch) > 0);
+        let mut wanted = p1.clone();
+        for i in 0..100 {
+            wanted[PAGE + 64 * i + 33] = fetched[PAGE + 64 * i + 33];
+        }
+        assert!(title.bytes() == wanted, "the second send's title bytes stay, the shader's go in");
+        assert!(shadow.cpu_side_for_test() == wanted, "and into the CPU side");
+    }
+
+    /// The merge's room starts again for each copy (`Room::next_copy`): a
+    /// run of one copy that starts where another copy's long run ends is
+    /// not one range with it (`card_dirty` sends each copy's own), and
+    /// takes a patch of its own.
+    #[test]
+    fn the_merge_takes_each_copys_runs_apart() {
+        let Some(host) = super::host() else {
+            return; // no host GPU here
+        };
+        if !crate::shadow::cards() || !host.card_ready() {
+            return;
+        }
+        let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        let memories = [TitleMemory::new(PAGE), TitleMemory::new(PAGE)];
+        let copies = memories.each_ref().map(|m| Shadow::on_card_for_test(host, m.address(), PAGE, false).expect("a copy"));
+        for (copy, memory) in copies.iter().zip(&memories) {
+            copy.refresh_for_test(0, &memory.bytes());
+            copy.writing(memory.address(), PAGE);
+        }
+        memories[0].write(700, &[1; 300]);
+        memories[1].write(1000, &[2; 3]);
+        let mut room = Room::new(true);
+        let full = room;
+        for (copy, memory) in copies.iter().zip(&memories) {
+            assert!(!copy.merge_under_writes(memory.address(), PAGE, &mut room));
+        }
+        let took = (full.copies - room.copies, full.patches.unwrap() - room.patches.unwrap());
+        assert_eq!(took, (1, 1), "a copy for the first copy's run, a patch for the second's");
+    }
+
+    /// The copies a submission refreshes while flights' shaders may write
+    /// them, and the span refreshed of each; without `late_exact` the
+    /// journal says whether a settle is due (it was not asked ahead about
+    /// these pages: yes), and no buffer for patches is taken.
+    #[test]
+    fn stale_under_flights_takes_the_copies_refreshed_under_flights() {
+        let Some(host) = super::host() else {
+            return; // no host GPU here
+        };
+        if !crate::shadow::cards() || !host.card_ready() {
+            return;
+        }
+        let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        let memory = TitleMemory::new(2 * PAGE);
+        let copy = Shadow::on_card_for_test(host, memory.address(), 2 * PAGE, false).expect("a copy");
+        let list = host.new_list().expect("a host list");
+        copy.refresh(&list, memory.address() as u64 + 100, 1000);
+        copy.refresh(&list, (memory.address() + PAGE) as u64, 500);
+        assert!(refreshed_under_flights(&[&list]).is_empty(), "no shader writes it");
+        copy.writing(memory.address() + 50, 200);
+        let spans = refreshed_under_flights(&[&list]);
+        assert_eq!(spans.len(), 1);
+        assert!(Arc::ptr_eq(&spans[0].0, &copy));
+        assert_eq!((spans[0].1, spans[0].2), (memory.address() + 100, memory.address() + PAGE + 500));
+        if !late_exact() {
+            let mut reserve: Option<PatchBuffer> = None;
+            assert!(stale_under_flights(host, &[&list], &mut reserve), "the journal cannot say: a settle is due");
+            assert!(reserve.is_none(), "no buffer for patches without the merge");
+        }
+        list.close();
+    }
+
+    /// Review (timing, not a check): how long a send of the most short
+    /// ranges the room takes (1,398,101 ranges of 3 bytes, 8 apart, to a
+    /// copy with hashes) holds the queue's order and the card's work, as
+    /// threads that wait for each over and over find it; and what its hash
+    /// runs cost, which `card_before` made under both before and now makes
+    /// with its plan.
+    #[test]
+    #[ignore = "review timing"]
+    fn rv_time_the_locks_a_send_of_the_most_short_ranges_holds() {
+        use std::sync::atomic::AtomicBool;
+        use std::time::{Duration, Instant};
+        let Some(host) = super::host() else {
+            return; // no host GPU here
+        };
+        if !crate::shadow::cards() || !host.card_ready() {
+            return;
+        }
+        let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        let _submitting = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        const RANGES: usize = 1_398_101;
+        let len = RANGES * 8;
+        // A title address the send does not read.
+        let start = 0x7_0000_0000usize;
+        let shadow = Shadow::on_card_for_test(host, start, len, true).expect("a copy");
+        let writes = host.new_list().expect("a host list");
+        shadow.gpu_writes(&writes, start as u64, len as u64);
+        writes.close();
+        // The first send makes the hashes, of every piece.
+        let plan = host.card_before(&[&writes], false, None, true).expect("a send");
+        wait_for_queue(host);
+        host.card_done(plan);
+        for i in 0..RANGES {
+            shadow.refresh_for_test(i * 8, &[0x5a; 3]);
+        }
+        let reserve = host.patch_reserve();
+        let stop = AtomicBool::new(false);
+        let wait_for = |lock: &(dyn Fn() + Sync)| {
+            let mut most = Duration::ZERO;
+            while !stop.load(Ordering::Relaxed) {
+                let asked = Instant::now();
+                lock();
+                most = most.max(asked.elapsed());
+                std::thread::yield_now();
+            }
+            most
+        };
+        let (order, work, sent, plan) = std::thread::scope(|s| {
+            let order = s.spawn(|| wait_for(&|| drop(QUEUE_ORDER.lock())));
+            let work = s.spawn(|| wait_for(&|| drop(CARD_WORK.lock())));
+            std::thread::sleep(Duration::from_millis(20));
+            let sending = Instant::now();
+            let plan = host.card_before(&[&writes], false, reserve, true).expect("a send");
+            let sent = sending.elapsed();
+            std::thread::sleep(Duration::from_millis(20));
+            stop.store(true, Ordering::Relaxed);
+            (order.join().unwrap(), work.join().unwrap(), sent, plan)
+        });
+        wait_for_queue(host);
+        assert!(plan.patches.is_some());
+        host.card_done(plan);
+        let ranges: Vec<(usize, usize)> = (0..RANGES).map(|i| (i * 8, i * 8 + 3)).collect();
+        let hashing = Instant::now();
+        let runs = crate::shadow::card_hash_runs((start, len), &ranges, false, true);
+        let hashing = hashing.elapsed();
+        eprintln!(
+            "rv timing: a send of {RANGES} short ranges took {sent:?}; a thread waited up to {order:?} for the queue's order and \
+             up to {work:?} for the card's work meanwhile; its hash runs ({} of them), made before both now, take {hashing:?}",
+            runs.len()
+        );
     }
 }
 
@@ -5380,7 +6208,6 @@ impl Host {
                 areas,
                 overdue: CardOverdue::default(),
                 patch: self.make_card_patch(),
-                patch_pool: PatchPool::default(),
             })
         }
     }
@@ -5441,24 +6268,17 @@ impl Host {
     /// short runs then take copies, as before. [`Host::card_before`] gives
     /// it back, or a plan whose patches it holds.
     fn patch_reserve(&self) -> Option<PatchBuffer> {
-        let most = CARD_PATCH_BYTES_MOST as u64;
-        let kept = {
-            let mut work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
-            let work = work.as_mut()?;
-            work.patch.as_ref()?;
-            work.patch_pool.take(most, u64::MAX)
-        };
-        match kept {
-            Some(((buffer, data), bytes)) => Some((buffer, data, bytes)),
-            None => self.make_patch_buffer(most),
+        if !CARD_WORK.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|work| work.patch.is_some()) {
+            return None;
         }
+        PatchPool::reserve(&PATCH_POOL, CARD_PATCH_BYTES_MOST as u64, |bytes| self.make_patch_buffer(bytes))
     }
 
     /// A buffer in the PC's memory of `bytes` for patches.
-    fn make_patch_buffer(&self, bytes: u64) -> Option<PatchBuffer> {
+    fn make_patch_buffer(&self, bytes: u64) -> Option<PatchMemory> {
         let made = self.shared_buffer(bytes).map(|(buffer, data)| {
             name(&buffer, || "patches of title bytes for copies in the card's memory".into());
-            (buffer, data as usize, bytes)
+            PatchMemory(buffer, data as usize)
         });
         if made.is_none() {
             CARD_PATCHED[4].fetch_add(1, Ordering::Relaxed);
@@ -5466,38 +6286,21 @@ impl Host {
         made
     }
 
-    /// A buffer for a plan's `bytes` of patches: the smallest kept that
-    /// holds them and is not four times the size they would make (the
-    /// submission's `reserve` is kept first), else one made of the next
-    /// power of two (64 KiB at least, where it was 1 MiB). Without memory,
-    /// the smallest kept that holds them, else the biggest kept: the caller
-    /// sends the ranges past its room by copies.
+    /// A buffer for a plan's `bytes` of patches ([`PatchPool::for_plan`]):
+    /// the smallest kept that holds them within four times the buffer one
+    /// made for them would be, else one made of their bytes' next power of
+    /// two (64 KiB at least, where it was 1 MiB); without memory the
+    /// submission's `reserve` if it holds them, else the biggest there is,
+    /// and the caller sends the ranges past its room by copies. The reserve
+    /// goes back to the pool once the plan's buffer is chosen.
     fn patch_buffer(&self, bytes: u64, reserve: Option<PatchBuffer>) -> Option<PatchBuffer> {
-        let want = bytes.next_power_of_two().max(PATCH_LEAST);
-        self.patch_back(reserve);
-        // `None` for the biggest kept.
-        let kept = |sizes: Option<(u64, u64)>| -> Option<PatchBuffer> {
-            let mut work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
-            let pool = &mut work.as_mut()?.patch_pool;
-            let ((buffer, data), size) = match sizes {
-                Some((least, most)) => pool.take(least, most),
-                None => pool.take_biggest(),
-            }?;
-            Some((buffer, data, size))
-        };
-        kept(Some((bytes, want.saturating_mul(4))))
-            .or_else(|| self.make_patch_buffer(want))
-            .or_else(|| kept(Some((bytes, u64::MAX))))
-            .or_else(|| kept(None))
+        PatchPool::for_plan(&PATCH_POOL, bytes, reserve, |want| self.make_patch_buffer(want))
     }
 
     /// A buffer of patches that no plan holds goes back to the pool.
     fn patch_back(&self, buffer: Option<PatchBuffer>) {
-        let Some((buffer, data, bytes)) = buffer else {
-            return;
-        };
-        if let Some(work) = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
-            work.patch_pool.give_back((buffer, data), bytes);
+        if let Some((buffer, bytes)) = buffer {
+            PATCH_POOL.lock().unwrap_or_else(|e| e.into_inner()).give_back(buffer, bytes);
         }
     }
 
@@ -5523,8 +6326,10 @@ impl Host {
     /// `flown`: the submission is sent ahead with [`relay`]. Its compare
     /// then stores the hashes it makes (see [`flagged_pieces`] and
     /// `relay`). `reserve`: the buffer of patches taken for the title's
-    /// bytes put in under flights ([`Host::patch_reserve`]).
-    fn card_before(&self, runs: &[&HostList], flown: bool, reserve: Option<PatchBuffer>) -> Option<CardPlan> {
+    /// bytes put in under flights ([`Host::patch_reserve`]). `relay`:
+    /// whether [`relay`] is on (the caller's [`relay`]); the send is then
+    /// numbered in the order of the queue.
+    fn card_before(&self, runs: &[&HostList], flown: bool, reserve: Option<PatchBuffer>, relay: bool) -> Option<CardPlan> {
         use std::sync::Arc;
         if !crate::shadow::cards() {
             self.patch_back(reserve);
@@ -5556,14 +6361,16 @@ impl Host {
         // that goes to the queue before then has a lower count and leaves
         // the ranges taken now out (`Shadow::card_merge_relay`), as it did
         // while the order's lock was held from the taking on. The patches
-        // are made before it is taken: the relay's fetches waited for them.
-        let sent_as = if relay() { *QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner()) + 1 } else { 0 };
-        let mut dirty = crate::shadow::card_dirty(sent_as);
+        // and the runs of pieces hashed again are made before it is taken:
+        // the relay's fetches waited for them.
+        let sent_as = if relay { *QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner()) + 1 } else { 0 };
+        let mut dirty = crate::shadow::card_dirty(sent_as, relay);
         let patching = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|work| work.patch.is_some());
         if (declared.is_empty() && dirty.is_empty()) || patching.is_none() {
             self.patch_back(reserve);
             return None;
         }
+        let patching = patching == Some(true);
         // A copy whose shader writes are declared for the first time gets
         // its bytes from before, whole.
         let mut whole: Vec<Arc<crate::shadow::Shadow>> = Vec::new();
@@ -5582,46 +6389,51 @@ impl Host {
         // Per copy: the ranges that go up by a copy each, and the short
         // ones that go up as patches ([`CARD_PATCH`]), which title bytes
         // put in under flights are (thousands of runs of a few bytes a
-        // frame), with where its patches are in the plan's buffer. Made
-        // before the order of the queue and the card's work are taken; the
-        // bytes are read under each copy's CPU side's lock alone.
-        let patchable: Vec<bool> = dirty
+        // frame), with where its patches are in the plan's buffer; and the
+        // runs of pieces hashed again after them. Made before the order of
+        // the queue and the card's work are taken; the bytes are read under
+        // each copy's CPU side's lock alone. The buffer may hold fewer
+        // patches than the short ranges make: the plan's patches are not
+        // all the merge's (short ranges of refreshes and of merges of what
+        // the card wrote go as patches too, past the room the merge took),
+        // and a buffer made for more than 16 MiB of them may find no
+        // memory; the short ranges past what it holds go by copies, past
+        // the 512 the merge counted.
+        let copies: Vec<SendCopy<'_>> = dirty
             .iter()
-            .map(|(shadow, _)| patching == Some(true) && shadow.card_sides().is_some_and(|(_, _, size)| card_patchable(size)))
-            .collect();
-        let split = |room: usize| -> (Vec<(Vec<(usize, usize)>, Vec<(usize, usize)>)>, usize) {
-            let mut left = room;
-            let split = dirty.iter().zip(&patchable).map(|((_, ranges), &p)| crate::shadow::card_split(ranges, p, &mut left)).collect();
-            (split, room - left)
-        };
-        let (mut splits, dwords) = split(usize::MAX);
-        let mut patches_in: Option<PatchBuffer> = None;
-        if dwords > 0 {
-            patches_in = self.patch_buffer(dwords as u64 * 12, reserve);
-            // Without memory for all of them: as many as the buffer holds,
-            // the short ranges past it by copies (the title's bytes put in
-            // under flights had their room in `reserve`).
-            let held = patches_in.as_ref().map_or(0, |b| (b.2 / 12) as usize);
-            if held < dwords {
-                splits = split(held).0;
-            }
-        } else {
-            self.patch_back(reserve);
-        }
-        let mut patches: Vec<[u32; 3]> = Vec::new();
-        let patched_at: Vec<std::ops::Range<usize>> = dirty
-            .iter()
-            .zip(&splits)
-            .map(|((shadow, _), (_, short))| {
-                let first = patches.len();
-                shadow.card_patches(short, &mut patches);
-                first..patches.len()
+            .map(|(shadow, ranges)| {
+                let sides = shadow.card_sides();
+                let twin = sides.as_ref().is_some_and(|(_, before, _)| before.is_some());
+                let (start, len) = shadow.span();
+                SendCopy {
+                    ranges,
+                    patchable: patching && sides.as_ref().is_some_and(|(_, _, size)| card_patchable(*size)),
+                    span: (start as usize, len as usize),
+                    rehash: match (twin, whole.iter().any(|s| Arc::ptr_eq(s, shadow))) {
+                        (false, _) => Rehash::No,
+                        (true, true) => Rehash::Whole,
+                        (true, false) => Rehash::Ranges,
+                    },
+                }
             })
             .collect();
-        if patches.is_empty() {
-            self.patch_back(patches_in.take());
-        }
-        if let Some((_, data, size)) = &patches_in {
+        let mut reserve = reserve;
+        let SendPlan {
+            splits,
+            patches,
+            patched_at,
+            buffer: patches_in,
+            hashes,
+        } = plan_send(
+            &copies,
+            patching,
+            |bytes| self.patch_buffer(bytes, reserve.take()),
+            |buffer| self.patch_back(Some(buffer)),
+            |i, short, out| dirty[i].0.card_patches(short, out),
+        );
+        drop(copies);
+        self.patch_back(reserve);
+        if let Some((PatchMemory(_, data), size)) = &patches_in {
             let bytes = patches.len() * 12;
             if bytes as u64 > *size {
                 fail(format_args!("{} patches of title bytes for a buffer of {size} bytes", patches.len()));
@@ -5635,7 +6447,7 @@ impl Host {
             CARD_PATCHED[2].fetch_add(patched, Ordering::Relaxed);
             crate::shadow::CARD_STATS[0].fetch_add(patched, Ordering::Relaxed);
         }
-        let mut order = relay().then(|| QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner()));
+        let mut order = relay.then(|| QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner()));
         if let Some(order) = order.as_mut() {
             if **order + 1 != sent_as {
                 fail(format_args!("the order of the queue moved from {} while send {sent_as} was made", sent_as - 1));
@@ -5657,7 +6469,7 @@ impl Host {
                 (|| -> windows::core::Result<()> {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
-                    for (((shadow, ranges), (copied, _)), patched) in dirty.iter().zip(&splits).zip(&patched_at) {
+                    for ((((shadow, ranges), (copied, _)), patched), rehash) in dirty.iter().zip(&splits).zip(&patched_at).zip(&hashes) {
                         let Some((staging, before, size)) = shadow.card_sides() else {
                             continue;
                         };
@@ -5674,7 +6486,7 @@ impl Host {
                         } else {
                             D3D12_RESOURCE_STATE_COPY_DEST
                         };
-                        if let (false, Some((buffer, _, _)), Some((root, pso))) =
+                        if let (false, Some((PatchMemory(buffer, _), _)), Some((root, pso))) =
                             (patched.is_empty(), &patches_in, &work.patch)
                         {
                             // After the copies; each patch puts the title's
@@ -5715,22 +6527,12 @@ impl Host {
                         list.SetComputeRootShaderResourceView(1, shadow.buffer.GetGPUVirtualAddress());
                         list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
                         list.SetComputeRootUnorderedAccessView(3, work.differs.0.GetGPUVirtualAddress());
-                        // Hashing only: the ring is set, never written.
+                        // Hashing only: the ring is set, never written. The
+                        // runs were made with the plan, outside the locks.
                         list.SetComputeRootUnorderedAccessView(4, Self::card_ring(work, false).0);
-                        let runs: Vec<crate::shadow::CardSpan> = if whole.iter().any(|s| Arc::ptr_eq(s, shadow)) {
-                            vec![shadow.card_run(0, usize::MAX)]
-                        } else {
-                            ranges.iter().map(|&(a, b)| shadow.card_run(a, b)).collect()
-                        };
-                        // The same pieces in fewer passes (`rehash_joined`).
-                        let runs = if rehash_joined(work.patch.is_some(), ranges.len()) {
-                            crate::shadow::joined_piece_runs(runs)
-                        } else {
-                            runs
-                        };
-                        CARD_PASSES[0].fetch_add(runs.len() as u64, Ordering::Relaxed);
-                        CARD_PASSES[1].fetch_add(runs.iter().map(|r| u64::from(r.pieces)).sum::<u64>(), Ordering::Relaxed);
-                        for run in runs {
+                        CARD_PASSES[0].fetch_add(rehash.len() as u64, Ordering::Relaxed);
+                        CARD_PASSES[1].fetch_add(rehash.iter().map(|r| u64::from(r.pieces)).sum::<u64>(), Ordering::Relaxed);
+                        for run in rehash {
                             let constants = [run.first, run.skew, size as u32, run.pieces, 0, 0, 0, 0];
                             list.SetComputeRoot32BitConstants(0, 8, constants.as_ptr().cast(), 0);
                             list.Dispatch(run.pieces.div_ceil(CARD_COMPARE_PIECES_PER_GROUP), 1, 1);
@@ -5790,7 +6592,7 @@ impl Host {
         // them is fetched.
         let pieces: Vec<u32> = plan.ranges.iter().filter(|r| r.compared).map(|r| r.span.pieces).collect();
         if pieces.iter().any(|&p| p > 0) {
-            if let Some(times) = work.overdue.look(work.areas.low(), relay(), work.areas.out(), late_most()) {
+            if let Some(times) = work.overdue.look(work.areas.low(), relay, work.areas.out(), late_most()) {
                 tracing::warn!(
                     times,
                     runs_out = work.areas.out(),
@@ -5858,7 +6660,7 @@ impl Host {
             }
             plan.lists.push((true, check));
         }
-        work.patch_pool.plan();
+        PATCH_POOL.lock().unwrap_or_else(|e| e.into_inner()).plan();
         Some(plan)
     }
 
@@ -5881,11 +6683,9 @@ impl Host {
     /// (`CardAreas`; plans are done with in the queue's order). The ring's
     /// limit is written either way ([`CardWork::plan_done`]).
     fn card_done(&self, plan: CardPlan) {
+        let mut plan = plan;
+        self.patch_back(plan.patches.take());
         if let Some(work) = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
-            let mut plan = plan;
-            if let Some((buffer, data, bytes)) = plan.patches.take() {
-                work.patch_pool.give_back((buffer, data), bytes);
-            }
             work.plan_done(plan);
         }
     }
@@ -6840,7 +7640,7 @@ impl Host {
             }
             settled += settling.elapsed();
         }
-        let card = self.card_before(runs, flown, reserve);
+        let card = self.card_before(runs, flown, reserve, relay());
         if let Some(check) = card.as_ref().and_then(|c| c.check.clone()) {
             lists.push(Some(check));
         }
@@ -8758,11 +9558,18 @@ impl Meter {
         {
             let [passes, pieces, compares] = [0, 1, 2].map(|i| CARD_PASSES[i].swap(0, Ordering::Relaxed) as f64 / frames);
             if passes + compares > 0.0 {
+                // What joins the runs hashed again (`rehash_joined`), as it
+                // stands: the patch, the switch, or the count of ranges.
+                let joined = if CARD_PATCHES.load(Ordering::Relaxed) {
+                    "always: the patch of title bytes compiled".to_string()
+                } else if rehash_runs() {
+                    "always: VICTORY_CARD_REHASH_RUNS=1".to_string()
+                } else {
+                    format!("past {REHASH_JOIN_FROM} ranges sent to a copy")
+                };
                 tracing::info!(
                     "our passes over copies in the card's memory per frame: {passes:.0} hash passes over {pieces:.0} pieces after \
-                     ranges were sent up (joined with patches, past {REHASH_JOIN_FROM} ranges, or with VICTORY_CARD_REHASH_RUNS=1: \
-                     now {}), {compares:.0} compare passes",
-                    if rehash_runs() { "on" } else { "off" }
+                     ranges were sent up (their runs joined {joined}), {compares:.0} compare passes"
                 );
             }
         }
