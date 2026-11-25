@@ -185,17 +185,29 @@ fn saved_code(inst: &Inst) -> u8 {
     }
 }
 
-/// The lane `l` reads with DPP, whether it reads 0 instead, and whether it
-/// writes; `None` for patterns not modelled.
-fn dpp_lane(d: Dpp, l: u32) -> Option<(u32, bool, bool)> {
+/// The lane `l` reads with DPP under `exec`, whether it reads 0 instead,
+/// and whether it writes; `None` for patterns not modelled. A source the
+/// EXEC bit leaves out arrives only with the FI flag; without it the read
+/// falls back as BOUND_CTRL says (DPP16: the destination keeps its value
+/// or zeroes) and DPP8 zeroes, so an active lane must not fold the
+/// inactive source's value into a constant.
+fn dpp_lane(d: Dpp, l: u32, exec: u64) -> Option<(u32, bool, bool)> {
+    let active = |lane: u32| exec >> lane & 1 == 1;
     match d {
-        Dpp::Lanes { sel, .. } => Some(((l & !7) | (sel >> (3 * (l & 7)) & 7), false, true)),
+        Dpp::Lanes { sel, fi } => {
+            let src = (l & !7) | (sel >> (3 * (l & 7)) & 7);
+            Some(if fi || active(src) {
+                (src, false, true)
+            } else {
+                (src, true, true)
+            })
+        }
         Dpp::Row {
             ctrl,
             row_mask,
             bank_mask,
             bound_ctrl,
-            ..
+            fi,
         } => {
             let (row, pos, n) = (l & !15, l & 15, u32::from(ctrl & 15));
             let enabled = row_mask >> (l >> 4 & 3) & 1 != 0 && bank_mask >> (l >> 2 & 3) & 1 != 0;
@@ -210,7 +222,8 @@ fn dpp_lane(d: Dpp, l: u32) -> Option<(u32, bool, bool)> {
                 0x160..=0x16F => (l ^ n, true),
                 _ => return None,
             };
-            match (inside, bound_ctrl) {
+            let fetched = inside && (fi || active(src));
+            match (fetched, bound_ctrl) {
                 (true, _) => Some((src, false, enabled)),
                 (false, true) => Some((l, true, enabled)),
                 (false, false) => Some((l, false, false)),
@@ -486,7 +499,7 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> (HashMap<Value, Shape>, 
                 let mut f = Vec::with_capacity(wave as usize);
                 let mut ok = true;
                 for l in 0..wave {
-                    match dpp_lane(d, l) {
+                    match dpp_lane(d, l, exec) {
                         Some((src, zero, on)) if src < wave => {
                             f.push(if zero { Sym::K(0) } else { s[src as usize] });
                             if !on {
@@ -852,8 +865,8 @@ mod tests {
             bound_ctrl: true,
             fi: false,
         };
-        assert_eq!(dpp_lane(shr, 16), Some((16, true, true)));
-        assert_eq!(dpp_lane(shr, 17), Some((16, false, true)));
+        assert_eq!(dpp_lane(shr, 16, u64::MAX), Some((16, true, true)));
+        assert_eq!(dpp_lane(shr, 17, u64::MAX), Some((16, false, true)));
         // row_mirror: lane 3 reads lane 12.
         let mirror = Dpp::Row {
             ctrl: 0x140,
@@ -862,13 +875,13 @@ mod tests {
             bound_ctrl: true,
             fi: false,
         };
-        assert_eq!(dpp_lane(mirror, 3), Some((12, false, true)));
+        assert_eq!(dpp_lane(mirror, 3, u64::MAX), Some((12, false, true)));
         // dpp8 [1,0,3,2,5,4,7,6] swaps neighbours.
         let swap = Dpp::Lanes {
             sel: 1 | 3 << 6 | 2 << 9 | 5 << 12 | 4 << 15 | 7 << 18 | 6 << 21,
             fi: false,
         };
-        assert_eq!(dpp_lane(swap, 8), Some((9, false, true)));
+        assert_eq!(dpp_lane(swap, 8, u64::MAX), Some((9, false, true)));
     }
 
     #[test]
@@ -1080,6 +1093,65 @@ mod tests {
             let (unknown, shape) = section(true);
             assert_eq!(unknown, None, "the DPP step stays followed");
             assert_eq!(shape, None, "lane 0 kept its own value");
+        }
+    }
+
+    /// An active destination whose DPP source EXEC leaves out must not
+    /// fold the source's value (a reviewer's witness: lane 0 out, every
+    /// lane reading it with `quad_perm:[0,0,0,0]`): without FI the read
+    /// keeps the destination or zeroes as BOUND_CTRL says, with FI it
+    /// fetches; DPP8 zeroes the inactive source and FI fetches it.
+    #[test]
+    fn an_inactive_dpp_source_is_kept_zeroed_or_fetched_by_the_flags() {
+        for (wave64, saveexec, mov_exec) in [(true, 0x25, 0x04), (false, 0x3D, 0x03)] {
+            let read_lane1 = vop3(5, 0x360, 258, 129, 0);
+            // The quad base (lane 0) is inactive; lane 1 reads it.
+            let cases = [
+                // (fi, bound_ctrl, DPP16, what lane 1 reads)
+                (false, false, true, Some(Shape::K(11))),
+                (true, false, true, Some(Shape::K(7))),
+                (true, true, true, Some(Shape::K(7))),
+                (false, true, true, Some(Shape::K(0))),
+                // DPP8 (0xEA fetches the inactive source, 0xE9 zeroes):
+                (false, false, false, Some(Shape::K(0))),
+                (true, false, false, Some(Shape::K(7))),
+            ];
+            for (fi, bound, dpp16, read) in cases {
+                let mut w = vec![
+                    sop1(0, saveexec, 193), // s_or_saveexec s0, -1: exec all
+                    vop1(1, 0x01, 135),    // v_mov_b32 v1, 7
+                    vop1(2, 0x01, 139),    // v_mov_b32 v2, 11
+                    sop1(EXEC, mov_exec, 194), // s_mov_b32 exec, -2: lane 0 out
+                ];
+                // v_mov_b32_dpp v2, v1: quad_perm:[0,0,0,0], or DPP8
+                // selecting lane 0 of the group.
+                w.push(if dpp16 {
+                    vop1(2, 0x01, 0xFA)
+                } else {
+                    vop1(2, 0x01, if fi { 0xEA } else { 0xE9 })
+                });
+                w.push(if dpp16 {
+                    0xFu32 << 28
+                        | 0xF << 24
+                        | u32::from(bound) << 19
+                        | u32::from(fi) << 18
+                        | 1
+                } else {
+                    1 // every lane selects lane 0 of its group, of v1
+                });
+                w.extend(read_lane1); // v_readlane_b32 s5, v2, 1
+                w.push(sop1(EXEC, mov_exec, 0)); // s_mov_b32 exec, s0
+                let p = build(&w, wave64);
+                let insts = &p.blocks[0].insts;
+                let lane1 = insts[5].write(Reg::S(5)).unwrap();
+                let sec = &sections(&p, 0)[&0];
+                assert!(sec.unknown.is_none());
+                assert_eq!(
+                    sec.shapes.get(&lane1).copied(),
+                    read,
+                    "wave64={wave64} fi={fi} bound_ctrl={bound} dpp16={dpp16}"
+                );
+            }
         }
     }
 
