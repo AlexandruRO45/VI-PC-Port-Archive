@@ -6592,6 +6592,10 @@ impl Meter {
             );
             crate::tiles::status();
             {
+                let (entries, free) = crate::descriptor::registry();
+                tracing::info!("view registry: {entries} entries, {free} free for reuse");
+            }
+            {
                 let made = crate::descriptor::host::MIRROR_MADE.swap(0, Ordering::Relaxed) as f64 / frames;
                 let later = crate::descriptor::host::MIRROR_DEFERRED.swap(0, Ordering::Relaxed) as f64 / frames;
                 let copied = crate::descriptor::host::VIEW_COPIED.swap(0, Ordering::Relaxed) as f64 / frames;

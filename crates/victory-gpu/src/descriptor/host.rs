@@ -2692,7 +2692,7 @@ struct Models {
     cpu: usize,
     step: u32,
     next: u32,
-    made: std::collections::HashMap<u64, (u32, Kept)>,
+    made: std::collections::BTreeMap<View, (u32, Kept)>,
 }
 
 /// The most views kept (a heap of that many descriptors, 8 MB at 32 bytes);
@@ -2732,7 +2732,7 @@ fn copy_or_make(key: u64, view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Optio
     let Some(models) = models.as_mut() else {
         return make(view, at);
     };
-    if let Some((at_model, kept)) = models.made.get(&key) {
+    if let Some((at_model, kept)) = models.made.get(view) {
         let from = D3D12_CPU_DESCRIPTOR_HANDLE {
             ptr: models.cpu + *at_model as usize * models.step as usize,
         };
@@ -2753,7 +2753,7 @@ fn copy_or_make(key: u64, view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Optio
     // Made at the model's slot first: the slot itself may be rewritten by a
     // later record, the model never is.
     let kept = make(view, slot)?;
-    models.made.insert(key, (at_model, kept.clone()));
+    models.made.insert(view.clone(), (at_model, kept.clone()));
     let _ = &models.heap;
     // SAFETY: as above; the model slot is written.
     unsafe { device.CopyDescriptorsSimple(1, at, slot, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) };
