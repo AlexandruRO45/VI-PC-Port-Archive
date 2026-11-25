@@ -1398,9 +1398,12 @@ extern "system" fn wait64(this: This, address: u64, cmp: u32, reference: u64, fl
 fn wait_value_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
-        let enabled = std::env::var_os("VICTORY_WAIT_VALUE").as_deref() != Some(std::ffi::OsStr::new("0"));
-        if !enabled {
-            tracing::info!("list memory waits disabled by VICTORY_WAIT_VALUE=0");
+        // A whole-list gate can stall a producer needed by the wait.
+        let enabled = std::env::var_os("VICTORY_WAIT_VALUE").is_some_and(|v| v == "1");
+        if enabled {
+            tracing::info!("experimental list memory waits enabled by VICTORY_WAIT_VALUE=1");
+        } else {
+            tracing::info!("list memory waits disabled (set VICTORY_WAIT_VALUE=1 to enable)");
         }
         enabled
     })
@@ -1648,9 +1651,9 @@ mod tests {
             assert!(!std::sync::Arc::ptr_eq(&old, &fresh));
             assert!(fresh.gates().is_empty());
             let gates = old.gates();
-            // Run this test both with the default and VICTORY_WAIT_VALUE=0.
-            if std::env::var("VICTORY_WAIT_VALUE").as_deref() == Ok("0") {
-                assert!(gates.is_empty(), "opt-out must not record either slot");
+            // Run this test both with the default and VICTORY_WAIT_VALUE=1.
+            if std::env::var("VICTORY_WAIT_VALUE").as_deref() != Ok("1") {
+                assert!(gates.is_empty(), "default must not record either slot");
             } else {
                 assert_eq!(gates.len(), 2);
                 assert_eq!((gates[0].0, gates[0].1, gates[0].2, gates[0].3), (at as usize, 3, 17, 4));
