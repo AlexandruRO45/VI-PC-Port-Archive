@@ -24,6 +24,7 @@ fn shader_commands_distinguish_clean_and_incomplete_scans() {
         let output = Command::new(env!("CARGO_BIN_EXE_victory"))
             .current_dir(dir.path())
             .env_remove("VICTORY_PAIRS")
+            .env_remove("VICTORY_EMIT_DUMP")
             .args([command, "first-input", "one", "second-input"])
             .output()
             .unwrap();
@@ -37,6 +38,7 @@ fn shader_commands_distinguish_clean_and_incomplete_scans() {
         let clean = Command::new(env!("CARGO_BIN_EXE_victory"))
             .current_dir(dir.path())
             .env_remove("VICTORY_PAIRS")
+            .env_remove("VICTORY_EMIT_DUMP")
             .args([command, "."])
             .output()
             .unwrap();
