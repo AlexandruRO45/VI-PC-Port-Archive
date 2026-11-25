@@ -76,14 +76,20 @@ tools/wine/proton-with-wineserver.sh /usr/share/steam/compatibilitytools.d/proto
 **Proton Experimental** (Steam's "Proton - Experimental"):
 
 ```sh
-tools/wine/build-wineserver.sh https://github.com/ValveSoftware/wine.git \
-    experimental_11.0 ~/wineserver-build
-tools/wine/proton-with-wineserver.sh ~/.steam/steam/steamapps/common/"Proton - Experimental" \
+P=~/.steam/steam/steamapps/common/"Proton - Experimental"
+# the Wine commit of the installed release (its tag is in "$P/version")
+wine=$(gh api "repos/ValveSoftware/Proton/contents/wine?ref=experimental-11.0-20261112" --jq .sha)
+tools/wine/build-wineserver.sh https://github.com/ValveSoftware/wine.git "$wine" \
+    ~/wineserver-build "$P"
+tools/wine/proton-with-wineserver.sh "$P" \
     ~/wineserver-build/build/server/wineserver ~/proton-victory
 ```
 
-Experimental moves often: build again after Steam updates it, or the
-server and the rest of Wine stop matching.
+Experimental moves often. Build from the Wine commit of the release you
+have installed (the Proton tag pins it), not the head of the
+`experimental_11.0` branch, and build again after Steam updates it.
+Tested on an RX 9070 (RADV) with `experimental-11.0-20261112`: a world
+frame went from 2.9–3.2 s to 0.7–1.0 s (measured by Beqren, #2082).
 
 **Valve Proton 10** (Steam's "Proton 10.0"):
 
@@ -120,7 +126,15 @@ Then run `victory.exe` with `~/proton-victory/proton runinprefix ...`.
 
 - The server must come from the same Wine source as the Proton it runs
   with: the two speak a private protocol, and a mismatch fails at start-up.
-  The build prints the protocol version (`SERVER_PROTOCOL_VERSION`).
+  The build regenerates `server_protocol.h` (`tools/make_requests`; a
+  committed header can lag behind, as Valve's experimental tree's does)
+  and prints `SERVER_PROTOCOL_VERSION`. Given the Proton directory as a
+  fourth argument, it also checks that version against that Proton's
+  `ntdll.so` and stops on a mismatch.
+- Instead of `proton-with-wineserver.sh`, a full copy of the Proton
+  directory (`cp -a --reflink=auto`) with only `files/bin/wineserver`
+  replaced works too: every file in it is real, so ntdll finds the new
+  server.
 - Proton ignores `WINESERVER`; ntdll starts the server found next to the
   real path of `ntdll.so`. That is why the copy is a tree of symlinks in
   which `ntdll.so`, the loader, `wine`, the `proton` script and the server
