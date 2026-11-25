@@ -62,6 +62,9 @@ pub(crate) struct Lowered {
     /// Whether it declares rasterizer-ordered views.
     #[cfg(test)]
     pub rovs: bool,
+    /// Live calls and integer binops, for tests that inspect lowering.
+    #[cfg(test)]
+    pub ops: String,
 }
 
 pub(crate) struct Parts<'a> {
@@ -1331,6 +1334,8 @@ impl<'a> Lower<'a> {
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
             #[cfg(test)]
             rovs: self.s.flags & flags::ROVS != 0,
+            #[cfg(test)]
+            ops: self.s.m.ops_text(),
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -10795,10 +10800,27 @@ mod tests {
                 outputs: vec![el("SV_Position", 3, 9, 4, false)],
                 prims: vec![],
                 mesh_stride: 0,
+                view_marks: false,
             })
         };
-        for comp in [9u8, 5, 4] {
-            lower_attr(comp).unwrap_or_else(|e| panic!("{comp}: {e}"));
+        let ops = |comp: u8| {
+            lower_attr(comp)
+                .unwrap_or_else(|e| panic!("{comp}: {e}"))
+                .ops
+        };
+        let f16 = ops(9);
+        assert!(
+            f16.contains("call dx.op.legacyF32ToF16"),
+            "float16:\n{f16}"
+        );
+        assert!(!f16.lines().any(|l| l == "and 0xffff"), "float16:\n{f16}");
+        for comp in [5u8, 4] {
+            let int = ops(comp);
+            assert!(
+                int.lines().any(|l| l == "and 0xffff"),
+                "{comp}:\n{int}"
+            );
+            assert!(!int.contains("legacyF32ToF16"), "{comp}:\n{int}");
         }
     }
 }
