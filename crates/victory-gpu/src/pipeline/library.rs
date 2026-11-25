@@ -591,8 +591,10 @@ pub(crate) fn save(now: bool) {
     // The bytes of the library written to `tmp`; 0 when no pipeline was
     // added: the library on disk is then what it was, and only the early
     // list is written (a title pipeline first drawn with wrote all 1,352 MB
-    // of the library again: run 60's second save).
-    let bytes = {
+    // of the library again: run 60's second save). The stores that snapshot
+    // covers are acknowledged only once the library holding them has
+    // replaced the file ([`publish`]).
+    let (bytes, added) = {
         let _all = one_call();
         // No store between asking the size and writing; loads go on.
         let _alone = library.saving.write().unwrap_or_else(|e| e.into_inner());
@@ -601,7 +603,7 @@ pub(crate) fn save(now: bool) {
             return;
         }
         if added == 0 {
-            0
+            (0, 0)
         } else {
             // SAFETY: a plain query.
             let size = unsafe { library.library.GetSerializedSize() };
@@ -609,16 +611,51 @@ pub(crate) fn save(now: bool) {
             if let Err(e) = serialise(&library.library, &tmp, size) {
                 tracing::warn!(error = %e, "host pipeline library not serialised");
                 let _ = std::fs::remove_file(&tmp);
+                // Nothing was written: the early list is still to be written.
+                USED_CHANGED.store(true, Ordering::Relaxed);
                 return;
             }
-            library.added.store(0, Ordering::Relaxed);
             SAVED.store(size as u64, Ordering::Relaxed);
-            size
+            (size, added)
         }
     };
     let used: Vec<String> = USED.lock().unwrap_or_else(|e| e.into_inner()).iter().flatten().cloned().collect();
-    let library_written = if bytes > 0 { replace_library(dir, &tmp) } else { Ok(()) };
+    let written = publish(dir, &tmp, bytes, &library.added, added, used.join("\n").as_bytes(), &USED_CHANGED);
+    match written {
+        Ok(()) => tracing::info!(
+            bytes,
+            early = used.len(),
+            made = MADE.load(Ordering::Relaxed),
+            loaded = LOADED.load(Ordering::Relaxed),
+            started_early = EARLY.load(Ordering::Relaxed),
+            "host pipeline library saved"
+        ),
+        Err(e) => tracing::warn!(error = %e, "host pipeline library not saved"),
+    }
+}
+
+/// Puts the written library and the early list in place, and clears the dirty
+/// state for exactly what reached the disk. What could not be written stays
+/// dirty, so the next save writes it again: a rename that failed once (the
+/// file held open, the folder made read-only, the system refusing to replace a
+/// mapped file) must not cost the stores it carried (`avt0m4t48`'s repro on
+/// #164: the state was cleared before the rename, so the retry returned
+/// without writing the pending data).
+fn publish(
+    dir: &std::path::Path,
+    tmp: &std::path::Path,
+    bytes: usize,
+    added: &AtomicU64,
+    snapshot: u64,
+    early: &[u8],
+    changed: &AtomicBool,
+) -> std::io::Result<()> {
+    let library_written = if bytes > 0 { replace_library(dir, tmp) } else { Ok(()) };
     if bytes > 0 && library_written.is_ok() {
+        // Only the stores this save serialised: those that arrived while it
+        // was written stay pending for the next one, and a save whose rename
+        // failed leaves all of them pending.
+        added.fetch_sub(snapshot, Ordering::Relaxed);
         // In place unless the system refused and the new one waits beside it.
         let in_place = !dir.join(NEXT_FILE).exists();
         if in_place && VIEW[0].load(Ordering::Relaxed) != 0 {
@@ -632,19 +669,13 @@ pub(crate) fn save(now: bool) {
             )
         });
     }
-    let written = library_written
-        .and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()));
-    match written {
-        Ok(()) => tracing::info!(
-            bytes,
-            early = used.len(),
-            made = MADE.load(Ordering::Relaxed),
-            loaded = LOADED.load(Ordering::Relaxed),
-            started_early = EARLY.load(Ordering::Relaxed),
-            "host pipeline library saved"
-        ),
-        Err(e) => tracing::warn!(error = %e, "host pipeline library not saved"),
+    let written = library_written.and_then(|()| write_atomically(&dir.join(EARLY_FILE), early));
+    if written.is_err() {
+        // The early list did not reach the disk (or the library did not, so it
+        // was not attempted): it is still to be written.
+        changed.store(true, Ordering::Relaxed);
     }
+    written
 }
 
 /// Writes the library's `size` serialised bytes to the file `tmp`: through
@@ -926,5 +957,97 @@ mod tests {
             .filter(|e| e.file_name().to_string_lossy().contains(".tmp-"))
             .collect();
         assert!(leftovers.is_empty(), "unexpected leftover temp files: {leftovers:?}");
+    }
+
+    /// Takes both destinations a save renames over, with a folder holding a
+    /// file: a file cannot replace one (`ERROR_ACCESS_DENIED`), so the rename
+    /// fails for a reason outside the save's control. Returns how to let go of
+    /// the obstruction.
+    fn hold_both_destinations(dir: &std::path::Path) -> impl FnOnce() {
+        for name in [LIBRARY_FILE, NEXT_FILE] {
+            let at = dir.join(name);
+            std::fs::create_dir(&at).unwrap();
+            std::fs::write(at.join("held"), b"held").unwrap();
+        }
+        let dir = dir.to_path_buf();
+        move || {
+            for name in [LIBRARY_FILE, NEXT_FILE] {
+                std::fs::remove_dir_all(dir.join(name)).unwrap();
+            }
+        }
+    }
+
+    /// A save whose rename fails keeps its stores and its early list pending,
+    /// and the next save writes them once the obstruction is gone. Both flags
+    /// were cleared before the write landed, so the retry saw nothing to do
+    /// and returned without the data (`avt0m4t48`'s repro on #164).
+    ///
+    /// Probes, all run 2026-11-25, each red before the fix and green after:
+    /// (a) acknowledging the stores before the rename (`added.store(0)` in
+    /// `save`, as it was) fails "the stores are still to be written";
+    /// (b) dropping the restore of `changed` in `publish` fails "the early
+    /// list is still to be written" here and in the test below;
+    /// (c) `added.store(0)` in place of `fetch_sub(snapshot)` fails the
+    /// "arrived during the save" assertion below.
+    #[test]
+    fn a_save_whose_rename_fails_keeps_its_stores_and_early_list_pending() {
+        let dir = tempfile::tempdir().unwrap();
+        let added = AtomicU64::new(3);
+        // `save` clears it with `swap(false)` before it writes.
+        let changed = AtomicBool::new(false);
+        let let_go = hold_both_destinations(dir.path());
+        let tmp = unique_tmp(&dir.path().join(LIBRARY_FILE));
+        std::fs::write(&tmp, b"the library's bytes").unwrap();
+        let early = b"key-a\nkey-b";
+        assert!(publish(dir.path(), &tmp, 17, &added, 3, early, &changed).is_err(), "the rename fails");
+        assert_eq!(added.load(Ordering::Relaxed), 3, "the stores are still to be written");
+        assert!(changed.load(Ordering::Relaxed), "the early list is still to be written");
+        assert!(!dir.path().join(EARLY_FILE).exists(), "nothing was written");
+        assert!(!tmp.exists(), "the staging file was let go");
+        // The obstruction removed: the next save writes what the failed one held.
+        let_go();
+        let tmp = unique_tmp(&dir.path().join(LIBRARY_FILE));
+        std::fs::write(&tmp, b"the library's bytes").unwrap();
+        changed.store(false, Ordering::Relaxed);
+        publish(dir.path(), &tmp, 17, &added, 3, early, &changed).expect("the retry publishes");
+        assert_eq!(added.load(Ordering::Relaxed), 0, "the stores reached the disk");
+        assert!(!changed.load(Ordering::Relaxed), "the early list reached the disk");
+        assert_eq!(std::fs::read(dir.path().join(LIBRARY_FILE)).unwrap(), b"the library's bytes");
+        assert_eq!(std::fs::read(dir.path().join(EARLY_FILE)).unwrap(), early);
+    }
+
+    /// A save acknowledges only the stores it serialised: one that arrives
+    /// while the library is being written stays pending for the next save.
+    #[test]
+    fn a_save_acknowledges_only_the_stores_it_serialised() {
+        let dir = tempfile::tempdir().unwrap();
+        let added = AtomicU64::new(4);
+        let changed = AtomicBool::new(false);
+        let snapshot = added.load(Ordering::Relaxed);
+        // A store arrives between the snapshot and the publication.
+        added.fetch_add(1, Ordering::Relaxed);
+        let tmp = unique_tmp(&dir.path().join(LIBRARY_FILE));
+        std::fs::write(&tmp, b"the library's bytes").unwrap();
+        publish(dir.path(), &tmp, 17, &added, snapshot, b"", &changed).expect("the library is published");
+        assert_eq!(added.load(Ordering::Relaxed), 1, "the store that arrived during the save is still pending");
+    }
+
+    /// The library publishes and the early list does not: the stores are
+    /// acknowledged (they reached the disk) and the list stays pending on its
+    /// own, so the next save retries the list without writing the library.
+    #[test]
+    fn an_early_list_that_cannot_be_written_stays_pending_after_the_library_is_published() {
+        let dir = tempfile::tempdir().unwrap();
+        let added = AtomicU64::new(2);
+        let changed = AtomicBool::new(false);
+        let at = dir.path().join(EARLY_FILE);
+        std::fs::create_dir(&at).unwrap();
+        std::fs::write(at.join("held"), b"held").unwrap();
+        let tmp = unique_tmp(&dir.path().join(LIBRARY_FILE));
+        std::fs::write(&tmp, b"the library's bytes").unwrap();
+        assert!(publish(dir.path(), &tmp, 17, &added, 2, b"key-a", &changed).is_err(), "the early list fails");
+        assert_eq!(added.load(Ordering::Relaxed), 0, "the library reached the disk");
+        assert!(changed.load(Ordering::Relaxed), "the early list is still to be written");
+        assert_eq!(std::fs::read(dir.path().join(LIBRARY_FILE)).unwrap(), b"the library's bytes");
     }
 }
