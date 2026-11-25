@@ -22,6 +22,8 @@ use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::*;
 
+mod gpu_detile;
+
 use crate::host::{HostList, host};
 use crate::object::This;
 
@@ -36,6 +38,7 @@ macro_rules! once {
 /// texture's subresources, and what was last detiled.
 pub(crate) struct Staging {
     buffer: ID3D12Resource,
+    gpu_detile: Option<gpu_detile::GpuDetile>,
     /// Its part of the buffer, if that is shared.
     _slot: Option<crate::texpool::Slot>,
     /// Its bytes.
@@ -83,7 +86,7 @@ impl Drop for Staging {
     fn drop(&mut self) {
         // Retire the upload buffer and its texpool slot so an in-flight GPU
         // submission or async copy cannot fault on freed staging memory.
-        crate::host::retire((self.buffer.clone(), self._slot.take()));
+        crate::host::retire((self.buffer.clone(), self._slot.take(), self.gpu_detile.take()));
     }
 }
 
@@ -376,6 +379,13 @@ impl Staging {
     /// Records `CopyTextureRegion` for every subresource from this staging
     /// buffer into `texture` (which must already be in `COPY_DEST`).
     pub(crate) fn record_copies(&self, list: &ID3D12GraphicsCommandList, texture: &ID3D12Resource) {
+        if let Some(conversion) = &self.gpu_detile {
+            conversion.record(list);
+            // SAFETY: the detiler left its scratch in COMMON.
+            unsafe { list.ResourceBarrier(&[crate::host::transition(
+                &self.buffer, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE
+            )]) };
+        }
         for (i, footprint) in self.footprints.iter().enumerate() {
             let to = D3D12_TEXTURE_COPY_LOCATION {
                 // SAFETY: a borrowed pointer the location never releases.
@@ -399,6 +409,12 @@ impl Staging {
             self.gpu_uploads
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
+        if self.gpu_detile.is_some() {
+            // SAFETY: the copies read the scratch in COPY_SOURCE.
+            unsafe { list.ResourceBarrier(&[crate::host::transition(
+                &self.buffer, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON
+            )]) };
+        }
     }
 
     #[cfg(test)]
@@ -408,6 +424,10 @@ impl Staging {
 
     /// Detiles `tiled` (the texture's memory) into the staging buffer.
     fn detile(&self, tiled: &[u8]) {
+        if let Some(conversion) = &self.gpu_detile {
+            conversion.fill(tiled);
+            return;
+        }
         #[cfg(feature = "diagnostics")]
         if tiled.iter().all(|&b| b == 0) {
             tracing::debug!(
@@ -645,22 +665,41 @@ fn create_staging(
             Some(&mut total),
         );
     }
+    let skip = crate::resource::skipped_mips(resource);
+    let gpu_detile = if gpu_detile::enabled()
+        && skip == 0
+        && title_written(texture)
+        && d.SampleDesc.Count == 1
+        && layout.size >= 1 << 20
+    {
+        gpu_detile::GpuDetile::new(host, &layout, &footprints, &rows, total)
+    } else {
+        None
+    };
+    let staged_bytes = gpu_detile.as_ref().map_or(total, gpu_detile::GpuDetile::bytes);
     if let Some(map) = map {
-        evict(map, total);
+        evict(map, staged_bytes);
     }
-    let (buffer, data, slot) = match crate::texpool::staging(host, total) {
-        Some((buffer, data, offset, slot)) => {
-            for f in &mut footprints {
-                f.Offset += offset;
-            }
-            (buffer, data, Some(slot))
+    let (buffer, data, slot) = if let Some(conversion) = &gpu_detile {
+        for footprint in &mut footprints {
+            footprint.Offset += conversion.linear_base;
         }
-        None => {
-            let (buffer, data) = host.upload_buffer(total)?;
-            (buffer, data, None)
+        (conversion.scratch.clone(), std::ptr::null_mut(), None)
+    } else {
+        match crate::texpool::staging(host, total) {
+            Some((buffer, data, offset, slot)) => {
+                for f in &mut footprints {
+                    f.Offset += offset;
+                }
+                (buffer, data, Some(slot))
+            }
+            None => {
+                let (buffer, data) = host.upload_buffer(total)?;
+                (buffer, data, None)
+            }
         }
     };
-    STAGED.fetch_add(total, Ordering::Relaxed);
+    STAGED.fetch_add(staged_bytes, Ordering::Relaxed);
     crate::host::name(&buffer, || {
         format!(
             "staging of {resource:?} {}x{}x{} f{}",
@@ -670,14 +709,15 @@ fn create_staging(
     Some(Arc::new(Staging {
         buffer,
         _slot: slot,
-        size: total,
+        gpu_detile,
+        size: staged_bytes,
         used: AtomicU64::new(now),
         data,
         footprints,
         rows,
         layout,
         mips: u32::from(d.MipLevels),
-        skip: crate::resource::skipped_mips(resource),
+        skip,
         memory,
         last: Mutex::default(),
         rewritten: Default::default(),
