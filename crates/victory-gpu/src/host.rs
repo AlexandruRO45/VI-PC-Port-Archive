@@ -807,6 +807,9 @@ mod tests {
 
 /// A host command list and its allocator, always used together.
 pub(crate) struct HostList {
+    /// The list holding this one's hoisted indirect clamps, open, to be
+    /// closed and run before it ([`crate::indirect::Clamps`]).
+    pub(crate) clamps: Mutex<Option<Box<crate::indirect::Clamps>>>,
     allocator: ID3D12CommandAllocator,
     pub(crate) list: ID3D12GraphicsCommandList,
     /// Work for submission time, in recorded order.
@@ -3826,6 +3829,7 @@ impl Host {
             }
             Ok(HostList {
                 allocator,
+                clamps: Mutex::default(),
                 list,
                 deferred: Mutex::default(),
                 scratch: Mutex::default(),
@@ -5464,6 +5468,19 @@ impl Host {
             settled += settling.elapsed();
         }
         for list in runs {
+            // The clamps of this list's indirect draws run before it, in a
+            // list of their own (`crate::indirect::Clamps`): a pass of ours
+            // between two draws turns the card from drawing to compute and
+            // back, and a run of draws with its clamps ahead costs one
+            // switch a run (from Belobug's fork).
+            if let Some(mut clamps) = list.clamps.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                crate::indirect::end_clamps(&mut clamps);
+                if let Ok(closed) = clamps.list.list.cast::<ID3D12CommandList>() {
+                    lists.push(Some(closed));
+                }
+                // Held until the list has run: its allocator is reset then.
+                crate::indirect::KEEP.with(|kept| kept.borrow_mut().push(clamps));
+            }
             list.run_deferred(&mut batch);
             firsts.push(lists.len());
             if let Some(prelude) = list.prelude() {
@@ -5656,6 +5673,9 @@ impl Host {
         }
         self.log_messages();
         submitting(0, 0);
+        // The clamps lists of this submission have run: let them go (their
+        // allocators may be reset now).
+        crate::indirect::KEEP.with(|kept| kept.borrow_mut().clear());
         #[cfg(feature = "diagnostics")]
         crate::copystat::submission_ends(lock);
         // With the relay: nothing is in the air now, so no fetch still to
@@ -5908,6 +5928,20 @@ impl Host {
 }
 
 impl HostList {
+    /// A list for the clamps of a run of indirect draws, which runs before
+    /// the list that draws ([`crate::indirect::Clamps`]): a list of its
+    /// own, with no prelude of the title's to wait for.
+    pub(crate) fn open_for_clamps(_into: &HostList) -> Option<HostList> {
+        let me = host()?;
+        match me.make_list() {
+            Ok(list) => Some(list),
+            Err(e) => {
+                tracing::warn!(error = %e, "no host list for the clamps of indirect draws");
+                None
+            }
+        }
+    }
+
     /// The timestamp heap and its read-back buffer (diagnostics, timing on).
     #[cfg(feature = "diagnostics")]
     fn stamps(&self) -> Option<&(ID3D12QueryHeap, ID3D12Resource)> {
@@ -6733,7 +6767,7 @@ impl HostList {
     /// a bigger scratch buffer replaces it: one barrier per list (where
     /// there was one per indirect execution), and the list ends as it
     /// begins however it is submitted.
-    fn indirect_common(&self, scratch: &ID3D12Resource) {
+    pub(crate) fn indirect_common(&self, scratch: &ID3D12Resource) {
         {
             let mut deferred = self.deferred();
             if deferred.indirect_readable != scratch.as_raw() as usize {

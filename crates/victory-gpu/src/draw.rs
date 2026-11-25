@@ -1993,7 +1993,15 @@ impl State {
             if let Some(View::Placed(false, resource, desc)) = heap.handle(index).and_then(crate::descriptor::view) {
                 let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
                 let len = crate::resource::placed_bytes(&resource).unwrap_or(1);
-                let mapped = crate::texture::mapped_bytes(address as *const u8, len as usize);
+                // How much of the texture's memory is there. A texture
+                // streaming in has its middle pages first and its first page
+                // not yet: `mapped_bytes` asks the ends, and said 0 for it,
+                // which is what "streamed out" means below (from DexNom's
+                // fork).
+                let mut mapped = crate::texture::mapped_bytes(address as *const u8, len as usize);
+                if mapped == 0 && crate::texture::any_mapped(address as usize, len as usize) {
+                    mapped = 1;
+                }
                 if mapped == 0 {
                     HEAP_TEXTURES_AWAY.fetch_add(1, Ordering::Relaxed);
                     // Streamed out: what the slot showed is let go.
@@ -3248,7 +3256,32 @@ impl State {
                 let count_arg = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
                 // More than the record asked for: a window clamped ahead,
                 // whose unfilled slots must not spend the list's budget.
-                let bounded = if windowed && records > 1 {
+                // Clamps of a run of draws go to a list before the one that
+                // draws (`crate::indirect::Clamps`): a pass of ours between
+                // two draws turns the card from drawing to compute and back,
+                // and this costs one switch a run (from Belobug's fork,
+                // where 225 ms of card time a frame became about 80 in a
+                // scene of 9,000 draws). A window clamped ahead is a pass of
+                // its own and stays here.
+                let hoisted = !windowed
+                    && crate::indirect::hoisting()
+                    && matches!(kind, DRAW | INDEXED | DISPATCH | MESH);
+                let mut hoisted_at = None;
+                let bounded = if hoisted {
+                    let mut slot = list.clamps.lock().unwrap_or_else(|e| e.into_inner());
+                    if slot.is_none() {
+                        *slot = crate::indirect::Clamps::new(list).map(Box::new);
+                    }
+                    match slot.as_mut() {
+                        Some(clamps) => {
+                            let made =
+                                crate::indirect::bound_before(clamps, (&args.buffer, offset), count_arg, (kind, step, records));
+                            hoisted_at = made.as_ref().map(|(_, at)| *at);
+                            made.map(|(buffer, _)| buffer)
+                        }
+                        None => None,
+                    }
+                } else if windowed && records > 1 {
                     crate::indirect::bound_ahead(list, (&args.buffer, offset), (kind, step, records))
                 } else {
                     crate::indirect::bound(list, (&args.buffer, offset), count_arg, (kind, step, records))
@@ -3294,7 +3327,7 @@ impl State {
                     records,
                     scratch: bounded.clone(),
                 });
-                (bounded, 0)
+                (bounded, hoisted_at.unwrap_or(0))
             }
         };
         #[cfg(feature = "diagnostics")]

@@ -581,6 +581,48 @@ impl Layout {
         self.mips.get(mip as usize).map_or(0, |m| m.depth)
     }
 
+    /// The bytes of tiled memory one subresource of mip `mip` may touch:
+    /// from the lowest address it reads to the highest, for array slice
+    /// `slice` (3D: every depth slice of the mip). A caller that has only
+    /// part of the memory can tell whether this level is all there.
+    pub fn span(&self, mip: u32, slice: u32) -> Result<(u64, u64), Error> {
+        let m = self.mips.get(mip as usize).ok_or(Error::Invalid)?;
+        let depth = m.depth;
+        let first = if self.desc.dimension == Dimension::Tex3d {
+            0
+        } else {
+            slice
+        };
+        if first >= self.slices || !self.addressable() {
+            return Err(Error::Invalid);
+        }
+        let n = self.desc.element_bytes as usize;
+        let bytes = m.width as usize * n;
+        let (mut low, mut high) = (u64::MAX, 0u64);
+        let mut take = |at: u64, len: usize| {
+            low = low.min(at);
+            high = high.max(at + len as u64);
+        };
+        // Only the tiled modes: a linear one has no row or column patterns
+        // (`detile` reads it row by row).
+        if self.desc.swizzle == Swizzle::LINEAR {
+            let base = u64::from(first) * self.slice_size + m.offset;
+            let end = base + u64::from(depth - 1) * u64::from(m.pitch) * n as u64 + bytes as u64;
+            return Ok((base, end));
+        }
+        for z in 0..depth {
+            let (s, inner) = self.split(first + z);
+            let base = u64::from(s) * self.slice_size + m.offset;
+            for y in 0..m.height {
+                take(base + self.row(m, y, inner) + self.column(m, 0), bytes);
+            }
+        }
+        if high == 0 {
+            return Err(Error::Invalid);
+        }
+        Ok((low, high))
+    }
+
     /// Copies one subresource out of tiled memory (the whole texture,
     /// [`Layout::size`] bytes) into linear rows: mip `mip` of array slice
     /// `slice` (3D: every depth slice of the mip, `slice` 0). Rows are

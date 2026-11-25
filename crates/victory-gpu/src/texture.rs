@@ -1129,6 +1129,17 @@ impl Staging {
         size
     }
 
+    /// Where a level of the texture lies in title memory: the bytes from
+    /// the first to the last of the blocks the level's slices take.
+    fn level_span(&self, mip: u32, slice: u32) -> (usize, usize) {
+        let size = self.layout.size as usize;
+        let Ok((start, end)) = self.layout.span(mip, slice) else {
+            return (0, size);
+        };
+        let (start, end) = (start as usize, end as usize);
+        (start.min(size), end.saturating_sub(start).min(size.saturating_sub(start)))
+    }
+
     /// The guard did not see a write to this texture, and the hash found it
     /// changed anyway: hash it at every check for a while, so that a picture
     /// that changes unseen is not shown up to eight frames late.
@@ -1206,6 +1217,17 @@ impl Staging {
                 linear.fill(0);
                 continue;
             }
+            // Only the levels that are all there are read: a level the
+            // title has not finished bringing in yet is drawn as black
+            // until it is, instead of holding the whole texture back from
+            // the card (its pages arrive middle first, so waiting for all
+            // of it kept a picture off the card for the frames of a load).
+            // `VICTORY_SPARSE_LEVELS=0`: read it as before.
+            let (from, len) = self.level_span(mip, slice);
+            if sparse_levels() && !committed(self.memory.wrapping_add(from), len) {
+                linear.fill(0);
+                continue;
+            }
             if let Err(e) =
                 self.layout
                     .detile(tiled, mip, slice, linear, pitch, pitch * rows as usize)
@@ -1215,6 +1237,21 @@ impl Staging {
             }
         }
     }
+}
+
+/// Whether a texture's levels are read one at a time, only those whose
+/// memory is there (`VICTORY_SPARSE_LEVELS=0` reads every level, as
+/// before).
+fn sparse_levels() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(u8::MAX);
+    let on = ON.load(Ordering::Relaxed);
+    if on == u8::MAX {
+        let set = std::env::var("VICTORY_SPARSE_LEVELS").ok().as_deref() != Some("0");
+        ON.store(u8::from(set), Ordering::Relaxed);
+        return set;
+    }
+    on != 0
 }
 
 /// Lets go of a title texture's staging buffer (lists that recorded an
@@ -1445,6 +1482,44 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
         p = next;
     }
     there
+}
+
+/// Whether any byte of `[start, start + len)` is mapped (from DexNom's
+/// fork). The first page is asked of the kernel's read; a range of one
+/// page with it not there has nothing, and any other is walked by
+/// `VirtualQuery` until a mapped region is found. A texture whose middle
+/// pages have arrived has no mapped first page, and before this it was
+/// taken for a texture that never arrived.
+pub(crate) fn any_mapped(start: usize, len: usize) -> bool {
+    let end = start.saturating_add(len);
+    if start == end {
+        return false;
+    }
+    if committed(start as *const u8, 1) {
+        return true;
+    }
+    if (end - 1) / 4096 == start / 4096 {
+        return false;
+    }
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery,
+    };
+    let mut p = start;
+    while p < end {
+        // SAFETY: plain data filled in by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        let n = unsafe { VirtualQuery(p as *const _, &mut info, size_of_val(&info)) };
+        let next = (info.BaseAddress as usize).saturating_add(info.RegionSize).min(end);
+        if n == 0 || next <= p {
+            return false;
+        }
+        if info.State == MEM_COMMIT && info.Protect & (PAGE_NOACCESS | PAGE_GUARD) == 0 {
+            return true;
+        }
+        p = next;
+    }
+    false
 }
 
 /// The staging state of a title texture, made on first use.
