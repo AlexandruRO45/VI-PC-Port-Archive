@@ -451,6 +451,20 @@ impl Latch {
     /// returns the host's state when it differs from what was recorded.
     fn seen(&mut self, now: u64, recorded: &Value) -> Option<Value> {
         self.read = Some(now);
+        // Diagnostics: presses held only by the latch (released again
+        // before this read), which the read would have missed without it.
+        #[cfg(feature = "diagnostics")]
+        match &self.raw {
+            Some(Value::Pad(raw)) if self.buttons & !raw.buttons != 0 => {
+                tracing::info!(buttons = format_args!("{:#x}", self.buttons & !raw.buttons), "a tap kept for the title's read (released before it)");
+            }
+            Some(Value::Keys(raw)) => {
+                for key in self.keys.iter().filter(|k| !raw.iter().any(|r| same_key(r, k))) {
+                    tracing::info!(virtual_key = key.virtual_key, "a key tap kept for the title's read (released before it)");
+                }
+            }
+            _ => {}
+        }
         self.buttons = 0;
         self.keys.clear();
         self.raw.clone().filter(|raw| raw != recorded)
