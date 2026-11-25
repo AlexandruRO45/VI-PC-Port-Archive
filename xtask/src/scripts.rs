@@ -316,11 +316,12 @@ mod tests {
             String::from_utf8_lossy(&out.stderr)
         );
         let stdout = String::from_utf8_lossy(&out.stdout);
-        // cmd.exe allocates the Wine console; the log mirrors to CONOUT$
-        // and to the file, so a redirected run still shows its logs.
+        // start.exe without /exec allocates the Wine console; the log
+        // mirrors to CONOUT$ and to the file, so a redirected run still
+        // shows its logs.
         assert!(
-            stdout.contains("cmd.exe /c"),
-            "the exe must run through cmd.exe for the Wine console: {stdout}"
+            stdout.contains("start.exe /wait"),
+            "the exe must run through start.exe for the Wine console: {stdout}"
         );
         assert!(
             stdout.contains("console=1"),

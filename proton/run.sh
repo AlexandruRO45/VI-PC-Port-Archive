@@ -34,7 +34,7 @@ usage: proton/run.sh [options] [--] [victory args...]
                  through the Valve family's shared present mode)
   --no-mangohud  leave MANGOHUD unset (no overlay)
   --log-window   show the logs in Wine's console window (the exe runs
-                 through cmd.exe); VICTORY_LOG_FILE picks the mirror log
+                 through start.exe); VICTORY_LOG_FILE picks the mirror log
 
 Notes:
   VICTORY_COPY_MEMORY defaults to 1: under Wine the title memory used in
@@ -271,13 +271,14 @@ wexe=$("$proton/proton" getcompatpath "$exe" 2>/dev/null)
 [[ -n $wexe ]] || die "proton getcompatpath failed for $exe"
 
 # --log-window shows the run's logs in Wine's own console window, the live
-# view the first runs had: the exe goes through cmd.exe so Wine allocates a
-# console, and victory mirrors its log to CONOUT$ (which reaches that window
-# even with stdout redirected) plus VICTORY_LOG_FILE.
+# view the first runs had: start.exe without /exec goes through ShellExecute,
+# so Wine allocates a fresh console (with /exec the child inherits the
+# redirected handles and no console window appears). victory mirrors its log
+# to CONOUT$ (which reaches that window) plus VICTORY_LOG_FILE.
 if [[ -n $log_window ]]; then
     export VICTORY_LOG_CONSOLE=1
     export VICTORY_LOG_FILE=${VICTORY_LOG_FILE:-$HOME/.local/share/victory/proton-run.log}
     mkdir -p "$(dirname "$VICTORY_LOG_FILE")"
-    exec "$proton/proton" waitforexitandrun 'C:\windows\system32\cmd.exe' /c "$wexe" "$@"
+    exec "$proton/proton" waitforexitandrun 'C:\windows\system32\start.exe' /wait "$wexe" "$@"
 fi
 exec "$proton/proton" waitforexitandrun "$wexe" "$@"
