@@ -27,6 +27,9 @@ platform; these notes are what has worked for testers.
 - Some translated shaders crash the driver's compiler, which ends the
   process. With `VICTORY_PIPELINE_JOURNAL=1` (#491, not merged yet), a
   pipeline whose creation ended a run is refused from the next run on.
+- Set `VKD3D_DISABLE_EXTENSIONS=VK_NV_raw_access_chains`. With vkd3d-proton's
+  raw access chains, the title's hair passes hang the GPU (RTX 5080, driver
+  615.71); without them they run, and the rest is drawn as before.
 - Some of the title's compute passes take the GPU past the driver's timeout
   (`NVRM: Xid 109 ... CTX SWITCH TIMEOUT` in the kernel log, then the title's
   own watchdog). `VICTORY_SKIP_PIPELINES=<hash>,...` (a diagnostics build)
