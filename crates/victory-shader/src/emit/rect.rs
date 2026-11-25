@@ -38,9 +38,8 @@ pub fn rectangle_gs(vs: &[u8]) -> Result<Vec<u8>, ShaderError> {
     for e in &mut elements {
         e.interp = match (e.kind, e.comp) {
             (3, _) => 4,
-            (13, _) => 1,
             (0 | 6 | 7, 9) => 2,
-            (0, _) => 1,
+            (_, 4 | 5) | (0 | 13, _) => 1,
             _ => 0,
         };
     }
@@ -263,6 +262,11 @@ mod tests {
                     col: 1,
                     ..element("TEXCOORD", 0, 1, 3, 1)
                 },
+                SigElement {
+                    comp: 5,
+                    col: 2,
+                    ..element("SV_ViewportArrayIndex", 5, 1, 3, 1)
+                },
             ];
             let load = |s: &mut Shader, id: u32, col: u8| {
                 let args = [s.m.i32(id), s.m.i32(0), s.m.i8(col), s.m.undef(s.t.i32)];
@@ -285,6 +289,8 @@ mod tests {
             let flat_u = s.m.cast(b, Cast::FpToUi, flat_u_f, s.t.i32);
             let args = [s.m.i32(4), s.m.i32(0), s.m.i8(0), flat_u];
             s.op(b, "storeOutput.i32", Attr::NoUnwind, s.t.void, 5, &args);
+            let vp = [s.m.i32(5), s.m.i32(0), s.m.i8(0), s.m.i32(0)];
+            s.op(b, "storeOutput.i32", Attr::NoUnwind, s.t.void, 5, &vp);
             s.m.terminate(b, Term::Ret);
             s.finish()
         };
@@ -311,6 +317,12 @@ mod tests {
                     comp: 5,
                     col: 1,
                     ..element("TEXCOORD", 0, 1, 3, 1)
+                },
+                SigElement {
+                    comp: 5,
+                    col: 2,
+                    usage: 0,
+                    ..element("SV_ViewportArrayIndex", 5, 1, 3, 1)
                 },
             ];
             s.outputs = vec![element("SV_Target", 16, 0, 0, 4)];
@@ -349,13 +361,13 @@ mod tests {
         );
         let psv = gs_c.part(FourCC::PSV0).unwrap().data;
         // Runtime info (4 + 48), 0 bindings (4), string table, index table,
-        // then 16-byte PSVSignatureElement records (5 inputs, 5 outputs).
+        // then 16-byte PSVSignatureElement records (6 inputs, 6 outputs).
         let str_len = u32::from_le_bytes(psv[56..60].try_into().unwrap()) as usize;
         let idx_at = 60 + str_len;
         let idx_cnt = u32::from_le_bytes(psv[idx_at..idx_at + 4].try_into().unwrap()) as usize;
         let els_at = idx_at + 4 + 4 * idx_cnt + 4;
-        let interps: Vec<u8> = (0..10).map(|i| psv[els_at + 16 * i + 13]).collect();
-        assert_eq!(interps, [0, 0, 0, 0, 0, 4, 2, 2, 1, 1]);
+        let interps: Vec<u8> = (0..12).map(|i| psv[els_at + 16 * i + 13]).collect();
+        assert_eq!(interps, [0, 0, 0, 0, 0, 0, 4, 2, 2, 1, 1, 1]);
 
         #[rustfmt::skip]
         let vertices = [
