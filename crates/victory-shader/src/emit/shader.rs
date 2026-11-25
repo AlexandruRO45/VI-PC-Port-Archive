@@ -148,6 +148,19 @@ pub fn view_heap_limit() -> u32 {
     VIEW_LIMIT.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// The last view-heap index a shader may name.
+fn view_index_limit(view_pages: bool, sampler: bool, host_limit: u32) -> u32 {
+    if sampler {
+        HEAP_SAMPLERS - 1
+    } else if view_pages {
+        HEAP_VIEWS - 1
+    } else if host_limit != 0 {
+        host_limit
+    } else {
+        0
+    }
+}
+
 thread_local! {
     /// [`super::Options::view_pages`] for the translation on this thread.
     static VIEW_PAGES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -442,7 +455,8 @@ impl Shader {
         props: (u32, u32),
     ) -> V {
         // a view index past the host heap (`set_view_heap_limit`) reads its null slot instead
-        let limit = VIEW_LIMIT.load(std::sync::atomic::Ordering::Relaxed);
+        let host_limit = VIEW_LIMIT.load(std::sync::atomic::Ordering::Relaxed);
+        let limit = view_index_limit(self.view_pages, sampler, host_limit);
         // (as `dx.op.binary` UMin: a compare and select emitted here made the bitcode invalid)
         let index = if !sampler && limit != 0 {
             let null = self.m.i32(limit);
@@ -456,7 +470,7 @@ impl Shader {
             // got yet) stays inside the largest heap there is.
             // shortcut: not the bound heap's own count, which a title
             // heap smaller than 2,048 would need.
-            let last = self.m.i32(2047);
+            let last = self.m.i32(limit);
             let i32t = self.t.i32;
             let v = self.op(block, "binary.i32", Attr::ReadNone, i32t, 40, &[index, last]);
             self.m.tag(v, super::bitcode::Tag::Clamp);
@@ -951,5 +965,23 @@ impl Shader {
             list.push(Some(self.m.md_node(ops)));
         }
         Some(self.m.md_node(list))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A paged view heap is virtual: its indices are clamped to the
+    /// virtual heap, not to the physical host heap the pages live in.
+    #[test]
+    fn paged_views_use_the_virtual_heap_limit() {
+        assert_eq!(
+            view_index_limit(true, false, 999_999),
+            HEAP_VIEWS - 1,
+            "the paged shader still clamps to the physical host heap's last slot"
+        );
+        assert_eq!(view_index_limit(false, false, 999_999), 999_999);
+        assert_eq!(view_index_limit(true, true, 999_999), HEAP_SAMPLERS - 1);
     }
 }

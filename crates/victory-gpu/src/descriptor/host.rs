@@ -880,6 +880,26 @@ pub(crate) fn view_pages() -> bool {
     })
 }
 
+/// The title's logical slot count and the host heap's physical slot count.
+/// A paged heap keeps every title slot logical: the page table maps them
+/// into the smaller physical heap. An ordinary capped heap mirrors only
+/// the title slots that fit and reserves the rest for dynamic views.
+fn logical_and_physical_slots(count: u32, extra: u32, null: u32, paged: bool) -> (u32, u32) {
+    if paged {
+        let physical = if null == 0 { count + extra } else { null + 1 };
+        return (count, physical);
+    }
+    if null == 0 {
+        return (count, count + extra);
+    }
+    let fitted = if count + extra <= null {
+        count
+    } else {
+        null - extra
+    };
+    (fitted, null + 1)
+}
+
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
         let host = host()?;
@@ -912,7 +932,20 @@ impl HostHeap {
         } else {
             victory_shader::emit::view_heap_limit()
         };
-        let (heap, count, size) = if null == 0 {
+        // Paged view heaps: the title's count stays logical and the host
+        // heap keeps only the physical slots it takes. Pages map the title's
+        // slots into those.
+        let paged = !sampler && view_pages();
+        let (logical, physical) = logical_and_physical_slots(count, extra, null, paged);
+        let (heap, count, size) = if paged {
+            match make(physical) {
+                Ok(heap) => (heap, logical, physical),
+                Err(e) => {
+                    tracing::warn!(error = %e, count, physical, sampler, "no host descriptor heap");
+                    return None;
+                }
+            }
+        } else if null == 0 {
             match make(count + extra) {
                 Ok(heap) => (heap, count, count + extra),
                 Err(e) => {
@@ -960,7 +993,6 @@ impl HostHeap {
         // Paged view heaps: the host heap is what the host accepts, but the
         // virtual heap is `HEAP_VIEWS` slots in pages of `PAGE`, translated
         // through a page table in a dedicated root SRV buffer.
-        let paged = !sampler && view_pages();
         let page_table_size = if paged {
             u64::from(victory_shader::emit::HEAP_VIEWS / PAGE) * 4
         } else {
@@ -1000,12 +1032,6 @@ impl HostHeap {
             return None;
         }
         let table = page_table.as_ref().map_or(0, |p| p.2);
-        // Every slot is virtual: the host heap as large as it takes.
-        let slots = if paged {
-            victory_shader::emit::HEAP_VIEWS
-        } else {
-            size
-        };
         // The dynamic slots' pages placed at once, together, past the null
         // and scratch pages: a table of them is bound as a range of the
         // host heap. Every other page reads the null page until placed.
@@ -1060,7 +1086,10 @@ impl HostHeap {
         // used-resource entry names) read a wild address. Every slot starts
         // null instead.
         let started = std::time::Instant::now();
-        if let Err(e) = h.fill_null(kind, slots) {
+        // Only physical descriptors can be filled. Virtual slots resolve
+        // through the null page until their own page is placed; copying
+        // the virtual slot count here would run past the host heap.
+        if let Err(e) = h.fill_null(kind, size) {
             tracing::warn!(error = %e, "host descriptor heap not made null");
         }
         tracing::debug!(ms = started.elapsed().as_millis(), "host descriptor heap made null");
@@ -3135,6 +3164,21 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A paged heap keeps every title slot logical even when the host's
+    /// physical heap is smaller; an ordinary capped heap mirrors only the
+    /// title slots that fit and reserves the rest for dynamic views.
+    #[test]
+    fn paged_heaps_keep_all_title_slots_logical() {
+        assert_eq!(
+            logical_and_physical_slots(1_245_184, DYNAMIC, 999_999, true),
+            (1_245_184, 1_000_000),
+        );
+        assert_eq!(
+            logical_and_physical_slots(1_245_184, DYNAMIC, 999_999, false),
+            (737_855, 1_000_000),
+        );
+    }
 
     /// A null texture UAV keeps the title's dimension (3D for the world's
     /// wind field), and is 2D when the title names none.
