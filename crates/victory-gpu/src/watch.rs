@@ -620,17 +620,17 @@ pub(crate) mod tests {
         let second = writing(p + 2 * PAGE, 3 * PAGE);
         let duplicate = writing(p + 2 * PAGE, 3 * PAGE);
         let extra = [writing(p, 1), writing(p + 5 * PAGE, 1), writing(p + 5 * PAGE, 1)];
-        t.take(p, p + 6 * PAGE);
+        let _ = t.take(p, p + 6 * PAGE);
         assert!((0..6).all(|i| t.changed(p / PAGE + i)));
         drop(first);
         drop(second);
         drop(extra);
-        t.take(p, p + 6 * PAGE);
+        let _ = t.take(p, p + 6 * PAGE);
         for i in 0..6 {
             assert_eq!(t.changed(p / PAGE + i), (2..5).contains(&i));
         }
         drop(duplicate);
-        t.take(p, p + 6 * PAGE);
+        let _ = t.take(p, p + 6 * PAGE);
         assert!((0..6).all(|i| !t.changed(p / PAGE + i)));
         drop(t);
         free(p);
