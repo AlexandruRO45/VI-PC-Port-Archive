@@ -980,6 +980,7 @@ mod tests {
                 threads: 32,
                 max_vertices: 32,
                 max_primitives: 32,
+                user_sgprs: 0,
                 topology: 2,
                 lds_bytes: 0,
             }),
@@ -1599,5 +1600,473 @@ mod tests {
         let io = crate::io::raise(&p, &native).unwrap();
         // Translated or refused with a reason; it must not panic.
         let _ = super::emit(&c, &native, &p, &st, &io, &res);
+    }
+
+    /// Builds a synthetic wave32 mesh shader with `user_sgprs` user-data dwords
+    /// (`layout_sgprs` of them mapped as root constants at slot 0) that skips a
+    /// write to `read_sgpr` when `s8 == 0` and exports the read value plus `s9`
+    /// across a full-screen triangle.
+    fn build_synthetic_mesh_sgpr(
+        user_sgprs: u8,
+        layout_sgprs: u32,
+        read_sgpr: u8,
+    ) -> Result<HostShader, ShaderError> {
+        let s = u32::from(read_sgpr);
+        let words = [
+            0xBF06_8008u32,          // s_cmp_eq_u32 s8, 0
+            0xBF85_0001,             // s_cbranch_scc1 +1
+            0xBE80_0387 | (s << 16), // s_mov_b32 s<read_sgpr>, 7
+            0x7E0C_0C00 | s,         // v_cvt_f32_u32 v6, s<read_sgpr>
+            0x060C_0C09,             // v_add_f32 v6, s9, v6
+            0x7E08_02F2,             // v_mov_b32 v4, 1.0
+            0x7E06_0280,             // v_mov_b32 v3, 0
+            0xD765_0000,
+            0x0001_00C1, // v_mbcnt_lo_u32_b32 v0, -1, 0
+            0x7D84_0081, // v_cmp_eq_u32 vcc_lo, 1, v0
+            0xD501_0001,
+            0x01A9_ECF3, // v_cndmask_b32 v1, -1.0, 4.0, vcc_lo
+            0x7D84_0082, // v_cmp_eq_u32 vcc_lo, 2, v0
+            0xD501_0002,
+            0x01A9_ECF3, // v_cndmask_b32 v2, -1.0, 4.0, vcc_lo
+            0xD4C1_000B,
+            0x0001_0700, // v_cmp_lt_u32 s11, v0, 3
+            0xBE8C_3C0B, // s_and_saveexec_b32 s12, s11
+            0xF800_00CF,
+            0x0403_0201, // exp pos0, v1, v2, v3, v4
+            0xF800_020F,
+            0x0406_0606, // exp param0, v6, v6, v6, v4
+            0xBEFE_030C, // s_mov_b32 exec_lo, s12
+            0x7E0E_02FF,
+            0x0020_0400, // v_mov_b32 v7, 0 | (1 << 10) | (2 << 20)
+            0xD4C2_000B,
+            0x0002_0080, // v_cmp_eq_u32 s11, 0, v0
+            0xBE8D_3C0B, // s_and_saveexec_b32 s13, s11
+            0xF800_0941,
+            0x0000_0007, // exp prim, v7, off, off, off done
+            0xBEFE_030C, // s_mov_b32 exec_lo, s12
+            0xBF81_0000, // s_endpgm
+        ];
+        let layout = if layout_sgprs > 0 {
+            vec![crate::native::RootParam {
+                root: crate::native::RootType::Constants,
+                table_offset_dwords: 0,
+                sgprs: layout_sgprs,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            }]
+        } else {
+            vec![]
+        };
+        let native = super::NativeProgram {
+            stage: super::HwStage::Ms,
+            wave64: false,
+            vgprs: 12,
+            layout,
+            used: vec![],
+            io: StageIo::Ms(crate::native::MeshIo {
+                outputs: vec![crate::native::VsOutput {
+                    usage: crate::native::Usage::Generic,
+                    row: 1,
+                    param: 0,
+                    fp16: false,
+                    pack2: false,
+                }],
+                clip_cntl: 0,
+                threads: 32,
+                max_vertices: 3,
+                max_primitives: 1,
+                user_sgprs,
+                topology: 2,
+                lds_bytes: 0,
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let pos = SigElement {
+            name: "SV_Position".into(),
+            index: 0,
+            kind: 3,
+            comp: 9,
+            interp: 4,
+            row: Some(0),
+            col: 0,
+            cols: 4,
+            usage: 0,
+            half: false,
+        };
+        let color = SigElement {
+            name: "COLOR".into(),
+            index: 0,
+            kind: 0,
+            comp: 9,
+            interp: 2,
+            row: Some(1),
+            col: 0,
+            cols: 4,
+            usage: 0,
+            half: false,
+        };
+        let osg1 = super::container::signature(&[pos, color], false);
+        let bytes = crate::dxbc::build(&[(super::FourCC::OSG1, &osg1)]);
+        let c = super::Container::parse(&bytes).unwrap();
+        let p = crate::ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+        let st = crate::structure::structure(&p).unwrap();
+        let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = crate::io::raise(&p, &native).unwrap();
+        super::emit(&c, &native, &p, &st, &io, &res)
+    }
+
+    #[test]
+    fn mesh_uninitialized_sgprs_read_as_zero_while_hardware_ones_stay_refused() {
+        // With 2 user SGPRs (`s8..=s9`), hardware initializes `s0..=s9` (10).
+        // `s5` (scratch wave offset in the merged-stage prefix) and `s9` when
+        // unmapped in the root layout remain refused as hardware SGPR inputs.
+        let bare = |sgpr: u32, user_sgprs: u8, layout_sgprs: u32| {
+            let words = [
+                0x7E00_0200u32 | sgpr, // v_mov_b32 v0, s<sgpr>
+                0xF800_0941,
+                0x0000_0000, // exp prim, v0, off, off, off done
+                0xF800_08CF,
+                0x0000_0000, // exp pos0, v0, v0, v0, v0 done
+                0xBF81_0000,
+            ];
+            let layout = if layout_sgprs > 0 {
+                vec![crate::native::RootParam {
+                    root: crate::native::RootType::Constants,
+                    table_offset_dwords: 0,
+                    sgprs: layout_sgprs,
+                    base_register: 0,
+                    user_data: 0,
+                    slot: 0,
+                }]
+            } else {
+                vec![]
+            };
+            let native = super::NativeProgram {
+                stage: super::HwStage::Ms,
+                wave64: false,
+                vgprs: 4,
+                layout,
+                used: vec![],
+                io: StageIo::Ms(crate::native::MeshIo {
+                    outputs: vec![],
+                    clip_cntl: 0,
+                    threads: 32,
+                    max_vertices: 3,
+                    max_primitives: 1,
+                    user_sgprs,
+                    topology: 2,
+                    lds_bytes: 0,
+                }),
+                code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+            };
+            let pos = SigElement {
+                name: "SV_Position".into(),
+                index: 0,
+                kind: 3,
+                comp: 9,
+                interp: 4,
+                row: Some(0),
+                col: 0,
+                cols: 4,
+                usage: 0,
+                half: false,
+            };
+            let osg1 = super::container::signature(&[pos], false);
+            let bytes = crate::dxbc::build(&[(super::FourCC::OSG1, &osg1)]);
+            let c = super::Container::parse(&bytes).unwrap();
+            let p = crate::ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+            let st = crate::structure::structure(&p).unwrap();
+            let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+            let io = crate::io::raise(&p, &native).unwrap();
+            super::emit(&c, &native, &p, &st, &io, &res)
+        };
+
+        assert!(matches!(
+            bare(5, 2, 2),
+            Err(ShaderError::Unsupported {
+                what: "a hardware SGPR input",
+                ..
+            })
+        ));
+        assert!(matches!(
+            bare(9, 2, 1),
+            Err(ShaderError::Unsupported {
+                what: "a hardware SGPR input",
+                ..
+            })
+        ));
+        // Above `initialized_sgprs` (`10`), an SGPR that no instruction writes
+        // anywhere in the program is refused explicitly as an unknown input
+        // rather than silently zeroed.
+        for unwrit in [10u32, 25] {
+            assert!(matches!(
+                bare(unwrit, 2, 2),
+                Err(ShaderError::Unsupported {
+                    what: "an SGPR no instruction writes, above the initialized ones",
+                    ..
+                })
+            ));
+        }
+        // `s3` is `MergedWaveInfo` and remains lowered as before.
+        let wave_info = bare(3, 2, 0).unwrap();
+        #[cfg(windows)]
+        if let Ok(mut v) = super::validator::Validator::load(
+            super::validator::Validator::default_path().as_deref(),
+        ) {
+            let mut copy = wave_info.dxil.clone();
+            let digest = copy[4..20].to_vec();
+            v.validate(&mut copy).unwrap();
+            assert_eq!(copy[4..20], digest[..]);
+        }
+
+        // Raising `user_sgprs` to 3 makes `s10` (`8 + 2`) hardware-initialized,
+        // so reading it without a layout mapping is refused; at `user_sgprs = 2`,
+        // `s10` is uninitialized on entry and reads as zero.
+        assert!(matches!(
+            build_synthetic_mesh_sgpr(3, 2, 10),
+            Err(ShaderError::Unsupported {
+                what: "a hardware SGPR input",
+                ..
+            })
+        ));
+        let ms = build_synthetic_mesh_sgpr(2, 2, 10).unwrap();
+        #[cfg(windows)]
+        if let Ok(mut v) = super::validator::Validator::load(
+            super::validator::Validator::default_path().as_deref(),
+        ) {
+            let mut copy = ms.dxil.clone();
+            let digest = copy[4..20].to_vec();
+            v.validate(&mut copy).unwrap();
+            assert_eq!(copy[4..20], digest[..]);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn mesh_uninitialized_sgprs_execute_on_host_gpus() {
+        use super::host::{Draw, Host, Root};
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::*;
+
+        let ms = build_synthetic_mesh_sgpr(2, 2, 10).unwrap();
+        let ps_words = [
+            0xC80A_0002u32, // v_interp_mov_f32 v2, p0, attr0.x
+            0x7E06_02F2,    // v_mov_b32 v3, 1.0
+            0xF800_180F,
+            0x0302_0202, // exp mrt0, v2, v2, v2, v3 done vm
+            0xBF81_0000, // s_endpgm
+        ];
+        let ps_native = super::NativeProgram {
+            stage: super::HwStage::Ps,
+            wave64: false,
+            vgprs: 4,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Ps {
+                inputs: vec![crate::native::PsInput {
+                    usage: crate::native::Usage::Generic,
+                    row: 1,
+                    mask: 0xF,
+                    attr: 0,
+                    flat: true,
+                    fp16: false,
+                    pack2: false,
+                    row2: 0,
+                }],
+                input_addr: 0,
+                db_shader_control: 0,
+                patches: vec![],
+            },
+            code: ps_words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let pos = SigElement {
+            name: "SV_Position".into(),
+            index: 0,
+            kind: 3,
+            comp: 9,
+            interp: 4,
+            row: Some(0),
+            col: 0,
+            cols: 4,
+            usage: 0,
+            half: false,
+        };
+        let color = SigElement {
+            name: "COLOR".into(),
+            index: 0,
+            kind: 0,
+            comp: 9,
+            interp: 1,
+            row: Some(1),
+            col: 0,
+            cols: 4,
+            usage: 0,
+            half: false,
+        };
+        let target = SigElement {
+            name: "SV_Target".into(),
+            index: 0,
+            kind: 16,
+            comp: 9,
+            interp: 0,
+            row: Some(0),
+            col: 0,
+            cols: 4,
+            usage: 15,
+            half: false,
+        };
+        let isg1 = super::container::signature(&[pos, color], true);
+        let osg1 = super::container::signature(&[target], false);
+        let ps_bytes =
+            crate::dxbc::build(&[(super::FourCC::ISG1, &isg1), (super::FourCC::OSG1, &osg1)]);
+        let ps_c = super::Container::parse(&ps_bytes).unwrap();
+        let ps_p =
+            crate::ir::build(&ps_native.patched_code(), ps_native.wave64, ps_native.vgprs).unwrap();
+        let ps_st = crate::structure::structure(&ps_p).unwrap();
+        let ps_res =
+            crate::resource::track(&ps_p, &ps_native.layout, ps_native.stage, Some(&ps_st))
+                .unwrap();
+        let ps_io = crate::io::raise(&ps_p, &ps_native).unwrap();
+        let ps = super::emit(&ps_c, &ps_native, &ps_p, &ps_st, &ps_io, &ps_res).unwrap();
+
+        if let Ok(mut v) = super::validator::Validator::load(
+            super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut ms.dxil.clone()).unwrap();
+            v.validate(&mut ps.dxil.clone()).unwrap();
+        }
+
+        let _one = super::valu_tests::ONE_AT_A_TIME
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let warp_only = std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1");
+        let mut adapters: Vec<(String, IDXGIAdapter1)> = Vec::new();
+        let mut seen = Vec::new();
+        // SAFETY: plain DXGI factory and adapter enumeration with valid out parameters.
+        unsafe {
+            let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).unwrap();
+            if !warp_only {
+                let mut idx = 0;
+                while let Ok(a) = factory.EnumAdapters1(idx) {
+                    idx += 1;
+                    if let Ok(desc) = a.GetDesc1() {
+                        let luid = (desc.AdapterLuid.HighPart, desc.AdapterLuid.LowPart);
+                        if !seen.contains(&luid) {
+                            seen.push(luid);
+                            let end = desc
+                                .Description
+                                .iter()
+                                .position(|&c| c == 0)
+                                .unwrap_or(desc.Description.len());
+                            adapters.push((String::from_utf16_lossy(&desc.Description[..end]), a));
+                        }
+                    }
+                }
+            }
+            if let Ok(w) = factory.EnumWarpAdapter::<IDXGIAdapter1>()
+                && let Ok(desc) = w.GetDesc1()
+            {
+                let luid = (desc.AdapterLuid.HighPart, desc.AdapterLuid.LowPart);
+                if !seen.contains(&luid) {
+                    seen.push(luid);
+                    let end = desc
+                        .Description
+                        .iter()
+                        .position(|&c| c == 0)
+                        .unwrap_or(desc.Description.len());
+                    adapters.push((
+                        format!(
+                            "WARP ({})",
+                            String::from_utf16_lossy(&desc.Description[..end])
+                        ),
+                        w,
+                    ));
+                }
+            }
+        }
+
+        let mut executed = 0usize;
+        for (name, adapter) in &adapters {
+            // SAFETY: D3D12 device creation and fixed-size feature queries.
+            let device = unsafe {
+                let mut dev: Option<ID3D12Device> = None;
+                if D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_12_0, &mut dev).is_err() {
+                    eprintln!("{name}: D3D12CreateDevice unavailable; skipped");
+                    continue;
+                }
+                let device = dev.unwrap();
+                let mut sm = D3D12_FEATURE_DATA_SHADER_MODEL {
+                    HighestShaderModel: D3D_SHADER_MODEL_6_6,
+                };
+                if device
+                    .CheckFeatureSupport(
+                        D3D12_FEATURE_SHADER_MODEL,
+                        (&raw mut sm).cast(),
+                        size_of_val(&sm) as u32,
+                    )
+                    .is_err()
+                    || sm.HighestShaderModel.0 < D3D_SHADER_MODEL_6_6.0
+                {
+                    eprintln!("{name}: SM < 6.6; skipped");
+                    continue;
+                }
+                let mut opt7 = D3D12_FEATURE_DATA_D3D12_OPTIONS7::default();
+                if device
+                    .CheckFeatureSupport(
+                        D3D12_FEATURE_D3D12_OPTIONS7,
+                        (&raw mut opt7).cast(),
+                        size_of_val(&opt7) as u32,
+                    )
+                    .is_err()
+                    || opt7.MeshShaderTier == D3D12_MESH_SHADER_TIER_NOT_SUPPORTED
+                {
+                    eprintln!("{name}: MeshShaderTier not supported; skipped");
+                    continue;
+                }
+                device
+            };
+
+            let host = Host { device };
+            let (root, pso) = host
+                .mesh_pipeline(&ms, &ps)
+                .unwrap_or_else(|e| panic!("{name}: mesh_pipeline failed: {e}"));
+            for (flag, want) in [(0u32, 0.75f32), (1u32, 7.75f32)] {
+                let pixels = host
+                    .draw(
+                        &root,
+                        &pso,
+                        &Draw {
+                            roots: vec![
+                                (0, Root::Constants(vec![flag, 0.75f32.to_bits()])),
+                                (1, Root::Constants(vec![0])),
+                            ],
+                            textures: &[],
+                            samplers: &[],
+                            vertices: &[],
+                            stride: 0,
+                            size: (4, 4),
+                            mesh_groups: 1,
+                        },
+                    )
+                    .unwrap_or_else(|e| panic!("{name} (flag={flag}): draw failed: {e}"));
+                assert_eq!(pixels.len(), 16);
+                for (i, px) in pixels.iter().enumerate() {
+                    assert_eq!(
+                        *px,
+                        [want, want, want, 1.0],
+                        "{name} (flag={flag}) pixel {i}"
+                    );
+                }
+            }
+            executed += 1;
+            eprintln!("{name}: mesh uninitialized SGPR verified (0.75 and 7.75 across 4x4 target)");
+        }
+        assert!(
+            executed > 0,
+            "no SM 6.6 mesh-shader device available (checked {} adapters)",
+            adapters.len()
+        );
     }
 }

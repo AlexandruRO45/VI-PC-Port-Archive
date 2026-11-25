@@ -296,9 +296,20 @@ pub struct MeshIo {
     pub threads: u32,
     pub max_vertices: u32,
     pub max_primitives: u32,
+    /// User SGPRs after the 8 merged-stage system SGPRs (`s8..`).
+    pub user_sgprs: u8,
     /// 1 lines, 2 triangles.
     pub topology: u8,
     pub lds_bytes: u32,
+}
+
+impl MeshIo {
+    /// SGPRs the hardware initializes: the 8 merged-stage system SGPRs
+    /// (`s0..=s7`), then the user SGPRs (`s8..`). The ones above hold
+    /// whatever the previous wave left.
+    pub fn initialized_sgprs(&self) -> u8 {
+        self.user_sgprs.saturating_add(8)
+    }
 }
 
 /// A compute program's dispatch settings.
@@ -787,6 +798,7 @@ fn ms_io(data: &[u8], lds_bytes: u32) -> Result<StageIo, ShaderError> {
         threads: half(0),
         max_vertices: half(2),
         max_primitives: half(4),
+        user_sgprs: info[6],
         topology: info[7],
         lds_bytes,
     }))
@@ -1059,17 +1071,31 @@ pub(crate) mod tests {
             fp16: false,
             pack2: false,
         };
+        let ms = MeshIo {
+            outputs: vec![out(1, 0), out(0, 0x82)],
+            clip_cntl: 0x0040_000F,
+            threads: 128,
+            max_vertices: 128,
+            max_primitives: 64,
+            user_sgprs: 13,
+            topology: 2,
+            lds_bytes: 16,
+        };
+        assert_eq!(ms.initialized_sgprs(), 21);
+        assert_eq!(p.io, StageIo::Ms(ms));
         assert_eq!(
-            p.io,
-            StageIo::Ms(MeshIo {
-                outputs: vec![out(1, 0), out(0, 0x82)],
-                clip_cntl: 0x0040_000F,
-                threads: 128,
-                max_vertices: 128,
-                max_primitives: 64,
+            MeshIo {
+                outputs: vec![],
+                clip_cntl: 0,
+                threads: 32,
+                max_vertices: 3,
+                max_primitives: 1,
+                user_sgprs: 0,
                 topology: 2,
-                lds_bytes: 16,
-            })
+                lds_bytes: 0,
+            }
+            .initialized_sgprs(),
+            8
         );
     }
 

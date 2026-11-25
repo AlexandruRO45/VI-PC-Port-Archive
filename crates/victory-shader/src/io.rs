@@ -198,8 +198,9 @@ pub struct Io {
     pub inputs: Vec<(Value, Input)>,
     pub interps: Vec<(Site, Interp)>,
     pub exports: Vec<Export>,
-    /// Compute and pixel: how many SGPRs the hardware initializes
-    /// ([`ComputeIo::initialized_sgprs`](crate::native::ComputeIo::initialized_sgprs);
+    /// Compute, mesh and pixel: how many SGPRs the hardware initializes
+    /// ([`ComputeIo::initialized_sgprs`](crate::native::ComputeIo::initialized_sgprs),
+    /// [`MeshIo::initialized_sgprs`](crate::native::MeshIo::initialized_sgprs);
     /// pixel: the user SGPRs, at least the 8 ABI slots and up to the last
     /// root parameter's, then the primitive mask and the ordered-section
     /// (POPS) collision id, as every pixel program of the title reads them).
@@ -311,6 +312,7 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
         inputs: inputs.clone(),
         initialized_sgprs: match &native.io {
             StageIo::Cs(cs) => Some(cs.initialized_sgprs()),
+            StageIo::Ms(ms) => Some(ms.initialized_sgprs()),
             StageIo::Ps { .. } => {
                 let user = native
                     .layout
@@ -747,6 +749,7 @@ mod tests {
                     threads: 128,
                     max_vertices: 128,
                     max_primitives: 128,
+                    user_sgprs: 4,
                     topology: 2,
                     lds_bytes: 0,
                 }),
@@ -762,6 +765,7 @@ mod tests {
         ])
         .unwrap();
         assert!(io.inputs.iter().any(|i| i.1 == Input::MeshGroup));
+        assert_eq!(io.initialized_sgprs, Some(12));
         assert_eq!(io.exports[0].target, Target::Primitive);
         // The group input is uniform only as the first lane reads it.
         assert!(mesh(&[0x7E02_0305, S_ENDPGM]).is_err()); // v_mov_b32 v1, v5
