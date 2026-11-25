@@ -3068,12 +3068,193 @@ pub(crate) fn in_parallel<T: Sync>(list: &[T], least: usize, f: impl Fn(&[T]) + 
         }
     };
     let threads = THREADS.min(list.len().div_ceil(piece));
-    std::thread::scope(|s| {
-        for _ in 1..threads {
-            s.spawn(work);
+    if helpers::made_each_time() {
+        return std::thread::scope(|s| {
+            for _ in 1..threads {
+                s.spawn(work);
+            }
+            work();
+        });
+    }
+    helpers::run(threads - 1, &work);
+}
+
+/// The threads [`in_parallel`] shares its work with, kept from one call to
+/// the next. A submission asks some tens of times, and making threads each
+/// time (with every loaded library told of each) was a tenth of the
+/// submitting thread's time in a sampled world frame.
+mod helpers {
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Condvar, Mutex, Once};
+
+    /// As many as [`super::in_parallel`] asks for at most.
+    const KEPT: usize = 5;
+
+    /// Whether threads are made for each call as before
+    /// (`VICTORY_HELPERS=0`).
+    pub(super) fn made_each_time() -> bool {
+        static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *OFF.get_or_init(|| std::env::var_os("VICTORY_HELPERS").is_some_and(|v| v == "0"))
+    }
+
+    /// One call's work, offered to the kept threads.
+    struct Job {
+        /// The caller's closure: only called by a thread counted in
+        /// `running` that found `closed` unset.
+        work: *const (dyn Fn() + Sync),
+        running: AtomicUsize,
+        /// The caller's own share is done: nothing is left to take.
+        closed: AtomicBool,
+        panicked: AtomicBool,
+        idle: (Mutex<()>, Condvar),
+    }
+
+    // SAFETY: the closure is `Sync`, and the pointer is only followed as
+    // `work` says.
+    unsafe impl Send for Job {}
+    // SAFETY: as above.
+    unsafe impl Sync for Job {}
+
+    static JOBS: Mutex<VecDeque<Arc<Job>>> = Mutex::new(VecDeque::new());
+    static MORE: Condvar = Condvar::new();
+
+    fn kept() {
+        loop {
+            let job = {
+                let mut jobs = JOBS.lock().unwrap_or_else(|e| e.into_inner());
+                loop {
+                    if let Some(job) = jobs.pop_front() {
+                        break job;
+                    }
+                    jobs = MORE.wait(jobs).unwrap_or_else(|e| e.into_inner());
+                }
+            };
+            job.running.fetch_add(1, Ordering::SeqCst);
+            if !job.closed.load(Ordering::SeqCst) {
+                // SAFETY: counted in `running` before `closed` was found
+                // unset, so the caller waits for this thread before the
+                // closure goes.
+                let work = unsafe { &*job.work };
+                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)).is_err() {
+                    job.panicked.store(true, Ordering::Relaxed);
+                }
+            }
+            if job.running.fetch_sub(1, Ordering::SeqCst) == 1 {
+                let _held = job.idle.0.lock().unwrap_or_else(|e| e.into_inner());
+                job.idle.1.notify_all();
+            }
         }
+    }
+
+    /// Closes the job and waits for the threads still in it, also when the
+    /// caller's share panics.
+    struct Close<'a>(&'a Job);
+
+    impl Drop for Close<'_> {
+        fn drop(&mut self) {
+            self.0.closed.store(true, Ordering::SeqCst);
+            let mut held = self.0.idle.0.lock().unwrap_or_else(|e| e.into_inner());
+            while self.0.running.load(Ordering::SeqCst) != 0 {
+                held = self.0.idle.1.wait(held).unwrap_or_else(|e| e.into_inner());
+            }
+        }
+    }
+
+    /// Runs `work` here and on up to `others` kept threads; returns once
+    /// none of them is in it. `work` returns when nothing is left to do, so
+    /// a thread that comes late finds the job closed and leaves it alone:
+    /// the caller never waits for a thread that has not started, and a call
+    /// from inside `work` cannot stand.
+    pub(super) fn run(others: usize, work: &(dyn Fn() + Sync)) {
+        if others == 0 {
+            return work();
+        }
+        static START: Once = Once::new();
+        START.call_once(|| {
+            for _ in 0..KEPT {
+                if let Err(error) = std::thread::Builder::new().name("victory-helper".into()).spawn(kept) {
+                    tracing::warn!(%error, "no helper thread");
+                }
+            }
+        });
+        // SAFETY: only the lifetime changes; `Close` below keeps the closure
+        // from being called once this returns.
+        let erased: *const (dyn Fn() + Sync + 'static) =
+            unsafe { std::mem::transmute(std::ptr::from_ref::<dyn Fn() + Sync + '_>(work)) };
+        let job = Arc::new(Job {
+            work: erased,
+            running: AtomicUsize::new(0),
+            closed: AtomicBool::new(false),
+            panicked: AtomicBool::new(false),
+            idle: (Mutex::new(()), Condvar::new()),
+        });
+        {
+            let mut jobs = JOBS.lock().unwrap_or_else(|e| e.into_inner());
+            jobs.extend(std::iter::repeat_n(job.clone(), others.min(KEPT)));
+        }
+        MORE.notify_all();
+        let close = Close(&job);
         work();
-    });
+        drop(close);
+        assert!(!job.panicked.load(Ordering::Relaxed), "a helper thread panicked");
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+        use super::super::in_parallel;
+
+        /// Every piece is done once, call after call on the same threads.
+        #[test]
+        fn kept_threads_do_every_piece_once() {
+            let list: Vec<u64> = (0..10_000).collect();
+            for _ in 0..500 {
+                let (sum, pieces) = (AtomicU64::new(0), AtomicUsize::new(0));
+                in_parallel(&list, 16, |piece| {
+                    sum.fetch_add(piece.iter().sum::<u64>(), Ordering::Relaxed);
+                    pieces.fetch_add(piece.len(), Ordering::Relaxed);
+                });
+                assert_eq!(sum.load(Ordering::Relaxed), 10_000 * 9_999 / 2);
+                assert_eq!(pieces.load(Ordering::Relaxed), list.len());
+            }
+        }
+
+        /// A call from inside a piece returns although every kept thread is
+        /// busy with the outer call.
+        #[test]
+        fn a_call_from_inside_a_piece_returns() {
+            let outer: Vec<u32> = (0..64).collect();
+            let done = AtomicUsize::new(0);
+            in_parallel(&outer, 1, |piece| {
+                for _ in piece {
+                    let inner: Vec<u32> = (0..64).collect();
+                    in_parallel(&inner, 1, |piece| {
+                        done.fetch_add(piece.len(), Ordering::Relaxed);
+                    });
+                }
+            });
+            assert_eq!(done.load(Ordering::Relaxed), 64 * 64);
+        }
+
+        /// A panic on a kept thread reaches the caller, and the threads go on.
+        #[test]
+        fn a_panic_in_a_piece_reaches_the_caller() {
+            let list: Vec<u32> = (0..4096).collect();
+            let caught = std::panic::catch_unwind(|| {
+                in_parallel(&list, 1, |piece| {
+                    assert!(!piece.contains(&4000), "meant");
+                });
+            });
+            assert!(caught.is_err());
+            let done = AtomicUsize::new(0);
+            in_parallel(&list, 1, |piece| {
+                done.fetch_add(piece.len(), Ordering::Relaxed);
+            });
+            assert_eq!(done.load(Ordering::Relaxed), list.len());
+        }
+    }
 }
 
 /// Brings `[from, from + len)` of a host copy up to date now.
