@@ -1024,11 +1024,17 @@ fn host_desc(desc: &ResourceDesc) -> Option<ResourceDesc> {
         d.format = family(d.format);
     }
     // The host refuses to create a resource flagged for unordered access whose
-    // format (and castable family) cannot be a UAV — e.g. B5G5R5A1_UNORM — even
-    // though the console allows it. Such a texture is made without the flag;
-    // its unordered views are then refused, the same as any other use the host
-    // does not take.
-    if d.flags & UNORDERED != 0 && !crate::host::uav_format(d.format) {
+    // format cannot be a typed UAV — e.g. B5G5R5A1_UNORM — even though the
+    // console allows it, unless it is made castable to one that can (the
+    // enhanced-barrier creation `make_texture` takes for colour textures).
+    // Such a texture is made without the flag; its unordered views are then
+    // refused, the same as any other use the host does not take.
+    if d.flags & UNORDERED != 0
+        && !crate::descriptor::host::typed_store(d.format)
+        && !castable(d.format)
+            .iter()
+            .any(|&f| crate::descriptor::host::typed_store(f))
+    {
         d.flags &= !UNORDERED;
     }
     Some(d)
@@ -1966,6 +1972,35 @@ mod tests {
         assert!(!bc1.contains(&70) && !bc1.contains(&98) && !bc1.contains(&17));
         assert!(castable(98).contains(&95) && castable(98).contains(&77));
         assert!(castable(53).contains(&56) && !castable(53).contains(&55));
+    }
+
+    /// The UAV flag a host texture is made with must be one the host can
+    /// legally create: the format itself, or a format it is made castable to,
+    /// must take a typed unordered view. A typeless colour texture (castable
+    /// to its typed member) keeps the flag; a format in a family with no such
+    /// member — the B5G5R5A1 case — loses it.
+    #[cfg(windows)]
+    #[test]
+    fn unordered_flag_follows_the_castable_route() {
+        if crate::host::host().is_none() {
+            return; // no host GPU here
+        }
+        let takes = |f: u32| {
+            crate::descriptor::host::typed_store(f)
+                || castable(f)
+                    .iter()
+                    .any(|&c| crate::descriptor::host::typed_store(c))
+        };
+        for &format in &[27u32, 28, 29, 86, 87, 10] {
+            let mut d = texture(4, 4, format, 1);
+            d.flags |= UNORDERED;
+            let made = host_desc(&d).unwrap();
+            assert_eq!(
+                made.flags & UNORDERED != 0,
+                takes(format),
+                "format {format}"
+            );
+        }
     }
 
     #[test]

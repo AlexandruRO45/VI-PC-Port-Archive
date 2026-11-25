@@ -4,7 +4,6 @@
 //! shortcut: every submission is waited for, so CPU and GPU never overlap;
 //! overlap them with per-submission fences once more than clears run.
 
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -680,43 +679,6 @@ struct Deferred {
     /// shaders read title memory with no copy (`crate::memory`); then what
     /// they wrote through views does not go back either.
     missed: Vec<Box<dyn Fn() -> bool + Send>>,
-}
-
-/// Whether the host device accepts `format` as a typed unordered-access view.
-/// A resource flagged `ALLOW_UNORDERED_ACCESS` whose format (and its castable
-/// family) cannot be a UAV is refused at creation on PC even though the
-/// console allows it, so such textures are made without the flag. Cached per
-/// format.
-pub(crate) fn uav_format(format: u32) -> bool {
-    static CACHE: OnceLock<Mutex<HashMap<u32, bool>>> = OnceLock::new();
-    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Some(&v) = cache.lock().unwrap_or_else(|e| e.into_inner()).get(&format) {
-        return v;
-    }
-    let v = host().is_some_and(|h| {
-        let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
-            Format: DXGI_FORMAT(format as i32),
-            ..Default::default()
-        };
-        // SAFETY: the query writes its own structure of the given size.
-        let ok = unsafe {
-            h.device
-                .CheckFeatureSupport(
-                    D3D12_FEATURE_FORMAT_SUPPORT,
-                    (&raw mut support).cast(),
-                    size_of_val(&support) as u32,
-                )
-                .is_ok()
-        };
-        const UAV: u32 = D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD.0 as u32
-            | D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE.0 as u32;
-        ok && (support.Support2.0 as u32) & UAV != 0
-    });
-    cache
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(format, v);
-    v
 }
 
 impl Host {
