@@ -6,7 +6,7 @@ files the user supplies. This fork follows upstream
 `main` and adds fixes aimed at one goal: getting the game's world to render
 correctly and playably on one particular PC.
 
-Refer to (CONTRIBUTING.md)[https://github.com/fxceless/victory-fork//main/CONTRIBUTING.md] for contributions including code and testing.
+Refer to (CONTRIBUTING.md)[https://github.com/fxceless/victory-fork/tree/main/CONTRIBUTING.md] for contributions including code and testing.
 
 
 **This repository contains no game files, code or assets.** You need your own
