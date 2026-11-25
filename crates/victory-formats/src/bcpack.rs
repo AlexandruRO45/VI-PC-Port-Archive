@@ -1605,4 +1605,106 @@ mod tests {
             assert!(ok, "entry {k}: {:?}", ix.ix);
         }
     }
+
+    /// `pick` indexes the dictionary with `r - i - 1`, where `r` comes from a
+    /// byte of the record and `i` is the block number. Nothing bounds it:
+    /// a 255-entry dictionary is exactly what the largest reachable index
+    /// (254, from `r = 255, i = 0`) needs, and shrinking `DICTIONARY` by one
+    /// would panic on the first block that reached it.
+    ///
+    /// The reachable range is pinned here, and the dictionary is the length
+    /// the format says it is.
+    #[test]
+    fn the_dictionary_covers_every_reference_a_record_can_name() {
+        // The largest a byte can hold, which is what `references` hands back.
+        let largest = usize::from(u8::MAX);
+        // Block 0 reaching furthest back: `r - i - 1` with `i = 0`.
+        let deepest = largest - 1;
+        assert!(
+            deepest < DICTIONARY,
+            "a reference of {largest} at block 0 wants dictionary[{deepest}], \
+             but DICTIONARY is {DICTIONARY}"
+        );
+        // And the tables build one entry per slot.
+        let t = Tables::parse(&tables()).unwrap();
+        assert_eq!(
+            t.bc7.len(),
+            DICTIONARY,
+            "the BC7 dictionary is {} entries, DICTIONARY says {DICTIONARY}",
+            t.bc7.len()
+        );
+    }
+
+    /// Every BC number `decode` accepts has a block size, and a `dst` that is
+    /// not a whole number of blocks is refused before any block is written.
+    ///
+    /// The check is `dst.is_empty() || !dst.len().is_multiple_of(block)`, so a
+    /// destination one byte short or one byte long is an error rather than a
+    /// partial write — worth holding, because the write below uses
+    /// `chunks_exact_mut` and a wrong block size there would silently leave
+    /// the tail of `dst` untouched instead of failing.
+    #[test]
+    fn a_destination_that_is_not_whole_blocks_is_refused() {
+        let t = Tables::parse(&tables()).unwrap();
+        let src = vec![0u8; 4096];
+        for (bc, block) in [(1u8, 8usize), (4, 8), (3, 16), (5, 16), (6, 16), (7, 16)] {
+            for blocks in [0usize, 1, 2, 5] {
+                let mut dst = vec![0u8; blocks * block];
+                // Whole blocks: accepted (the stream may still be short, which
+                // is a different error, so only accept the destination and
+                // let the decoder say what it wants about the stream).
+                if blocks > 0 {
+                    let _ = decode(bc, &src, &mut dst, &t);
+                }
+                // One byte short and one byte long: refused for the length.
+                for off in [-1isize, 1] {
+                    let len = (blocks * block) as isize + off;
+                    if len < 0 {
+                        continue;
+                    }
+                    let mut bad = vec![0u8; len as usize];
+                    let err = decode(bc, &src, &mut bad, &t);
+                    assert!(
+                        matches!(&err, Err(e) if e.0.contains("whole number of blocks")),
+                        "bc{bc} with {} bytes ({blocks} blocks of {block}): {err:?}",
+                        bad.len()
+                    );
+                }
+            }
+        }
+        // An empty destination is refused too, rather than decoded as zero blocks.
+        let mut empty: Vec<u8> = Vec::new();
+        assert!(decode(7, &src, &mut empty, &t).is_err());
+        // And a BC number outside the set has no block size at all.
+        for bc in [0u8, 2, 8, 9, 255] {
+            let mut dst = vec![0u8; 16];
+            let err = decode(bc, &src, &mut dst, &t);
+            assert!(
+                matches!(&err, Err(e) if e.0.contains("unsupported BC format")),
+                "bc{bc}: {err:?}"
+            );
+        }
+    }
+
+    /// Every byte value as a whole stream: the decoder answers an error or a
+    /// decoded block, and never panics.
+    ///
+    /// `noise_never_panics` walks pseudo-random streams of many lengths; the
+    /// degenerate ones — all zeros, all ones — are the shapes a real chunk
+    /// starts from and are cheap to cover exhaustively.
+    #[test]
+    fn the_degenerate_streams_never_panic() {
+        let t = Tables::parse(&tables()).unwrap();
+        for fill in [0x00u8, 0xFF, 0xAA, 0x55] {
+            for len in [1usize, 8, 16, 31, 32, 33, 64, 128, 256] {
+                let src = vec![fill; len];
+                for (bc, block) in [(1u8, 8usize), (4, 8), (3, 16), (5, 16), (6, 16), (7, 16)] {
+                    for blocks in [1usize, 4] {
+                        let mut dst = vec![0u8; blocks * block];
+                        let _ = decode(bc, &src, &mut dst, &t);
+                    }
+                }
+            }
+        }
+    }
 }
