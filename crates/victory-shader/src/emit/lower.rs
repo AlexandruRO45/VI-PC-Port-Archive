@@ -95,10 +95,15 @@ enum Stop {
     Fail(ShaderError),
 }
 
+#[cfg(any(test, all(windows, feature = "host")))]
 pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
+    lower_with_limit(parts, super::HEAP_VIEWS)
+}
+
+pub(crate) fn lower_with_limit(parts: &Parts, view_limit: u32) -> Result<Lowered, ShaderError> {
     let mut bad = HashMap::new();
     loop {
-        match Lower::new(parts, &bad).run() {
+        match Lower::new(parts, &bad, view_limit).run() {
             Ok(l) => return Ok(l),
             Err(Stop::Retry(v, why)) => {
                 if bad.insert(v, why).is_some() {
@@ -541,7 +546,7 @@ fn code_table_start(p: &crate::ir::Program, addresses: &[&crate::resource::Addre
 }
 
 impl<'a> Lower<'a> {
-    fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>) -> Self {
+    fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>, view_limit: u32) -> Self {
         let p = x.p;
         let mut phi_at = HashMap::new();
         for (b, block) in p.blocks.iter().enumerate() {
@@ -550,6 +555,7 @@ impl<'a> Lower<'a> {
             }
         }
         let mut s = Shader::new(x.native.stage == HwStage::Ps);
+        s.view_limit = view_limit;
         s.inputs = x.inputs.clone();
         s.outputs = x.outputs.clone();
         let insts = || p.blocks.iter().flat_map(|b| &b.insts);
@@ -5266,24 +5272,12 @@ impl<'a> Lower<'a> {
             Source::Phi { .. } => return Err(WHY),
             _ => self.lane_heap_index(src, false)?,
         };
-        let c = self.cur;
-        let four = self.s.m.i32(4);
-        let at = self.s.m.bin(c, Bin::Mul, index, four);
-        let table = self.s.root_srv_handle(VIEW_STRIDES);
-        let iu = self.s.m.undef(self.s.t.i32);
-        let mask = self.s.m.i8(1);
-        let r = self.s.op(
-            c,
-            "rawBufferLoad.f32",
-            Attr::ReadOnly,
-            self.s.t.res_ret,
-            139,
-            &[table, at, iu, mask, four],
-        );
-        let x = self.s.m.extract(c, r, 0);
-        let word = self.as_int(x);
-        let bits = self.s.m.i32(VIEW_STRIDE_BITS);
-        Ok(self.s.m.bin(c, Bin::And, word, bits))
+        let index = if self.s.view_limit == super::PORTABLE_VIEWS {
+            self.s.clamp_heap_index(self.cur, index, false)
+        } else {
+            index
+        };
+        Ok(self.stride_at(index))
     }
 
     /// The used-resource entry a descriptor loaded from a table falls in.
@@ -5549,20 +5543,12 @@ impl<'a> Lower<'a> {
             return index;
         }
         let c = self.cur;
-        let last = self.s.m.i32(super::HEAP_VIEWS - 1);
-        let over = self.s.m.cmp(c, pred::IUGT, index, last);
-        let index = self.s.m.select(c, over, last, index);
-        let four = self.s.m.i32(4);
-        let at = self.s.m.bin(c, Bin::Mul, index, four);
-        let table = self.s.root_srv_handle(VIEW_STRIDES);
-        let (iu, mask) = (self.s.m.undef(self.s.t.i32), self.s.m.i8(1));
-        let r = self.s.op(c, "rawBufferLoad.f32", Attr::ReadOnly, self.s.t.res_ret, 139, &[table, at, iu, mask, four]);
-        let x = self.s.m.extract(c, r, 0);
-        let stride = self.as_int(x);
+        let index = self.s.clamp_heap_index(c, index, false);
+        let stride = self.view_word(index);
         let zero = self.s.m.i32(0);
         let none = self.s.m.cmp(c, pred::EQ, stride, zero);
         // The null unordered access view sits just below the null SRV.
-        let null = super::NULL_BUFFER_VIEW - u32::from(props.0 & 0x1000 != 0);
+        let null = self.s.view_limit - 2 - u32::from(props.0 & 0x1000 != 0);
         let null = self.s.m.i32(null);
         self.s.m.select(c, none, null, index)
     }
