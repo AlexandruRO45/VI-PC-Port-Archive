@@ -1254,6 +1254,113 @@ impl<'a> Lower<'a> {
         }
         Ok(local_bits)
     }
+
+    /// `x` of lane `src` (in this lane's quad) through quad reads, whose
+    /// lane must be a constant.
+    pub(super) fn quad_pick(&mut self, x: V, src: V) -> V {
+        self.s.flags |= flags::WAVE_OPS;
+        let c = self.cur;
+        let three = self.s.m.i32(3);
+        let q = self.s.m.bin(c, Bin::And, src, three);
+        let mut r = x;
+        for n in 0..4 {
+            let kn = self.s.m.i32(n);
+            let read = self.s.op(
+                c,
+                "quadReadLaneAt.i32",
+                Attr::NoUnwind,
+                self.s.t.i32,
+                122,
+                &[x, kn],
+            );
+            let is = self.s.m.cmp(c, pred::EQ, q, kn);
+            r = self.s.m.select(c, is, read, r);
+        }
+        r
+    }
+
+    /// Whether a quad-local read must reach helper lanes: in a pixel program
+    /// every quad a triangle edge crosses has some (the console's whole-quad
+    /// mode runs them; discarded pixels stay helpers too), and only quad
+    /// reads see them on the host (wave reads give 0 from them on AMD: wrong
+    /// derivatives of computed values along every triangle edge).
+    pub(super) fn helpers_read(&self, quad: bool) -> bool {
+        quad && self.s.pixel
+    }
+
+    /// `v_readfirstlane_b32`'s result `first` of `own` in a pixel shader:
+    /// a helper lane takes its own value instead.
+    ///
+    /// On the console, whole-quad mode puts helper lanes in EXEC, so a
+    /// waterfall loop (read the first lane's value, run the lanes with that
+    /// value, take them out of EXEC) serves helper lanes too. On the host,
+    /// wave operations leave helper lanes out (DXIL before
+    /// `WaveOpsIncludeHelperLanes`): once only helper lanes are left in such
+    /// a loop, `WaveReadLaneFirst` reads no lane, no lane matches, and the
+    /// loop runs to [`LOOP_LIMIT`] in every such lane: draws of 0.3 to 1.3 s
+    /// each, then DEVICE_HUNG. With its own value a helper lane matches in
+    /// the first pass and leaves; what a helper lane computes only feeds
+    /// derivatives, and its stores are dropped.
+    pub(super) fn helper_reads_own(&mut self, own: V, first: V) -> V {
+        if !self.s.pixel {
+            return first;
+        }
+        let c = self.cur;
+        let helper = self
+            .s
+            .op(c, "isHelperLane.i1", Attr::ReadOnly, self.s.t.i1, 221, &[]);
+        self.s.m.select(c, helper, own, first)
+    }
+
+    pub(super) fn read_lane(&mut self, x: V, lane: V) -> V {
+        self.s.op(
+            self.cur,
+            "waveReadLaneAt.i32",
+            Attr::NoUnwind,
+            self.s.t.i32,
+            117,
+            &[x, lane],
+        )
+    }
+
+    /// Whether `src` is active under the current `EXEC` mask (`guard` for
+    /// straight-line narrowing, plus the host wave's live lanes for
+    /// branch-structurised control flow). Returns `None` for unguarded pixel
+    /// quad ops so WQM helper lanes remain active (`waveActiveBallot` excludes
+    /// helper lanes in DXIL).
+    pub(super) fn src_lane_active(&mut self, src: V, guard: Option<V>, mesh_quad: bool) -> Option<V> {
+        let c = self.cur;
+        if self.s.pixel {
+            let g = guard?;
+            let (one, zero) = (self.s.m.i32(1), self.s.m.i32(0));
+            let active_i32 = self.s.m.select(c, g, one, zero);
+            let picked = self.quad_pick(active_i32, src);
+            return Some(self.s.m.cmp(c, pred::NE, picked, zero));
+        }
+        let bit = guard.unwrap_or_else(|| self.s.m.bool(true));
+        let i32t = self.s.t.i32;
+        let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+        let ballot = self
+            .s
+            .op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[bit]);
+        self.s.flags |= flags::WAVE_OPS;
+        let (lo, hi) = (
+            self.s.m.extract(c, ballot, 0),
+            self.s.m.extract(c, ballot, 1),
+        );
+        let ballot_lane = if mesh_quad {
+            let host_lane = self
+                .s
+                .op(c, "waveGetLaneIndex", Attr::ReadOnly, i32t, 111, &[]);
+            let (not3, three) = (self.s.m.i32(!3), self.s.m.i32(3));
+            let base = self.s.m.bin(c, Bin::And, host_lane, not3);
+            let q = self.s.m.bin(c, Bin::And, src, three);
+            self.s.m.bin(c, Bin::Or, base, q)
+        } else {
+            src
+        };
+        Some(self.lane_bit_of(c, ballot_lane, lo, hi))
+    }
 }
 
 
