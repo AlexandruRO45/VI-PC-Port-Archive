@@ -185,11 +185,13 @@ mod device_type {
     /// not ours, ask the host.
     fn open(root: Key, sub: *const u16, out: *mut Key) -> Option<u32> {
         if root == oem() {
-            if !(sub.is_null() || is(sub, "")) {
-                return Some(FILE_NOT_FOUND);
-            }
+            // The host checks for somewhere to put the key before it looks
+            // at the path.
             if out.is_null() {
                 return Some(INVALID_PARAMETER);
+            }
+            if !(sub.is_null() || is(sub, "")) {
+                return Some(FILE_NOT_FOUND);
             }
             // SAFETY: checked non-null; the title passes room for a key.
             unsafe { out.write(oem()) };
@@ -372,6 +374,32 @@ mod device_type {
                     );
                     assert_eq!(RegCloseKey(again), SUCCESS);
                 }
+                assert_eq!(RegCloseKey(key), SUCCESS);
+            }
+        }
+
+        #[test]
+        fn nowhere_to_put_the_key_is_an_invalid_parameter() {
+            const KEY_READ: u32 = 0x2_0019;
+            let (missing, empty) = (w("NoSuchSubkey"), w(""));
+            let host_key = w(r"Software\Microsoft\Windows NT\CurrentVersion");
+            for (root, path) in [(oem(), w(KEY)), (std::ptr::null_mut(), host_key)] {
+                // Ours, then the host's for comparison.
+                let mut key = std::ptr::null_mut();
+                assert_eq!(RegOpenKeyW(LOCAL_MACHINE, path.as_ptr(), &mut key), SUCCESS);
+                assert!(root.is_null() || key == root);
+                let none = std::ptr::null_mut();
+                for sub in [missing.as_ptr(), empty.as_ptr(), std::ptr::null()] {
+                    assert_eq!(RegOpenKeyW(key, sub, none), INVALID_PARAMETER, "{sub:?}");
+                    assert_eq!(
+                        RegOpenKeyExW(key, sub, 0, KEY_READ, none),
+                        INVALID_PARAMETER,
+                        "{sub:?}"
+                    );
+                }
+                // With somewhere to put it, the path is looked at.
+                let mut sub = std::ptr::null_mut();
+                assert_eq!(RegOpenKeyW(key, missing.as_ptr(), &mut sub), FILE_NOT_FOUND);
                 assert_eq!(RegCloseKey(key), SUCCESS);
             }
         }
