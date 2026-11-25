@@ -168,13 +168,25 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
             ];
             let end = regs[end_reg as usize & 15] as usize;
             let start = ctx.Rax as usize;
-            if end > start && end - start < 2 << 30 {
+            if end <= start {
+                // The loop tests at its foot: it zeroes one line whatever the end is.
+                let line = start & !63;
+                if !writable(line, 64) {
+                    return 0; // the real instruction faults there too
+                }
+                // SAFETY: the 64-byte line is committed and writable.
+                unsafe { std::ptr::write_bytes(line as *mut u8, 0, 64) };
+                ctx.Rax = start.wrapping_add(64) as u64;
+            } else {
+                // A gigabyte at a time: a longer block (the title has heaps of more than
+                // two) goes on at the same instruction, as one cut short does below.
+                let stop = end.min(start.saturating_add(1 << 30));
                 // Region by region: a block may lie across several (the title's pages are
                 // mapped one view each), and one answer for all of it was a refusal, after
                 // which every 64-byte line took an exception of its own.
                 let mut at = start;
-                while at < end {
-                    let Some(to) = writable_to(at, end) else { break };
+                while at < stop {
+                    let Some(to) = writable_to(at, stop) else { break };
                     // SAFETY: committed and writable from `at` to `to`.
                     unsafe { std::ptr::write_bytes(at as *mut u8, 0, to - at) };
                     at = to;
@@ -184,13 +196,14 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
                 }
                 ZEROED.fetch_add((at - start) as u64, Relaxed);
                 if at < end {
-                    // What follows is not writable: the loop goes on there (the same
-                    // instruction again), where the real one faults too.
+                    // The rest of a long block, or what follows is not writable: the
+                    // loop goes on there (the same instruction again), where the real
+                    // one faults too.
                     ctx.Rax = at as u64;
                     return CONTINUE_EXECUTION;
                 }
+                ctx.Rax = end as u64;
             }
-            ctx.Rax = end as u64;
         }
         ConsoleOnly::Rdpru => {
             let mut v = 0i64;

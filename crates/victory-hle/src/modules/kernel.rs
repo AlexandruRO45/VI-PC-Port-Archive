@@ -63,8 +63,12 @@ pub extern "system" fn GetModuleFileNameA(module: *mut c_void, out: *mut u8, siz
     let Some(path) = title_path(module) else {
         return host::get_module_file_name_a(module, out, size);
     };
+    // In the code page the title's narrow file calls are decoded with, as
+    // the host gives its own modules' paths: a folder with a letter outside
+    // ASCII is not that folder in UTF-8.
+    let path = host::ansi(&path);
     // SAFETY: the title passes a buffer of `size` bytes.
-    copy_truncated(path.as_bytes(), unsafe {
+    copy_truncated(&path, unsafe {
         std::slice::from_raw_parts_mut(out, size as usize)
     })
 }
@@ -400,6 +404,23 @@ pub(crate) fn callers() -> String {
 mod host {
     use std::ffi::c_void;
 
+    /// `text` in the process's ANSI code page.
+    pub(super) fn ansi(text: &str) -> Vec<u8> {
+        use windows_sys::Win32::Globalization::{CP_ACP, WideCharToMultiByte};
+        let wide: Vec<u16> = text.encode_utf16().collect();
+        let Ok(len) = i32::try_from(wide.len()) else {
+            return text.as_bytes().to_vec();
+        };
+        let (none, unused) = (std::ptr::null(), std::ptr::null_mut());
+        // SAFETY: a sizing call, then a call with room for `n` bytes.
+        unsafe {
+            let n = WideCharToMultiByte(CP_ACP, 0, wide.as_ptr(), len, unused, 0, none, unused.cast());
+            let mut out = vec![0u8; usize::try_from(n).unwrap_or(0)];
+            WideCharToMultiByte(CP_ACP, 0, wide.as_ptr(), len, out.as_mut_ptr(), n, none, unused.cast());
+            out
+        }
+    }
+
     use windows_sys::Win32::Foundation::{FreeLibrary, SetLastError};
     use windows_sys::Win32::System::Diagnostics::Debug::RtlCaptureStackBackTrace;
     use windows_sys::Win32::System::LibraryLoader::{
@@ -535,6 +556,10 @@ mod host {
 mod host {
     use std::ffi::c_void;
 
+    pub(super) fn ansi(text: &str) -> Vec<u8> {
+        text.as_bytes().to_vec()
+    }
+
     pub(super) fn get_module_handle_w(_: *const u16) -> *mut c_void {
         std::ptr::null_mut()
     }
@@ -617,6 +642,32 @@ mod tests {
         let mut small = [0u8; 4];
         assert_eq!(GetModuleFileNameA(module, small.as_mut_ptr(), 4), 4);
         assert_eq!(&small, &[b'C', b':', b'\\', 0]);
+    }
+
+    /// The narrow path is in the ANSI code page: the host's narrow file
+    /// calls, which the title hands it back to, decode it to the wide one.
+    #[cfg(windows)]
+    #[test]
+    fn narrow_title_paths_are_in_the_ansi_code_page() {
+        use windows_sys::Win32::Globalization::{CP_ACP, MultiByteToWideChar};
+        let base = 0x7000_0001_0000;
+        let path = "C:\\Usu\u{e1}rios\\Jo\u{e3}o\\game.exe";
+        runtime::set_image_path(base, std::path::Path::new(path));
+        let mut buf = [0u8; 64];
+        let n = GetModuleFileNameA(base as *mut c_void, buf.as_mut_ptr(), buf.len() as u32);
+        assert_eq!(buf[n as usize], 0);
+        let mut back = [0u16; 64];
+        // SAFETY: `n` bytes in, room for 64 units out.
+        let units = unsafe {
+            MultiByteToWideChar(CP_ACP, 0, buf.as_ptr(), n as i32, back.as_mut_ptr(), 64)
+        };
+        let back = String::from_utf16_lossy(&back[..units as usize]);
+        // A code page without these letters gives its nearest ones, which
+        // UTF-8 bytes read in that code page never are.
+        assert_eq!(back.chars().count(), path.chars().count());
+        if back != path {
+            assert!(back.starts_with("C:\\Usu") && back.ends_with("\\game.exe"), "{back}");
+        }
     }
 
     fn w(text: &str) -> Vec<u16> {

@@ -4550,6 +4550,11 @@ impl<'a> Lower<'a> {
             _ => None,
         };
         if name == "ds_swizzle_b32" {
+            // The two top modes rotate a row of lanes and reverse for an
+            // FFT; neither is a pick within a quad.
+            if offset >= 0xC000 {
+                return Err("a rotating or FFT swizzle");
+            }
             // Bit 15 set: each lane of a quad picks a lane of it; else lanes
             // of each group of 32 combine their index with and/or/xor masks.
             let quad = offset & 0x8000 != 0
@@ -5525,20 +5530,31 @@ impl<'a> Lower<'a> {
             }
             "s_lshl1_add_u32" | "s_lshl2_add_u32" | "s_lshl3_add_u32" | "s_lshl4_add_u32" => {
                 let (a, b) = (src32(self, 0)?, src32(self, 1)?);
-                let k = self.s.m.i32(u32::from(name.as_bytes()[6] - b'0'));
+                let n = u32::from(name.as_bytes()[6] - b'0');
+                let k = self.s.m.i32(n);
                 let t = self.s.m.bin(c, Bin::Shl, a, k);
-                (self.s.m.bin(c, Bin::Add, t, b), None)
+                let r = self.s.m.bin(c, Bin::Add, t, b);
+                // SCC: the carry out of the 64-bit sum, so a bit shifted
+                // out of the first operand counts as the low sum's does.
+                let (z, top) = (self.s.m.i32(0), self.s.m.i32(32 - n));
+                let out = self.s.m.bin(c, Bin::LShr, a, top);
+                let out = self.s.m.cmp(c, pred::NE, out, z);
+                let wrapped = self.s.m.cmp(c, pred::IULT, r, t);
+                (r, Some(self.s.m.bin(c, Bin::Or, out, wrapped)))
             }
             "s_min_u32" | "s_max_u32" | "s_min_i32" | "s_max_i32" => {
                 let (a, b) = (src32(self, 0)?, src32(self, 1)?);
+                // SCC: whether the first operand is the result (of equal
+                // operands the minimum is the second, the maximum the
+                // first).
                 let p = match name {
                     "s_min_u32" => pred::IULT,
-                    "s_max_u32" => pred::IUGT,
+                    "s_max_u32" => pred::IUGE,
                     "s_min_i32" => pred::SLT,
-                    _ => pred::SGT,
+                    _ => pred::SGE,
                 };
                 let t = self.s.m.cmp(c, p, a, b);
-                (self.s.m.select(c, t, a, b), None)
+                (self.s.m.select(c, t, a, b), Some(t))
             }
             "s_abs_i32" => {
                 let a = src32(self, 0)?;
@@ -9982,18 +9998,12 @@ impl<'a> Lower<'a> {
             let spatial = coords - usize::from(kind == 6 || kind == 7);
             // A cube's gradients are the two of its face coordinates.
             let grads = if kind == 5 { 2 } else { spatial };
-            let deriv_regs = if op == 63 {
-                if *a16 {
-                    grads.div_ceil(2)
-                } else {
-                    grads
-                }
-            } else {
-                0
-            };
+            // Whole dwords, with a16 too: 16-bit gradients have opcodes of
+            // their own (`_g16`), which are not lowered.
+            let deriv_regs = if op == 63 { grads } else { 0 };
             let coord_base = first + 2 * deriv_regs;
             let mut cs = vec![fu; 4];
-            // With a16, sampling coordinates, gradients, LOD and clamp are f16.
+            // With a16, sampling coordinates, LOD and clamp are f16.
             let to_float = |l: &mut Self, x: V| {
                 if *a16 {
                     let f = l.s.t.f32;
@@ -10221,8 +10231,8 @@ impl<'a> Lower<'a> {
                     for (axis, slot) in len.iter_mut().enumerate() {
                         let mut sum = self.s.m.f32(0);
                         for k in 0..2 {
-                            let x = addr_packed(self, first + axis * deriv_regs, k)?;
-                            let x = to_float(self, x);
+                            let x = addr_u32(self, first + axis * deriv_regs + k)?;
+                            let x = self.as_float(x);
                             let sq = self.s.m.bin(c, Bin::Mul, x, x);
                             sum = self.s.m.bin(c, Bin::Add, sum, sq);
                         }
@@ -10238,11 +10248,10 @@ impl<'a> Lower<'a> {
                     let width = self.s.m.extract(c, d, 0);
                     let width = self.s.m.cast(c, Cast::UiToFp, width, self.s.t.f32);
                     let texels = self.s.m.bin(c, Bin::Mul, longer, width);
-                    // log2 = natural logarithm / ln 2; a length of 0 gives
-                    // minus infinity, which the sampler clamps to level 0.
-                    let ln = self.unary(23, texels);
-                    let per_ln2 = self.s.m.f32(std::f32::consts::LOG2_E.to_bits());
-                    let lod = self.s.m.bin(c, Bin::Mul, ln, per_ln2);
+                    // The host's logarithm is to base 2 (as `v_log_f32`
+                    // uses it); a length of 0 gives minus infinity, which
+                    // the sampler clamps to level 0.
+                    let lod = self.unary(23, texels);
                     args.extend(&os);
                     args.push(lod);
                     call_sample(self, "sampleLevel.f32", 62, &args, &mut gathered)
@@ -10250,10 +10259,10 @@ impl<'a> Lower<'a> {
                 63 => {
                     let mut g = vec![fu; 6];
                     for k in 0..spatial {
-                        let x = addr_packed(self, first, k)?;
-                        g[k] = to_float(self, x);
-                        let y = addr_packed(self, first + deriv_regs, k)?;
-                        g[3 + k] = to_float(self, y);
+                        let x = addr_u32(self, first + k)?;
+                        g[k] = self.as_float(x);
+                        let y = addr_u32(self, first + deriv_regs + k)?;
+                        g[3 + k] = self.as_float(y);
                     }
                     args.extend(&os);
                     args.extend(g);

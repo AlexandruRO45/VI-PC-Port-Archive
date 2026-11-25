@@ -117,7 +117,7 @@ pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_ADDRESSES, SLOT_FAULTS, SLOT_MEMORY,
     SLOT_STRIDES, SLOT_STRIDES_COUNT, SLOT_STRIDES_DWORDS, USER_DATA_SPACE, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
-    set_view_heap_limit,
+    set_view_heap_limit, view_heap_limit,
 };
 
 /// The loop limit without an override: 2^20.
@@ -753,7 +753,9 @@ fn signature(part: &[u8]) -> Result<Vec<container::SigElement>, ShaderError> {
     use crate::dxbc::u32_at;
     let count = u32_at(part, 0)? as usize;
     let base = u32_at(part, 4)? as usize;
-    let mut out = Vec::with_capacity(count);
+    // A count the part cannot hold is found out row by row below; room is
+    // set aside for the rows it can.
+    let mut out = Vec::with_capacity(count.min(part.len() / 32));
     for i in 0..count {
         let at = base + 32 * i;
         let name_at = u32_at(part, at + 4)? as usize;
@@ -764,6 +766,9 @@ fn signature(part: &[u8]) -> Result<Vec<container::SigElement>, ShaderError> {
         let mask = *part
             .get(at + 24)
             .ok_or(ShaderError::Malformed("truncated"))?;
+        if mask & 0xF0 != 0 {
+            return Err(ShaderError::Malformed("a signature mask past four components"));
+        }
         if u32_at(part, at + 28)? != 0 {
             return Err(ShaderError::Unsupported {
                 offset: 0,
@@ -855,6 +860,21 @@ mod tests {
         assert_eq!(parse_shader_opt(Some("0x1")), 1);
         assert_eq!(parse_shader_opt(Some("0xffffffff")), all);
         assert_eq!(parse_shader_opt(Some("on")), all);
+    }
+
+    #[test]
+    fn the_wave_wide_form_is_allowed_only_inside_with_wave_wide() {
+        assert!(!super::WIDE_HERE.with(|w| w.get()));
+        let inner = super::with_wave_wide(|| {
+            let nested = super::with_wave_wide(|| super::WIDE_HERE.with(|w| w.get()));
+            (nested, super::WIDE_HERE.with(|w| w.get()))
+        });
+        assert_eq!(inner, (true, true));
+        assert!(!super::WIDE_HERE.with(|w| w.get()));
+        // (a translator panic, which the shader cache catches, leaves it off too)
+        let panicked = std::panic::catch_unwind(|| super::with_wave_wide(|| panic!("translator")));
+        assert!(panicked.is_err());
+        assert!(!super::WIDE_HERE.with(|w| w.get()));
     }
 
     #[test]

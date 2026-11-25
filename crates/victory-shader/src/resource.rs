@@ -653,12 +653,24 @@ impl<'a> Tracer<'a> {
             dynamic: Some(v),
         };
         if let Some(reg) = self.inputs[v.0 as usize] {
+            // A parameter's first dword is a base where the parameter is an
+            // address; a root constant is a computed term in any dword.
             return match self.param_of(reg) {
-                Some((_, 0)) => Sum {
-                    base: Some(v),
-                    offset: 0,
-                    dynamic: None,
-                },
+                Some((param, 0))
+                    if matches!(
+                        self.layout[param].root,
+                        RootType::Table
+                            | RootType::ResourceHeap
+                            | RootType::SamplerHeap
+                            | RootType::Descriptor
+                    ) =>
+                {
+                    Sum {
+                        base: Some(v),
+                        offset: 0,
+                        dynamic: None,
+                    }
+                }
                 _ => dynamic,
             };
         }
@@ -2532,6 +2544,36 @@ pub(crate) mod tests {
         );
         let nonconstant = track_words(&code, &[param(Table, 6, 1), table], HwStage::Ms);
         assert!(nonconstant.root_indexed_views.is_empty());
+    }
+
+    #[test]
+    fn a_root_constant_in_its_first_dword_is_an_offset_not_a_base() {
+        // As above, with the constant itself as the offset register.
+        let code = [
+            0xBE93_0380, // s_mov_b32 s19, 0
+            0xF408_0209,
+            0x1C00_0000, // s_load_dwordx4 s[8:11], s[18:19], s14
+            0xE000_2000,
+            0x8002_0400, // buffer_load_format_x v4, v0, s[8:11], 0 idxen
+            S_ENDPGM,
+        ];
+        let table = RootParam {
+            slot: 7,
+            ..param(Table, 10, 1)
+        };
+        let r = track_words(&code, &[param(Constants, 6, 1), table], HwStage::Ms);
+        assert_eq!(r.scalar[0].1.param, 1);
+        assert!(r.scalar[0].1.dynamic.is_some());
+        assert_eq!(
+            r.root_indexed_views,
+            [RootIndexedView {
+                table_slot: 7,
+                constant_slot: 0,
+                constant_dword: 0,
+                byte_offset: 0,
+                shift: 0,
+            }]
+        );
     }
 
     #[test]

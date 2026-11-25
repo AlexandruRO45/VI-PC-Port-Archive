@@ -2351,3 +2351,75 @@ fn scalar_sign_extension_preserves_scc() {
         );
     }
 }
+
+#[test]
+fn scalar_min_max_set_scc_when_the_first_operand_is_the_result() {
+    let cases = [
+        [5, 3, 0, 0],
+        [3, 5, 0, 0],
+        [0, 0, 0, 0],
+        [7, 7, 0, 0],
+        [0x8000_0000, 1, 0, 0],
+        [1, 0x8000_0000, 0, 0],
+        [u32::MAX, u32::MAX, 0, 0],
+    ];
+    // s_min_i32, s_min_u32, s_max_i32, s_max_u32.
+    for (opcode, signed, max) in [
+        (0x06, true, false),
+        (0x07, false, false),
+        (0x08, true, true),
+        (0x09, false, true),
+    ] {
+        // The result in s6, complemented on SCC=0.
+        let shader = build_valu_cs(&[
+            sop2(opcode, 6, 0, 1),
+            sop2(0x0a, 7, 128, 193),
+            sop2(0x12, 7, 6, 7),
+            vop1(0x001, 0, sgpr(7)),
+        ]);
+        run_cases(&shader, &cases, |backend, _, [a, b, ..], got| {
+            let less = if signed { (a as i32) < (b as i32) } else { a < b };
+            // Of equal operands the minimum is the second, the maximum the first.
+            let first = if max { !less } else { less };
+            let result = if first { a } else { b };
+            assert_eq!(
+                got,
+                if first { result } else { !result },
+                "{backend}: opcode {opcode:#x} of {a:#x} and {b:#x}"
+            );
+        });
+    }
+}
+
+#[test]
+fn scalar_shift_adds_set_scc_to_the_carry_of_the_wide_sum() {
+    let cases = [
+        [0, 0, 0, 0],
+        [1, 1, 0, 0],
+        [0x8000_0000, 0, 0, 0],
+        [0x4000_0000, 0xc000_0000, 0, 0],
+        [0x1000_0000, 5, 0, 0],
+        [0x0fff_ffff, 0x10, 0, 0],
+        [0x7fff_ffff, 1, 0, 0],
+        [u32::MAX, u32::MAX, 0, 0],
+    ];
+    // s_lshl1_add_u32 .. s_lshl4_add_u32.
+    for shift in 1..=4u8 {
+        // The result in s6, complemented on SCC=0.
+        let shader = build_valu_cs(&[
+            sop2(0x2d + shift, 6, 0, 1),
+            sop2(0x0a, 7, 128, 193),
+            sop2(0x12, 7, 6, 7),
+            vop1(0x001, 0, sgpr(7)),
+        ]);
+        run_cases(&shader, &cases, |backend, _, [a, b, ..], got| {
+            let wide = (u64::from(a) << shift) + u64::from(b);
+            let result = wide as u32;
+            assert_eq!(
+                got,
+                if wide >> 32 != 0 { result } else { !result },
+                "{backend}: shift {shift} of {a:#x} and {b:#x}"
+            );
+        });
+    }
+}

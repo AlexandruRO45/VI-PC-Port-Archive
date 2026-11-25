@@ -7,11 +7,13 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use victory_hle::{HleResolver, HostPolicy};
 use victory_loader::Provenance;
-use victory_pe::{ImageInfo, ImportSymbol};
+use victory_pe::ImageInfo;
 
 #[derive(Default)]
 struct DllStats {
-    functions: BTreeSet<ImportSymbol>,
+    /// By name or ordinal: the hint beside a name differs between images
+    /// built against other import libraries, and is not another function.
+    functions: BTreeSet<String>,
     hle: usize,
     host: usize,
     missing: usize,
@@ -64,7 +66,7 @@ pub fn run(paths: Vec<PathBuf>, strict: bool, list_missing: bool) -> Result<()> 
                             .insert(path.to_path_buf());
                     }
                     // Count each dll!function once across all images.
-                    if stats.functions.insert(e.symbol.clone()) {
+                    if stats.functions.insert(e.symbol.to_string()) {
                         match class {
                             Some(Provenance::Hle) => stats.hle += 1,
                             Some(Provenance::Host) => stats.host += 1,

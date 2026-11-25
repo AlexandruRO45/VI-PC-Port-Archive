@@ -772,9 +772,55 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     true
 }
 
+/// Makes one placeholder of those `[base, base + len)` lies in. Views
+/// unmapped earlier leave the reservation cut where they began and ended,
+/// and the host splits and replaces a placeholder only within one: a range
+/// that crosses such a cut (pages mapped in other runs than before) could
+/// not be mapped. Does nothing where a view is still mapped in between;
+/// the mapping then fails as it did.
+fn join_placeholders(base: usize, len: usize) {
+    /// `VirtualFree`'s flag for it (`winnt.h`; not among the bindings').
+    const MEM_COALESCE_PLACEHOLDERS: u32 = 1;
+    let query = |at: usize| {
+        // SAFETY: plain data, filled by the query of our own process.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: an out structure of the size passed.
+        let n = unsafe {
+            VirtualQueryEx(
+                GetCurrentProcess(),
+                at as *const c_void,
+                &mut info,
+                size_of::<MEMORY_BASIC_INFORMATION>(),
+            )
+        };
+        (n != 0).then_some(info)
+    };
+    if len == 0 {
+        return;
+    }
+    let (Some(first), Some(last)) = (query(base), query(base + len - 1)) else {
+        return;
+    };
+    // Each placeholder is an allocation of its own.
+    if first.AllocationBase == last.AllocationBase {
+        return;
+    }
+    let start = first.AllocationBase as usize;
+    let end = last.BaseAddress as usize + last.RegionSize;
+    // SAFETY: acts only on whole adjacent placeholders, and fails otherwise.
+    unsafe {
+        VirtualFree(
+            start as *mut c_void,
+            end - start,
+            MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS,
+        )
+    };
+}
+
 /// Maps `slice` and the slices after it over `[base, base + len)`, which
-/// must lie in one placeholder.
+/// must lie in placeholders.
 fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
+    join_placeholders(base, len);
     // SAFETY: splits the placeholder around the range (failing harmlessly
     // when the range is the whole placeholder), then maps the section
     // there; both act only on placeholders.
@@ -1288,6 +1334,56 @@ mod tests {
         assert!(!map_alias(b as u64, at(a, 1) as u64, PAGE as u64));
         assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
         assert_eq!(XMemIsToolsMemAvailable(), 0);
+    }
+
+    /// Views that were unmapped leave the reservation in placeholders cut
+    /// where they ended; pages mapped later in other runs cross the cuts.
+    #[test]
+    fn pages_map_across_the_placeholders_earlier_views_left() {
+        let mut pages = [0usize; 4];
+        let mut n = 4;
+        assert_eq!(XMemAllocatePhysicalPages(0, &mut n, pages.as_mut_ptr()), 1);
+        assert_eq!(n, 4);
+        let p = XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            4 * PAGE,
+            MEM_RESERVE | PAGES_64K,
+            0,
+            PAGE_READWRITE,
+        );
+        assert!(!p.is_null());
+        let at = |page: usize| p.wrapping_byte_add(page * PAGE);
+        let none = std::ptr::null();
+
+        // Two pages and back: a placeholder of two pages, then the rest.
+        assert_eq!(XMemMapPhysicalPages(p, 2, pages.as_ptr()), p);
+        assert_eq!(XMemMapPhysicalPages(p, 2, none), p);
+        // All four cross that cut.
+        assert_eq!(XMemMapPhysicalPages(p, 4, pages.as_ptr()), p);
+        // SAFETY: mapped read-write.
+        unsafe {
+            at(3).cast::<u8>().write(5);
+            assert_eq!(at(3).cast::<u8>().read(), 5);
+        }
+        assert_eq!(XMemMapPhysicalPages(p, 4, none), p);
+
+        // One view per page (no two in the order of their section), and
+        // back: four placeholders. Then other runs over them.
+        let mixed = [pages[1], pages[0], pages[3], pages[2]];
+        assert_eq!(XMemMapPhysicalPages(p, 4, mixed.as_ptr()), p);
+        assert_eq!(XMemMapPhysicalPages(p, 4, none), p);
+        assert_eq!(XMemMapPhysicalPages(at(1), 3, pages.as_ptr()), at(1));
+        // SAFETY: mapped read-write.
+        unsafe {
+            at(1).cast::<u8>().write(6);
+            at(3).cast::<u8>().write(8);
+            assert_eq!(at(1).cast::<u8>().read(), 6);
+            assert_eq!(at(3).cast::<u8>().read(), 8);
+        }
+        assert_eq!(query(p).host.State, MEM_RESERVE);
+        assert_eq!(query(at(1)).host.State, MEM_COMMIT);
+        assert_eq!(XMemMapPhysicalPages(at(1), 3, none), at(1));
+        assert_eq!(XMemFreePhysicalPages(4, pages.as_ptr()), 1);
     }
 
     /// A thread that reads a mapped page in place, as the GPU side reads a
