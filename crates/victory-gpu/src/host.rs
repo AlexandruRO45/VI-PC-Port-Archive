@@ -8,7 +8,7 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WAIT_FAILED, WAIT_OBJECT_0, WPARAM};
 use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -5476,19 +5476,23 @@ impl Host {
             unsafe {
                 self.queue.ExecuteCommandLists(group);
                 self.card_sent();
-                let waited = self
-                    .queue
-                    .Signal(&self.fence, *submitted)
-                    .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
-                match waited {
-                    Ok(()) => {
-                        working(false);
-                        WaitForSingleObject(self.event, INFINITE);
-                        stood(started);
-                        working(true);
-                    }
-                    Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
+                if let Err(e) = self.queue.Signal(&self.fence, *submitted) {
+                    fail(format_args!("could not signal a synchronous host submission ({e})"));
                 }
+                if let Err(e) = self.fence.SetEventOnCompletion(*submitted, self.event) {
+                    fail(format_args!("could not register a synchronous host fence wait ({e})"));
+                }
+                working(false);
+                match WaitForSingleObject(self.event, INFINITE) {
+                    WAIT_OBJECT_0 => {}
+                    WAIT_FAILED => {
+                        let error = windows::core::Error::from_thread();
+                        fail(format_args!("could not wait for a synchronous host submission ({error})"));
+                    }
+                    status => fail(format_args!("unexpected synchronous host fence wait result ({:#x})", status.0)),
+                }
+                stood(started);
+                working(true);
             }
             // With timing on each group is one of `runs` (and the compare
             // of copies in the card's memory, with the last): every
@@ -5517,8 +5521,6 @@ impl Host {
             let _ = (i, started);
         }
         let _ = &firsts;
-        FINISHED.store(this_submission, Ordering::Release);
-        bury(this_submission);
         let gpu = prepared.elapsed();
         submission_us(0, (prepared - started).as_micros() as u64);
         submission_us(1, gpu.as_micros() as u64);
@@ -5548,6 +5550,8 @@ impl Host {
                 last_notes(runs)
             ));
         }
+        FINISHED.store(this_submission, Ordering::Release);
+        bury(this_submission);
         submitting(3, runs.len());
         // What shaders wrote goes back before the bottom-of-pipe writes,
         // which tell the title the GPU is done; each range once per
