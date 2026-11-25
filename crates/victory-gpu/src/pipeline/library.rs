@@ -596,6 +596,34 @@ mod tests {
     }
 
     #[test]
+    fn warp_device_uses_its_dxgi_adapter() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
+
+        // SAFETY: the factory and adapter stay live while creating the device.
+        let (adapter, device) = unsafe {
+            let Ok(factory): windows::core::Result<IDXGIFactory4> =
+                CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))
+            else {
+                return;
+            };
+            let Ok(adapter) = factory.EnumWarpAdapter::<IDXGIAdapter1>() else {
+                return;
+            };
+            let mut device: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).is_err() {
+                return;
+            }
+            (adapter, device.unwrap())
+        };
+
+        let actual = device_adapter(&device).expect("WARP device adapter metadata");
+        // SAFETY: query the live adapter used to create the device.
+        let expected = unsafe { adapter.GetDesc1() }.unwrap();
+        assert_eq!(actual.AdapterLuid, expected.AdapterLuid);
+        assert_ne!(actual.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32, 0);
+    }
+
+    #[test]
     #[ignore = "creates devices on every DXGI adapter, including physical GPUs"]
     fn each_d3d12_device_uses_its_own_dxgi_adapter() {
         use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
