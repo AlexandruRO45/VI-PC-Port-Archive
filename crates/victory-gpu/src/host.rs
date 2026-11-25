@@ -215,7 +215,6 @@ fn create() -> windows::core::Result<Host> {
         // Diagnostics: the software adapter, on which a shader's wild access
         // is an access violation in this process (a crash report with the
         // address and instruction) instead of a GPU fault and driver reset.
-        
         let warp = if cfg!(feature = "diagnostics") && crate::switch::on("VICTORY_D3D12_WARP") {
             Some(warp_adapter()?)
         } else {
