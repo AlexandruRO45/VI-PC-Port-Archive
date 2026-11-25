@@ -16,11 +16,14 @@ from time import monotonic, sleep
 
 from .dxil_store import DxilStore, write_identity
 from .inspect import digest
+from .shader_diagnostics import refusal_line
 from .shader_prep import SOURCE_CACHE, ToolFailure, compiler_tools, run_tool
 
 
 MAX_SHADER_BYTES = 64 << 20
 XSHADER_UNSUPPORTED_HLSL = 65
+# The emitter's one-line refusal reason kept beside an .unsupported marker.
+REASON_BYTES = 512
 SOURCE_KEY = r"[a-f0-9]{64}"
 STENCIL_KEY = SOURCE_KEY + r"_rt[0-7]"
 LINK_KEY = "_".join([SOURCE_KEY] * 3)
@@ -28,9 +31,15 @@ REQUEST_PATTERNS = {".link": LINK_KEY, ".stencil": STENCIL_KEY, ".dxbc": SOURCE_
 
 
 class ShaderRefused(ValueError):
-    def __init__(self, message, *, cached):
+    def __init__(self, message, *, cached, remembered=False):
         super().__init__(message)
         self.cached = cached
+        # A cached refusal whose emitter reason was kept beside its marker.
+        self.remembered = remembered
+
+    @property
+    def reason_known(self):
+        return not self.cached or self.remembered
 
 
 def bounded_shader(path):
@@ -113,6 +122,22 @@ def exact_marker(path, expected):
                     and stream.read(len(expected) + 1) == expected)
     except OSError:
         return False
+
+
+def remembered_reason(path):
+    """The refusal reason saved with a marker, or None for caches that predate it."""
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        with os.fdopen(os.open(path, flags), "rb") as stream:
+            info = os.fstat(stream.fileno())
+            if not stat.S_ISREG(info.st_mode) or info.st_size > REASON_BYTES:
+                return None
+            data = stream.read(REASON_BYTES + 1)
+    except OSError:
+        return None
+    if len(data) > REASON_BYTES:
+        return None
+    return data.decode("utf-8", errors="replace").strip() or None
 
 
 @contextmanager
@@ -261,6 +286,9 @@ def compile_request(source, key, tools, cache, session, *, remember=None):
                     os.replace(reply, session / dest.name)
                 return True
             if exact_marker(refusal, key.encode("ascii")):
+                reason = remembered_reason(dest.with_suffix(".reason"))
+                if reason:
+                    raise ShaderRefused(reason, cached=True, remembered=True)
                 raise ShaderRefused("cached unsupported HLSL translation", cached=True)
             return False
 
@@ -280,6 +308,10 @@ def compile_request(source, key, tools, cache, session, *, remember=None):
                 # input parsing, tool startup and filesystem failures remain retryable.
                 if error.returncode != XSHADER_UNSUPPORTED_HLSL:
                     raise
+                # Publish the reason first: a visible marker may already be read.
+                reason = work / "reason"
+                reason.write_bytes(refusal_line(str(error)).encode("utf-8")[:REASON_BYTES])
+                os.replace(reason, dest.with_suffix(".reason"))
                 marker = work / "unsupported"
                 marker.write_text(key, encoding="ascii")
                 os.replace(marker, refusal)

@@ -115,6 +115,8 @@ struct alignas(16) WrapperOwn {
     Wrapper* list_device;    // CommandList: wrapper that created this list.
     Wrapper* signature_device; // CommandSignature: owner of the supported single-command shape
     IndirectCommand indirect_command;
+    ID3D12RootSignature* signature_root; // CommandSignature: desktop root of a Dispatch with root constants, or null
+    UINT indirect_bytes; // CommandSignature: bytes one command reads (root constants plus the Dispatch record)
     IndirectGraphicsPipeline indirect_graphics;
     UINT list_node_mask;
 };
@@ -928,6 +930,24 @@ u64 __stdcall device_create_command_signature(Wrapper* self, const D3D12_COMMAND
         return S_OK;
     }
     const u64 result = create_slot<device_kind, 41, 2>(self, reinterpret_cast<u64>(desc), root, iid, out, 0, 0, 0, 0);
+    if (SUCCEEDED(static_cast<HRESULT>(result)) && out && desc && root && desc->NumArgumentDescs > 1) {
+        // A Dispatch preceded by root constants for the signature's root (#1759 part 2). Other root argument
+        // types (root views, vertex and index buffer views) and graphics commands remain unsupported here.
+        auto* signature = *reinterpret_cast<Wrapper**>(out);
+        UINT bytes = sizeof(D3D12_DISPATCH_ARGUMENTS);
+        bool constants_only = desc->pArgumentDescs[desc->NumArgumentDescs - 1].Type == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH;
+        for (UINT i = 0; constants_only && i + 1 < desc->NumArgumentDescs; ++i) {
+            constants_only = desc->pArgumentDescs[i].Type == D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT;
+            bytes += desc->pArgumentDescs[i].Constant.Num32BitValuesToSet * sizeof(UINT);
+        }
+        if (constants_only && desc->ByteStride == bytes && signature && signature->own().kind == command_signature_kind) {
+            auto& state = signature->own();
+            state.indirect_command = IndirectCommand::dispatch;
+            state.signature_root = reinterpret_cast<ID3D12RootSignature*>(unwrap(root));
+            state.indirect_bytes = bytes;
+            state.signature_device = self;
+        }
+    }
     if (SUCCEEDED(static_cast<HRESULT>(result)) && out && desc && !root && desc->NumArgumentDescs == 1) {
         auto* signature = *reinterpret_cast<Wrapper**>(out);
         if (signature && signature->own().kind == command_signature_kind) {
@@ -941,6 +961,7 @@ u64 __stdcall device_create_command_signature(Wrapper* self, const D3D12_COMMAND
                 state.indirect_command = IndirectCommand::draw_indexed;
             if (type == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH && desc->ByteStride == sizeof(D3D12_DISPATCH_MESH_ARGUMENTS))
                 state.indirect_command = IndirectCommand::dispatch_mesh;
+            state.indirect_bytes = desc->ByteStride;
             if (state.indirect_command != IndirectCommand::none) state.signature_device = self;
         }
     }
@@ -1835,7 +1856,7 @@ std::size_t readable_window(u64 address, std::size_t wanted)
 struct Pass {
     bool pipeline_real = false;      // the bound pipeline has a desktop pipeline
     bool compute_pipeline = false;
-    bool compute_root = false;
+    ID3D12RootSignature* compute_root = nullptr; // desktop compute root set by slot 33
     IndirectGraphicsPipeline indirect_graphics;
     ID3D12RootSignature* graphics_root = nullptr;
     bool targets_bound = false;
@@ -1956,8 +1977,9 @@ void __stdcall list_compute_root(Wrapper* self, void* root)
     if (!list) return;
     Wrapper* w = as_wrapper(root);
     Pass& pass = pass_of(self);
-    pass.compute_root = w && w->own().kind == root_signature_kind && w->own().real && !root_heap_flags(w);
-    if (pass.compute_root) list->SetComputeRootSignature(static_cast<ID3D12RootSignature*>(w->own().real));
+    const bool real = w && w->own().kind == root_signature_kind && w->own().real && !root_heap_flags(w);
+    pass.compute_root = real ? static_cast<ID3D12RootSignature*>(w->own().real) : nullptr;
+    if (pass.compute_root) list->SetComputeRootSignature(pass.compute_root);
 }
 
 // The guest method has independent resource and byte-offset arguments.
@@ -1979,13 +2001,13 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
         return refuse("missing or placeholder signature");
     const Wrapper* device = self->own().list_device;
     if (!device || sig->own().signature_device != device)
-        return refuse("requires a supported single rootless signature from this device");
+        return refuse("requires a supported signature from this device");
     const auto command = sig->own().indirect_command;
     const bool indexed = command == IndirectCommand::draw_indexed;
     const bool mesh = command == IndirectCommand::dispatch_mesh;
     const bool graphics = indexed || mesh || command == IndirectCommand::draw;
     Pass& pass = pass_of(self);
-    u64 bytes = sizeof(D3D12_DISPATCH_ARGUMENTS);
+    u64 bytes = sig->own().indirect_bytes;
     if (graphics) {
         if (indexed) bytes = sizeof(D3D12_DRAW_INDEXED_ARGUMENTS);
         else if (mesh) bytes = sizeof(D3D12_DISPATCH_MESH_ARGUMENTS);
@@ -2004,6 +2026,8 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
             return refuse("draw requires a single-sample render target");
     } else if (!pass.compute_pipeline || !pass.compute_root) {
         return refuse("requires a desktop compute pipeline and root");
+    } else if (sig->own().signature_root && sig->own().signature_root != pass.compute_root) {
+        return refuse("signature root constants require the bound compute root");
     }
     Wrapper* buffer = as_wrapper(argument);
     if (!buffer || buffer->own().kind != resource_kind || !buffer->own().real)
@@ -2384,6 +2408,7 @@ extern SRWLOCK written_lock;
 struct TextureWrite {
     u64 generation = 0;
     UINT bc7_width = 0, bc7_height = 0;
+    bool desktop_rows = false;  // the last XG copy wrote desktop-footprint rows (not the opt-in BC7 tiles)
 };
 std::unordered_map<u64, TextureWrite>& written_textures();
 ID3D12Resource* sampled_address_texture(Wrapper* resource);
@@ -3816,6 +3841,7 @@ void note_texture_write(void* base, UINT bc7_width, UINT bc7_height)
     ++written.generation;
     written.bc7_width = bc7_width;
     written.bc7_height = bc7_height;
+    written.desktop_rows = !bc7_width;
     ReleaseSRWLockExclusive(&written_lock);
 }
 }  // namespace

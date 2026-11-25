@@ -912,6 +912,33 @@ fn lower_lane_spills(insns: &mut [Insn], wave32: bool, group_reads: bool) -> Res
                 }
             }
         }
+        // A uniform Sgpr lane operand is only expressible through the whole-wave
+        // group read; anything else stays refused. Spill areas (vregs written
+        // by v_writelane) are still slotted per constant lane, so they remain
+        // refused for dynamic lanes.
+        if !wave32 && group_reads && ins.op == READLANE {
+            let converted = match (ins.src.first(), ins.src.get(1), ins.dst.first()) {
+                (Some(Opnd::Vgpr(v)), Some(Opnd::Sgpr(_)),
+                 Some(Opnd::Vgpr(_)) | Some(Opnd::Sgpr(_)))
+                    if !any_written.contains(v) =>
+                {
+                    let v = *v;
+                    let d = match ins.dst.first() {
+                        Some(Opnd::Vgpr(n)) | Some(Opnd::Sgpr(n)) => *n,
+                        _ => unreachable!(),
+                    };
+                    ins.dst = vec![Opnd::Sgpr(d)];
+                    ins.src = vec![Opnd::Vgpr(v), ins.src[1].clone()];
+                    ins.enc = Enc::Sop1;
+                    ins.mnemonic = GROUP_READ.into();
+                    true
+                }
+                _ => false,
+            };
+            if converted {
+                continue;
+            }
+        }
         let lane = match ins.src.get(1) {
             Some(Opnd::ConstInt(l)) if (0..64).contains(l) => *l,
             other => return Err(format!("lane op at {at:#x}: non-constant lane operand {other:?}")),
@@ -1404,11 +1431,21 @@ fn translate_outputs_once(ex: &ShaderExtract, feeds_ps: Option<&InputInterp>, ou
     let scan_width = scan.as_ref().map(|s| s.width);
     let indexed_lane = !resolve_wave32 && (group_extrema || ex.stage == Stage::Compute && (indexed_lane::constant_reads(compute_group(ex), &mut insns)
         || indexed_lane::prepare(compute_group(ex), &mut insns)));
+    // A uniform Sgpr lane operand is only expressible through the whole-wave
+    // group read, which needs shared-memory exchange like a swizzle does.
+    let has_dynamic_lane_read = insns.iter().any(|i| i.enc == Enc::Vop3
+        && i.op == 0x360
+        && matches!(i.src.get(1), Some(Opnd::Sgpr(_))));
     if !wave_cull && !page_waves { {
         // Swizzles already exchange values through group memory; so can a lane read.
         let [x, y, z] = compute_group(ex);
-        let group_reads = ex.stage == Stage::Compute && !resolve_wave32 && !lone_lane::on() && x * y * z % 64 == 0
-            && insns.iter().any(|i| i.mnemonic == "ds_swizzle_b32") && insns.iter().any(|i| i.mnemonic.ends_with("exec_b64") || i.mnemonic == "s_mov_b64")
+        // Swizzle shaders already handle EXEC; a fully uniform shader (no EXEC
+        // instructions) is the simplest case for the group read. Both cases share
+        // the swizzle validation below.
+        let swizzle_group_reads = insns.iter().any(|i| i.mnemonic == "ds_swizzle_b32")
+            && insns.iter().any(|i| i.mnemonic.ends_with("exec_b64") || i.mnemonic == "s_mov_b64");
+        let group_reads = ex.stage == Stage::Compute && !resolve_wave32 && !lone_lane::on() && x * y * z % 32 == 0
+            && (swizzle_group_reads || has_dynamic_lane_read)
             && !insns.iter().any(|i| i.enc == Enc::Ds && i.mnemonic != "ds_swizzle_b32" && i.mnemonic.starts_with("ds_ordered"));
         if ex.stage == Stage::Pixel && pixel_heap_base(ex, 5).is_some() { lower_first_lane_reads(&mut insns); }
         lower_lane_spills(&mut insns, resolve_wave32, group_reads)?;
@@ -1496,7 +1533,7 @@ fn translate_outputs_once(ex: &ShaderExtract, feeds_ps: Option<&InputInterp>, ou
     // DS bit-mask mode operates on the low five lane bits in wave32 and wave64.
     // Map guest lanes by workgroup index, independently of the Vulkan subgroup layout.
     em.compute_swizzle = ex.stage == Stage::Compute && scan_width.is_none() && !resolve_wave32
-        && em.insns.iter().any(|i| i.mnemonic == "ds_swizzle_b32");
+        && (em.insns.iter().any(|i| i.mnemonic == "ds_swizzle_b32") || has_dynamic_lane_read);
     if em.compute_swizzle {
         let [x, y, z] = compute_group(ex);
         let count = x.checked_mul(y).and_then(|n| n.checked_mul(z)).unwrap_or(0);
@@ -1619,13 +1656,10 @@ fn translate_outputs_once(ex: &ShaderExtract, feeds_ps: Option<&InputInterp>, ou
     em.view_cull = view_cull;
     em.light_grid = light_grid;
     em.emit_body(is_ps)?;
-    if ex.stage == Stage::Pixel || fspx_wave.is_some()
-        || (ex.stage == Stage::Compute
-            && (packed_root::matches_program(&ex.isa, 60424, 0xc449ec66f2170fb3)
-                || packed_root::matches_program(&ex.isa, 56932, 0x5504968d23557c53)))
-    {
-        em.body = exec_group::group(&em.body);
-    }
+    // Each guarded VGPR write would otherwise be its own branch. The region
+    // closes before anything other than pure register arithmetic, so this is
+    // the same program in every stage, with fewer blocks for DXC and dxil-spirv.
+    em.body = exec_group::group(&em.body);
     if hair_cluster_export {
         em.body.insert_str(0, "    uint4 hair_record = 0;\n");
         em.body.push_str(hair_cluster_export::EPILOGUE);
@@ -9758,6 +9792,72 @@ mod tests {
         let mut insns = masked_reduction_insns(32, "v_min_f32", 4, Some(f32::INFINITY.to_bits()), 2);
         insns[1].dst = vec![Opnd::Vgpr(9)]; // identity materialized in the wrong register
         assert!(lower_wave_reductions(&mut insns).is_err());
+    }
+
+    fn lane_insn(mnemonic: &str, op: u32, dst: Vec<Opnd>, src: Vec<Opnd>) -> Insn {
+        Insn {
+            offset: 0x100,
+            dwords: 1,
+            enc: Enc::Vop3,
+            op,
+            raw: vec![0],
+            mnemonic: mnemonic.to_string(),
+            dst,
+            src,
+            aux: Default::default(),
+        }
+    }
+
+    fn sgpr_lane_readlane(v: u8, lane: u8, dst: u8) -> Insn {
+        lane_insn("v_readlane_b32", 0x360,
+                  vec![Opnd::Vgpr(dst)],
+                  vec![Opnd::Vgpr(v), Opnd::Sgpr(lane), Opnd::Sgpr(0)])
+    }
+
+    fn const_lane_readlane(v: u8, lane: i64, dst: u8) -> Insn {
+        lane_insn("v_readlane_b32", 0x360,
+                  vec![Opnd::Vgpr(dst)],
+                  vec![Opnd::Vgpr(v), Opnd::ConstInt(lane), Opnd::Sgpr(0)])
+    }
+
+    fn spill_writelane(v: u8, lane: i64, value: u8) -> Insn {
+        lane_insn("v_writelane_b32", 0x361,
+                  vec![Opnd::Vgpr(v)],
+                  vec![Opnd::Sgpr(value), Opnd::ConstInt(lane), Opnd::Sgpr(0)])
+    }
+
+    #[test]
+    fn sgpr_lane_readlane_becomes_group_read_when_group_reads() {
+        let mut insns = vec![sgpr_lane_readlane(4, 2, 7)];
+        lower_lane_spills(&mut insns, false, true).expect("group read");
+        assert_eq!(insns[0].mnemonic, "tb_group_readlane");
+        assert_eq!(insns[0].dst, vec![Opnd::Sgpr(7)]);
+        assert_eq!(insns[0].src, vec![Opnd::Vgpr(4), Opnd::Sgpr(2)]);
+    }
+
+    #[test]
+    fn sgpr_lane_readlane_refused_without_group_reads() {
+        let mut insns = vec![sgpr_lane_readlane(4, 2, 7)];
+        let err = lower_lane_spills(&mut insns, false, false).expect_err("refused");
+        assert!(err.contains("non-constant lane operand"));
+    }
+
+    #[test]
+    fn sgpr_lane_readlane_refused_on_spill_area() {
+        // A vreg written by v_writelane is slotted per constant lane; a dynamic
+        // lane cannot address that slot, so it must stay refused.
+        let mut insns = vec![spill_writelane(4, 0, 2), sgpr_lane_readlane(4, 2, 7)];
+        let err = lower_lane_spills(&mut insns, false, true).expect_err("refused");
+        assert!(err.contains("non-constant lane operand"));
+    }
+
+    #[test]
+    fn const_lane_readlane_still_group_read_when_group_reads() {
+        let mut insns = vec![const_lane_readlane(4, 3, 7)];
+        lower_lane_spills(&mut insns, false, true).expect("group read");
+        assert_eq!(insns[0].mnemonic, "tb_group_readlane");
+        assert_eq!(insns[0].dst, vec![Opnd::Sgpr(7)]);
+        assert_eq!(insns[0].src, vec![Opnd::Vgpr(4), Opnd::ConstInt(3)]);
     }
 
     #[test]

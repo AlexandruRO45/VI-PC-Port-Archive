@@ -379,7 +379,7 @@ class RuntimeShaderLinks(unittest.TestCase):
             self.assertEqual(reports[0]["totals"], {"compiled": 1, "cached": 0, "unsupported": 1, "failed": 0})
             self.assertEqual(reports[0]["refusal_buckets"], {"other_refusal": 1})
             self.assertEqual(reports[1]["totals"], {"compiled": 0, "cached": 1, "unsupported": 1, "failed": 0})
-            self.assertEqual(reports[1]["refusal_buckets"], {"cached_reason_unavailable": 1})
+            self.assertEqual(reports[1]["refusal_buckets"], {"other_refusal": 1})
             self.assertEqual(reports[1]["request_types"], {".dxbc": 1, ".link": 1})
             self.assertNotIn(str(directory), json.dumps(reports))
             title.write_bytes(b"a different title build")

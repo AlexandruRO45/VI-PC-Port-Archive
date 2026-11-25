@@ -10,10 +10,15 @@ MASKS = (
 )
 
 
+def refusal_line(message):
+    """The emitter's reason: the last non-empty line, without the tool prefix."""
+    message = re.sub(r"^xshader(?:\.exe)? failed \(65\):\s*", "", message)
+    return next((part.strip() for part in reversed(message.splitlines()) if part.strip()), "")
+
+
 def normalize_refusal(message):
     """One line per refusal, with program counters, registers and counts masked."""
-    message = re.sub(r"^xshader(?:\.exe)? failed \(65\):\s*", "", message)
-    line = next((part.strip() for part in reversed(message.splitlines()) if part.strip()), "")
+    line = refusal_line(message)
     for pattern, replacement in MASKS:
         line = pattern.sub(replacement, line)
     return line or "(no message)"
@@ -30,8 +35,7 @@ SAMPLER = re.compile(
 
 def refusal_detail(message):
     """Preserve useful distinctions without copying native shader code."""
-    message = re.sub(r"^xshader(?:\.exe)? failed \(65\):\s*", "", message)
-    line = next((part.strip() for part in reversed(message.splitlines()) if part.strip()), "")
+    line = refusal_line(message)
     match = OPCODE.search(line) or LEADING_OPCODE.match(line)
     words = SAMPLER.search(line)
     return {

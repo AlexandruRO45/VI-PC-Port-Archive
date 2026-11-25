@@ -274,11 +274,19 @@ unsafe fn check_uma_import(device: &ID3D12Device, u: &crate::gpu::uma::Uma, bufs
         readback.Unmap(0, None);
         Ok(got)
     };
-    let got = run();
+    let got = match run() {
+        Ok(got) => got,
+        Err(e) => {
+            // The copy may still be running: what it uses stays (a few KiB, once). Released under
+            // the GPU, vkd3d-proton frees it at once and the GPU faults (RADV: page faults, then a
+            // ring timeout) – a slow first use of the imported window is enough to get here.
+            std::mem::forget((queue, alloc, list, fence, readback));
+            return Err(e);
+        }
+    };
     for &(_, _, p, _) in &probes {
         u.free(p);
     }
-    let got = got?;
     let wrong: Vec<String> =
         probes.iter().filter(|&&(_, i, _, c)| got[i] != c).map(|&(k, i, _, c)| format!("window {k}: wrote {c:#x}, the GPU read {:#x}", got[i])).collect();
     if !wrong.is_empty() {
@@ -3598,7 +3606,7 @@ fn pso_trace() -> bool {
 fn driver_compile_identified<R>(kind: &str, bytes: usize, gate: bool, record: Option<(u64, bool)>, build: impl FnOnce() -> R) -> (R, std::time::Duration) {
     let huge = gate && bytes >= huge_pso_bytes() && std::thread::current().name().is_some_and(|n| n.starts_with("xcl-pso"));
     let waited = std::time::Instant::now();
-    let slot = huge.then(|| big_compile_turn(compile_slots(bytes), big_compile_commit_free, super::pso_async::build_is_wanted)).flatten();
+    let slot = huge.then(|| big_compile_turn(compile_slots(bytes), || big_compile_commit_free(big_compile_headroom(bytes)), super::pso_async::build_is_wanted)).flatten();
     let waited = waited.elapsed();
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
     let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed) + 1;
@@ -3635,12 +3643,12 @@ fn gate_compute_driver_compile(has_cached_blob: bool) -> bool {
 }
 
 /// Before a big driver compile in the background: its turn – at most the configured number at
-/// once, and 3 GB of commit
-/// free (each takes ~1.5 GB; the title loading next to it must not run out). Unless one of the
-/// title's threads waits for the pipeline (`wanted`): then at once and without a slot (None), as
-/// when that thread builds it itself. Holding such a build back holds the title back: on a
-/// machine with less than 3 GB of commit free throughout a retail title's world loading, the
-/// first one would not go on and keeps the slot, until the title's watchdog ends it.
+/// once, and the commit headroom it asks for (`commit_free`, from `big_compile_headroom`; the
+/// title loading next to it must not run out). Unless one of the title's threads waits for the
+/// pipeline (`wanted`): then at once and without a slot (None), as when that thread builds it
+/// itself. Holding such a build back holds the title back: on a machine with less than the
+/// headroom free throughout a retail title's world loading, the first one would not go on and
+/// keeps the slot, until the title's watchdog ends it.
 fn big_compile_turn(slots: &'static Slots, commit_free: impl Fn() -> bool, wanted: impl Fn() -> bool) -> Option<SlotGuard> {
     const LOOK: std::time::Duration = std::time::Duration::from_millis(50);
     let slot = {
@@ -3666,12 +3674,21 @@ fn big_compile_turn(slots: &'static Slots, commit_free: impl Fn() -> bool, wante
     Some(slot)
 }
 
-/// 3 GB of commit are free (true when that is not known).
-fn big_compile_commit_free() -> bool {
+/// Commit headroom a big driver compile waits for: 3 GB for the class that starts at
+/// `huge_pso_bytes()` (each takes ~1.5 GB in the driver), and ~512× the DXIL size above 6 MiB
+/// of it — the driver's compile of a 29.8 MB program grew past 14 GB free before it was stopped
+/// (#1269), and programs of ~1 MB took several GB each on an 8 GB card (same issue). The floor
+/// leaves every program up to 6 MiB of DXIL waiting for exactly what it waited for before.
+fn big_compile_headroom(dxil_len: usize) -> u64 {
+    (3u64 << 30).max(dxil_len as u64 * 512)
+}
+
+/// That much commit is free (true when that is not known).
+fn big_compile_commit_free(need: u64) -> bool {
     use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
     let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
     m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
-    unsafe { GlobalMemoryStatusEx(&mut m) == 0 || m.ullAvailPageFile >= 3 << 30 }
+    unsafe { GlobalMemoryStatusEx(&mut m) == 0 || m.ullAvailPageFile >= need }
 }
 
 #[cfg(test)]
@@ -3786,6 +3803,17 @@ mod big_compile_tests {
     }
 
     #[test]
+    fn headroom_is_the_3_gb_floor_until_512_times_the_dxil_exceeds_it() {
+        // the class from huge_pso_bytes() up to 6 MiB of DXIL: the floor, unchanged
+        assert_eq!(big_compile_headroom(huge_pso_bytes()), 3 << 30);
+        assert_eq!(big_compile_headroom(6 << 20), 3 << 30);
+        // above it the wait scales with the program: the 29.8 MB one that grew past 14 GB of
+        // free commit (#1269) waits for 15 GB
+        assert_eq!(big_compile_headroom(8 << 20), 4 << 30);
+        assert_eq!(big_compile_headroom(29_800_000), 29_800_000u64 * 512);
+    }
+
+    #[test]
     fn unwanted_builds_go_one_at_a_time_when_the_commit_is_there() {
         static S: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 1 };
         let first = big_compile_turn(&S, || true, || false).expect("its turn");
@@ -3850,7 +3878,7 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
     if let Some(b) = &cached {
         copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE { pCachedBlob: b.as_ptr() as *const c_void, CachedBlobSizeInBytes: b.len() };
     }
-    // in the background, a few at a time and within the commit left (each ~1.5 GB in the driver)
+    // in the background, a few at a time and within the commit headroom the program asks for
     let record = crate::gpu::shader::fnv64(cs);
     let (mut hr, mut in_driver) = driver_compile_identified(
         "compute",
@@ -5035,6 +5063,71 @@ unsafe fn payload_shader<'a>(p: &[u8]) -> Option<&'a [u8]> {
     shader_bytes(&b)
 }
 
+/// The passthrough mesh shader emits triangles for both translated MS and GS pipelines.
+fn two_pass_mesh_stream(rs: *mut c_void, ms: &[u8], ps: Option<&[u8]>) -> StreamOut {
+    let mut out = StreamOut::default();
+    out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, &rs);
+    out.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, ms);
+    if let Some(ps) = ps {
+        out.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps);
+    }
+    out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY, &D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE);
+    out
+}
+
+#[cfg(test)]
+#[test]
+fn passthrough_mesh_stream_accepts_a_triangle_driver_blob() {
+    use crate::gpu::recomp::{dxc, runner};
+    if dxc::location().is_err() {
+        runner::skip_test("no DXC");
+        return;
+    }
+    if super::backend() != super::Backend::Real {
+        return runner::skip_test("no GPU");
+    }
+    let raw = device_raw();
+    let dev = unsafe { ID3D12Device::from_raw_borrowed(&raw) }.unwrap();
+    let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS7::default();
+    if unsafe { dev.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS7, (&mut options as *mut D3D12_FEATURE_DATA_D3D12_OPTIONS7).cast(), std::mem::size_of_val(&options) as u32) }.is_err()
+        || options.MeshShaderTier.0 < D3D12_MESH_SHADER_TIER_1.0
+    {
+        return runner::skip_test("no mesh shaders");
+    }
+    let (ms, _) = dummy_mesh().expect("compile a synthetic triangle mesh shader");
+    unsafe {
+        let mut sig = None;
+        D3D12SerializeRootSignature(&D3D12_ROOT_SIGNATURE_DESC::default(), D3D_ROOT_SIGNATURE_VERSION_1, &mut sig, None).unwrap();
+        let sig = sig.unwrap();
+        let rs: ID3D12RootSignature = dev.CreateRootSignature(
+            0, std::slice::from_raw_parts(sig.GetBufferPointer() as *const u8, sig.GetBufferSize()),
+        ).unwrap();
+        let create: PsoFn = std::mem::transmute(orig_fn(raw, slot_of(raw, "CreatePipelineState")));
+        let build = |stream: &StreamOut| {
+            let desc = [stream.0.len(), stream.0.as_ptr() as usize];
+            let mut pso = std::ptr::null_mut();
+            let hr = create(raw, desc.as_ptr().cast(), &pc_iid(Kind::PipelineState), &mut pso);
+            assert!(hr >= 0 && !pso.is_null(), "mesh PSO creation failed ({hr:#x})");
+            ID3D12PipelineState::from_raw(pso)
+        };
+
+        let mut reference = StreamOut::default();
+        reference.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, &rs.as_raw());
+        reference.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, ms);
+        reference.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY, &D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE);
+        let blob = build(&reference).GetCachedBlob().unwrap();
+        let mut translated = two_pass_mesh_stream(rs.as_raw(), ms, None);
+        let subobjects = stream_subobjects(&translated.0).unwrap();
+        let topology = subobjects.iter().find(|(kind, _)| *kind == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY.0 as u32);
+        assert_eq!(topology.map(|(_, payload)| *payload), Some(D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE.0.to_le_bytes().as_slice()));
+        translated.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CACHED_PSO, &D3D12_CACHED_PIPELINE_STATE {
+            pCachedBlob: blob.GetBufferPointer(),
+            CachedBlobSizeInBytes: blob.GetBufferSize(),
+        });
+        build(&translated);
+    }
+}
+
 /// The console PS of a two-pass pipeline (a PC PS passes as it is).
 /// The PS of a two-pass pipeline (DXIL, static samplers – a PC PS passes as it is).
 fn two_pass_ps(ps: Option<&[u8]>, split_wave64: bool) -> Result<(Option<Vec<u8>>, Vec<crate::gpu::recomp::pso::StaticSampler>), String> {
@@ -5057,7 +5150,7 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
     let bytes = stream.shader_bytes() + tp.cs.len();
     let gate = bytes >= huge_pso_bytes() && std::thread::current().name().is_some_and(|n| n.starts_with("xcl-pso"));
     let waited = std::time::Instant::now();
-    let _slot = gate.then(|| big_compile_turn(compile_slots(bytes), big_compile_commit_free, super::pso_async::build_is_wanted)).flatten();
+    let _slot = gate.then(|| big_compile_turn(compile_slots(bytes), || big_compile_commit_free(big_compile_headroom(bytes)), super::pso_async::build_is_wanted)).flatten();
     if gate {
         crate::xlog_info!("D3D12.X: two-pass {kind} PSO ({bytes} B DXIL) gated: {}, waited {} ms", _slot.is_some(), waited.elapsed().as_millis());
     }
@@ -5185,14 +5278,9 @@ unsafe fn translated_mesh_stream_once(this: *mut c_void, desc: *const c_void, ri
     };
     let Some(rs) = abi_rs_for(this, &ps_samplers) else { return Some(E_INVALIDARG) };
     // the title's state (blend, rasteriser, depth, formats …) with XCL's RS and shaders
-    let mut out = StreamOut::default();
-    out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, &rs);
-    out.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, &tp.ms);
-    if let Some(p) = &ps {
-        out.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, p);
-    }
+    let mut out = two_pass_mesh_stream(rs, &tp.ms, ps.as_deref());
     for (ty, payload) in &subs {
-        let skip = [0, 2, 19, 24, 25].contains(ty); // RS, PS, cached PSO, AS, MS
+        let skip = [0, 2, 14, 19, 24, 25].contains(ty); // RS, PS, topology, cached PSO, AS, MS
         if !skip {
             let (_, palign) = super::null::subobject_payload(*ty).unwrap_or((0, 4));
             // RENDER_TARGET_FORMATS, DEPTH_STENCIL_FORMAT: the console's formats as the PC's
@@ -5260,12 +5348,7 @@ unsafe fn translated_gs_pso(this: *mut c_void, d: &D3D12_GRAPHICS_PIPELINE_STATE
         }
     };
     let Some(rs) = abi_rs_for(this, &ps_samplers) else { return E_INVALIDARG };
-    let mut out = StreamOut::default();
-    out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, &rs);
-    out.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, &tp.ms);
-    if let Some(p) = &ps {
-        out.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, p);
-    }
+    let mut out = two_pass_mesh_stream(rs, &tp.ms, ps.as_deref());
     out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, &d.BlendState);
     out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, &d.SampleMask);
     out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, &d.RasterizerState);
@@ -5446,6 +5529,7 @@ unsafe fn stream_pipeline(desc: *const c_void) -> StreamPipeline {
         FrontFace: keep,
         BackFace: keep,
     };
+    let mut has_depth_stencil = false;
     for (ty, p) in &subs {
         match ty {
             0 => put(&mut g.pRootSignature, p),
@@ -5459,7 +5543,10 @@ unsafe fn stream_pipeline(desc: *const c_void) -> StreamPipeline {
             9 => put(&mut g.SampleMask, p),
             10 => put(&mut g.RasterizerState, p),
             // DEPTH_STENCIL; DEPTH_STENCIL1 is that and the depth bounds test
-            11 | 21 => put(&mut g.DepthStencilState, p),
+            11 | 21 => {
+                has_depth_stencil = true;
+                put(&mut g.DepthStencilState, p);
+            }
             12 => put(&mut g.InputLayout, p),
             13 => put(&mut g.IBStripCutValue, p),
             14 => put(&mut g.PrimitiveTopologyType, p),
@@ -5474,6 +5561,7 @@ unsafe fn stream_pipeline(desc: *const c_void) -> StreamPipeline {
             18 => put(&mut g.NodeMask, p),
             20 => put(&mut g.Flags, p),
             26 => {
+                has_depth_stencil = true;
                 let mut d: D3D12_DEPTH_STENCIL_DESC2 = std::mem::zeroed();
                 put(&mut d, p);
                 let face = |f: &D3D12_DEPTH_STENCILOP_DESC1| D3D12_DEPTH_STENCILOP_DESC { StencilFailOp: f.StencilFailOp, StencilDepthFailOp: f.StencilDepthFailOp, StencilPassOp: f.StencilPassOp, StencilFunc: f.StencilFunc };
@@ -5505,6 +5593,11 @@ unsafe fn stream_pipeline(desc: *const c_void) -> StreamPipeline {
             }
             _ => {}
         }
+    }
+    // D3D12 pipeline state streams default DepthEnable to FALSE when no depth-stencil
+    // subobject is supplied and DSVFormat is DXGI_FORMAT_UNKNOWN (0).
+    if !has_depth_stencil && g.DSVFormat.0 == 0 {
+        g.DepthStencilState.DepthEnable = false.into();
     }
     // a rect list stays one for translated_graphics_pso, which gives it its GS (untranslated, it
     // becomes the PC's in graphics_pso)
@@ -6862,5 +6955,62 @@ mod map_tests {
                 m.remove(&(upload.as_raw() as usize));
             }
         }
+    }
+
+    #[test]
+    fn stream_pipeline_defaults_depth_enable_from_dsv_format() {
+        let console_vs = crate::gpu::xbox::tests::sample(
+            1,
+            &[crate::gpu::xbox::tests::fssm(&crate::gpu::xbox::tests::CODE, &[])],
+        );
+        let push_sub = |buf: &mut Vec<u8>, ty: u32, payload: &[u8], align: usize| {
+            buf.extend_from_slice(&ty.to_le_bytes());
+            if align == 8 {
+                buf.extend_from_slice(&0u32.to_le_bytes());
+            }
+            buf.extend_from_slice(payload);
+            while buf.len() % 8 != 0 {
+                buf.push(0);
+            }
+        };
+        let parse = |dsv_format: Option<u32>, explicit_depth: Option<bool>| -> D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+            let mut stream = Vec::new();
+            let mut vs_bc = [0u8; 16];
+            vs_bc[0..8].copy_from_slice(&(console_vs.as_ptr() as usize).to_le_bytes());
+            vs_bc[8..16].copy_from_slice(&console_vs.len().to_le_bytes());
+            push_sub(&mut stream, 1, &vs_bc, 8);
+            if let Some(fmt) = dsv_format {
+                push_sub(&mut stream, 16, &fmt.to_le_bytes(), 4);
+            }
+            if let Some(en) = explicit_depth {
+                let ds = D3D12_DEPTH_STENCIL_DESC {
+                    DepthEnable: en.into(),
+                    ..Default::default()
+                };
+                let bytes = unsafe {
+                    std::slice::from_raw_parts(&ds as *const _ as *const u8, std::mem::size_of::<D3D12_DEPTH_STENCIL_DESC>())
+                };
+                push_sub(&mut stream, 11, bytes, 4);
+            }
+            #[repr(C)]
+            struct StreamDesc {
+                size: usize,
+                ptr: usize,
+            }
+            let desc = StreamDesc { size: stream.len(), ptr: stream.as_ptr() as usize };
+            match unsafe { stream_pipeline(&desc as *const _ as *const c_void) } {
+                StreamPipeline::Graphics(g) => *g,
+                _ => panic!("expected graphics stream pipeline"),
+            }
+        };
+
+        // Omitted DEPTH_STENCIL + omitted/UNKNOWN DSVFormat -> DepthEnable defaults to false.
+        assert!(!parse(None, None).DepthStencilState.DepthEnable.as_bool());
+        assert!(!parse(Some(0), None).DepthStencilState.DepthEnable.as_bool());
+        // Omitted DEPTH_STENCIL + non-UNKNOWN DSVFormat (D32_FLOAT = 40) -> DepthEnable defaults to true.
+        assert!(parse(Some(40), None).DepthStencilState.DepthEnable.as_bool());
+        // Explicit DEPTH_STENCIL subobject is always preserved regardless of DSVFormat.
+        assert!(parse(None, Some(true)).DepthStencilState.DepthEnable.as_bool());
+        assert!(!parse(Some(40), Some(false)).DepthStencilState.DepthEnable.as_bool());
     }
 }

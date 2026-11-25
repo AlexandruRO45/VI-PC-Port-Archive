@@ -50,7 +50,7 @@ class ScarlettPreparation(unittest.TestCase):
             log = stderr.getvalue()
             self.assertEqual(compile_mock.call_count, 7)
             self.assertIn("1 compiled, 1 cached, 4 unsupported, 1 failed", log)
-            self.assertIn("3 new, 1 cached (reason unavailable)", log)
+            self.assertIn("3 with a reason, 1 cached before reasons were kept.", log)
             self.assertIn("2 x s_load at 0x_: dynamic soffset unsupported", log)
             self.assertIn("1 x unverified mesh shader bindings", log)
             self.assertNotIn("x cached unsupported HLSL", log)

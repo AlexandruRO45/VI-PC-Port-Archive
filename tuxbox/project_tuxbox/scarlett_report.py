@@ -42,8 +42,8 @@ REFUSALS = (
 )
 
 def refusal_bucket(error):
-    if error.cached:
-        # The persistent marker holds only a key, not its original reason.
+    if not error.reason_known:
+        # A marker written before reasons were kept holds only a key.
         return "cached_reason_unavailable"
     message = str(error)
     # ToolFailure prefixes the emitter stderr. Do not expose it in the report.

@@ -100,6 +100,30 @@ pub(super) fn group(body: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::group;
+    use crate::{ShaderExtract, Stage};
+
+    fn compute_extract(words: &[u32]) -> ShaderExtract {
+        let isa: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        ShaderExtract { flat_inputs: Vec::new(), flat_outputs: Vec::new(),
+            stage: Stage::Compute, shader_model: (6, 0), required_features: None,
+            bitcode_stripped: true, fspx_config: None, ps09_pixel_inputs: None,
+            fssm: Vec::new(), entry: Some("main".into()), isa_data: isa.clone(),
+            isa, isa_offset_in_fssm: 0, psv_threads: None, isa_preamble: [0, 64, 1, 1],
+            has_input_sig: false, has_output_sig: false, has_psv0: false, has_root_sig: false,
+            input_sig: Vec::new(), output_sig: Vec::new(), resources: Vec::new(),
+            gs_info: None, mesh_info: None, primitive_sig: Vec::new(), root_sig: None,
+        }
+    }
+
+    #[test]
+    fn compute_register_writes_share_one_exec_region() {
+        // v_add_nc_u32 v1, v0, v0; v_add_nc_u32 v2, v1, v1; s_endpgm
+        let ex = compute_extract(&[0x4a02_0100, 0x4a04_0301, 0xbf81_0000]);
+        let hlsl = super::super::translate(&ex).unwrap().hlsl;
+        assert_eq!(hlsl.matches("if (exec_lo & 1u)").count(), 1, "{hlsl}");
+        assert!(hlsl.contains("    if (exec_lo & 1u) {\n        v1 = "), "{hlsl}");
+        assert!(hlsl.contains("\n        v2 = "), "{hlsl}");
+    }
 
     #[test]
     fn adjacent_pixel_register_writes_keep_order_and_exec_boundaries() {

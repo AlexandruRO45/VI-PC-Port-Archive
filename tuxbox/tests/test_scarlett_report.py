@@ -25,6 +25,8 @@ class ScarlettReport(unittest.TestCase):
     def test_cache_unknown_and_no_private_text(self):
         self.assertEqual(refusal_bucket(ShaderRefused("cached unsupported HLSL translation", cached=True)),
                          "cached_reason_unavailable")
+        remembered = ShaderRefused("s_load at 0xec: dynamic soffset unsupported", cached=True, remembered=True)
+        self.assertEqual(refusal_bucket(remembered), "scalar_dynamic_offset")
         self.assertEqual(refusal_bucket(ShaderRefused("/home/private/name secret", cached=False)), "other_refusal")
         self.assertEqual(failure_bucket(subprocess.TimeoutExpired([Path("/home/private/dxc"), "/secret"], 15)),
                          "dxc_timeout")

@@ -215,11 +215,14 @@ A completed preparation prints one `ProjectScarlett preparation aggregate:`
 JSON line to stderr with checked/compiled/cached/unsupported/failed counts,
 request types, fixed refusal buckets and failure buckets. This does not
 change the compiler, marker format, timeouts or cache behaviour.
-Warm refusal markers retain no reason: these are counted as
-`cached_reason_unavailable`, not guessed. Unknown fresh reasons go into
-`other_refusal`. The aggregate line alone contains no paths, request keys,
-shader data or raw diagnostics; the surrounding normal output may contain
-private paths and should not be shared without review.
+Each refusal marker has a `<key>.reason` file beside it holding the
+emitter's one-line reason, so a warm run reports the same bucket as the
+run that refused the shader. Markers written by older TuxBox builds have
+no reason file and are counted as `cached_reason_unavailable`, not
+guessed. Unknown reasons go into `other_refusal`. The aggregate line
+alone contains no paths, request keys, shader data or raw diagnostics;
+the surrounding normal output may contain private paths and should not be
+shared without review.
 
 For a full fresh emitter-only ranking even on a warm cache, use the existing
 triage tool in aggregate mode against the authorized local request archive:

@@ -1393,6 +1393,22 @@ int check_xbox_queue_slots() {
     EXPECT(xs::queue_slot_hits(35) == 2 && queue_mock->calls[35] == 0 && queue_mock->calls[10] == 2);
     EXPECT(queue_mock->args[10][0] == 0 && queue_mock->args[10][1] == 0);
 
+    // Queue slot 18. The title's call (one pointer to 8 bytes) is the frequency getter, PC slot 16, and never the
+    // PC slot 18 (GetDesc), which would write a 16-byte description through that pointer. A host caller, under a
+    // classifier and with none installed, keeps the PC slot 18.
+    std::uint64_t frequency[3] = {0xA5A5A5A5A5A5A5A5ull, 0xA5A5A5A5A5A5A5A5ull, 0xA5A5A5A5A5A5A5A5ull};
+    xs::set_console_caller([](std::uint64_t) { return true; });
+    raw(queue, 18, word(&frequency[1]));
+    EXPECT(queue_mock->calls[16] == 1 && queue_mock->calls[18] == 0 && queue_mock->args[16][0] == word(&frequency[1]));
+    EXPECT(frequency[0] == 0xA5A5A5A5A5A5A5A5ull && frequency[2] == 0xA5A5A5A5A5A5A5A5ull);
+    xs::set_console_caller([](std::uint64_t) { return false; });
+    D3D12_COMMAND_QUEUE_DESC host_desc{};
+    raw(queue, 18, word(&host_desc));
+    EXPECT(queue_mock->calls[16] == 1 && queue_mock->calls[18] == 1 && queue_mock->args[18][0] == word(&host_desc));
+    xs::set_console_caller(nullptr);
+    raw(queue, 18, word(&host_desc));
+    EXPECT(queue_mock->calls[16] == 1 && queue_mock->calls[18] == 2);
+
     EXPECT(release(queue) == 0 && release(device) == 0 && mock->refs == 0);
     std::printf("%s: queue slot 35 routes ExecuteCommandLists(count, lists) to PC slot 10 with UINT count masking\n",
                 g_label);
@@ -2338,6 +2354,7 @@ int check_console_command_list() {
     EXPECT(xs::console_to_pc_list_slot(60) == 58);   // EndEvent
     EXPECT(xs::console_to_pc_list_slot(61) == 59);   // ExecuteIndirect
     EXPECT(xs::console_to_pc_list_slot(85) == 16);   // CopyTextureRegion
+    EXPECT(xs::console_to_pc_list_slot(139) == 10);  // Reset, as the retail title calls it
     EXPECT(xs::console_to_pc_list_slot(146) == 80);  // GCL7 Barrier
     EXPECT(xs::console_to_pc_list_slot(148) == xs::kListNotForwarded); // AllocateUploadMemory
 
@@ -2440,6 +2457,15 @@ int check_console_command_list() {
     EXPECT(hr_of(raw(list_proxy, 10, word(allocator), 0, 0, 0)) == S_OK);
     EXPECT(real_list->calls[10] == 1);
     EXPECT(real_list->args[10][0] == word(real_allocator));
+    std::memcpy(&c18, reinterpret_cast<const void*>(base + 0x18), sizeof(c18));
+    EXPECT(c18 == expected_limit);
+
+    // Console slot 139 is Reset as the retail title calls it: the same PC slot 10, allocator unwrapped, cursor
+    // re-pinned, and the list's own slot 139 never reached.
+    std::memcpy(reinterpret_cast<void*>(base + 0x18), &zero, sizeof(zero));
+    EXPECT(hr_of(raw(list_proxy, 139, word(allocator), 0, 0, 0)) == S_OK);
+    EXPECT(real_list->calls[10] == 2 && real_list->calls[139] == 0);
+    EXPECT(real_list->args[10][0] == word(real_allocator) && real_list->args[10][1] == 0);
     std::memcpy(&c18, reinterpret_cast<const void*>(base + 0x18), sizeof(c18));
     EXPECT(c18 == expected_limit);
 

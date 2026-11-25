@@ -123,7 +123,7 @@ def prepare_scarlett(executable, host):
                 compiled = compile_request(source, source.stem, tools, cache, None)
                 return ("compiled" if compiled else "cached"), None, None, source.suffix, None
             except ShaderRefused as exc:
-                return "unsupported", None, refusal_bucket(exc), source.suffix, None if exc.cached else normalize_refusal(str(exc))
+                return "unsupported", None, refusal_bucket(exc), source.suffix, normalize_refusal(str(exc)) if exc.reason_known else None
             except (OSError, ValueError, subprocess.SubprocessError) as exc:
                 return "failed", f"{source.name}: {exc}", failure_bucket(exc), source.suffix, None
 
@@ -160,8 +160,9 @@ def prepare_scarlett(executable, host):
         report_progress(None, "ProjectScarlett preparation aggregate: " +
                         json.dumps(receipt, sort_keys=True, separators=(",", ":")))
     if unsupported:
-        report_progress(None, f"ProjectScarlett shader refusals: {totals['unsupported'] - refusal_counts['cached_reason_unavailable']} new, "
-                        f"{refusal_counts['cached_reason_unavailable']} cached (reason unavailable).")
+        unknown = refusal_counts['cached_reason_unavailable']
+        report_progress(None, f"ProjectScarlett shader refusals: {totals['unsupported'] - unknown} with a reason, "
+                        f"{unknown} cached before reasons were kept.")
         for reason, count in sorted(reasons.items(), key=lambda item: (-item[1], item[0]))[:10]:
             report_progress(None, f"  {count} x {reason}")
     return True
