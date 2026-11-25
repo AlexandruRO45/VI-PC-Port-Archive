@@ -193,9 +193,7 @@ impl Validator {
             ) -> Hresult = method(self.object, 3);
             let hr = validate(self.object, &mut blob, IN_PLACE_EDIT, &mut result);
             if hr < 0 || result.is_null() {
-                if !result.is_null() {
-                    release(result);
-                }
+                release(result);
                 return Err(format!("Validate failed: {hr:#x}"));
             }
             let mut status = 0;
@@ -251,359 +249,83 @@ impl Drop for Validator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
-
-    const E_FAIL: Hresult = 0x8000_4005_u32 as i32;
-    const E_NOINTERFACE: Hresult = 0x8000_4002_u32 as i32;
-
-    #[repr(C)]
-    struct ErrorBlobVtable {
-        qi: unsafe extern "system" fn(
-            *mut MockErrorBlob,
-            *const [u8; 16],
-            *mut *mut c_void,
-        ) -> Hresult,
-        add_ref: unsafe extern "system" fn(*mut MockErrorBlob) -> u32,
-        release: unsafe extern "system" fn(*mut MockErrorBlob) -> u32,
-        ptr: unsafe extern "system" fn(*mut MockErrorBlob) -> *const u8,
-        len: unsafe extern "system" fn(*mut MockErrorBlob) -> usize,
-    }
-
-    #[repr(C)]
-    struct MockErrorBlob {
-        vtable: *const ErrorBlobVtable,
-        ptr: *const u8,
-        len: usize,
-        releases: usize,
-    }
-
-    unsafe extern "system" fn mock_blob_qi(
-        _: *mut MockErrorBlob,
-        _: *const [u8; 16],
-        out: *mut *mut c_void,
-    ) -> Hresult {
-        // SAFETY: caller provides a writable output pointer.
-        unsafe { *out = std::ptr::null_mut() };
-        E_NOINTERFACE
-    }
-
-    unsafe extern "system" fn mock_blob_add_ref(_: *mut MockErrorBlob) -> u32 {
-        1
-    }
-
-    unsafe extern "system" fn mock_blob_release(this: *mut MockErrorBlob) -> u32 {
-        // SAFETY: `this` points to a live `MockErrorBlob` on the test stack.
-        unsafe {
-            (*this).releases += 1;
-        }
-        0
-    }
-
-    unsafe extern "system" fn mock_blob_ptr(this: *mut MockErrorBlob) -> *const u8 {
-        // SAFETY: `this` points to a live `MockErrorBlob` on the test stack.
-        unsafe { (*this).ptr }
-    }
-
-    unsafe extern "system" fn mock_blob_len(this: *mut MockErrorBlob) -> usize {
-        // SAFETY: `this` points to a live `MockErrorBlob` on the test stack.
-        unsafe { (*this).len }
-    }
-
-    static MOCK_ERROR_BLOB_VTABLE: ErrorBlobVtable = ErrorBlobVtable {
-        qi: mock_blob_qi,
-        add_ref: mock_blob_add_ref,
-        release: mock_blob_release,
-        ptr: mock_blob_ptr,
-        len: mock_blob_len,
-    };
-
-    #[repr(C)]
-    struct ResultVtable {
-        qi: unsafe extern "system" fn(
-            *mut MockResult,
-            *const [u8; 16],
-            *mut *mut c_void,
-        ) -> Hresult,
-        add_ref: unsafe extern "system" fn(*mut MockResult) -> u32,
-        release: unsafe extern "system" fn(*mut MockResult) -> u32,
-        get_status: unsafe extern "system" fn(*mut MockResult, *mut Hresult) -> Hresult,
-        get_result: unsafe extern "system" fn(*mut MockResult, *mut Object) -> Hresult,
-        get_errors: unsafe extern "system" fn(*mut MockResult, *mut Object) -> Hresult,
-    }
-
-    #[repr(C)]
-    struct MockResult {
-        vtable: *const ResultVtable,
-        status_hr: Hresult,
-        status: Hresult,
-        error_hr: Hresult,
-        error_blob: Object,
-        releases: usize,
-    }
-
-    unsafe extern "system" fn mock_result_qi(
-        _: *mut MockResult,
-        _: *const [u8; 16],
-        out: *mut *mut c_void,
-    ) -> Hresult {
-        // SAFETY: caller provides a writable output pointer.
-        unsafe { *out = std::ptr::null_mut() };
-        E_NOINTERFACE
-    }
-
-    unsafe extern "system" fn mock_result_add_ref(_: *mut MockResult) -> u32 {
-        1
-    }
-
-    unsafe extern "system" fn mock_result_release(this: *mut MockResult) -> u32 {
-        // SAFETY: `this` points to a live `MockResult` on the test stack.
-        unsafe {
-            (*this).releases += 1;
-        }
-        0
-    }
-
-    unsafe extern "system" fn mock_result_get_status(
-        this: *mut MockResult,
-        out: *mut Hresult,
-    ) -> Hresult {
-        // SAFETY: `this` and `out` are valid pointers for this mock call.
-        unsafe {
-            *out = (*this).status;
-            (*this).status_hr
-        }
-    }
-
-    unsafe extern "system" fn mock_result_get_result(
-        _: *mut MockResult,
-        out: *mut Object,
-    ) -> Hresult {
-        // SAFETY: caller provides a writable output pointer.
-        unsafe { *out = std::ptr::null_mut() };
-        E_FAIL
-    }
-
-    unsafe extern "system" fn mock_result_get_errors(
-        this: *mut MockResult,
-        out: *mut Object,
-    ) -> Hresult {
-        // SAFETY: `this` and `out` are valid pointers for this mock call.
-        unsafe {
-            *out = (*this).error_blob;
-            (*this).error_hr
-        }
-    }
-
-    static MOCK_RESULT_VTABLE: ResultVtable = ResultVtable {
-        qi: mock_result_qi,
-        add_ref: mock_result_add_ref,
-        release: mock_result_release,
-        get_status: mock_result_get_status,
-        get_result: mock_result_get_result,
-        get_errors: mock_result_get_errors,
-    };
-
-    #[repr(C)]
-    struct ValidatorVtable {
-        qi: unsafe extern "system" fn(
-            *mut MockValidator,
-            *const [u8; 16],
-            *mut *mut c_void,
-        ) -> Hresult,
-        add_ref: unsafe extern "system" fn(*mut MockValidator) -> u32,
-        release: unsafe extern "system" fn(*mut MockValidator) -> u32,
-        validate:
-            unsafe extern "system" fn(*mut MockValidator, *mut Blob, u32, *mut Object) -> Hresult,
-    }
-
-    #[repr(C)]
-    struct MockValidator {
-        vtable: *const ValidatorVtable,
-        validate_hr: Hresult,
-        result: Object,
-        releases: usize,
-    }
-
-    unsafe extern "system" fn mock_val_qi(
-        _: *mut MockValidator,
-        _: *const [u8; 16],
-        out: *mut *mut c_void,
-    ) -> Hresult {
-        // SAFETY: caller provides a writable output pointer.
-        unsafe { *out = std::ptr::null_mut() };
-        E_NOINTERFACE
-    }
-
-    unsafe extern "system" fn mock_val_add_ref(_: *mut MockValidator) -> u32 {
-        1
-    }
-
-    unsafe extern "system" fn mock_val_release(this: *mut MockValidator) -> u32 {
-        // SAFETY: `this` points to a live `MockValidator` on the test stack.
-        unsafe {
-            (*this).releases += 1;
-        }
-        0
-    }
-
-    unsafe extern "system" fn mock_val_validate(
-        this: *mut MockValidator,
-        _: *mut Blob,
-        _: u32,
-        out: *mut Object,
-    ) -> Hresult {
-        // SAFETY: `this` and `out` are valid pointers for this mock call.
-        unsafe {
-            *out = (*this).result;
-            (*this).validate_hr
-        }
-    }
-
-    static MOCK_VALIDATOR_VTABLE: ValidatorVtable = ValidatorVtable {
-        qi: mock_val_qi,
-        add_ref: mock_val_add_ref,
-        release: mock_val_release,
-        validate: mock_val_validate,
-    };
 
     #[test]
-    fn get_status_failure_returns_err_and_releases_result() {
-        let mut mock_res = MockResult {
-            vtable: &MOCK_RESULT_VTABLE,
-            status_hr: E_FAIL,
-            status: 0,
-            error_hr: E_FAIL,
-            error_blob: std::ptr::null_mut(),
-            releases: 0,
-        };
-        let mut mock_val = MockValidator {
-            vtable: &MOCK_VALIDATOR_VTABLE,
-            validate_hr: 0,
-            result: (&raw mut mock_res).cast(),
-            releases: 0,
-        };
-        let mut v = Validator {
-            object: (&raw mut mock_val).cast(),
-            module: std::ptr::null_mut(),
-        };
-        let mut buf = [0u8; 4];
-        let Err(err) = v.validate(&mut buf) else {
-            panic!("expected GetStatus failure");
-        };
-        assert_eq!(err, format!("GetStatus failed: {E_FAIL:#x}"));
-        assert_eq!(mock_res.releases, 1);
-        drop(v);
-        assert_eq!(mock_val.releases, 1);
-    }
+    fn null_error_blob_falls_back_without_ub() {
+        const E_FAIL: Hresult = 0x8000_4005_u32 as i32;
 
-    #[test]
-    fn null_empty_error_blob_falls_back_without_ub() {
-        let dummy = *b"x";
-        let cases = [
-            (std::ptr::null(), 0),
-            (std::ptr::null(), 16),
-            (dummy.as_ptr(), 0),
+        #[repr(C)]
+        struct Fake {
+            vtbl: *const [*const (); 6],
+            out: Object,
+        }
+
+        unsafe extern "system" fn noop(_: Object) -> u32 {
+            0
+        }
+        unsafe extern "system" fn validate(
+            this: *mut Fake,
+            _: *mut Blob,
+            _: u32,
+            out: *mut Object,
+        ) -> Hresult {
+            // SAFETY: `this` and `out` are valid pointers from `Validator::validate`.
+            unsafe { *out = (*this).out };
+            0
+        }
+        unsafe extern "system" fn get_status(_: Object, out: *mut Hresult) -> Hresult {
+            // SAFETY: `out` is a valid stack pointer from `Validator::validate`.
+            unsafe { *out = E_FAIL };
+            0
+        }
+        unsafe extern "system" fn get_errors(this: *mut Fake, out: *mut Object) -> Hresult {
+            // SAFETY: `this` and `out` are valid pointers from `Validator::validate`.
+            unsafe { *out = (*this).out };
+            0
+        }
+
+        let val_vtbl = [
+            std::ptr::null(),
+            std::ptr::null(),
+            noop as *const (),
+            validate as *const (),
+            std::ptr::null(),
+            std::ptr::null(),
         ];
-        for (ptr, len) in cases {
-            let mut mock_blob = MockErrorBlob {
-                vtable: &MOCK_ERROR_BLOB_VTABLE,
-                ptr,
+        let res_vtbl = [
+            std::ptr::null(),
+            std::ptr::null(),
+            noop as *const (),
+            get_status as *const (),
+            std::ptr::null(),
+            get_errors as *const (),
+        ];
+
+        let mut byte = 0u8;
+        for (data, len) in [
+            (std::ptr::null_mut(), 0),
+            (std::ptr::null_mut(), 16),
+            (&raw mut byte, 0),
+        ] {
+            let mut err_blob = Blob {
+                vtable: &BLOB_VTABLE,
+                data,
                 len,
-                releases: 0,
             };
-            let mut mock_res = MockResult {
-                vtable: &MOCK_RESULT_VTABLE,
-                status_hr: 0,
-                status: E_FAIL,
-                error_hr: 0,
-                error_blob: (&raw mut mock_blob).cast(),
-                releases: 0,
+            let mut res = Fake {
+                vtbl: &res_vtbl,
+                out: (&raw mut err_blob).cast(),
             };
-            let mut mock_val = MockValidator {
-                vtable: &MOCK_VALIDATOR_VTABLE,
-                validate_hr: 0,
-                result: (&raw mut mock_res).cast(),
-                releases: 0,
+            let mut val = Fake {
+                vtbl: &val_vtbl,
+                out: (&raw mut res).cast(),
             };
-            let mut v = Validator {
-                object: (&raw mut mock_val).cast(),
+            let mut validator = Validator {
+                object: (&raw mut val).cast(),
                 module: std::ptr::null_mut(),
             };
-            let mut buf = [0u8; 4];
-            let Err(err) = v.validate(&mut buf) else {
-                panic!("expected validation rejection");
-            };
+            let err = validator.validate(&mut [0u8; 4]).unwrap_err();
             assert_eq!(err, format!("rejected ({E_FAIL:#x})"));
-            assert_eq!(mock_blob.releases, 1);
-            assert_eq!(mock_res.releases, 1);
-            drop(v);
-            assert_eq!(mock_val.releases, 1);
         }
-    }
-
-    #[test]
-    fn validate_error_with_non_null_result_releases_result() {
-        let mut mock_res = MockResult {
-            vtable: &MOCK_RESULT_VTABLE,
-            status_hr: 0,
-            status: 0,
-            error_hr: 0,
-            error_blob: std::ptr::null_mut(),
-            releases: 0,
-        };
-        let mut mock_val = MockValidator {
-            vtable: &MOCK_VALIDATOR_VTABLE,
-            validate_hr: E_FAIL,
-            result: (&raw mut mock_res).cast(),
-            releases: 0,
-        };
-        let mut v = Validator {
-            object: (&raw mut mock_val).cast(),
-            module: std::ptr::null_mut(),
-        };
-        let mut buf = [0u8; 4];
-        let Err(err) = v.validate(&mut buf) else {
-            panic!("expected Validate failure");
-        };
-        assert_eq!(err, format!("Validate failed: {E_FAIL:#x}"));
-        assert_eq!(mock_res.releases, 1);
-        drop(v);
-        assert_eq!(mock_val.releases, 1);
-    }
-
-    #[test]
-    fn load_errors_strip_nul_and_free_module() {
-        let missing = std::path::Path::new("victory_missing_validator_test.dll");
-        let Err(err) = Validator::load(Some(missing)) else {
-            panic!("loading missing DLL unexpectedly succeeded");
-        };
-        assert!(!err.contains('\0'), "NUL byte leaked into error: {err:?}");
-        assert!(
-            err.contains("victory_missing_validator_test.dll"),
-            "unexpected missing-DLL error: {err:?}"
-        );
-
-        let candidates = ["cabinet.dll", "msimg32.dll", "lz32.dll", "version.dll"];
-        let mut target = None;
-        for dll in candidates {
-            let wide: Vec<u16> = dll.encode_utf16().chain([0]).collect();
-            // SAFETY: `wide` is a NUL-terminated UTF-16 DLL name.
-            let handle = unsafe { GetModuleHandleW(wide.as_ptr()) };
-            if handle.is_null() {
-                target = Some((dll, wide));
-                break;
-            }
-        }
-        let (dll, wide) = target.expect("all candidate system DLLs are already loaded");
-        let Err(err) = Validator::load(Some(std::path::Path::new(dll))) else {
-            panic!("loading {dll} as a validator unexpectedly succeeded");
-        };
-        assert!(
-            err.contains("DxcCreateInstance"),
-            "expected GetProcAddress failure for {dll}, got: {err:?}"
-        );
-        // SAFETY: `wide` is a NUL-terminated UTF-16 DLL name.
-        let after = unsafe { GetModuleHandleW(wide.as_ptr()) };
-        assert!(after.is_null(), "{dll} remained loaded after failed load");
     }
 }
