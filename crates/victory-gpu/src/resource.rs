@@ -336,11 +336,11 @@ fn mip_count(desc: &ResourceDesc) -> u32 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PlacedFootprint {
     pub(crate) offset: u64,
-    format: u32,
-    width: u32,
-    height: u32,
-    depth: u32,
-    row_pitch: u32,
+    pub(crate) format: u32,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) depth: u32,
+    pub(crate) row_pitch: u32,
 }
 
 impl PlacedFootprint {
@@ -2307,8 +2307,38 @@ mod tests {
         type Copy =
             extern "system" fn(This, *const Location, u32, u32, u32, *const Location, *const u8);
         slot::<Copy>(list, 0x80)(list, &to, 0, 0, 0, &from, null.cast());
+        // Exercise the title entry point in the same list: a partial copy
+        // into a padded footprint with a non-aligned offset and nonzero XY.
+        let mut result = null;
+        assert_eq!(create_committed(null, &PROPERTIES, 0, &buffer(128), 0, null.cast(), iid, &mut result), S_OK);
+        let (out, _) = buffer_bytes(result).unwrap();
+        // SAFETY: the test owns the buffer until after submission.
+        unsafe { out.write_bytes(0xca, 128) };
+        let result_loc = Location {
+            resource: result,
+            kind: 1,
+            footprint: PlacedFootprint { offset: 3, row_pitch: 20, ..rows },
+        };
+        let crop = [1u32, 1, 0, 3, 3, 1];
+        slot::<Copy>(list, 0x80)(list, &result_loc, 1, 1, 0, &to, crop.as_ptr().cast());
+        let rejected = Location { footprint: PlacedFootprint { format: 118, ..result_loc.footprint }, ..result_loc };
+        slot::<Copy>(list, 0x80)(list, &rejected, 0, 0, 0, &to, null.cast());
+        // The target bytes cannot be published until the fence.
+        // SAFETY: the title buffer is live and has 128 bytes.
+        assert!(unsafe { std::slice::from_raw_parts(out, 128) }.iter().all(|&b| b == 0xca));
         slot::<extern "system" fn(This) -> HRESULT>(list, 0x48)(list);
         slot::<extern "system" fn(This, u32, *const This)>(queue, 0x50)(queue, 1, &list);
+
+        // SAFETY: the fence was waited, and the test still owns both buffers.
+        let read = unsafe { std::slice::from_raw_parts(out, 128) };
+        let mut expected = [0xca; 128];
+        for row in 0..2 {
+            let at = 3 + (1 + row) * 20 + 4;
+            let input = (1 + row) * 256 + 4;
+            expected[at..at + 8].copy_from_slice(&bytes[input..input + 8]);
+        }
+        assert_eq!(read, expected, "cropped readback preserves padding and untouched pixels");
+        slot::<extern "system" fn(This) -> u32>(result, 0x10)(result);
 
         // Read the host texture back into a readback buffer.
         let readback_heap = D3D12_HEAP_PROPERTIES {
@@ -2345,7 +2375,7 @@ mod tests {
         let readback = readback.unwrap();
         let host_image = host_resource(image).unwrap();
         let back = host.new_list().unwrap();
-        let (_, before) = host_transition(image, 0x800).unwrap();
+        let before = host_transition(image, 0x800).map_or(0x800, |(_, before)| before);
         // The upload list holds the texture until it is reset.
         assert!(std::sync::Arc::strong_count(&host_copy(image).unwrap()) > 2);
         use windows::core::Interface;
@@ -2361,11 +2391,13 @@ mod tests {
         };
         // SAFETY: an open list, live resources, locations in the host layout.
         unsafe {
-            back.list.ResourceBarrier(&[crate::host::transition(
-                host_image,
-                D3D12_RESOURCE_STATES(before as i32),
-                D3D12_RESOURCE_STATE_COPY_SOURCE,
-            )]);
+            if before != 0x800 {
+                back.list.ResourceBarrier(&[crate::host::transition(
+                    host_image,
+                    D3D12_RESOURCE_STATES(before as i32),
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                )]);
+            }
             back.list.CopyTextureRegion(
                 (&raw const out_to).cast(),
                 0,

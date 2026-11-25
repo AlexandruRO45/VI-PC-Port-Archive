@@ -553,9 +553,11 @@ pub(crate) struct CopyLocation {
     footprint: crate::resource::PlacedFootprint,
 }
 
-/// Texture to texture on the GPU; buffer to texture through an upload
-/// buffer filled at submission. Texture to buffer (read back) is not done
-/// yet.
+#[cfg(windows)]
+mod readback;
+
+/// Texture to texture on the GPU, buffer to texture through an upload,
+/// and supported texture-to-buffer copies published after the GPU fence.
 extern "system" fn copy_texture_region(
     this: This,
     dst: *const CopyLocation,
@@ -578,9 +580,13 @@ extern "system" fn copy_texture_region(
         else {
             return;
         };
+        if dst.kind == FOOTPRINT {
+            // SAFETY: a copy box, if supplied, contains six u32 bounds.
+            let source_box = unsafe { source_box.as_ref() }.copied();
+            readback::record(&list, dst, [x, y, z], src, source_box);
+            return;
+        }
         let Some(to) = crate::resource::host_resource(dst.resource) else {
-            static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| tracing::warn!("texture to buffer copies not implemented"));
             return;
         };
         let mut from = src;
