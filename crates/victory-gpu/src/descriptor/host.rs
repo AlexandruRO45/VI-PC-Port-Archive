@@ -1808,46 +1808,37 @@ impl HostHeap {
     /// `record`: the record's bytes as the caller read them (through the
     /// kernel, which fails on a page the title unmapped meanwhile where a
     /// read in place would fault: the title unmaps heap pages too).
-    pub(crate) fn mirror_copied(&self, index: u32, handle: u64, record: &[u8]) -> bool {
-        if index >= self.count {
-            return false;
-        }
-        // A slot draws read through a table lately is left to its draws,
-        // as the passes over slots picked by index leave it
-        // (`texture_slots_remapped`, `slots_written_under`): the title
-        // writes its per-draw tables into the same heap every frame, and
-        // each draw makes what its table shows in a slot of its own. Those
-        // were most of the 26,000 to 43,000 records a frame this pass
-        // mirrored in run 200 and in the play session after it, each then
-        // made and brought up to date once more by the pass over buffer
-        // views (some 50 ms a frame). `VICTORY_HEAP_SYNC_TABLES=1`: they
-        // are mirrored too, as in run 200.
-        if !sync_tables() && self.tabled_lately(index, crate::frame::current()) {
-            COPIED_TABLED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            return false;
-        }
-        let n = record.len();
-        // Never 0, which is "never looked at". (A multiply-and-fold over
-        // the record's words: BLAKE3 here was most of the 35 to 42 ms a
-        // frame this pass took over some 250,000 to 300,000 records, run
-        // 200.)
-        let print = record_print(record) | 1;
+    ///
+    /// The slots of a page are taken together: `records` gives each slot's
+    /// index and record, `handle_of` its handle, and the lock on the
+    /// fingerprints is taken once for all of them (a page of the views heap
+    /// is 2,048 slots, and some 180,000 slots a frame were each locking it
+    /// and hashing their record with BLAKE3: most of the pass's time).
+    /// Returns how many were mirrored.
+    pub(crate) fn mirror_copied<'a>(
+        &self,
+        records: impl Iterator<Item = (u32, &'a [u8])>,
+        handle_of: impl Fn(u32) -> u64,
+        changed: &mut Vec<u32>,
+    ) -> u64 {
+        changed.clear();
         {
             let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
             if copied.is_empty() {
                 copied.resize(self.count as usize, 0);
             }
-            let Some(last) = copied.get_mut(index as usize) else {
-                return false;
-            };
-            // A slot never looked at that holds nothing: as it was.
-            if *last == print || (*last == 0 && record[..n].iter().all(|&b| b == 0)) {
-                return false;
+            for (index, record) in records {
+                if let Some(last) = copied.get_mut(index as usize)
+                    && record_changed(last, record)
+                {
+                    changed.push(index);
+                }
             }
-            *last = print;
         }
-        self.mirror(index, handle, false);
-        true
+        for &index in changed.iter() {
+            self.mirror(index, handle_of(index), false);
+        }
+        changed.len() as u64
     }
 
     /// Makes host slot `index` from the record the title has at `handle`
@@ -2156,37 +2147,6 @@ fn unordered_range(base: u64, words: &[u32; 10]) -> Option<(u64, u64)> {
 
 /// The host resource a slot made by [`make`] views, if any.
 type Kept = Option<ID3D12Resource>;
-
-/// Whether the pass over records copied in as bytes also mirrors slots
-/// that draws read through tables lately (`VICTORY_HEAP_SYNC_TABLES=1`;
-/// off by default: [`HostHeap::mirror_copied`]).
-fn sync_tables() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_SYNC_TABLES").is_some_and(|v| v == "1"))
-}
-
-/// Since the last frame line: slots on changed heap pages that
-/// [`HostHeap::mirror_copied`] left to their draws (tables' slots).
-pub(crate) static COPIED_TABLED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// A 64-bit fingerprint of a descriptor record's bytes (16 or 32 of them):
-/// equal records give equal prints, and two different records the same
-/// print about once in 2^64. Not a hash anyone can attack: the records
-/// are our own.
-fn record_print(record: &[u8]) -> u64 {
-    const K: u64 = 0x9e37_79b9_7f4a_7c15;
-    let mut h = K ^ record.len() as u64;
-    let mut words = record.chunks_exact(8);
-    for word in &mut words {
-        let w = u64::from_le_bytes(word.try_into().unwrap_or([0; 8]));
-        h = (h ^ w).wrapping_mul(K);
-        h ^= h >> 29;
-    }
-    for &b in words.remainder() {
-        h = (h ^ u64::from(b)).wrapping_mul(K);
-    }
-    h ^ (h >> 32)
-}
 
 /// Whether a buffer view off its buffer's elements gets a copy of its own
 /// bytes (`VICTORY_VIEW_OWN_COPY=0`: it is refused and reads zeros, as
@@ -3521,31 +3481,6 @@ mod tests {
 }
 
 #[cfg(test)]
-mod record_print_tests {
-    use super::record_print;
-
-    /// Equal records print alike; a record that differs in any one byte,
-    /// or in its length, prints otherwise.
-    #[test]
-    fn a_record_that_changed_prints_otherwise() {
-        let record: Vec<u8> = (0..32u8).map(|i| i.wrapping_mul(37).wrapping_add(5)).collect();
-        let print = record_print(&record);
-        assert_eq!(print, record_print(&record.clone()));
-        for at in 0..32 {
-            for bit in 0..8 {
-                let mut other = record.clone();
-                other[at] ^= 1 << bit;
-                assert_ne!(record_print(&other), print, "byte {at} bit {bit}");
-            }
-        }
-        assert_ne!(record_print(&record[..16]), print);
-        assert_ne!(record_print(&[0u8; 32]), record_print(&[0u8; 16]));
-        // A record of zeros is told from "never looked at" by the caller's `| 1`.
-        assert_ne!(record_print(&[0u8; 32]) | 1, 0);
-    }
-}
-
-#[cfg(test)]
 mod own_copy_tests {
     use super::own_bytes_if;
 
@@ -3572,5 +3507,88 @@ mod own_copy_tests {
         assert_eq!(own_bytes_if(true, 8, base, 2, 0, 32, 32, true), None);
         assert_eq!(own_bytes_if(true, 8, base, 2, 4, 0, 0, false), None);
         assert_eq!(own_bytes_if(false, 8, base, 2, 4, 32, 32, true), None);
+    }
+}
+
+/// A fingerprint of a descriptor record for [`HostHeap::mirror_copied`],
+/// never 0 (which is "never looked at").
+///
+/// Word by word, each step a bijection of the state (a rotation, an
+/// exclusive or with the word, a multiplication by an odd number): two
+/// records of one length that differ in a single 8-byte word never have
+/// the same fingerprint, and others have it with the chance of any 64-bit
+/// hash. It only has to tell a record from the one last seen in its slot,
+/// and a 32-byte record takes four steps.
+fn fingerprint(record: &[u8]) -> u64 {
+    const ODD: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mut state = record.len() as u64 ^ ODD;
+    let mut words = record.chunks_exact(8);
+    for word in &mut words {
+        let word = u64::from_le_bytes(word.try_into().unwrap_or([0; 8]));
+        state = (state.rotate_left(23) ^ word).wrapping_mul(ODD);
+    }
+    let rest = words.remainder();
+    if !rest.is_empty() {
+        let mut word = [0; 8];
+        word[..rest.len()].copy_from_slice(rest);
+        state = (state.rotate_left(23) ^ u64::from_le_bytes(word)).wrapping_mul(ODD);
+    }
+    state | 1
+}
+
+/// Whether `record` is not the record whose fingerprint `last` holds, which
+/// then takes this one's. A slot never looked at that holds nothing is as
+/// it was.
+fn record_changed(last: &mut u64, record: &[u8]) -> bool {
+    let print = fingerprint(record);
+    if *last == print || (*last == 0 && record.iter().all(|&b| b == 0)) {
+        return false;
+    }
+    *last = print;
+    true
+}
+
+#[cfg(test)]
+mod copied_tests {
+    use super::{fingerprint, record_changed};
+
+    /// A record is mirrored when it is not the one last seen in its slot,
+    /// and only then.
+    #[test]
+    fn a_record_counts_as_changed_once_per_change() {
+        let mut last = 0;
+        // Never looked at and empty: as it was.
+        assert!(!record_changed(&mut last, &[0; 32]));
+        assert_eq!(last, 0);
+        let mut record = [0u8; 32];
+        record[0] = 7;
+        assert!(record_changed(&mut last, &record));
+        assert!(!record_changed(&mut last, &record));
+        record[31] = 1;
+        assert!(record_changed(&mut last, &record));
+        // Emptied after it held something: a change.
+        assert!(record_changed(&mut last, &[0; 32]));
+        assert!(!record_changed(&mut last, &[0; 32]));
+    }
+
+    /// Any single byte or single bit changed gives another fingerprint, for
+    /// both record sizes (32 bytes for views, 16 for samplers), and it is
+    /// never the "never looked at" 0.
+    #[test]
+    fn records_one_word_apart_never_share_a_fingerprint() {
+        for size in [16usize, 32, 12] {
+            let base: Vec<u8> = (0..size as u8).map(|i| i.wrapping_mul(37)).collect();
+            let print = fingerprint(&base);
+            assert_ne!(print, 0);
+            for byte in 0..size {
+                for bit in 0..8 {
+                    let mut other = base.clone();
+                    other[byte] ^= 1 << bit;
+                    assert_ne!(fingerprint(&other), print, "size {size} byte {byte} bit {bit}");
+                }
+            }
+        }
+        assert_ne!(fingerprint(&[0; 16]), 0);
+        assert_ne!(fingerprint(&[0; 16]), fingerprint(&[0; 32]));
     }
 }
