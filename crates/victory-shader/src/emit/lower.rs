@@ -12342,14 +12342,24 @@ mod tests {
         const PER_LANE_V8: u32 = 0x7E10_0D00; // v_cvt_f32_u32 v8, v0
         const ALIKE_V8: u32 = 0x7E10_0210; // v_mov_b32 v8, s16
         // v_mov_b32 v1, s16; ds_read_b32 v2, v1 (alike, as in the LDS test); then the writer
-        let lds = |writer: u32| vec![0x7E02_0210, 0xD8D8_0000, 0x0200_0001, writer];
-        let cases: [(&str, Vec<u32>, Vec<u32>, u32, u16); 6] = [
-            // v8 += s17 * v2
-            ("v_fmac_f32", vec![PER_LANE_V8], lds(0x5610_0411), 8, 16),
-            // the low half of v8 = f16(v2)
-            ("v_cvt_f16_f32", vec![PER_LANE_V8], lds(0x7E10_1502), 8, 16),
-            // the low half of v8 = s17 + v2
-            ("v_add_f16", vec![PER_LANE_V8], lds(0x6410_0411), 8, 16),
+        let lds = |writer: &[u32]| [&[0x7E02_0210, 0xD8D8_0000, 0x0200_0001][..], writer].concat();
+        // Writers that keep part of the old v8: an accumulator, or the high half.
+        let keep_old: [(&str, &[u32]); 9] = [
+            ("v_fmac_f32", &[0x5610_0411]),                  // v8 += s17 * v2
+            ("v_mac_f32", &[0x3E10_0411]),                   // v8 += s17 * v2
+            ("v_cvt_f16_f32", &[0x7E10_1502]),               // the low half of v8 = f16(v2)
+            ("v_rcp_f16", &[0x7E10_A902]),                   // ... = 1 / v2
+            ("v_add_f16", &[0x6410_0411]),                   // ... = s17 + v2
+            ("v_fmac_f16", &[0x6C10_0411]),                  // ... += s17 * v2
+            ("v_fma_f16", &[0xD74B_0008, 0x0406_0411]),      // ... = s17 * v2 + v1
+            ("v_add_nc_u16", &[0xD703_0008, 0x0002_0411]),   // ... = s17 + v2
+            ("v_fma_mixlo_f16", &[0xCC21_0008, 0x040A_0411]), // ... = s17 * v2 + v2
+        ];
+        let mut cases: Vec<(&str, Vec<u32>, Vec<u32>, u32, u16)> = keep_old
+            .iter()
+            .map(|&(name, writer)| (name, vec![PER_LANE_V8], lds(writer), 8, 16))
+            .collect();
+        cases.extend([
             (
                 "v_movrels_b32",
                 vec![
@@ -12383,7 +12393,7 @@ mod tests {
                 2,
                 16,
             ),
-        ];
+        ]);
         const NEEDS_ALL: &str = "a first-lane read where not every lane runs";
         let mut wrong = Vec::new();
         for (name, setup, region, read, vgprs) in cases {
@@ -12399,11 +12409,7 @@ mod tests {
             }
         }
         // The same reads where the old value is alike: no exchange is needed.
-        for (name, writer) in [
-            ("v_fmac_f32", 0x5610_0411),
-            ("v_cvt_f16_f32", 0x7E10_1502),
-            ("v_add_f16", 0x6410_0411),
-        ] {
+        for (name, writer) in keep_old {
             if let Err(e) = lower_in_halves(&program(&[ALIKE_V8], &lds(writer), 8), 16) {
                 wrong.push(format!("{name} over an alike old value: {e}"));
             }
@@ -12454,6 +12460,20 @@ mod tests {
                 if same.contains(&v3) != alike {
                     wrong.push(format!("{name} over an old v3 alike: {alike}"));
                 }
+            }
+        }
+        // A write of two registers (ds_read_b64 v[3:4], v1) over an alike old v3: v4 is
+        // alike only where its own old value is.
+        for (old_v4, alike) in [
+            (0x7E08_0300, false), // v_mov_b32 v4, v0
+            (0x7E08_0210, true),  // v_mov_b32 v4, s16
+        ] {
+            let mut words = program(0x7E06_0210, &[0xD9D8_0000, 0x0300_0001]);
+            words.insert(2, old_v4);
+            let (insts, same) = alike_in(&words);
+            let read = insts.iter().find(|i| i.name() == "ds_read_b64").unwrap();
+            if same.contains(&read.write(ir::Reg::V(4)).unwrap()) != alike {
+                wrong.push(format!("ds_read_b64 over an old v4 alike: {alike}"));
             }
         }
         assert!(wrong.is_empty(), "{wrong:#?}");
