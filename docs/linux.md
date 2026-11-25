@@ -24,8 +24,6 @@ platform; these notes are what has worked for testers.
 
 ## Common snags
 
-From slauko's testing:
-
 - **The start screen waits for ever without a pad.** Wine's XInput can report
   a "pad" that never presses anything (here a mouse's HID interface), and the
   keyboard stands in for a pad only while there is none. The log shows
