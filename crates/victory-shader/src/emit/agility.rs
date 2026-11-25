@@ -19,8 +19,7 @@ use windows::Win32::Graphics::Direct3D12::{
     ID3D12DeviceConfiguration, ID3D12DeviceFactory, ID3D12DeviceRemovedExtendedDataSettings,
     ID3D12SDKConfiguration1,
 };
-use windows::Win32::Graphics::Dxgi::IDXGIAdapter;
-use windows::core::{Interface, PCSTR, Result as WinResult};
+use windows::core::{IUnknown, Interface, PCSTR, Param, Result as WinResult};
 
 /// Serializes `desc` through `device`'s own `ID3D12DeviceConfiguration` when
 /// available (so an Agility SDK device does not go through an older in-box
@@ -90,7 +89,9 @@ impl Factory {
         let factory = unsafe {
             let mut cfg: Option<ID3D12SDKConfiguration1> = None;
             D3D12GetInterface(&CLSID_D3D12SDKConfiguration, &mut cfg).map_err(|e| {
-                format!("ID3D12SDKConfiguration1 unavailable ({e}); Windows 10 needs KB5029331+")
+                format!(
+                    "ID3D12SDKConfiguration1 unavailable ({e}); Windows 10 21H2/22H2 needs KB5029331+ (d3d12.dll 10.0.19041.3393+)"
+                )
             })?;
             let cfg = cfg.ok_or("D3D12GetInterface returned no ID3D12SDKConfiguration1")?;
             let factory = create_factory(&cfg, version, &dir)?;
@@ -131,18 +132,15 @@ impl Factory {
 
     /// Creates a `D3D_FEATURE_LEVEL_12_0` device on `adapter` (or the default
     /// hardware adapter when `None`) through this factory.
-    pub fn create_device(&self, adapter: Option<&IDXGIAdapter>) -> WinResult<ID3D12Device> {
+    pub fn create_device<P>(&self, adapter: P) -> WinResult<ID3D12Device>
+    where
+        P: Param<IUnknown>,
+    {
         let mut device: Option<ID3D12Device> = None;
         // SAFETY: valid factory and optional DXGI adapter.
         unsafe {
-            match adapter {
-                Some(a) => self
-                    .factory
-                    .CreateDevice(a, D3D_FEATURE_LEVEL_12_0, &mut device)?,
-                None => self
-                    .factory
-                    .CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?,
-            }
+            self.factory
+                .CreateDevice(adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
         }
         device.ok_or_else(windows::core::Error::empty)
     }
