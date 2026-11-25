@@ -72,6 +72,30 @@ answering for a switched-off pad occupies slot 0 with an all-zero report, which 
 stand-in. Treating a slot as a pad only after its first non-rest report (cleared on disconnect)
 covers that case; it was not needed for the run below and is not part of this document.
 
+## Wave width is not what kills the compiler
+
+The same load was run with `VICTORY_HOST_WAVE=32` (wired into the `run` path locally; in this
+snapshot it is only read by `translate`). That changes lowering for wave64 programs and changes
+the shader cache key, so every pipeline is rebuilt from scratch.
+
+| Run | Translation | Shaders / pipelines / refused at the fault | Stage reached | Fault |
+| --- | --- | ---: | --- | --- |
+| default | native wave64 | 895 / 652 / 140 | world load, ~5 min in | `amdxc64.dll+0x861b9f`, `victory-pipelines-1` |
+| `VICTORY_HOST_WAVE=32` | wave64 emulated on 32 lanes | 358 / 275 / 11 | **menus**, ~30 s in | `amdxc64.dll+0x861b9f`, `victory-pipelines-6` |
+
+Identical fault offset on a different wave width, at a different stage, with a fresh pipeline
+cache. So the crash is not a wave64-specific path: whatever construct kills AMD's compiler is
+present in both sets of pipelines, and recompiling from cold only makes it happen earlier. That
+argues against wave64 emulation as a workaround for this fault, and for isolating the compiler
+call itself (the area PR #2 targets) or finding the shader that trips it.
+
+Both runs end with the same two lines and no device removal:
+
+```
+first-chance 0xc0000005 at amdxc64.dll+0x861b9f (read 0x8: nothing mapped there)
+unhandled    0xc0000005 at amdxc64.dll+0x861b9f (read 0x8: nothing mapped there)
+```
+
 ## Not tested
 
 - Ray tracing (`--rt`) on RDNA4; only the default renderer was run.
