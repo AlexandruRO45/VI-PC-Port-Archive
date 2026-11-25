@@ -86,6 +86,12 @@ enum Stop {
     Fail(ShaderError),
 }
 
+/// Shift taking a heap slot to the byte of its [`shader::SLOT_VIEWS`] record.
+fn view_record_shift() -> u32 {
+    debug_assert!(super::shader::SLOT_VIEWS_RECORD_BYTES.is_power_of_two());
+    super::shader::SLOT_VIEWS_RECORD_BYTES.trailing_zeros()
+}
+
 pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
     let mut bad = HashMap::new();
     loop {
@@ -2794,8 +2800,8 @@ impl<'a> Lower<'a> {
         let i32t = self.s.t.i32;
         let slot = self.s.op(c, "binary.i32", Attr::ReadNone, i32t, 40, &[slot, last]);
         self.s.m.tag(slot, Tag::Clamp);
-        let three = self.s.m.i32(3);
-        let byte = self.s.m.bin(c, Bin::Shl, slot, three);
+        let shift = self.s.m.i32(view_record_shift());
+        let byte = self.s.m.bin(c, Bin::Shl, slot, shift);
         let h = self.s.root_srv_handle(super::shader::SLOT_VIEWS);
         let iu = self.s.m.undef(self.s.t.i32);
         let mask = self.s.m.i8(0xF);
@@ -2818,8 +2824,8 @@ impl<'a> Lower<'a> {
             self.as_int(len),
             self.as_int(stride),
         );
-        let off = a.offset as i32;
-        let (lo, hi) = self.address_plus(lo, hi, off);
+        // The loaded address is the view's own: `a.offset` is a place in the
+        // descriptor table (already part of `slot`), not in the buffer.
         Ok(Some((lo, hi, len, stride)))
     }
 
@@ -11384,6 +11390,28 @@ mod tests {
     use crate::{io, ir, resource, structure};
 
     const S_ENDPGM: u32 = 0xBF81_0000;
+
+    #[test]
+    fn view_records_are_indexed_by_their_sixteen_byte_size() {
+        // The host writes four dwords per slot (address lo/hi, length,
+        // stride); the shader must step 16 bytes, not 8.
+        assert_eq!(super::super::shader::SLOT_VIEWS_RECORD_BYTES, 16);
+        assert_eq!(1u32 << super::view_record_shift(), 16);
+        assert_eq!(5u32 << super::view_record_shift(), 80);
+    }
+
+    #[test]
+    fn view_address_indexed_keeps_the_loaded_address() {
+        // The table offset is part of the slot, not of the buffer address:
+        // the function must not add `a.offset` to what the table holds.
+        let src = include_str!("lower.rs");
+        let body = src
+            .split("fn view_address_indexed")
+            .nth(1)
+            .and_then(|s| s.split("fn address_plus").next())
+            .unwrap();
+        assert!(!body.contains("address_plus("));
+    }
 
     #[test]
     fn packed_pixel_inputs_find_their_second_row() {
