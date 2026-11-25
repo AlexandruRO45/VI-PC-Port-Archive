@@ -375,17 +375,33 @@ impl Shadow {
                     // Title memory with the GPU's bytes put in; the copy
                     // takes the title's bytes in turn.
                     let mut changed = false;
-                    for ((t, h), o) in title.iter_mut().zip(host.iter_mut()).zip(old) {
+                    // Only the bytes the GPU actually wrote (and title had not
+                    // already) go back into title memory: writing the whole
+                    // piece would clobber title writes that landed in between
+                    // the read and the write (#721).
+                    let mut changed_runs: Vec<(usize, usize)> = Vec::new();
+                    let mut run_start: Option<usize> = None;
+                    for (i, ((t, h), o)) in title.iter_mut().zip(host.iter_mut()).zip(old).enumerate() {
                         if *h != *o && *t != *h {
                             *t = *h;
                             changed = true;
+                            if run_start.is_none() {
+                                run_start = Some(i);
+                            }
+                        } else if let Some(rs) = run_start.take() {
+                            changed_runs.push((rs, i - rs));
                         }
                         *h = *t;
                     }
+                    if let Some(rs) = run_start.take() {
+                        changed_runs.push((rs, n - rs));
+                    }
                     if changed {
                         let _writing = crate::watch::writing(start + at, n);
-                        crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
-                        written += n;
+                        for &(off, len) in &changed_runs {
+                            crate::host::write_mapped((start + at + off) as *mut u8, title[off..off + len].as_ptr(), len);
+                        }
+                        written += changed_runs.iter().map(|&(_, l)| l).sum::<usize>();
                     }
                     synced.push((start + at) / PAGE);
                 }
@@ -394,9 +410,34 @@ impl Shadow {
             // Pages made equal to title memory are current in the copy, so
             // our own write is not taken for the title's; others keep what
             // they had (a title write there shows at the next refresh).
+            // A page is marked current only if title memory still matches the
+            // host copy: a title write that landed during the copy (after the
+            // page was read) shows up as a difference, so the page stays
+            // stale and the next refresh copies it (#722).
             let (first, last) = ((start + from).div_ceil(PAGE), (start + to) / PAGE);
+            let whole: Vec<usize> = synced
+                .into_iter()
+                .filter(|p| {
+                    if !(first..last).contains(p) {
+                        return false;
+                    }
+                    let page_addr = *p * PAGE;
+                    let pfrom = page_addr.max(start);
+                    let pto = (page_addr + PAGE).min(start + self.len as usize);
+                    if pfrom >= pto {
+                        return false;
+                    }
+                    let n = pto - pfrom;
+                    let mut buf = vec![0u8; n];
+                    if !crate::host::read_into(pfrom as *const u8, &mut buf) {
+                        return false;
+                    }
+                    // SAFETY: inside the mapping; only the submitting thread writes it.
+                    let host = unsafe { std::slice::from_raw_parts(self.data.add(pfrom - start), n) };
+                    buf == host
+                })
+                .collect();
             if let Some(t) = &self.tracked {
-                let whole: Vec<usize> = synced.into_iter().filter(|p| (first..last).contains(p)).collect();
                 t.taken(&whole);
             }
         }
@@ -1081,8 +1122,8 @@ mod tests {
         // The GPU writes inside two ranges.
         copy.write_host((p + 20) as u64, &[1, 2, 3]);
         copy.write_host((p + PAGE + 5) as u64, &[9]);
-        assert_eq!(copy.copy_back(p + 16, 64), 64, "the range's part of the piece");
-        assert_eq!(copy.copy_back(p + PAGE, 2 * PAGE), PAGE, "the piece written");
+        assert_eq!(copy.copy_back(p + 16, 64), 3, "the range's part of the piece");
+        assert_eq!(copy.copy_back(p + PAGE, 2 * PAGE), 1, "the piece written");
         assert_eq!(copy.copy_back(p + PAGE, PAGE), 0, "compared once");
         assert_eq!(copy.copy_back(p + 3 * PAGE, 100), 0);
         assert_eq!(copy.copy_back(p + 80, 8), 0);

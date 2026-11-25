@@ -2266,14 +2266,30 @@ impl<'a> Lower<'a> {
     /// The median of three. With a NaN among them the hardware gives the
     /// minimum of the three instead (the host's minimum skips NaNs, so that
     /// is the smallest number among them).
+    fn nan_safe_min(&mut self, a: V, b: V) -> V {
+        let c = self.cur;
+        let r = self.max_min_flushed(false, a, b);
+        let nan_a = self.s.m.cmp(c, pred::UNO, a, a);
+        let nan_b = self.s.m.cmp(c, pred::UNO, b, b);
+        let r = self.s.m.select(c, nan_a, b, r);
+        self.s.m.select(c, nan_b, a, r)
+    }
+    fn nan_safe_max(&mut self, a: V, b: V) -> V {
+        let c = self.cur;
+        let r = self.max_min_flushed(true, a, b);
+        let nan_a = self.s.m.cmp(c, pred::UNO, a, a);
+        let nan_b = self.s.m.cmp(c, pred::UNO, b, b);
+        let r = self.s.m.select(c, nan_a, b, r);
+        self.s.m.select(c, nan_b, a, r)
+    }
     fn med3(&mut self, a: V, b: V, third: V) -> V {
         let c = self.cur;
         let (a, b, third) = (self.ftz(a), self.ftz(b), self.ftz(third));
-        let lo = self.max_min_flushed(false, a, b);
-        let hi = self.max_min_flushed(true, a, b);
-        let t = self.max_min_flushed(false, hi, third);
-        let median = self.max_min_flushed(true, lo, t);
-        let least = self.max_min_flushed(false, lo, third);
+        let lo = self.nan_safe_min(a, b);
+        let hi = self.nan_safe_max(a, b);
+        let t = self.nan_safe_min(hi, third);
+        let median = self.nan_safe_max(lo, t);
+        let least = self.nan_safe_min(lo, third);
         let ab = self.s.m.cmp(c, pred::UNO, a, b);
         let nan3 = self.s.m.cmp(c, pred::UNO, third, third);
         let nan = self.s.m.bin(c, Bin::Or, ab, nan3);
