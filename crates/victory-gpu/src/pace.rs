@@ -69,7 +69,10 @@ fn sleep_until(deadline: Instant, timer: Option<&std::os::windows::io::OwnedHand
                     std::ptr::null(),
                     0,
                 ) != 0;
-                if on && WaitForSingleObject(handle.as_raw_handle(), INFINITE) == WAIT_FAILED {
+                // The fallback sleeps where the timer left nothing waiting:
+                // a failed arm of `SetWaitableTimer` (or of the wait itself)
+                // would busy-spin through the whole frame's rest.
+                if !on || WaitForSingleObject(handle.as_raw_handle(), INFINITE) == WAIT_FAILED {
                     std::thread::sleep(left - SPIN);
                 }
             },
