@@ -109,3 +109,18 @@ def test_tombox_dir_serves_esram_apu_and_umd_libraries(tmp_path, runtime_dir):
     result = subprocess.run([str(runtime_dir / "anyxboxx.exe"), str(exe)], capture_output=True, text=True,
                             timeout=60, env=environment)
     assert result.returncode == 42, result.stderr
+
+
+AUDIO_TOMBOX_LIBRARIES = {"AcpHal.dll": "AcpHalCreate", "chad.dll": "XDspConnectWithMaximumStreamLimit"}
+
+
+@pytest.mark.skipif(not all((TOMBOX_DIR / name.lower()).is_file() for name in AUDIO_TOMBOX_LIBRARIES),
+                    reason="DLL audio de TomBox non compilées (tools/build_tombox.py acphal chad)")
+def test_tombox_dir_serves_acphal_and_chad_audio_libraries(tmp_path, runtime_dir):
+    imports = list(AUDIO_TOMBOX_LIBRARIES.items())
+    exe = build_pe(tmp_path / "audio_libs.exe", lambda iat: Asm().mov_eax(42).ret().build(), imports=imports, dll=False)
+    assert launch(runtime_dir, exe).returncode != 42
+    environment = {**os.environ, "ANYXBOXX_TOMBOX_DIR": str(TOMBOX_DIR)}
+    result = subprocess.run([str(runtime_dir / "anyxboxx.exe"), str(exe)], capture_output=True, text=True,
+                            timeout=60, env=environment)
+    assert result.returncode == 42, result.stderr
