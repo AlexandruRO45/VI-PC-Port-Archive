@@ -1,7 +1,6 @@
 //! Original 65,536-slot D3D12 allocator and descriptor readback fixture.
-//! Set VICTORY_TABLE_TEST_ADAPTER (amd, nvidia or warp),
-//! VICTORY_TABLE_TEST_AGILITY (Agility SDK 1.620.x x64 DLL directory) and
-//! VICTORY_TABLE_TEST_DXC (dxc.exe path), then run:
+//! Set VICTORY_TABLE_TEST_ADAPTER (amd, nvidia or warp) and
+//! VICTORY_TABLE_TEST_AGILITY (Agility SDK 1.620.x x64 DLL directory), then run:
 //! cargo test --release -p victory-gpu --features diagnostics capped_pool_texture_table_reuse -- --ignored --nocapture
 //! The default run uses GPU-based validation. Set VICTORY_TABLE_TEST_TIMING=1
 //! to measure CPU descriptor preparation with validation disabled.
@@ -10,17 +9,18 @@ use super::*;
 use std::mem::ManuallyDrop;
 use std::time::Instant;
 use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
+use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
 use windows::Win32::Graphics::Dxgi::*;
-use windows::core::{Interface, PCSTR};
+use windows::core::{Interface, PCSTR, s};
 
 const HLSL: &str = r#"
-#define RS "RootFlags(CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED), RootConstants(num32BitConstants=2, b0), UAV(u0)"
-cbuffer Constants : register(b0) { uint slot, index; };
+#define RS "RootConstants(num32BitConstants=1, b0), UAV(u0), DescriptorTable(SRV(t0))"
+cbuffer Constants : register(b0) { uint index; };
 RWByteAddressBuffer output : register(u0);
+Texture2D<uint> image : register(t0);
 [RootSignature(RS)]
 [numthreads(1, 1, 1)]
 void main() {
-    Texture2D<uint> image = ResourceDescriptorHeap[slot];
     output.Store(index * 4, image.Load(int3(0, 0, 0)));
 }
 "#;
@@ -84,22 +84,26 @@ fn device(validate: bool) -> (ID3D12Device, String) {
 }
 
 fn shader(hlsl: &str) -> Vec<u8> {
-    let dir = tempfile::tempdir().unwrap();
-    let source = dir.path().join("table.hlsl");
-    let binary = dir.path().join("table.dxil");
-    std::fs::write(&source, hlsl).unwrap();
-    let result = std::process::Command::new(std::env::var_os("VICTORY_TABLE_TEST_DXC").unwrap())
-        .args(["-E", "main", "-T", "cs_6_6", "-Fo"])
-        .arg(&binary)
-        .arg(&source)
-        .output()
-        .unwrap();
-    assert!(
-        result.status.success(),
-        "{}",
-        String::from_utf8_lossy(&result.stderr)
-    );
-    std::fs::read(binary).unwrap()
+    let mut code = None;
+    // SAFETY: the source and names live for the call, and the output blob is ours.
+    unsafe {
+        D3DCompile(
+            hlsl.as_ptr().cast(),
+            hlsl.len(),
+            s!("descriptor reuse fixture"),
+            None,
+            None,
+            s!("main"),
+            s!("cs_5_1"),
+            0,
+            0,
+            &mut code,
+            None,
+        )
+        .expect("compile descriptor reuse fixture");
+        let code = code.unwrap();
+        std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize()).to_vec()
+    }
 }
 
 fn compute_pipeline(
@@ -475,9 +479,9 @@ fn run(fixture: &Fixture, shared: bool, lists: usize, distinct: bool) -> ResultR
                 list.SetDescriptorHeaps(&[Some(heap.heap.clone())]);
                 list.SetComputeRootSignature(&fixture.root);
                 list.SetPipelineState(&fixture.pso);
-                let values = [slot + position, index as u32];
-                list.SetComputeRoot32BitConstants(0, 2, values.as_ptr().cast(), 0);
+                list.SetComputeRoot32BitConstant(0, index as u32, 0);
                 list.SetComputeRootUnorderedAccessView(1, output.GetGPUVirtualAddress());
+                list.SetComputeRootDescriptorTable(2, heap.gpu(slot + position));
                 list.Dispatch(1, 1, 1);
                 expected[index] = if rewritten { SECOND } else { FIRST };
                 work.push(list.clone());
@@ -528,7 +532,7 @@ fn run(fixture: &Fixture, shared: bool, lists: usize, distinct: bool) -> ResultR
 }
 
 #[test]
-#[ignore = "requires a named D3D12 adapter, DXC and Agility SDK 1.620.x"]
+#[ignore = "requires a named D3D12 adapter, Windows Graphics Tools and Agility SDK 1.620.x"]
 fn capped_pool_texture_table_reuse() {
     let timing = std::env::var_os("VICTORY_TABLE_TEST_TIMING").is_some();
     let (device, name) = device(!timing);
