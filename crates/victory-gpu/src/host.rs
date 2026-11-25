@@ -2089,28 +2089,49 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
     None
 }
 
+/// Keep the first-seen order of copies while looking up their spans by
+/// identity. The Arc in each entry keeps its address live for the index.
+struct RefreshSpans<T> {
+    spans: Vec<(std::sync::Arc<T>, usize, usize)>,
+    index: std::collections::HashMap<*const T, usize>,
+}
+
+impl<T> RefreshSpans<T> {
+    fn new() -> Self {
+        Self { spans: Vec::new(), index: std::collections::HashMap::new() }
+    }
+
+    fn add(&mut self, copy: &std::sync::Arc<T>, from: usize, to: usize) {
+        let key = std::sync::Arc::as_ptr(copy);
+        let at = *self.index.entry(key).or_insert_with(|| {
+            let at = self.spans.len();
+            self.spans.push((copy.clone(), from, to));
+            at
+        });
+        let span = &mut self.spans[at];
+        (span.1, span.2) = (span.1.min(from), span.2.max(to));
+    }
+}
+
 /// With flights in the air, after the submission's write-watch asking:
 /// whether `runs` refresh a range of a host copy that a flight's shaders
 /// may write and that the title wrote since it was last copied. The
 /// refresh leaves ranges shaders are writing alone (`Shadow::update`), so
 /// the title's bytes there would reach the card a submission late.
 fn stale_under_flights(runs: &[&HostList]) -> bool {
-    use std::sync::Arc;
     // Per copy, the span of what is refreshed (a flush brings that much
-    // up to date at most).
-    let mut spans: Vec<(Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
+    // up to date at most). Preserve order for the shared runs_left budget.
+    let mut spans = RefreshSpans::new();
     for list in runs {
         for step in &list.deferred().copies {
             if let Step::Refresh(shadow, address, len) = step
                 && shadow.writes_pending()
             {
-                match spans.iter_mut().find(|s| Arc::ptr_eq(&s.0, shadow)) {
-                    Some(s) => (s.1, s.2) = (s.1.min(*address), s.2.max(*address + *len)),
-                    None => spans.push((shadow.clone(), *address, *address + *len)),
-                }
+                spans.add(shadow, *address, *address + *len);
             }
         }
     }
+    let spans = spans.spans;
     if late_exact() {
         // The title's bytes are put in beside the flights' writes; a
         // settle is still due where that could not be done. At most this
@@ -2525,6 +2546,51 @@ fn late_line(frames: f64) {
 #[cfg(test)]
 mod late_tests {
     use super::{continues, join_ranges, touches};
+
+    #[test]
+    fn refresh_spans_preserve_copy_identity_order_and_bounds() {
+        use std::sync::Arc;
+        let a = Arc::new(7);
+        let b = Arc::new(7);
+        let c = Arc::new(8);
+        let mut spans = super::RefreshSpans::new();
+        spans.add(&a, 20, 30);
+        spans.add(&b, 5, 10);
+        spans.add(&c, 80, 90);
+        spans.add(&a.clone(), 10, 25);
+        spans.add(&b, 8, 40);
+        spans.add(&a, 50, 60);
+        assert_eq!(spans.spans.len(), 3);
+        for ((copy, from, to), (expected, lo, hi)) in
+            spans.spans.iter().zip([(&a, 10, 60), (&b, 5, 40), (&c, 80, 90)])
+        {
+            assert!(Arc::ptr_eq(copy, expected));
+            assert_eq!((*from, *to), (lo, hi));
+        }
+    }
+
+    #[test]
+    fn refresh_spans_match_linear_reference() {
+        use std::sync::Arc;
+        let copies: Vec<_> = (0..64).map(Arc::new).collect();
+        let mut spans = super::RefreshSpans::new();
+        let mut reference: Vec<(Arc<usize>, usize, usize)> = Vec::new();
+        for i in 0usize..4096 {
+            let copy = &copies[(i * 17) % copies.len()];
+            let from = (i * 31) % 1024;
+            let to = from + i % 64;
+            spans.add(copy, from, to);
+            match reference.iter_mut().find(|entry| Arc::ptr_eq(&entry.0, copy)) {
+                Some(entry) => (entry.1, entry.2) = (entry.1.min(from), entry.2.max(to)),
+                None => reference.push((copy.clone(), from, to)),
+            }
+        }
+        assert_eq!(spans.spans.len(), reference.len());
+        for (actual, expected) in spans.spans.iter().zip(&reference) {
+            assert!(Arc::ptr_eq(&actual.0, &expected.0));
+            assert_eq!((actual.1, actual.2), (expected.1, expected.2));
+        }
+    }
 
     /// Copies join only when both ends continue and the whole does not
     /// overlap itself.
