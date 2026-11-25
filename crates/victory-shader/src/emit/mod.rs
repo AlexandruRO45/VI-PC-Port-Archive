@@ -516,6 +516,7 @@ pub fn translate_with(container: &[u8], options: Options) -> Result<HostShader, 
 /// `None` for depth-only draws), pruning arbitrary mesh outputs the pixel
 /// shader never reads so the mesh shader fits within [`MESH_OUTPUT_LIMIT`]
 /// (32 KiB) while keeping both stages' signatures linked for D3D12.
+/// Returns an error if the retained outputs still exceed the limit.
 pub fn translate_linked(
     mesh: &[u8],
     pixel: Option<&[u8]>,
@@ -532,7 +533,7 @@ pub fn translate_linked(
     };
     let Some(ps_bytes) = pixel else {
         let empty = lower::KeptOutputs::new();
-        let linked_ms = emit_pruned(&ms_in, options, Some(&empty))?;
+        let linked_ms = emit_linked_mesh(&ms_in, options, &empty)?;
         return Ok((linked_ms, None));
     };
     let pp = prepare(ps_bytes)?;
@@ -546,9 +547,27 @@ pub fn translate_linked(
     };
     let full_ps = emit_pruned(&ps_in, options, None)?;
     let reads = pixel_input_reads(&full_ps.dxil)?;
-    let linked_ms = emit_pruned(&ms_in, options, Some(&reads))?;
+    let linked_ms = emit_linked_mesh(&ms_in, options, &reads)?;
     let linked_ps = emit_pruned(&ps_in, options, Some(&reads))?;
     Ok((linked_ms, Some(linked_ps)))
+}
+
+fn emit_linked_mesh(
+    input: &EmitInput<'_>,
+    options: Options,
+    reads: &lower::KeptOutputs,
+) -> Result<HostShader, ShaderError> {
+    let linked = emit_pruned(input, options, Some(reads))?;
+    let bytes = mesh_output_bytes(&linked.dxil).ok_or(ShaderError::Malformed(
+        "linked shader has no mesh output declaration",
+    ))?;
+    if bytes > MESH_OUTPUT_LIMIT {
+        return Err(ShaderError::Unsupported {
+            offset: 0,
+            what: "a linked mesh shader exceeding the 32 KiB output budget",
+        });
+    }
+    Ok(linked)
 }
 
 struct EmitInput<'a> {
@@ -676,14 +695,18 @@ fn emit_pruned(
         mesh_stride,
         view_marks: options.view_marks,
     };
-    let l = match lower::lower_pruned(&parts(st, res), keep) {
+    let run = |parts: &lower::Parts| match keep {
+        Some(keep) => lower::lower_pruned(parts, Some(keep)),
+        None => lower::lower(parts),
+    };
+    let l = match run(&parts(st, res)) {
         // Discarded lanes kept on as helpers can read what no surviving
         // lane does (a register only killed lanes skipped writing); such a
         // program kills them as the console does (`structure::killing`).
         Err(_) if !st.discards.is_empty() => {
             let st = structure::killing(p)?;
             let res = resource::track(p, &native.layout, native.stage, Some(&st))?;
-            lower::lower_pruned(&parts(&st, &res), keep)?
+            run(&parts(&st, &res))?
         }
         l => l?,
     };
@@ -2098,7 +2121,7 @@ mod tests {
     /// pixel output on hardware and WARP.
     #[test]
     fn linked_mesh_and_pixel_prune_unused_outputs_under_32k_and_draw() {
-        let (ms_bytes, ms_native) = wide_mesh_parts(128, 128, 128);
+        let (ms_bytes, ms_native) = wide_mesh_parts(128, 128, 256);
         let mc = Container::parse(&ms_bytes).unwrap();
         let mp = ir::build(&ms_native.patched_code(), ms_native.wave64, ms_native.vgprs).unwrap();
         let mst = structure::structure(&mp).unwrap();
@@ -2117,9 +2140,25 @@ mod tests {
         assert_eq!(mesh_output_bytes(&standalone.dxil), Some(34_816));
         assert!(mesh_output_bytes(&standalone.dxil).unwrap() > MESH_OUTPUT_LIMIT);
 
+        // Keeping all four position components plus 60 arbitrary ones fits
+        // exactly. Keeping one more must fail after linking.
+        let mut wide_reads: lower::KeptOutputs = (0..15)
+            .map(|index| (("TEXCOORD".into(), index), 0xF))
+            .collect();
+        let at_limit = emit_linked_mesh(&ms_in, Options::default(), &wide_reads).unwrap();
+        assert_eq!(mesh_output_bytes(&at_limit.dxil), Some(MESH_OUTPUT_LIMIT));
+        wide_reads.insert(("TEXCOORD".into(), 15), 1);
+        assert_eq!(
+            emit_linked_mesh(&ms_in, Options::default(), &wide_reads).err(),
+            Some(ShaderError::Unsupported {
+                offset: 0,
+                what: "a linked mesh shader exceeding the 32 KiB output budget",
+            }),
+        );
+
         // Depth-only linking (no pixel shader) drops all arbitrary outputs.
         let empty = lower::KeptOutputs::new();
-        let depth_ms = emit_pruned(&ms_in, Options::default(), Some(&empty)).unwrap();
+        let depth_ms = emit_linked_mesh(&ms_in, Options::default(), &empty).unwrap();
         assert_eq!(mesh_output_bytes(&depth_ms.dxil), Some(4 * 4 * 128));
 
         // Paired pixel shader declaring the same 17 rows, reading only
@@ -2217,8 +2256,18 @@ mod tests {
         assert_eq!(reads.get(&("TEXCOORD".into(), 0)), Some(&0b0011));
         assert_eq!(reads.get(&("TEXCOORD".into(), 15)), Some(&0b1100));
 
-        let linked_ms = emit_pruned(&ms_in, Options::default(), Some(&reads)).unwrap();
+        let linked_ms = emit_linked_mesh(&ms_in, Options::default(), &reads).unwrap();
         let linked_ps = emit_pruned(&ps_in, Options::default(), Some(&reads)).unwrap();
+        // The sparse signatures fit even at the original declared count, but
+        // 128 lanes cannot emit indices for 256 primitives.
+        for mesh in [&standalone, &depth_ms, &linked_ms] {
+            let c = Container::parse(&mesh.dxil).unwrap();
+            let psv = c.part(FourCC::PSV0).unwrap().data;
+            assert_eq!(
+                u16::from_le_bytes(psv[4 + 14..4 + 16].try_into().unwrap()),
+                128
+            );
+        }
         // SV_Position (4) + TEXCOORD0.xy (2) + TEXCOORD15.zw (2) = 8 components.
         assert_eq!(mesh_output_bytes(&linked_ms.dxil), Some(8 * 4 * 128));
         assert!(!linked_ps.dxil.is_empty());
@@ -2228,6 +2277,7 @@ mod tests {
             if let Ok(mut v) = super::validator::Validator::load(
                 super::validator::Validator::default_path().as_deref(),
             ) {
+                v.validate(&mut at_limit.dxil.clone()).unwrap();
                 v.validate(&mut depth_ms.dxil.clone()).unwrap();
                 v.validate(&mut linked_ms.dxil.clone()).unwrap();
                 v.validate(&mut linked_ps.dxil.clone()).unwrap();

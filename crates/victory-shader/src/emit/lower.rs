@@ -664,9 +664,10 @@ impl<'a> Lower<'a> {
             // Each lane writes only its own vertex/primitive (`mesh_thread()`),
             // so when the declared counts exceed DXIL's 32 KiB output budget we
             // can safely tighten them down to the group's thread count.
+            // Use the original signatures so linking cannot restore counts.
             if super::container::mesh_output_bytes(
-                &s.outputs,
-                &s.prims,
+                &x.outputs,
+                &x.prims,
                 max_vertices,
                 max_primitives,
             ) > super::container::MESH_OUTPUT_LIMIT
