@@ -231,7 +231,7 @@ pub(crate) fn track(start: usize, len: usize, views: bool) -> Option<Tracked> {
 /// committed memory).
 fn runtime_memory(at: usize, views: bool) -> bool {
     use windows_sys::Win32::System::Memory::{
-        GetWriteWatch, MEM_COMMIT, MEM_PRIVATE, MEMORY_BASIC_INFORMATION, VirtualQuery,
+        GetWriteWatch, MEM_COMMIT, MEM_IMAGE, MEM_PRIVATE, MEMORY_BASIC_INFORMATION, VirtualQuery,
     };
     let page = at & !(4096 - 1);
     let (mut found, mut count, mut granularity) = (0usize, 1usize, 0u32);
@@ -246,7 +246,9 @@ fn runtime_memory(at: usize, views: bool) -> bool {
     let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
     // SAFETY: a valid out pointer of the right size.
     let n = unsafe { VirtualQuery(page as *const _, &mut info, size_of_val(&info)) };
-    n != 0 && !(info.State == MEM_COMMIT && info.Type == MEM_PRIVATE)
+    // A mapped image is no GPU memory either: guarding its pages would take
+    // execute access from code that shares a 64 KiB page with data.
+    n != 0 && info.Type != MEM_IMAGE && !(info.State == MEM_COMMIT && info.Type == MEM_PRIVATE)
 }
 
 impl Drop for Tracked {
@@ -721,6 +723,17 @@ pub(crate) mod tests {
         assert!(t.take(p, p + 3 * PAGE).is_empty());
         drop(t);
         free(p);
+    }
+
+    /// A mapped image (the title's own `.rdata`, `.data`, or code in the same
+    /// 64 KiB page) is not the runtime's GPU memory: guarding it would take
+    /// execute access from code.
+    #[test]
+    fn image_memory_is_not_tracked() {
+        static IN_THE_IMAGE: [u8; 64] = [1; 64];
+        let at = IN_THE_IMAGE.as_ptr() as usize;
+        assert!(track(at, IN_THE_IMAGE.len(), true).is_none());
+        assert!(track(image_memory_is_not_tracked as fn() as usize, 16, true).is_none());
     }
 
     /// Plain committed memory (the C heap) is not tracked; reserved memory
