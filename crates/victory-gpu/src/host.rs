@@ -1100,9 +1100,12 @@ fn computed_tail(runs: &[&HostList]) -> Option<usize> {
             }
             _ => false,
         }) {
+            // Opaque CPU writes cannot forward exact destination ranges.
             // The same closed list can appear more than once.
             drop(deferred);
-            return computed_suffix_preserves_shadows(runs, i).then_some(i);
+            return runs[i..].iter().all(|list| {
+                !list.deferred().copies.iter().any(|step| matches!(step, Step::Run(_)))
+            }).then_some(i);
         }
         opaque |= deferred.opaque_writes;
         writes.extend_from_slice(&deferred.write_ranges);
@@ -1110,22 +1113,14 @@ fn computed_tail(runs: &[&HostList]) -> Option<usize> {
     None
 }
 
-/// A title write invalidates Batch's set of current shadows. If a
-/// later refresh runs after a missed prefix, it could then copy old title
-/// bytes over a private producer. Keep such a batch together.
-fn computed_suffix_preserves_shadows(runs: &[&HostList], from: usize) -> bool {
-    let mut title_written = false;
-    for (i, list) in runs.iter().enumerate() {
-        for step in &list.deferred().copies {
-            match step {
-                Step::Copy(_, _, len) if *len != 0 => title_written = true,
-                Step::Run(_) => title_written = true,
-                Step::Refresh(..) | Step::Heap(_) if i >= from && title_written => return false,
-                _ => {}
-            }
+fn computed_write_pages(runs: &[&HostList]) -> Vec<crate::shadow::WriteRange> {
+    let mut pages = crate::shadow::view_write_pages(true);
+    for list in runs {
+        for collect in &list.deferred().memory_pages {
+            collect(&mut pages);
         }
     }
-    true
+    pages
 }
 
 impl Host {
@@ -1344,8 +1339,9 @@ impl Host {
                 missed.clear();
                 suffix
             } else {
-                // Keep the snapshots and marks, and do not publish the
-                // prefix. The suffix continues to stage from title memory.
+                // The prefix remains private. Preserve its GPU bytes
+                // through subsequent CPU copies and shadow refreshes.
+                batch.preserve_gpu_writes(prefix);
                 runs
             };
             self.run_batch(suffix, submitted, &mut batch, std::time::Instant::now());
@@ -1522,17 +1518,7 @@ impl Host {
         let withholding = crate::memory::withholding();
         // An ordinary marked or declared copy can otherwise take a
         // computed program's held bytes along from the same shadow page.
-        let held_pages = if withholding {
-            let mut held = crate::shadow::memory_write_pages();
-            for list in runs {
-                for pages in &list.deferred().memory_pages {
-                    pages(&mut held);
-                }
-            }
-            held
-        } else {
-            Vec::new()
-        };
+        let held_pages = if withholding { computed_write_pages(runs) } else { Vec::new() };
         for (list, &missed) in runs.iter().zip(missed) {
             let deferred = list.deferred();
             let missed = missed || withholding && !deferred.missed.is_empty();
@@ -2507,7 +2493,13 @@ impl HostList {
                         add(C::CopyBytes, len as u64);
                     }
                     batch.title_written();
-                    copy_mapped(dst as *mut u8, src as *const u8, len, true);
+                    if batch.preserved.is_empty() {
+                        copy_mapped(dst as *mut u8, src as *const u8, len, true);
+                    } else {
+                        copy_mapped_delivering(dst as *mut u8, src as *const u8, len, true, |at, n| {
+                            batch.apply_title_copy(at, n);
+                        });
+                    }
                     len
                 }
                 &Step::Fill(dst, src, len) => {
@@ -2580,6 +2572,12 @@ impl HostList {
 /// title memory asks for every copy whole. What the title's threads write
 /// meanwhile is for later submissions (on the console it would race the
 /// GPU).
+struct PreservedCopy {
+    shadow: std::sync::Arc<crate::shadow::Shadow>,
+    /// Sorted disjoint intervals, expressed as (start, end).
+    ranges: Vec<(usize, usize)>,
+}
+
 #[derive(Default)]
 struct Batch {
     refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
@@ -2588,9 +2586,64 @@ struct Batch {
     /// The range of each copy brought up to date since the last title
     /// write, by copy (held, so that its address names no other).
     current: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+    /// Completed GPU writes that remain private until logical completion.
+    preserved: std::collections::HashMap<usize, PreservedCopy>,
 }
 
 impl Batch {
+    fn preserve_gpu_writes(&mut self, prefix: &[&HostList]) {
+        let mut writes = computed_write_pages(prefix);
+        writes.extend(crate::shadow::view_write_pages(false));
+        for list in prefix {
+            for step in &list.deferred().copies {
+                if let Step::GpuWrite(shadow, at, len, false, _) = step {
+                    writes.push((shadow.clone(), *at, *len));
+                }
+            }
+        }
+        writes.sort_unstable_by_key(|(s, at, _)| (std::sync::Arc::as_ptr(s) as usize, *at));
+        for (shadow, at, len) in writes {
+            let (start, bytes) = shadow.range();
+            let from = at.max(start as usize);
+            let end = at.saturating_add(len).min((start + bytes) as usize);
+            if from >= end {
+                continue;
+            }
+            let key = std::sync::Arc::as_ptr(&shadow) as usize;
+            let ranges = &mut self.preserved.entry(key).or_insert_with(|| PreservedCopy {
+                shadow,
+                ranges: Vec::new(),
+            }).ranges;
+            if let Some(last) = ranges.last_mut()
+                && from <= last.1
+            {
+                last.1 = last.1.max(end);
+            } else {
+                ranges.push((from, end));
+            }
+        }
+    }
+
+    fn apply_title_copy(&self, at: usize, len: usize) {
+        if len == 0 {
+            return;
+        }
+        self.apply_title_range(at, len);
+        for (alias, n) in crate::watch::aliased_ranges(at, len) {
+            self.apply_title_range(alias, n);
+        }
+    }
+
+    fn apply_title_range(&self, at: usize, len: usize) {
+        for preserved in self.preserved.values() {
+            let i = preserved.ranges.partition_point(|&(_, end)| end <= at);
+            for &(a, b) in preserved.ranges[i..].iter().take_while(|&&(start, _)| start < at + len) {
+                let (a, b) = (a.max(at), b.min(at + len));
+                preserved.shadow.apply_title_copy(a, b - a);
+            }
+        }
+    }
+
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
         // Nothing to copy: a world submission asks for every copy its heaps'
         // views and page tables reach (~9,000), a few of them written.
@@ -2628,7 +2681,21 @@ impl Batch {
         let mut total = 0;
         for (shadow, from, to) in self.refreshes.drain(..) {
             let started = std::time::Instant::now();
-            let copied = shadow.update(from, to - from);
+            let key = std::sync::Arc::as_ptr(&shadow) as usize;
+            let mut at = from;
+            let mut copied = 0;
+            if let Some(preserved) = self.preserved.get(&key) {
+                let i = preserved.ranges.partition_point(|&(_, end)| end <= from);
+                for &(a, b) in preserved.ranges[i..].iter().take_while(|&&(start, _)| start < to) {
+                    if at < a {
+                        copied += shadow.update(at, a - at);
+                    }
+                    at = at.max(b);
+                }
+            }
+            if at < to {
+                copied += shadow.update(at, to - at);
+            }
             let us = started.elapsed().as_micros() as u64;
             #[cfg(feature = "diagnostics")]
             crate::copystat::range(from, to - from, us, 0);
@@ -2637,7 +2704,6 @@ impl Batch {
             total += copied;
             // Kept: the union with what was current if they touch, else
             // the larger.
-            let key = std::sync::Arc::as_ptr(&shadow) as usize;
             let (_, a, b) = self.current.entry(key).or_insert((shadow, from, to));
             if from <= *b && *a <= to {
                 (*a, *b) = ((*a).min(from), (*b).max(to));
@@ -2663,11 +2729,22 @@ impl Batch {
 /// its copy has failed (asked before each, the world's 80 copies per frame
 /// cost 60 ms).
 pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: bool) {
+    copy_mapped_delivering(dst, src, len, title_dst, |_, _| {});
+}
+
+fn copy_mapped_delivering(
+    dst: *mut u8,
+    src: *const u8,
+    len: usize,
+    title_dst: bool,
+    mut delivered: impl FnMut(usize, usize),
+) {
     #[cfg(feature = "diagnostics")]
     match crate::copystat::mode() {
         1 => {
             // SAFETY: timing only: the caller vouches for the source.
             unsafe { std::ptr::copy(src, dst, len) };
+            delivered(dst as usize, len);
             return;
         }
         2 => return,
@@ -2680,7 +2757,7 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     let _writing = title_dst.then(|| crate::watch::writing(dst as usize, len));
     #[cfg(feature = "diagnostics")]
     let moved = std::time::Instant::now();
-    let whole = read(src, dst, len);
+    let whole = read_delivering(src, dst, len, &mut delivered);
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::MoveUs, moved.elapsed().as_micros() as u64);
     if whole {
@@ -2700,14 +2777,22 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     // that fails), zeros for what cannot be read.
     for_pieces(src as usize, len, 64 << 10, |at, n| {
         let to = dst.wrapping_add(at - src as usize);
-        if !read(at as *const u8, to, n) {
+        if !read_delivering(at as *const u8, to, n, &mut delivered) {
             for_pieces(at, n, 4 << 10, |at, n| {
                 let to = dst.wrapping_add(at - src as usize);
-                if !read(at as *const u8, to, n) {
+                if !read_delivering(at as *const u8, to, n, &mut delivered) {
                     #[cfg(feature = "diagnostics")]
                     crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
-                    // SAFETY: inside the destination, which is mapped.
-                    unsafe { to.write_bytes(0, n) };
+                    if title_dst {
+                        // The title can remap the destination after the
+                        // commitment check. Let the kernel check it again.
+                        let zeros = [0u8; 4 << 10];
+                        read_delivering(zeros.as_ptr(), to, n, &mut delivered);
+                    } else {
+                        // SAFETY: inside the caller's private upload mapping.
+                        unsafe { to.write_bytes(0, n) };
+                        delivered(to as usize, n);
+                    }
                 }
             });
         }
@@ -2724,13 +2809,21 @@ pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
 /// page is not readable or a destination page not writable (the bytes
 /// before that page may have been copied).
 fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
+    read_delivering(src, dst, len, &mut |_, _| {})
+}
+
+fn read_delivering(src: *const u8, dst: *mut u8, len: usize, delivered: &mut impl FnMut(usize, usize)) -> bool {
     use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let mut done = 0;
     // SAFETY: the destination is `len` bytes the caller may write, host
     // memory or title memory; the kernel checks both ranges, and a page it
     // cannot read or write fails the call instead of faulting.
-    unsafe { ReadProcessMemory(GetCurrentProcess(), src.cast(), dst.cast(), len, &mut done) != 0 }
+    let ok = unsafe { ReadProcessMemory(GetCurrentProcess(), src.cast(), dst.cast(), len, &mut done) != 0 };
+    if done != 0 {
+        delivered(dst as usize, done);
+    }
+    ok
 }
 
 /// Copies host memory into title memory after a submission (what shaders
@@ -2769,7 +2862,7 @@ fn for_pieces(start: usize, len: usize, step: usize, mut f: impl FnMut(usize, us
 
 #[cfg(test)]
 mod title_copies {
-    use super::{copy_mapped, write_mapped};
+    use super::{Batch, PreservedCopy, copy_mapped, copy_mapped_delivering, write_mapped};
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE,
         VirtualAlloc, VirtualFree, VirtualProtect,
@@ -2830,6 +2923,75 @@ mod title_copies {
         assert!(to[BLOCK..2 * BLOCK].iter().all(|&b| b == 0));
         assert!(to[2 * BLOCK..].iter().all(|&b| b == 7));
         release(holes);
+    }
+
+    #[test]
+    fn delivery_tracks_mapped_bytes_and_zero_fallback() {
+        let from = holed(0x55);
+        let mut to = vec![0xeeu8; 3 * BLOCK];
+        let start = to.as_mut_ptr() as usize;
+        let mut reported = vec![false; to.len()];
+        copy_mapped_delivering(to.as_mut_ptr(), from, to.len(), true, |at, len| {
+            reported[at - start..at - start + len].fill(true);
+        });
+        assert!(reported.into_iter().all(|b| b));
+        assert!(to[..BLOCK].iter().all(|&b| b == 0x55));
+        assert!(to[BLOCK..2 * BLOCK].iter().all(|&b| b == 0));
+        assert!(to[2 * BLOCK..].iter().all(|&b| b == 0x55));
+
+        let hole = holed(0xee);
+        let mut reported = 0;
+        // SAFETY: pointer arithmetic within the reservation, used only
+        // through the kernel. The destination block is uncommitted.
+        let unmapped = unsafe { hole.add(BLOCK) };
+        copy_mapped_delivering(unmapped, to.as_ptr(), BLOCK, true, |_, n| reported += n);
+        assert_eq!(reported, 0);
+        release(from);
+        release(hole);
+    }
+
+    #[test]
+    fn ordered_copy_through_an_alias_preserves_unwritten_private_bytes() {
+        use crate::watch::PAGE;
+        use windows_sys::Win32::System::Memory::{MEMORY_MAPPED_VIEW_ADDRESS, UnmapViewOfFile};
+        if super::host().is_none() {
+            assert!(std::env::var_os("VICTORY_TEST_ORDERING_REQUIRE_GPU").is_none());
+            return;
+        }
+        let (at, alias) = crate::watch::tests::twin_views(1);
+        let initial = [11u32, 0, 11];
+        // SAFETY: our fresh mapped page.
+        unsafe { (at as *mut u32).copy_from_nonoverlapping(initial.as_ptr(), 3) };
+        crate::shadow::register(at, at as u64, PAGE as u64);
+        let shadow = crate::shadow::find(at as u64, PAGE as u64).unwrap();
+        shadow.update(at, PAGE);
+        shadow.write_host(at as u64, &29u32.to_ne_bytes());
+        shadow.write_host((at + 8) as u64, &37u32.to_ne_bytes());
+        let mut batch = Batch::default();
+        batch.preserved.insert(std::sync::Arc::as_ptr(&shadow) as usize, PreservedCopy {
+            shadow: shadow.clone(),
+            ranges: vec![(at, at + PAGE)],
+        });
+        batch.title_written();
+        // The third value equals guest memory but still overrides the
+        // earlier GPU write. The first dword was not copied.
+        let patch = [55u32, 11];
+        copy_mapped_delivering((alias + 4) as *mut u8, patch.as_ptr().cast(), 8, true, |at, len| {
+            batch.apply_title_copy(at, len);
+        });
+        batch.add(&shadow, at, PAGE);
+        batch.flush();
+        assert_eq!(shadow.read_host(at as u64, 3), [29, 55, 11]);
+        // SAFETY: the fenced GPU value must still be invisible in the title.
+        assert_eq!(unsafe { (at as *const u32).read() }, 11);
+        drop(batch);
+        drop(shadow);
+        crate::shadow::unregister(at, at as u64);
+        for mapping in [alias, at] {
+            crate::watch::title_memory_remapped(mapping, PAGE);
+            // SAFETY: these are the two views of the test allocation.
+            assert_ne!(unsafe { UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: mapping as *mut _ }) }, 0);
+        }
     }
 
     #[test]

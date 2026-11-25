@@ -783,6 +783,18 @@ pub fn title_memory_aliased(at: usize, others: &[usize]) {
     }
 }
 
+/// Other runtime mappings of the bytes in a delivered title-memory copy.
+pub(crate) fn aliased_ranges(start: usize, len: usize) -> Vec<(usize, usize)> {
+    let end = start.saturating_add(len);
+    let g = guards();
+    g.alias_of.range(start / PAGE..end.div_ceil(PAGE)).flat_map(|(&page, mappings)| {
+        let base = page * PAGE;
+        let from = start.saturating_sub(base);
+        let to = (end - base).min(PAGE);
+        mappings.iter().map(move |alias| (alias * PAGE + from, to - from))
+    }).collect()
+}
+
 /// Does this byte range reach a pending write directly or through another
 /// mapping of the same physical page?
 pub(crate) fn overlaps_writes((start, len): (usize, usize), writes: &[(usize, usize)]) -> bool {

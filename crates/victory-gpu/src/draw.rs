@@ -2438,14 +2438,15 @@ void main() {
                 suffix.list.Dispatch(1, 1, 1);
             }
             let cpu = 55u32;
-            if miss != 0 {
-                if overlap_refresh {
-                    suffix.defer_copy((address + 8) as *mut u8, (&raw const cpu).cast(), 4);
-                    target.refresh(suffix, address as u64, 16);
-                }
+            if overlap_refresh && case < 2 {
+                let source = if miss == 0 { address as *const u8 } else { (&raw const cpu).cast() };
+                suffix.defer_copy((address + 8) as *mut u8, source, 4);
+                target.refresh(suffix, address as u64, 16);
+            }
+            if miss != 0 || overlap_refresh && case == 0 {
                 let (bit, _) = target.mark_entry(address as u64).unwrap();
                 let dirty = crate::shadow::view_writes(false).unwrap();
-                target.gpu_writes(suffix, (address + 4) as u64, 4, true);
+                target.gpu_writes(suffix, (address + 4) as u64, 4, miss != 0);
                 // SAFETY: the target and the ordinary mark bitmap live
                 // through the list. This writes next to the withheld dword.
                 unsafe {
@@ -2463,12 +2464,17 @@ void main() {
             let read = unsafe { [(address as *const u32).read(), result_data.cast::<u32>().read(), copied] };
             println!("computed tail case {case}: source, staged CBV, CPU copy = {read:?}");
             assert_eq!(read, [expected; 3]);
-            // SAFETY: also inside the allocation, initialized to zero.
-            assert_eq!(unsafe { ((address + 4) as *const u32).read() }, 0);
-            if miss != 0 {
+            // SAFETY: both dwords are inside the title allocation.
+            let more = unsafe { [((address + 4) as *const u32).read(), ((address + 8) as *const u32).read()] };
+            assert_eq!(more, match (overlap_refresh, case) {
+                (true, 0) => [29, 29],
+                (true, 1) => [0, 55],
+                _ => [0, 0],
+            });
+            if miss != 0 || overlap_refresh && case == 0 {
                 let private = target.read_host(address as u64, 4);
-                println!("private shadow after suffix: {private:?}");
-                assert_eq!([private[1], private[2]], [29, if overlap_refresh { 55 } else { 0 }]);
+                println!("shadow after suffix: {private:?}");
+                assert_eq!([private[1], private[2]], [29, more[1]]);
             }
             for resource in [result, title_list, allocator] {
                 crate::object::slot::<extern "system" fn(This) -> u32>(resource, 0x10)(resource);

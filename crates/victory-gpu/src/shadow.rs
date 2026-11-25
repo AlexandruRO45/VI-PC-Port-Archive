@@ -248,6 +248,34 @@ impl Shadow {
         self.marks.is_some()
     }
 
+    /// Refresh only bytes delivered by an ordered title copy. A whole
+    /// page refresh at a native fence would replace GPU data on that page.
+    /// Keep the snapshot in sync so these bytes are not copied back as GPU
+    /// writes. The tracker stays dirty for the next logical submission.
+    pub(crate) fn apply_title_copy(&self, address: usize, len: usize) {
+        let (from, to) = self.inside(address, len);
+        if from >= to {
+            return;
+        }
+        let n = to - from;
+        let mut bytes = pooled(n);
+        bytes.resize(n, 0);
+        if crate::host::read_into((self.start as usize + from) as *const u8, &mut bytes) {
+            // SAFETY: the span is inside the mapping. This runs between
+            // native phases after the producer fence.
+            unsafe { self.data.add(from).copy_from_nonoverlapping(bytes.as_ptr(), n) };
+            let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
+            for (start, old) in &mut before.0 {
+                let a = (*start).max(from);
+                let b = (*start + old.len()).min(to);
+                if a < b {
+                    old[a - *start..b - *start].copy_from_slice(&bytes[a - from..b - from]);
+                }
+            }
+        }
+        give_back(bytes);
+    }
+
     /// `[address, address + len)` cut to the buffer, as offsets in the copy.
     fn inside(&self, address: usize, len: usize) -> (usize, usize) {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
@@ -855,10 +883,10 @@ fn page_of_mark(m: &Marks, n: u32) -> Option<(Arc<Shadow>, usize)> {
     })
 }
 
-/// View pages marked by computed-address shaders. Read after the fence,
+/// View pages marked by the selected shader class. Read after the fence,
 /// without consuming the marks that logical completion will use.
-pub(crate) fn memory_write_pages() -> Vec<WriteRange> {
-    let Some(b) = bitmap(true) else { return Vec::new() };
+pub(crate) fn view_write_pages(memory: bool) -> Vec<WriteRange> {
+    let Some(b) = bitmap(memory) else { return Vec::new() };
     let m = marks();
     let words = (victory_shader::emit::VIEW_WRITE_BITS / 32) as usize;
     let used = (m.end as usize).div_ceil(32).min(words);
