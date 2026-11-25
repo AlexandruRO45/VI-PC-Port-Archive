@@ -1135,13 +1135,10 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             buffer_srv(address, bytes, desc, at)
         }
         View::NullConstant => {
-            // SAFETY: a null description initializes an unbound CBV.
-            unsafe {
-                device.CreateConstantBufferView(
-                    None::<*const D3D12_CONSTANT_BUFFER_VIEW_DESC>,
-                    at,
-                )
-            };
+            // A buffer read through a heap index takes a raw SRV on the host
+            // even when the title called it a constant buffer, so the null
+            // that stands in for it is the same null buffer view.
+            null_buffer_view(at);
             Some(None)
         }
         View::Shader(resource, desc) => {
