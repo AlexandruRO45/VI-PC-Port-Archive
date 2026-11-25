@@ -64,7 +64,7 @@ fn local(url: &[u16]) -> Result<Vec<u16>, (String, String)> {
         if !drive(rest) {
             return Err(("unc".into(), host_of(rest.trim_start_matches("UNC\\"))));
         }
-        return Ok(with_nul(url));
+        text.clone()
     } else if share(&text) {
         return Err(("unc".into(), host_of(&text[2..])));
     } else if drive(&text) {
@@ -538,6 +538,13 @@ mod tests {
             std::fs::read(&host).ok().as_deref(),
             Some(&b"1"[..]),
             "{host}"
+        );
+        let obj = text(&local(&wide(&format!(r"\??\{letter}:\movies\intro.mp4"))).unwrap());
+        assert!(obj.starts_with(r"\??\"), "{obj}");
+        assert_eq!(
+            std::fs::read(&obj).ok().as_deref(),
+            Some(&b"1"[..]),
+            "{obj}"
         );
         let from_url =
             text(&local(&wide(&format!("file:///{letter}:/movies/intro%20a.mp4"))).unwrap());
