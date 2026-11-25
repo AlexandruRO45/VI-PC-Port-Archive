@@ -397,6 +397,49 @@ fn physical() -> MutexGuard<'static, Physical> {
     PHYSICAL.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Create a section whose views share the same physical pages. Under Wine a
+/// file in the optional backing directory lets Linux reclaim the data through
+/// the filesystem. The temporary file is deleted when its last handle closes.
+fn physical_section(size: usize) -> std::io::Result<Section> {
+    use std::os::windows::io::AsRawHandle;
+    let wine = on_wine();
+    let file = match wine.then(|| std::env::var_os("VICTORY_PHYSICAL_BACKING_DIR")).flatten() {
+        Some(directory) => {
+            let directory = std::path::Path::new(&directory);
+            victory_core::ensure_outside_repo(directory).map_err(std::io::Error::other)?;
+            Some(tempfile::tempfile_in(directory)?)
+        }
+        None => None,
+    };
+    let storage = file.as_ref().map_or(INVALID_HANDLE_VALUE, |f| f.as_raw_handle());
+    let protection = if file.is_some() {
+        PAGE_READWRITE
+    } else if wine {
+        PAGE_READWRITE | SEC_COMMIT
+    } else {
+        PAGE_READWRITE | SEC_RESERVE
+    };
+    // SAFETY: storage is a live writable file or the pagefile sentinel. The
+    // new section holds its own reference to the storage.
+    let handle = unsafe {
+        CreateFileMappingW(
+            storage,
+            std::ptr::null(),
+            protection,
+            (size as u64 >> 32) as u32,
+            size as u32,
+            std::ptr::null(),
+        )
+    };
+    if handle.is_null() {
+        return Err(std::io::Error::last_os_error());
+    }
+    if file.is_some() {
+        tracing::info!(bytes = size, "physical pages use temporary file backing");
+    }
+    Ok(Section(handle))
+}
+
 /// `count` is in and out (pages wanted, pages given); all or nothing here.
 pub extern "system" fn XMemAllocatePhysicalPages(
     flags: u64,
@@ -411,31 +454,16 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     let Some(size) = n.checked_mul(PAGE).filter(|&s| s > 0) else {
         return 0;
     };
-    // A pagefile-backed section of `size` bytes, its pages committed when
-    // first mapped or written (`commit`): the title asks for 6.1
-    // GiB at once, which a busy host often cannot commit (error 1450).
-    // SAFETY: plain section creation.
-    let handle = unsafe {
-        CreateFileMappingW(
-            INVALID_HANDLE_VALUE,
-            std::ptr::null(),
-            // Under Wine a committed section is a sparse file, free until
-            // touched, and committing a reserved one page by page costs a
-            // wineserver request each that scans every range committed so
-            // far: commit it whole there.
-            PAGE_READWRITE | if on_wine() { SEC_COMMIT } else { SEC_RESERVE },
-            (size as u64 >> 32) as u32,
-            size as u32,
-            std::ptr::null(),
-        )
+    let section = match physical_section(size) {
+        Ok(section) => section,
+        Err(error) => {
+            tracing::warn!(n, %error, "XMemAllocatePhysicalPages failed");
+            // SAFETY: checked non-null above.
+            unsafe { count.write(0) };
+            return 0;
+        }
     };
-    if handle.is_null() {
-        let error = std::io::Error::last_os_error();
-        tracing::warn!(n, %error, "XMemAllocatePhysicalPages failed");
-        // SAFETY: checked non-null.
-        unsafe { count.write(0) };
-        return 0;
-    }
+    let handle = section.0;
     tracing::debug!(
         n,
         flags = format_args!("{flags:#x}"),
@@ -444,7 +472,7 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     // For the GPU side's in-place census: only a committed section can be
     // opened as a host heap.
     victory_gpu::title_memory_section(handle as usize, size as u64, on_wine());
-    let section = Arc::new(Section(handle));
+    let section = Arc::new(section);
     let mut physical = physical();
     let first = physical.next_page;
     physical.next_page += n * FRAMES;
