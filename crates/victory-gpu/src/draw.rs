@@ -19,7 +19,7 @@ use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
 use windows::core::Interface;
 
-use crate::host::HostList;
+use crate::host::{Crumb, HostList};
 use crate::object::This;
 use crate::pipeline::host::HostPipeline;
 
@@ -906,7 +906,7 @@ impl State {
         list.keep(&resource);
         let gpu = visible.gpu(slot);
         // SAFETY: an open list; both slots view the live resource.
-        unsafe {
+        list.crumbed(Crumb::Clear, Some("unordered access clear"), || unsafe {
             if float {
                 let values = values.map(f32::from_bits);
                 list.list
@@ -915,7 +915,7 @@ impl State {
                 list.list
                     .ClearUnorderedAccessViewUint(gpu, at, &resource, &values, rects);
             }
-        }
+        });
     }
 
     /// Runs a dispatch on the host.
@@ -951,7 +951,7 @@ impl State {
         #[cfg(feature = "diagnostics")]
         self.probe_small(list, true);
         // SAFETY: an open list with everything set.
-        unsafe { list.list.Dispatch(x, y, z) };
+        list.crumbed(Crumb::Dispatch, None, || unsafe { list.list.Dispatch(x, y, z) });
         #[cfg(feature = "diagnostics")]
         self.probe_written(list);
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
@@ -1033,7 +1033,7 @@ impl State {
                     #[cfg(feature = "diagnostics")]
                     list.note_op(|| self.op_text(format!("mesh {x}"), false));
                     // SAFETY: an open list with everything set.
-                    unsafe { l6.DispatchMesh(x, 1, 1) };
+                    list.crumbed(Crumb::Mesh, None, || unsafe { l6.DispatchMesh(x, 1, 1) });
                     DRAWN.fetch_add(1, Ordering::Relaxed);
                     true
                 }
@@ -1408,10 +1408,10 @@ impl State {
             #[cfg(feature = "diagnostics")]
             self.probe_small(list, false);
             // SAFETY: an open list with everything set.
-            unsafe {
+            list.crumbed(Crumb::Draw, None, || unsafe {
                 list.list
                     .DrawInstanced(count, instances, from, first_instance)
-            };
+            });
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         if !ran {
@@ -1502,10 +1502,10 @@ impl State {
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("indexed {indices}x{instances}"), false));
             // SAFETY: an open list with everything set.
-            unsafe {
+            list.crumbed(Crumb::Draw, None, || unsafe {
                 list.list
                     .DrawIndexedInstanced(indices, instances, first, base, first_instance)
-            };
+            });
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         if !ran {
@@ -1633,7 +1633,7 @@ impl State {
         });
         // SAFETY: an open list with everything set; the buffers are host
         // copies the list keeps alive (refresh), the signature is cached.
-        unsafe {
+        list.crumbed(Crumb::Indirect, None, || unsafe {
             list.list.ExecuteIndirect(
                 &signature,
                 max,
@@ -1642,7 +1642,7 @@ impl State {
                 counter.as_ref().map(|(s, _)| &s.buffer),
                 counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
             )
-        };
+        });
         // A listed frame: what the records held (after the clamp).
         #[cfg(feature = "diagnostics")]
         if crate::capture::dump_on() {
