@@ -42,10 +42,24 @@ powershell -ExecutionPolicy Bypass -File scripts\play.ps1 -Game "<your game fold
 (a DualShock/DualSense through DS4Windows works). With no pad connected the
 keyboard acts as one while the game window has focus.
 
-## Faster settings (optional, off by default)
+## Performance branch (`perf-aggressive`)
 
-`VICTORY_RELAY=2`, or `VICTORY_LATE_WAIT=3 VICTORY_WIDE_BACK=1` cut frame
-time on the test machines. Set them in PowerShell before running the script.
+Experimental, aimed at frame rate over picture. Every switch below can be
+turned back off by setting it to the value shown.
+
+| Change | Turn off |
+|---|---|
+| CPU and GPU overlap: submissions sent ahead, copy-back on its own thread (`VICTORY_RELAY=2` is now the default) | `VICTORY_RELAY=0` (or `=1` for the first stage only) |
+| Snapshots/compares, refreshes and merges spread over several threads | `VICTORY_WIDE_BACK=0`, `VICTORY_WIDE_REFRESH=0`, `VICTORY_WIDE_MERGE=0` |
+| Texture refreshes do not wait for the runtime's remapping lock | `VICTORY_TEXTURE_NO_WAIT=0` |
+| Adjacent title buffer copies joined into one | `VICTORY_JOIN_COPIES=0` |
+| GPU re-hash passes joined into runs | `VICTORY_CARD_REHASH_RUNS=0` |
+| Pipeline wait budget per frame 24 ms instead of 500 ms (a missing pipeline skips its draw for a frame instead of stalling) | `VICTORY_PIPELINE_WAIT_MS=500` |
+| GPU compare/hash shader: one 256-thread group per 64 KiB piece instead of one thread | (code change) |
+| Release build: fat LTO, one codegen unit, `x86-64-v3` (AVX2) | edit `Cargo.toml` / `.cargo/config.toml` |
+
+Check the compare shader on Windows with
+`cargo test --release -p victory-gpu warp_card_compare`.
 
 ## Debugging switches
 
