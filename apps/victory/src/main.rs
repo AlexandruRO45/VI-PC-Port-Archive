@@ -139,7 +139,7 @@ enum Console {
 fn main() -> Result<()> {
     victory_core::logging::init("info");
     #[cfg(victory_agility)]
-    agility::check_runtime();
+    agility::check_runtime()?;
     // The audio recorder `run` starts for `VICTORY_AUDIO_CAPTURE`.
     #[cfg(all(windows, feature = "diagnostics"))]
     if victory_hle::modules::audio::capture::child() {
@@ -253,15 +253,23 @@ pub(crate) fn default_paths(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
 /// sits next to the output binary, and this module is compiled only then.
 #[cfg(victory_agility)]
 mod agility {
-    /// Agility SDK version, matching `D3D12Core.dll` `1.614.1`.
+    use anyhow::{Result, bail};
+
+    /// Agility SDK version announced to the loader.
+    ///
+    /// Defaults to 614 (`1.614.1`); override at build time with
+    /// `VICTORY_AGILITY_VERSION` (see `apps/victory/build.rs`).
     #[unsafe(no_mangle)]
-    pub static D3D12SDKVersion: u32 = 614;
+    pub static D3D12SDKVersion: u32 = parse_agility_sdk_version(env!("VICTORY_AGILITY_VERSION"));
 
     /// Path the loader appends to the executable's directory.
     const SDK_PATH: &[u8] = b".\\D3D12\\\0";
 
     /// A `static` may not hold a raw pointer directly (it is not `Sync`), but
     /// the loader wants the export's contents to be one, so wrap it.
+    ///
+    /// The loader dereferences this export as a `const char*`; an array export
+    /// would publish the path bytes themselves, not a pointer to them.
     #[repr(transparent)]
     pub struct SdkPath(*const u8);
 
@@ -273,22 +281,49 @@ mod agility {
     #[unsafe(no_mangle)]
     pub static D3D12SDKPath: SdkPath = SdkPath(SDK_PATH.as_ptr());
 
-    /// Point a missing runtime out before a device-creation failure does.
-    pub fn check_runtime() {
+    /// Fail early when the staged runtime is missing.
+    ///
+    /// A binary that exports the Agility opt-in cannot start without
+    /// `D3D12Core.dll`: the D3D12 loader refuses with `0x887e0003`. Report that
+    /// here instead of letting the load failure stand alone.
+    pub fn check_runtime() -> Result<()> {
         let Ok(exe) = std::env::current_exe() else {
-            return;
+            return Ok(());
         };
         let Some(dir) = exe.parent() else {
-            return;
+            return Ok(());
         };
         let runtime = dir.join("D3D12").join("D3D12Core.dll");
-        if !runtime.is_file() {
-            eprintln!(
-                "victory: this build opted into the D3D12 Agility SDK runtime, but {} is \
-                 missing; copy D3D12Core.dll from Microsoft.Direct3D.D3D12 into that \
-                 directory (or run `cargo xtask agility` and rebuild)",
-                runtime.display()
-            );
+        if runtime.is_file() {
+            return Ok(());
         }
+        bail!(
+            "this build opted into the D3D12 Agility SDK runtime, but {} is missing. \
+             The process will exit: without that DLL the D3D12 loader fails with \
+             0x887e0003. Copy D3D12Core.dll (1.614.1 or newer) from \
+             Microsoft.Direct3D.D3D12 into that directory, or run `cargo xtask agility` \
+             and rebuild",
+            runtime.display()
+        );
+    }
+
+    const fn parse_agility_sdk_version(raw: &str) -> u32 {
+        let bytes = raw.as_bytes();
+        let mut n = 0u32;
+        let mut i = 0;
+        while i < bytes.len() {
+            let d = bytes[i];
+            assert!(
+                d.is_ascii_digit(),
+                "VICTORY_AGILITY_VERSION must be a positive decimal integer"
+            );
+            n = n * 10 + (d - b'0') as u32;
+            i += 1;
+        }
+        assert!(
+            n > 0,
+            "VICTORY_AGILITY_VERSION must be a positive decimal integer"
+        );
+        n
     }
 }

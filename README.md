@@ -79,6 +79,11 @@ cargo xtask agility                      # Microsoft.Direct3D.D3D12 1.614.1 → 
 cargo build --release -p victory         # build.rs enables the exports when D3D12Core.dll is present
 ```
 
+The staged `D3D12Core.dll` must be 1.614.1 or newer. An older DLL makes the
+loader refuse with `0x887e0003` and the first device creation fails. A newer
+package (for example 1.620.x) is fine; to announce it instead of 614, rebuild
+with `VICTORY_AGILITY_VERSION` set to that SDK number (e.g. `620`).
+
 `cargo clean` removes that folder; run `cargo xtask agility` again before
 rebuilding. Windows 11 hosts that already expose SM 6.6 can skip this.
 

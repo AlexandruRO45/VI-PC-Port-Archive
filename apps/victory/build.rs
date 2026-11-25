@@ -14,20 +14,26 @@
 //! Stage that file with `cargo xtask agility`, then rebuild. Without it the
 //! binary keeps using the system runtime, unchanged. A cargo warning is
 //! emitted either way so a missing runtime is not mistaken for a GPU limit.
+//!
+//! Set `VICTORY_AGILITY_VERSION` to announce a newer SDK than the default
+//! (for example `620` after staging a 1.620.x `D3D12Core.dll`). The staged
+//! DLL must be at least as new as the announced version.
 
 use std::path::PathBuf;
 
-/// Agility SDK version the exports below announce, matching `1.614.1`.
-const SDK_VERSION: u32 = 614;
+/// Default Agility SDK version the exports announce, matching `1.614.1`.
+const DEFAULT_SDK_VERSION: u32 = 614;
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-env-changed=VICTORY_AGILITY_VERSION");
     println!("cargo:rustc-check-cfg=cfg(victory_agility)");
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows")
         || std::env::var("CARGO_CFG_TARGET_ENV").as_deref() != Ok("msvc")
     {
         return;
     }
+    let sdk_version = agility_sdk_version();
     let Ok(out_dir) = std::env::var("OUT_DIR") else {
         return;
     };
@@ -46,18 +52,45 @@ fn main() {
         println!(
             "cargo:warning=no app-local D3D12 runtime at {}; the host stays at \
              whatever shader model the system D3D12 reports (SM 6.5 on Windows 10). \
-             Run `cargo xtask agility` then rebuild to opt into Agility SDK {SDK_VERSION}",
+             Run `cargo xtask agility` then rebuild to opt into Agility SDK {sdk_version}",
             runtime.display()
         );
         return;
     }
+    // The binary reads this through `env!` when the `victory_agility` cfg is on.
+    println!("cargo:rustc-env=VICTORY_AGILITY_VERSION={sdk_version}");
     println!("cargo:rustc-cfg=victory_agility");
     // DATA: these are statics, not functions; MSVC needs the flag for dumpbin
     // to list them as data exports the D3D12 loader can read.
+    // `-bins` (not plain `rustc-link-arg`) keeps `/EXPORT:…,DATA` off benches
+    // and other package targets that do not link these statics (LNK2001).
     println!("cargo:rustc-link-arg-bins=/EXPORT:D3D12SDKVersion,DATA");
     println!("cargo:rustc-link-arg-bins=/EXPORT:D3D12SDKPath,DATA");
     println!(
-        "cargo:warning=opting the host D3D12 runtime into Agility SDK {SDK_VERSION} ({})",
+        "cargo:warning=opting the host D3D12 runtime into Agility SDK {sdk_version} ({})",
         runtime.display()
     );
+}
+
+fn agility_sdk_version() -> u32 {
+    match std::env::var("VICTORY_AGILITY_VERSION") {
+        Ok(raw) => match raw.parse::<u32>() {
+            Ok(v) if v > 0 => v,
+            Ok(_) => {
+                println!(
+                    "cargo:warning=VICTORY_AGILITY_VERSION must be a positive integer; \
+                     using default {DEFAULT_SDK_VERSION}"
+                );
+                DEFAULT_SDK_VERSION
+            }
+            Err(_) => {
+                println!(
+                    "cargo:warning=VICTORY_AGILITY_VERSION={raw:?} is not a u32; \
+                     using default {DEFAULT_SDK_VERSION}"
+                );
+                DEFAULT_SDK_VERSION
+            }
+        },
+        Err(_) => DEFAULT_SDK_VERSION,
+    }
 }
