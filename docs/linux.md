@@ -13,9 +13,10 @@ platform. These notes are what has worked for testers.
   `WINEDLLOVERRIDES="d3d12,d3d12core,dxgi=n,b"`, with vkd3d-proton's
   `d3d12.dll` and `d3d12core.dll` next to `victory.exe`. Wine's builtin
   `libvkd3d-1.dll` takes a different path and is not what has been tested.
-- NVIDIA: some translated shaders crash the driver's compiler. With
-  `VICTORY_PIPELINE_JOURNAL=1` a pipeline whose creation ends the process
-  is refused from the next run on, so a run gets further each time.
+- NVIDIA: some translated shaders crash the driver's compiler, which ends
+  the process. #491 (not merged yet) adds `VICTORY_PIPELINE_JOURNAL=1`:
+  a pipeline whose creation ended a run is refused from the next run on,
+  so each run gets further. Without #491 the variable does nothing.
 
 ## The wineserver patch (about four times faster)
 
