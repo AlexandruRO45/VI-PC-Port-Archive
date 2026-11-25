@@ -203,6 +203,8 @@ struct Lower<'a> {
     pending_masks: Vec<(V, usize, usize)>,
     data_phis: Vec<(V, usize, usize)>,
     read_phis: HashSet<Value>,
+    /// SCC values (and phis reaching them) read by non-branch instructions.
+    scc_reads: HashSet<Value>,
     params: HashMap<Value, (usize, u32)>,
     barycentrics: HashMap<Value, (Barycentric, u8)>,
     user_data: Option<V>,
@@ -619,6 +621,23 @@ impl<'a> Lower<'a> {
                 }
             }
         }
+        let mut scc_reads: HashSet<Value> = p
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .filter(|i| !i.name().starts_with("s_cbranch_"))
+            .filter_map(|i| i.read(Reg::Scc))
+            .collect();
+        let mut scc_work: Vec<Value> = scc_reads.iter().copied().collect();
+        while let Some(v) = scc_work.pop() {
+            if let Some(&(b, i)) = phi_at.get(&v) {
+                for &a in &p.blocks[b].phis[i].args {
+                    if scc_reads.insert(a) {
+                        scc_work.push(a);
+                    }
+                }
+            }
+        }
         Lower {
             s,
             x,
@@ -636,6 +655,7 @@ impl<'a> Lower<'a> {
             pending_masks: Vec::new(),
             data_phis: Vec::new(),
             read_phis: HashSet::new(),
+            scc_reads,
             params: x.res.params.iter().map(|&(v, p, d)| (v, (p, d))).collect(),
             barycentrics: HashMap::new(),
             user_data: None,
@@ -3476,6 +3496,32 @@ impl<'a> Lower<'a> {
         };
         let lo = dst_code.and_then(|c| inst.write(Reg::S(c)));
         if inst.write(Reg::S(EXEC)).is_some() || self.is_mask(lo) {
+            if let Some(scc) = scc
+                && self.scc_reads.contains(&scc)
+                && lane_mask_scc_enabled()
+                && let Some(m) = inst
+                    .write(Reg::S(EXEC))
+                    .or(lo)
+                    .and_then(|v| self.x.st.masks.get(&v).copied())
+            {
+                let bit = self.boolean(m, self.cur)?;
+                self.s.flags |= flags::WAVE_OPS;
+                let r = self.s.op(
+                    self.cur,
+                    "waveAnyTrue",
+                    Attr::NoUnwind,
+                    self.s.t.i1,
+                    113,
+                    &[bit],
+                );
+                for &(_, v) in &inst.writes {
+                    if v != scc {
+                        self.vals.insert(v, Val::Missing(LANE_MASK));
+                    }
+                }
+                self.vals.insert(scc, Val::Bit(r));
+                return Ok(());
+            }
             return Err(LANE_MASK);
         }
         if matches!(
@@ -11228,6 +11274,29 @@ mod tests {
         lower_wave(&wave64_pair, vec![], vec![], true)
             .expect("wave64 pair select mask should lower");
     }
+
+    #[test]
+    fn a_lane_mask_scc_lowers() {
+        // Scalar bitwise op writing both a tracked lane mask (s2) and SCC,
+        // read as SCC by s_cselect_b32 rather than reading s2 as data.
+        let words = [
+            0x7D84_0080, // v_cmp_eq_u32 vcc_lo, 0, v0
+            0x8702_7E6A, // s_and_b32 s2, vcc_lo, exec_lo
+            0x8503_80C1, // s_cselect_b32 s3, -1, 0
+            0xBF06_8003, // s_cmp_eq_u32 s3, 0
+            0xBF85_0001, // s_cbranch_scc1 -> end
+            0xBE80_0380, // s_mov_b32 s0, 0
+            S_ENDPGM,
+        ];
+        lowers(&words, 0).expect("SCC from lane mask SOP should lower");
+    }
+}
+
+/// Whether SCC written by a scalar mask instruction lowers as `WaveActiveAnyTrue`
+/// (`VICTORY_LANE_MASK_SCC`, on unless 0).
+fn lane_mask_scc_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_LANE_MASK_SCC").map_or(true, |v| v != "0"))
 }
 
 /// Whether `v_cndmask_b32` with an untracked mask operand lowers as lane-bit
