@@ -9498,15 +9498,22 @@ impl<'a> Lower<'a> {
             off = self.s.m.bin(c, Bin::Add, off, x);
             fixed = None;
         }
+        // Views read raw (all but typed views; typed-format loads too): an
+        // index is a byte offset, `index * stride`, added to the offset.
+        let raw = !typed || format.is_some();
         // A descriptor built around a root view has the stride the code puts
         // in dword 1 (bits 16-29) and no record limit (dword 2 is -1): an
         // index is a byte offset into the raw root view.
         let index = match (src, index) {
             (Source::Built { address, bits, words }, Some(ix))
-                if address.param < self.x.native.layout.len() && !typed =>
+                if address.param < self.x.native.layout.len() && raw =>
             {
                 if bits >> 30 != 0 || words[0] != u32::MAX {
                     return Err("a root view indexed with swizzling or a record limit");
+                }
+                // The lane index added to the index (dword 3 bit 23).
+                if words[1] >> 23 & 1 != 0 {
+                    return Err("a swizzled root view: the lane index added to the index");
                 }
                 let stride = self.s.m.i32(bits >> 16 & 0x3FFF);
                 let byte = self.s.m.bin(c, Bin::Mul, ix, stride);
@@ -9562,7 +9569,7 @@ impl<'a> Lower<'a> {
         // so no stride: its bytes are addressed as the hardware does, the
         // element times the view's stride (the host's table) plus the offset.
         let index = match index {
-            Some(i) if used.is_none() && !typed => {
+            Some(i) if used.is_none() && raw => {
                 let stride = self.view_stride(src)?;
                 let rows = self.s.m.bin(c, Bin::Mul, i, stride);
                 off = self.s.m.bin(c, Bin::Add, rows, off);
@@ -9787,8 +9794,14 @@ impl<'a> Lower<'a> {
             return Ok(());
         }
         if let Some(f) = *format {
-            if index.is_some() {
-                return Err("a typed-format load by index");
+            // By index (what the root-view and heap cases above leave): the
+            // console adds index * stride (the descriptor's) to the byte
+            // offset.
+            if let Some(index) = index {
+                let stride = self.descriptor_stride(src, used)?;
+                let k = self.s.m.i32(stride);
+                let at = self.s.m.bin(c, Bin::Mul, index, k);
+                off = self.s.m.bin(c, Bin::Add, at, off);
             }
             let (h, off) = self.raw_view(site, src, off, 4 * count, (11 | u, 0), false, guard)?;
             let Some(Operand::Vector { reg, .. }) = *data else {
@@ -9938,6 +9951,31 @@ impl<'a> Lower<'a> {
             self.write(inst, Reg::V(reg + k as u8), x, guard);
         }
         Ok(())
+    }
+
+    /// The stride of the buffer descriptor `src` (`used`, its used-resource
+    /// entry) for a typed-format load by index (around a root view or from
+    /// the resource heap, the index is a byte offset before): a descriptor
+    /// built in the code has it in the bits OR-ed into dword 1; one from a
+    /// table, the entry's (shortcut: taken to be the descriptor's, as for
+    /// structured buffers).
+    fn descriptor_stride(&self, src: &Source, used: Option<&UsedResource>) -> Result<u32, Why> {
+        let stride = match *src {
+            Source::Built { bits, words, .. } => {
+                // Swizzled addressing (dword 1 bit 31) and the lane index
+                // added to the index (dword 3 bit 23) address otherwise.
+                if bits >> 31 != 0 || words[1] >> 23 & 1 != 0 {
+                    return Err("a swizzled buffer descriptor");
+                }
+                // (Known, so 0 too: the console then ignores the index.)
+                return Ok(bits >> 16 & 0x3FFF);
+            }
+            _ => used.map_or(0, |u| u.stride),
+        };
+        if stride == 0 {
+            return Err("a typed-format load by index of unknown stride");
+        }
+        Ok(stride)
     }
 
     /// The element of a typed view (`buffer_load_format_*`,

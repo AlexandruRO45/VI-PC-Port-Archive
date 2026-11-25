@@ -6,7 +6,7 @@
 use windows::Win32::Graphics::Dxgi::Common::*;
 
 use super::host::{Dispatch, Host, Root, Stride, View};
-use super::{HostShader, lower, validator};
+use super::{HostShader, UserData, lower, validator};
 use crate::native::{
     ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
 };
@@ -225,10 +225,16 @@ fn build(
     Ok(shader)
 }
 
-/// Runs one group of `shader` with `views` at heap indices 0.. and `roots`
-/// after the user data (root parameter 1..) on the hardware GPU and on WARP
-/// (each skipped without a device); per one that ran, the UAVs' dwords.
-fn run(shader: &HostShader, views: &[View], roots: &[Root]) -> Vec<(&'static str, Vec<Vec<u32>>)> {
+/// Runs one group of `shader` with `views` at heap indices 0.., user data
+/// from `ud` (per entry), and `roots` after the user data (root parameter
+/// 1..) on the hardware GPU and on WARP (each skipped without a device);
+/// per one that ran, the UAVs' dwords.
+fn run(
+    shader: &HostShader,
+    views: &[View],
+    roots: &[Root],
+    ud: &dyn Fn(&UserData) -> u32,
+) -> Vec<(&'static str, Vec<Vec<u32>>)> {
     let _one = super::valu_tests::ONE_AT_A_TIME
         .lock()
         .unwrap_or_else(|e| e.into_inner());
@@ -241,9 +247,11 @@ fn run(shader: &HostShader, views: &[View], roots: &[Root]) -> Vec<(&'static str
         let (root, pso) = host
             .compute_pipeline(shader)
             .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
-        // The view table starts at heap index 0.
-        let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
-        let mut params = vec![(0, Root::Constants(ud))];
+        let mut data = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        for u in &shader.user_data {
+            data[u.index as usize] = ud(u);
+        }
+        let mut params = vec![(0, Root::Constants(data))];
         for (n, r) in roots.iter().enumerate() {
             let Root::View { srv, data } = r else {
                 panic!("root views only")
@@ -270,6 +278,12 @@ fn run(shader: &HostShader, views: &[View], roots: &[Root]) -> Vec<(&'static str
     }
     assert!(!out.is_empty(), "neither hardware nor WARP SM 6.6 device");
     out
+}
+
+/// User data: the view table at heap index 0 (nothing else).
+fn table_at_0(u: &UserData) -> u32 {
+    assert_eq!(u.root, RootType::Table, "unexpected user data {u:?}");
+    0
 }
 
 /// The prologue of the programs: the table address at s[4:5], its entry 0
@@ -449,7 +463,7 @@ fn lds_bytes_and_halves_of_one_dword_from_many_lanes() {
     let m = lds_model();
     let bytes: Vec<u32> = (0..LANES).map(|t| lds_byte(t) & 0xFF).collect();
     let halves: Vec<u32> = (0..LANES).map(|t| lds_half(t) & 0xFFFF).collect();
-    for (label, uavs) in run(&shader, &views, &[]) {
+    for (label, uavs) in run(&shader, &views, &[], &table_at_0) {
         let out = &uavs[0];
         for t in 0..LANES {
             let at = (t * LDS_RESULTS) as usize;
@@ -638,7 +652,7 @@ fn typed_loads_at_whole_element_offsets() {
                 stride: Stride::Format(format, size),
             },
         ];
-        for (label, uavs) in run(&shader, &views, &[]) {
+        for (label, uavs) in run(&shader, &views, &[], &table_at_0) {
             for t in 0..32 {
                 for (k, e) in typed_load_elements(t).into_iter().enumerate() {
                     for c in 0..4 {
@@ -687,7 +701,7 @@ fn typed_stores_at_whole_element_offsets() {
                 bytes: size,
             },
         ];
-        for (label, uavs) in run(&shader, &views, &[]) {
+        for (label, uavs) in run(&shader, &views, &[], &table_at_0) {
             for e in 0..64u32 {
                 let t = (e % 32) as f32;
                 let x = if e < 32 { t + 0.5 } else { t };
@@ -809,7 +823,7 @@ fn typed_stores_of_some_channels_keep_the_others() {
                 bytes: size,
             },
         ];
-        for (label, uavs) in run(&shader, &views, &[]) {
+        for (label, uavs) in run(&shader, &views, &[], &table_at_0) {
             for e in 0..128u32 {
                 let t = (e / 4) as f32;
                 let given: &[f32] = match e % 4 {
@@ -828,6 +842,306 @@ fn typed_stores_of_some_channels_keep_the_others() {
                     );
                 }
             }
+        }
+    }
+}
+
+// ---- typed-format loads by index ----
+
+/// MTBUF `tbuffer_load_format_* vdata, vaddr, s[srsrc:srsrc+3], 0
+/// format:... offset` with `offen`/`idxen`.
+#[allow(clippy::too_many_arguments)]
+const fn mtbuf(
+    op: u8,
+    format: u8,
+    vdata: u8,
+    vaddr: u8,
+    srsrc: u8,
+    offset: u16,
+    offen: bool,
+    idxen: bool,
+) -> [u32; 2] {
+    [
+        0x3A << 26
+            | (format as u32 & 0x7F) << 19
+            | (op as u32 & 7) << 16
+            | (idxen as u32) << 13
+            | (offen as u32) << 12
+            | (offset as u32 & 0xFFF),
+        0x80 << 24
+            | (op as u32 >> 3) << 21
+            | (srsrc as u32 >> 2) << 16
+            | (vdata as u32) << 8
+            | vaddr as u32,
+    ]
+}
+
+const TBUFFER_LOAD_FORMAT_X: u8 = 0;
+const TBUFFER_LOAD_FORMAT_XY: u8 = 1;
+const TBUFFER_LOAD_FORMAT_XYZW: u8 = 3;
+/// GFX10 buffer formats: 8 uint, 8_8_8_8 uint, 32_32 uint, 32_32_32_32 uint.
+const FMT_8_UINT: u8 = 5;
+const FMT_8888_UINT: u8 = 60;
+const FMT_32_32_UINT: u8 = 62;
+const FMT_32X4_UINT: u8 = 75;
+
+/// Records of 5 dwords: the data the typed-format loads read.
+fn records() -> Vec<u32> {
+    (0..5 * 40)
+        .map(|i| (0x0101_0101 * (i % 251)) ^ (i << 24))
+        .collect()
+}
+
+/// 32 lanes read records of 20 bytes by index from the raw view at entry 1
+/// (its entry's stride 20): four dwords at offset 4; four bytes at a lane's
+/// offset of 0 or 4; one byte at offset 3.
+fn indexed_format_program() -> Vec<u32> {
+    let mut w = prologue();
+    // v1 = t, v2 = 4 (t & 1), v14 = 64 t.
+    w.push(vop1(V_MOV_B32, 1, v(0)));
+    w.push(vop2(V_AND_B32, 2, int(1), 0));
+    w.push(vop2(V_LSHLREV_B32, 2, int(2), 2));
+    w.push(vop2(V_LSHLREV_B32, 14, int(6), 0));
+    w.extend(mtbuf(
+        TBUFFER_LOAD_FORMAT_XYZW,
+        FMT_32X4_UINT,
+        20,
+        0,
+        12,
+        4,
+        false,
+        true,
+    ));
+    w.extend(mtbuf(
+        TBUFFER_LOAD_FORMAT_XYZW,
+        FMT_8888_UINT,
+        24,
+        1,
+        12,
+        0,
+        true,
+        true,
+    ));
+    w.extend(mtbuf(
+        TBUFFER_LOAD_FORMAT_X,
+        FMT_8_UINT,
+        28,
+        0,
+        12,
+        3,
+        false,
+        true,
+    ));
+    for k in 0..9u8 {
+        w.extend(store_dword(20 + k, 14, 8, 4 * u16::from(k)));
+    }
+    w.push(S_ENDPGM);
+    w
+}
+
+#[test]
+fn typed_format_loads_by_index_from_a_table() {
+    let shader = build_typed(&indexed_format_program(), 20, ResourceType::Srv).expect("lower");
+    let data = records();
+    let views = [
+        View::RawUav(32 * 16),
+        View::Buffer {
+            data: &data,
+            stride: Stride::Raw,
+        },
+    ];
+    for (label, uavs) in run(&shader, &views, &[], &table_at_0) {
+        for t in 0..32u32 {
+            let r = 5 * t as usize;
+            let bytes = data[r + (t & 1) as usize].to_le_bytes();
+            let mut want: Vec<u32> = data[r + 1..r + 5].to_vec();
+            want.extend(bytes.map(u32::from));
+            want.push(data[r] >> 24);
+            let at = (16 * t) as usize;
+            assert_eq!(uavs[0][at..at + 9], want[..], "{label}: lane {t}");
+        }
+    }
+    // Without a stride, by index is refused.
+    let e = build_typed(&indexed_format_program(), 0, ResourceType::Srv).expect_err("refused");
+    assert!(e.contains("unknown stride"), "{e}");
+}
+
+/// 32 lanes read two dwords at offset 4 of record t through a descriptor
+/// built around the root SRV at s[1:2] with stride 12 (dword 3 `w3`).
+fn built_format_program(w3: u32) -> Vec<u32> {
+    let mut w = prologue();
+    w.push(s_mov_b32(16, 1));
+    // s_or_b32 s17, s2, 12 << 16
+    w.extend([0x8000_0000 | 0x10 << 23 | 17 << 16 | 255 << 8 | 2, 12 << 16]);
+    w.extend([s_mov_b32(18, 255), u32::MAX]);
+    w.extend([s_mov_b32(19, 255), w3]);
+    w.push(vop2(V_LSHLREV_B32, 14, int(3), 0));
+    w.extend(mtbuf(
+        TBUFFER_LOAD_FORMAT_XY,
+        FMT_32_32_UINT,
+        20,
+        0,
+        16,
+        4,
+        false,
+        true,
+    ));
+    w.extend(store_dword(20, 14, 8, 0));
+    w.extend(store_dword(21, 14, 8, 4));
+    w.push(S_ENDPGM);
+    w
+}
+
+fn build_built(words: &[u32]) -> Result<HostShader, String> {
+    let root = RootParam {
+        root: RootType::Descriptor,
+        table_offset_dwords: 0,
+        sgprs: 2,
+        base_register: 0,
+        user_data: 1,
+        slot: 1,
+    };
+    let srv = UsedResource {
+        kind: ResourceType::Srv,
+        root: RootType::Descriptor,
+        table_offset_dwords: 0,
+        lower_bound: 0,
+        // (The root SRV's entry says 1: the descriptor's own stride counts.)
+        stride: 1,
+        dwords: 4,
+        user_data: 1,
+        slot: 1,
+    };
+    build(
+        words,
+        32,
+        0,
+        vec![table(), root],
+        vec![entry(ResourceType::Uav, 0, 0), srv],
+    )
+}
+
+#[test]
+fn typed_format_loads_by_index_through_a_built_descriptor() {
+    let shader = build_built(&built_format_program(0x0002_7FAC)).expect("lower");
+    let data = records();
+    // The root SRV is the host's raw view of it (`emit`, "Root SRVs and
+    // root UAVs"), at heap index 1, its address at byte 0 of the view.
+    let views = [
+        View::RawUav(64),
+        View::Buffer {
+            data: &data,
+            stride: Stride::Raw,
+        },
+    ];
+    let ud = |u: &UserData| match (u.root, u.dword) {
+        (RootType::Table, _) => 0,
+        (RootType::Descriptor, super::ROOT_SRV_VIEW) => 1,
+        (RootType::Descriptor, super::ROOT_VIEW_OFFSET) => 0,
+        other => panic!("unexpected user data {other:?}"),
+    };
+    for (label, uavs) in run(&shader, &views, &[], &ud) {
+        for t in 0..32usize {
+            let want = [data[3 * t + 1], data[3 * t + 2]];
+            assert_eq!(uavs[0][2 * t..2 * t + 2], want, "{label}: lane {t}");
+        }
+    }
+    // The lane index added to the index (dword 3 bit 23) is refused.
+    let e = build_built(&built_format_program(0x0082_7FAC)).expect_err("refused");
+    assert!(e.contains("swizzled"), "{e}");
+}
+
+/// User data: s0 the heap index of a buffer (a root constant), s1 the
+/// resource heap, s2 a table with a raw UAV. Each lane reads two dwords at
+/// offset 4 of element t of the heap's buffer by index, and stores them
+/// to dwords 2t, 2t + 1 of the UAV.
+fn heap_format_program() -> Vec<u32> {
+    let mut w = vec![
+        0x8F04_8500, // s_lshl_b32 s4, s0, 5
+        s_mov_b32(6, 1),
+        s_mov_b32(7, 128),
+        0xF408_0203,
+        0x0800_0000, // s_load_dwordx4 s[8:11], s[6:7], s4
+        s_mov_b32(12, 2),
+        s_mov_b32(13, 128),
+    ];
+    w.extend(s_load_dwordx4(16, 12, 0));
+    w.push(vop2(V_LSHLREV_B32, 14, int(3), 0));
+    w.extend(mtbuf(
+        TBUFFER_LOAD_FORMAT_XY,
+        FMT_32_32_UINT,
+        20,
+        0,
+        8,
+        4,
+        false,
+        true,
+    ));
+    w.extend(store_dword(20, 14, 16, 0));
+    w.extend(store_dword(21, 14, 16, 4));
+    w.push(S_ENDPGM);
+    w
+}
+
+/// A typed-format load by index through a descriptor the shader takes from
+/// the resource heap (no used-resource entry, so no stride) reads at
+/// index × the view's stride, from the host's view-stride table.
+#[test]
+fn typed_format_loads_by_index_from_the_heap_take_the_views_stride() {
+    let param = |root, user_data: u8| RootParam {
+        root,
+        table_offset_dwords: 0,
+        sgprs: 1,
+        base_register: 0,
+        user_data,
+        slot: user_data,
+    };
+    let uav = UsedResource {
+        kind: ResourceType::Uav,
+        root: RootType::Table,
+        table_offset_dwords: 0,
+        lower_bound: 0,
+        stride: 0,
+        dwords: 4,
+        user_data: 2,
+        slot: 2,
+    };
+    let shader = build(
+        &heap_format_program(),
+        32,
+        0,
+        vec![
+            param(RootType::Constants, 0),
+            param(RootType::ResourceHeap, 1),
+            param(RootType::Table, 2),
+        ],
+        vec![uav],
+    )
+    .expect("lower");
+    assert_eq!(shader.root_srvs, [super::VIEW_STRIDES]);
+    let data = records();
+    let views = [
+        View::RawUav(64),
+        View::Buffer {
+            data: &data,
+            stride: Stride::Raw,
+        },
+    ];
+    // The stride table: heap index 1 holds 12-byte elements.
+    let roots = [Root::View {
+        srv: true,
+        data: vec![4, 12],
+    }];
+    // The buffer is at heap index 1, the UAV's table at 0.
+    let ud = |u: &UserData| match u.root {
+        RootType::Constants => 1,
+        RootType::Table => 0,
+        other => panic!("unexpected user data {other:?}"),
+    };
+    for (label, uavs) in run(&shader, &views, &roots, &ud) {
+        for t in 0..32usize {
+            let want = [data[3 * t + 1], data[3 * t + 2]];
+            assert_eq!(uavs[0][2 * t..2 * t + 2], want, "{label}: lane {t}");
         }
     }
 }
