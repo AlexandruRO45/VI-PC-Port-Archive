@@ -2083,6 +2083,38 @@ impl<'a> Lower<'a> {
         )
     }
 
+    /// The lanes active at this point, as a ballot: (low dword, high dword).
+    fn active_lanes(&mut self) -> (V, V) {
+        let c = self.cur;
+        let t = self.s.m.bool(true);
+        let i32t = self.s.t.i32;
+        let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+        let r = self
+            .s
+            .op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[t]);
+        self.s.flags |= flags::WAVE_OPS;
+        (self.s.m.extract(c, r, 0), self.s.m.extract(c, r, 1))
+    }
+
+    /// Whether `lane` is in `ballot`, as 0 or 1.
+    fn lane_set(&mut self, ballot: (V, V), lane: V) -> V {
+        let c = self.cur;
+        let five = self.s.m.i32(5);
+        let idx = self.s.m.bin(c, Bin::LShr, lane, five);
+        let word = if self.wave() == 64 {
+            let zero = self.s.m.i32(0);
+            let high = self.s.m.cmp(c, pred::NE, idx, zero);
+            self.s.m.select(c, high, ballot.1, ballot.0)
+        } else {
+            ballot.0
+        };
+        let thirty_one = self.s.m.i32(31);
+        let sh = self.s.m.bin(c, Bin::And, lane, thirty_one);
+        let bit = self.s.m.bin(c, Bin::LShr, word, sh);
+        let one = self.s.m.i32(1);
+        self.s.m.bin(c, Bin::And, bit, one)
+    }
+
     /// The prefix of a min or max over the lanes below this one (and its own
     /// term when `inclusive`), as a Hillis-Steele scan: at each step the lane
     /// merges the value `step` lanes below, and keeps its own value where the
@@ -2092,6 +2124,10 @@ impl<'a> Lower<'a> {
     /// The merges are the same ones the translator emits for `v_min_u32` and
     /// friends, so a float prefix folds with `max_min` (FMin/FMax) and keeps
     /// the non-NaN operand, as the console does.
+    ///
+    /// `WaveReadLaneAt` of an inactive lane is undefined in D3D12, so every
+    /// read of a lane outside the ballot takes the operation's identity
+    /// instead: a merge with it changes nothing.
     fn wave_prefix_scan(&mut self, op: super::wave::Op, arg: V, id: V, inclusive: bool) -> V {
         use super::wave::Op;
         self.s.prefix_scans += 1;
@@ -2099,6 +2135,16 @@ impl<'a> Lower<'a> {
         let float = matches!(op, Op::MinF | Op::MaxF);
         let lane = self.lane_index();
         let zero = self.s.m.i32(0);
+        // A merge with the identity changes nothing.
+        let identity = self.s.m.i32(match op {
+            Op::MinU => u32::MAX,
+            Op::MaxU => 0,
+            Op::MinI => 0x7FFF_FFFF,
+            Op::MaxI => 0x8000_0000,
+            Op::MinF => 0x7F80_0000,
+            _ => 0xFF80_0000,
+        });
+        let active = self.active_lanes();
         let mut r = arg;
         let mut step = 1u32;
         while step < self.wave() {
@@ -2112,6 +2158,9 @@ impl<'a> Lower<'a> {
             let below = self.s.m.select(c, enough, under, zero);
             let bits = if float { self.as_int(r) } else { r };
             let raw = self.read_lane(bits, below);
+            let set = self.lane_set(active, below);
+            let live = self.s.m.cmp(c, pred::NE, set, zero);
+            let raw = self.s.m.select(c, live, raw, identity);
             let other = if float { self.as_float(raw) } else { raw };
             let merged = match op {
                 Op::MinU => {
@@ -2147,6 +2196,9 @@ impl<'a> Lower<'a> {
         let below = self.s.m.select(c, nonzero, under, zero);
         let bits = if float { self.as_int(r) } else { r };
         let raw = self.read_lane(bits, below);
+        let set = self.lane_set(active, below);
+        let live = self.s.m.cmp(c, pred::NE, set, zero);
+        let raw = self.s.m.select(c, live, raw, identity);
         let other = if float { self.as_float(raw) } else { raw };
         let id = if float { self.as_float(id) } else { id };
         self.s.m.select(c, nonzero, other, id)
