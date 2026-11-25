@@ -812,6 +812,202 @@ fn root_signature(
 mod tests {
     use super::*;
 
+    #[test]
+    fn direct_mesh_dispatch_uses_all_group_counts() {
+        use crate::object::{S_OK, This, guid, slot};
+        use std::os::windows::process::CommandExt;
+        use victory_shader::{HwStage, emit};
+
+        let Some(host) = host().filter(|host| host.mesh_shaders()) else {
+            eprintln!("mesh shaders unavailable; skipped");
+            return;
+        };
+        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS9::default();
+        // SAFETY: the query writes one correctly sized options structure.
+        if unsafe {
+            host.device.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS9,
+                (&raw mut options).cast(),
+                size_of_val(&options) as u32,
+            )
+        }
+        .is_err()
+            || !options.MeshShaderPipelineStatsSupported.as_bool()
+        {
+            eprintln!("mesh pipeline statistics unavailable; skipped");
+            return;
+        }
+        let dxc = std::env::var_os("VICTORY_PC_DXC")
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                emit::validator::Validator::default_path().map(|p| p.with_file_name("dxc.exe"))
+            });
+        let Some(dxc) = dxc.filter(|path| path.is_file()) else {
+            eprintln!("no PC dxc.exe; skipped");
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let hlsl = dir.path().join("grid.hlsl");
+        let dxil = dir.path().join("grid.dxil");
+        // One thread per group makes MSInvocations equal the number of groups.
+        std::fs::write(
+            &hlsl,
+            r#"
+struct Vertex { float4 pos : SV_Position; };
+[numthreads(1, 1, 1)]
+[outputtopology("triangle")]
+void main(out vertices Vertex verts[3], out indices uint3 tris[1]) {
+    SetMeshOutputCounts(3, 1);
+    verts[0].pos = float4(-1, -1, 0.5, 1);
+    verts[1].pos = float4(-1,  1, 0.5, 1);
+    verts[2].pos = float4( 1, -1, 0.5, 1);
+    tris[0] = uint3(0, 1, 2);
+}
+"#,
+        )
+        .unwrap();
+        let output = std::process::Command::new(dxc)
+            .creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW)
+            .args(["-T", "ms_6_6", "-E", "main", "-Fo"])
+            .args([&dxil, &hlsl])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let dxil = std::fs::read(dxil).unwrap();
+        let shader = Shader::new("mesh", &dxil);
+        assert!(
+            shader
+                .translated
+                .set(Some(Translated {
+                    host: emit::HostShader {
+                        stage: HwStage::Ms,
+                        dxil,
+                        user_data: vec![],
+                        samplers: vec![],
+                        static_samplers: vec![],
+                        root_cbvs: vec![],
+                        root_srvs: vec![],
+                        root_uavs: vec![],
+                        memory: false,
+                        memory_writes: false,
+                        view_addresses: false,
+                        heap: false,
+                        heap_writes: false,
+                        view_marks: false,
+                    },
+                    used: vec![],
+                }))
+                .is_ok()
+        );
+        let mut graphics = GraphicsState {
+            topology: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+            ..Default::default()
+        };
+        graphics.depth.DepthEnable = false.into();
+        let null = std::ptr::null();
+        let mut pipeline = null;
+        assert_eq!(
+            crate::pipeline::hand_out(
+                vec![Arc::new(shader)],
+                Some(Box::new(graphics)),
+                &crate::pipeline::PIPELINE_IIDS[0],
+                &mut pipeline
+            ),
+            S_OK
+        );
+        assert!(
+            crate::pipeline::host_pipeline(pipeline).is_some(),
+            "native mesh pipeline did not build"
+        );
+
+        let allocator_iid = guid(
+            0x6102dee4,
+            0xaf59,
+            0x4b09,
+            [0xb9, 0x99, 0xb4, 0x4d, 0x73, 0xf0, 0x9b, 0x24],
+        );
+        let list_iid = guid(
+            0x5b160d0f,
+            0xac1b,
+            0x4185,
+            [0x8b, 0xa8, 0xb3, 0xae, 0x42, 0xa5, 0xa4, 0x55],
+        );
+        let (mut alloc, mut list) = (null, null);
+        assert_eq!(
+            crate::list::create_allocator(null, 0, &allocator_iid, &mut alloc),
+            S_OK
+        );
+        assert_eq!(
+            crate::list::create_list(null, 0, 0, alloc, null, &list_iid, &mut list),
+            S_OK
+        );
+        let native = crate::list::host_list(list).unwrap();
+        slot::<extern "system" fn(This, This)>(list, 0xc8)(list, pipeline);
+        let mut queries: Option<ID3D12QueryHeap> = None;
+        let groups = [(2, 1, 1), (2, 3, 1), (2, 1, 4), (2, 3, 4), (2, 0, 4)];
+        // SAFETY: a live device and storage for the returned query heap.
+        unsafe {
+            host.device
+                .CreateQueryHeap(
+                    &D3D12_QUERY_HEAP_DESC {
+                        Type: D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS1,
+                        Count: groups.len() as u32 + 1,
+                        NodeMask: 0,
+                    },
+                    &mut queries,
+                )
+                .unwrap();
+        }
+        let queries = queries.unwrap();
+        let count = groups.len() + 1;
+        let size = (count * size_of::<D3D12_QUERY_DATA_PIPELINE_STATISTICS1>()) as u64;
+        let (readback, mapped) = native.readback(host, size).unwrap();
+        let kind = D3D12_QUERY_TYPE_PIPELINE_STATISTICS1;
+        let dispatch = slot::<extern "system" fn(This, u32, u32, u32)>(list, crate::list::slot_offset_for_test(list, 0x3f8));
+        for (index, (x, y, z)) in groups.into_iter().enumerate() {
+            // SAFETY: the open list and the indexed query belong to this fixture.
+            unsafe { native.list.BeginQuery(&queries, kind, index as u32) };
+            dispatch(list, x, y, z);
+            // SAFETY: ends the query begun above, of the same type and index.
+            unsafe { native.list.EndQuery(&queries, kind, index as u32) };
+        }
+        let last = groups.len() as u32;
+        // SAFETY: a live query heap with one more query and a live command list.
+        unsafe { native.list.BeginQuery(&queries, kind, last) };
+        slot::<extern "system" fn(This, u32, u64, u64, u64)>(list, crate::list::slot_offset_for_test(list, 0x310))(list, 2, 0, 0, 0);
+        // SAFETY: every query has been begun and ended by this command list;
+        // readback holds one statistics record per query.
+        unsafe {
+            native.list.EndQuery(&queries, kind, last);
+            native
+                .list
+                .ResolveQueryData(&queries, kind, 0, count as u32, &readback, 0);
+        }
+        assert_eq!(
+            slot::<extern "system" fn(This) -> i32>(list, 0x48)(list),
+            S_OK
+        );
+        host.execute(&[native]);
+        // SAFETY: the completed resolve wrote count live mapped records.
+        let actual: Vec<_> = unsafe {
+            std::slice::from_raw_parts(
+                mapped.cast::<D3D12_QUERY_DATA_PIPELINE_STATISTICS1>(),
+                count,
+            )
+        }
+        .iter()
+        .map(|s| s.MSInvocations)
+        .collect();
+        for object in [list, alloc, pipeline] {
+            slot::<extern "system" fn(This) -> u32>(object, 0x10)(object);
+        }
+        assert_eq!(actual, [2, 6, 8, 24, 0, 2]);
+    }
+
     fn element(format: DXGI_FORMAT, offset: u32) -> D3D12_INPUT_ELEMENT_DESC {
         D3D12_INPUT_ELEMENT_DESC {
             SemanticName: PCSTR(c"TEXCOORD".as_ptr().cast()),
