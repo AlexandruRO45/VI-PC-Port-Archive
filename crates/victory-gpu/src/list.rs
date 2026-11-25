@@ -2187,7 +2187,7 @@ mod tests {
         let null = std::ptr::null();
         let (mut allocator, mut list) = (null, null);
         assert_eq!(create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator), S_OK);
-        assert_eq!(new_list(0, allocator, &LIST_IIDS[0], &mut list), S_OK);
+        assert_eq!(new_list(0, allocator, null, &LIST_IIDS[0], &mut list), S_OK);
         let memory = [0u64; 2];
         let at = |i: usize| (&raw const memory[i]) as u64;
         let value = |i: usize| {
