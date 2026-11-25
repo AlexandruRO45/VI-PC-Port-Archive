@@ -1659,6 +1659,86 @@ fn fspx_programs_run_with_the_hardwares_dot_products() {
     }
 }
 
+#[test]
+fn v_cmp_class_f64_matches_rdna2() {
+    let select = vop3(0x101, 0, 128, 129, sgpr(6)); // v_cndmask_b32_e64 v0, 0, 1, s6
+    let compare = |src0, modifiers: [u32; 2], literal| {
+        let mut words = vop3(0x0a8, 6, src0, vgpr(3), 0); // v_cmp_class_f64_e64 s6, src0, v3
+        words[0] |= modifiers[0];
+        words[1] |= modifiers[1];
+        let mut body = Vec::from(words);
+        body.extend(literal);
+        body.extend(select);
+        build_valu_cs(&body)
+    };
+    let cases = [
+        (0x7ff0_0000_0000_0001u64, 0), // sNaN with only a low-word payload
+        (0xfff8_0000_0000_0000, 1),    // negative qNaN
+        (0xfff0_0000_0000_0000, 2),    // -inf
+        (0xbff0_0000_0000_0000, 3),    // -1.0
+        (0x8000_0000_0000_0001, 4),    // smallest negative subnormal
+        (0x8000_0000_0000_0000, 5),    // -0
+        (0x0000_0000_0000_0000, 6),    // +0
+        (0x0000_0000_0000_0001, 7),    // smallest positive subnormal
+        (0x3ff0_0000_0000_0000, 8),    // +1.0
+        (0x7ff0_0000_0000_0000, 9),    // +inf
+    ];
+    let cases: Vec<_> = cases
+        .into_iter()
+        .flat_map(|(bits, class)| {
+            let bit = 1 << class;
+            [
+                [bits as u32, (bits >> 32) as u32, bit, 1],
+                [bits as u32, (bits >> 32) as u32, 0x3ff ^ bit, 0],
+            ]
+        })
+        .collect();
+    let check = |label: &str, _, input: [u32; 4], actual| {
+        assert_eq!(actual, input[3], "{label}: {input:08x?}");
+    };
+    for source in [vgpr(1), sgpr(0)] {
+        let shader = compare(source, [0, 0], None);
+        let container = crate::Container::parse(&shader.dxil).unwrap();
+        let features = container.part(crate::FourCC::SFI0).unwrap();
+        let flags = u64::from_le_bytes(features.data.try_into().unwrap());
+        assert_eq!(flags & super::shader::flags::INT64, 0);
+        run_cases(&shader, &cases, check);
+    }
+    // ABS and NEG change only the sign bit; the low-word payload stays intact.
+    run_cases(
+        &compare(vgpr(1), [1 << 8, 1 << 29], None),
+        &[[1, 0, 1 << 4, 1], [1, 0, 1 << 7, 0], [0, 0, 1 << 5, 1]],
+        check,
+    );
+    // A 32-bit literal occupies the high word of a binary64 source.
+    run_cases(
+        &compare(255, [0, 0], Some(0x7ff0_0000)),
+        &[[0, 0, 1 << 9, 1]],
+        check,
+    );
+    // Integer inline constants supply raw bits; floating inline constants use binary64.
+    for (source, class) in [(129, 7), (193, 1), (243, 3), (248, 8)] {
+        run_cases(
+            &compare(source, [0, 0], None),
+            &[[0, 0, 1 << class, 1]],
+            check,
+        );
+    }
+}
+
+#[test]
+fn v_cmpx_class_f64_filters_stores() {
+    let shader = build_valu_cs(&[
+        0x7c00_0000 | 0x0b8 << 17 | 3 << 9 | vgpr(1) as u32, // v_cmpx_class_f64 v[1:2], v3
+        vop1(1, 0, 129),                                     // v_mov_b32 v0, 1
+    ]);
+    run_cases(
+        &shader,
+        &[[1, 0, 1 << 7, 1], [1, 0, 1 << 6, 0]],
+        |label, _, input, actual| assert_eq!(actual, input[3], "{label}: {input:08x?}"),
+    );
+}
+
 /// `v_pk_fmac_f16` (VOP2): each half of the destination plus the product
 /// of the sources' halves.
 #[test]
