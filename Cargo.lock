@@ -651,8 +651,6 @@ dependencies = [
  "blake3",
  "clap",
  "memchr",
- "miniz_oxide",
- "tempfile",
  "tracing",
  "victory-core",
  "victory-game",

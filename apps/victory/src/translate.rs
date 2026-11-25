@@ -343,9 +343,13 @@ pub fn run(
     for (reason, (n, example)) in failed {
         println!("  {n:>7}  {reason}  (e.g. {example})");
     }
+    check_matches(&requested, &t.matched)
+}
+
+fn check_matches(requested: &BTreeSet<u64>, matched: &BTreeMap<u64, String>) -> Result<()> {
     let missing: Vec<_> = requested
         .iter()
-        .filter(|id| !t.matched.contains_key(id))
+        .filter(|id| !matched.contains_key(id))
         .map(|id| format!("{id:016x}"))
         .collect();
     anyhow::ensure!(
@@ -953,3 +957,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod hash_tests;
