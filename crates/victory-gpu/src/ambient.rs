@@ -44,7 +44,11 @@ pub(crate) fn level() -> Option<f32> {
         if set.trim() == "off" {
             return -1.0;
         }
-        set.trim().parse().ok().filter(|l: &f32| l.is_finite() && *l >= 0.0).unwrap_or(DEFAULT)
+        set.trim()
+            .parse()
+            .ok()
+            .filter(|l: &f32| l.is_finite() && *l >= 0.0)
+            .unwrap_or(DEFAULT)
     });
     (level >= 0.0).then_some(level)
 }
@@ -113,30 +117,36 @@ fn live_level() -> Option<f32> {
         if !cfg!(feature = "diagnostics") {
             return;
         }
-        let Some(file) = std::env::var_os("VICTORY_AMBIENT_FILE") else { return };
-        let _ = std::thread::Builder::new().name("victory-ambient".into()).spawn(move || {
-            loop {
-                let read: Vec<f32> = std::fs::read_to_string(&file)
-                    .unwrap_or_default()
-                    .split_whitespace()
-                    .filter_map(|v| v.parse().ok())
-                    .collect();
-                if let [level, r, g, b, ref rest @ ..] = read[..] {
-                    if let [s, r, n, t] = rest[..] {
-                        *SHADE.lock().unwrap_or_else(|e| e.into_inner()) = Some([s, r, n, t]);
+        let Some(file) = std::env::var_os("VICTORY_AMBIENT_FILE") else {
+            return;
+        };
+        let _ = std::thread::Builder::new()
+            .name("victory-ambient".into())
+            .spawn(move || {
+                loop {
+                    let read: Vec<f32> = std::fs::read_to_string(&file)
+                        .unwrap_or_default()
+                        .split_whitespace()
+                        .filter_map(|v| v.parse().ok())
+                        .collect();
+                    if let [level, r, g, b, ref rest @ ..] = read[..] {
+                        if let [s, r, n, t] = rest[..] {
+                            *SHADE.lock().unwrap_or_else(|e| e.into_inner()) = Some([s, r, n, t]);
+                        }
+                        let new = Some((level.max(0.0), [r, g, b]));
+                        let mut live = LIVE.lock().unwrap_or_else(|e| e.into_inner());
+                        if *live != new {
+                            tracing::info!(level, r, g, b, "ambient light set from the file");
+                            *live = new;
+                        }
                     }
-                    let new = Some((level.max(0.0), [r, g, b]));
-                    let mut live = LIVE.lock().unwrap_or_else(|e| e.into_inner());
-                    if *live != new {
-                        tracing::info!(level, r, g, b, "ambient light set from the file");
-                        *live = new;
-                    }
+                    std::thread::sleep(std::time::Duration::from_millis(500));
                 }
-                std::thread::sleep(std::time::Duration::from_millis(500));
-            }
-        });
+            });
     });
-    LIVE.lock().unwrap_or_else(|e| e.into_inner()).map(|(level, _)| level)
+    LIVE.lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .map(|(level, _)| level)
 }
 
 const SOURCE: &str = r#"
@@ -355,11 +365,17 @@ pub(crate) fn raise(list: &HostList, light: This, depth: Option<This>) -> bool {
             ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
             Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
             Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
-                Texture2D: D3D12_TEX2D_SRV { MipLevels: 1, ..Default::default() },
+                Texture2D: D3D12_TEX2D_SRV {
+                    MipLevels: 1,
+                    ..Default::default()
+                },
             },
         };
-        let beside = D3D12_CPU_DESCRIPTOR_HANDLE { ptr: at.ptr + pass.step as usize };
-        host.device.CreateShaderResourceView(depth, Some(&seen), beside);
+        let beside = D3D12_CPU_DESCRIPTOR_HANDLE {
+            ptr: at.ptr + pass.step as usize,
+        };
+        host.device
+            .CreateShaderResourceView(depth, Some(&seen), beside);
         l.SetDescriptorHeaps(&[Some(pass.views.clone())]);
         l.SetComputeRootSignature(&pass.root);
         l.SetPipelineState(&pass.pso);

@@ -717,8 +717,16 @@ fn map_whole(physical: &mut Physical, base: usize, pages: &[usize]) -> bool {
             }
             if len > WHOLE
                 || len != first.section.1
-                || physical.views.range(..at + len).next_back().is_some_and(|(v, (n, _))| v + n > at)
-                || physical.whole.iter().any(|w| Arc::ptr_eq(&w.2, &first.section))
+                || !placeholder(at).is_some_and(|(start, stop)| start == at && stop == at + len)
+                || physical
+                    .views
+                    .range(..at + len)
+                    .next_back()
+                    .is_some_and(|(v, (n, _))| v + n > at)
+                || physical
+                    .whole
+                    .iter()
+                    .any(|w| Arc::ptr_eq(&w.2, &first.section))
             {
                 return false;
             }
@@ -733,7 +741,11 @@ fn map_whole(physical: &mut Physical, base: usize, pages: &[usize]) -> bool {
             if !map_view(at, len, &all) {
                 return false;
             }
-            tracing::info!(at = format_args!("{at:#x}"), len, "a reservation of physical pages shown whole");
+            tracing::info!(
+                at = format_args!("{at:#x}"),
+                len,
+                "a reservation of physical pages shown whole"
+            );
             victory_gpu::title_memory_remapped(at, len);
             physical.views.insert(at, (len, all));
             physical.whole.push((at, len, first.section.clone()));
@@ -757,7 +769,12 @@ fn map_whole(physical: &mut Physical, base: usize, pages: &[usize]) -> bool {
         if !same || slice.index != wanted && (taken || physical.bound.contains(page)) {
             // shortcut: shown as it is; the title sees other bytes than it
             // asked for.
-            tracing::warn!(page, wanted, same, "a page mapped again in a reservation shown whole");
+            tracing::warn!(
+                page,
+                wanted,
+                same,
+                "a page mapped again in a reservation shown whole"
+            );
             continue;
         }
         if slice.index != wanted {
@@ -822,8 +839,12 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
 pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     let (to, from, len) = (to as usize, from as usize, len as usize);
     let mut physical = physical();
-    if in_whole(&physical, to, len) {
-        tracing::warn!(to = format_args!("{to:#x}"), len, "page mappings into a reservation shown whole");
+    if len != 0 && in_whole(&physical, to, len) {
+        tracing::warn!(
+            to = format_args!("{to:#x}"),
+            len,
+            "page mappings into a reservation shown whole"
+        );
         return false;
     }
     unmap(&mut physical, to, len);
@@ -938,7 +959,12 @@ fn map_view(base: usize, len: usize, slice: &Slice) -> bool {
         return false;
     }
     // The GPU side guards every view of a page together.
-    victory_gpu::title_memory_view(base, len, slice.section.0 as usize, (slice.index * PAGE) as u64);
+    victory_gpu::title_memory_view(
+        base,
+        len,
+        slice.section.0 as usize,
+        (slice.index * PAGE) as u64,
+    );
     true
 }
 
@@ -1032,13 +1058,18 @@ fn commit_limit_message(
 /// Returns `[base, base + len)` to placeholders; views reaching past it
 /// are mapped again outside it.
 fn unmap(physical: &mut Physical, base: usize, len: usize) {
-    // No bytes: no view to return. The search below would still find the
-    // view holding `base` and cut it in two there, and its range of views
-    // starting inside would run backwards (which `BTreeMap` panics on).
-    if len == 0 || in_whole(physical, base, len) {
+    if len == 0 {
         return;
     }
+
     let end = base + len;
+
+    // A partial unmap splits a whole mapping into separate views.
+    // Its whole-mapping metadata is no longer valid.
+    physical
+        .whole
+        .retain(|(at, size, _)| *at + *size <= base || *at >= end);
+
     // Views do not overlap: the one holding `base`, then those starting
     // inside (the GPU's page mappings make one view per page).
     let first = physical
@@ -1047,16 +1078,20 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
         .next_back()
         .filter(|(at, (size, _))| *at + size > base)
         .map(|(at, _)| *at);
+
     let hit: Vec<usize> = first
         .into_iter()
         .chain(physical.views.range(base + 1..end).map(|(at, _)| *at))
         .collect();
+
     for at in hit {
         let Some((size, slice)) = physical.views.remove(&at) else {
             continue;
         };
+
         victory_gpu::title_memory_remapped(at, size);
         victory_gpu::title_memory_view_gone(at, size);
+
         // SAFETY: a view we mapped; it becomes a placeholder again.
         unsafe {
             UnmapViewOfFile2(
@@ -1067,9 +1102,11 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
                 MEM_PRESERVE_PLACEHOLDER,
             )
         };
+
         if at < base {
             map(physical, at, base - at, slice.clone());
         }
+
         if at + size > end {
             let index = slice.index + (end - at) / PAGE;
             map(physical, end, at + size - end, Slice { index, ..slice });
