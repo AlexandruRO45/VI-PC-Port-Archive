@@ -1,280 +1,146 @@
-# VIctory
+# Vice-Tay
 
-Runs Grand Theft Auto VI (Xbox Series X|S) natively on Windows, from files
-the user supplies.
+Vice-Tay is an experimental Windows compatibility layer for the Xbox Series build of Grand Theft Auto VI. It is based on [VIctory](https://github.com/Marvisak/VIctory). It runs the title's x86-64 code natively, implements the Xbox services it uses, and translates console GPU programs to DXIL for Direct3D 12. The runtime operates offline. The repository contains source code and synthetic test fixtures.
 
-The title's x86-64 code runs unchanged inside our process; VIctory supplies
-the platform underneath it and converts the title's data, ahead of time where
-it can (shaders and pipelines too, see Getting started) and on first use
-otherwise. See [docs/architecture.md](docs/architecture.md).
+## Current status
 
-## Status (2026-11-25)
+The development build reaches the opening screens, loads saves, and has shown the prologue under player control. Rendering and frame pacing remain work in progress. Daylight scenes can show an overexposed sky, jagged shadows, and missing details. Ray-traced lighting is incomplete, and turning the camera or moving between scenes can cause long frames. Campaign completion and sustained stability are still unverified.
 
-**Not playable yet, but you can get into the game.** The title boots, runs
-its menus at its own 30 fps, loads the world, plays the intro cutscene and
-reaches the **prologue**, the mission after it, with the graphics fully
-displayed, at about **1 frame per second**.
+The latest local run on 25 November 2026 reached the 3D opening cinematic on `main` at `b033e17a`. The cinematic had dark silhouettes and visible lighting defects while shader compilation was active. The gameplay measurements below come from a separate run in the prologue.
 
-| Stage | State |
-|-------|-------|
-| Boot, first-boot screens (accessibility, language, settings, legal) | works, 30 fps |
-| Intro video with sound | works |
-| Start screen, profile and saves | works |
-| Loading into the world (about a minute) | works |
-| The intro cutscene | plays at about 1 fps (0.9-1.0 s a frame, warm cache, quiet machine): textured and lit characters with whole hair, buildings, sky, depth of field, the title card, credits and interface. Missing: ray-traced shadows and indirect light, the local-light shadow mask. Seen in some shots: a pink band over nearer bodies, a stand-in head on a secondary character for a few frames |
-| The prologue | reached; the graphics are fully displayed, at about 1 fps |
-
-In the intro cutscene at 1 fps the opening credits land over other shots than
-on a console: they follow the frame count, the shots follow the clock.
-
-Tested on one machine: Windows 11, AMD RX 6700 XT (12 GB).
-
-> **Warning.** Entering the world on a real GPU hung it in earlier builds,
-> and Windows then reset the display driver (every monitor goes black for a
-> moment). The latest runs, several minutes each in the world, did not, but
-> it is not ruled out; a run can also end on a GPU fault (`crashes.log`). A
-> diagnostics build with `VICTORY_D3D12_WARP=1` renders on the software
-> adapter instead (too slow to reach the world in minutes).
-
-What each part does today and what it still needs:
-
-| Subsystem | Today | Needs |
-|-----------|-------|-------|
-| Loader | Runs the title's executable and its DLLs in our process; crash reports name the faulting code and are kept in `crashes.log` | – |
-| Runtime services | One signed-in offline user, licences, packages, saves that survive a kill at any step, text entry dialog | Speech is silent; the dialog and relaunch are untested live |
-| Network | Offline by design: the title cannot reach the network | – |
-| Files and streaming | Archives and streamed data read, zlib and BCPack decoded in parallel | Loading is limited by writes into title memory |
-| Input | XInput pads, keyboard, keyboard stand-in pad | Trigger rumble |
-| Audio | Menu, video and loading sound; XMA voices and Opus streams decode | Reverb is silent; Opus results unverified against the title |
-| GPU: menus | Draws, compute and presentation on host D3D12; only changed title memory is copied | Frame pacing drifts on one screen in release builds |
-| GPU: world | The scene is drawn and presented: mesh pipelines, indirect execution, views the shaders pick from the heap themselves, title memory read by address, depth written from compute, lists that wait for values other queues write, textures made when a shader first reads them, pipelines pre-built or made by worker threads and kept on disk | The title's ray-tracing structures are never built (no ray-traced shadows or indirect light in the intro cutscene); about 1 s a frame; draws of untranslated shaders are dropped; real queries, depth bounds, HDR and scaling are missing |
-| Shaders | Console GPU code recompiled to DXIL, ahead of time (`translate --cache`) or at first use, cached on disk. Menus: all. World: all but under 300 of 24,387 programs | Merged geometry stages (195 programs) and under 100 others; fused multiply-adds follow the host GPU; some compute programs need a GPU with 64-lane waves |
-| Textures | Console tiled layouts and detiling for the modes the title uses | Render-target metadata planes |
-| Series S mode | Menus, loading and the world run with the PC upscaler (`VICTORY_FIDELITYFX_DIR`, about 1 s a frame) | The title's own upscaler DLLs: six of their passes are untranslated, so their picture is wrong |
-
-## Development PC
-
-| Component | Configuration |
-|-----------|---------------|
-| Processor | AMD Ryzen 9 9950X3D (16 cores, 32 threads) |
-| Motherboard | MSI MAG X870 TOMAHAWK WIFI (MS-7E51), BIOS 1.A93 |
-| Graphics card | NVIDIA GeForce RTX 4090 (24 GB GDDR6X) |
-| Graphics driver | NVIDIA 621.40 (WDDM) |
-| Memory | 48 GB DDR5 (2 × 24 GB, configured at 8000 MT/s) |
-| System storage | Samsung 990 PRO 4 TB NVMe SSD |
-| Operating system | Windows 11 Pro 26H2, 64-bit (build 26300.10075) |
+Recent changes on `main` include recovery after texture remap queue overflow, pooled GPU upload buffers for texture copies, and reuse of pipeline references within a command list. [PR #14](https://github.com/TaynanGT/Vice-Tay/pull/14) records the changes and their sources.
 
 ## Local test results
 
-The November 24, 2026 test of revision `05a78e3` used the Xbox Series X profile.
-It rendered at 2560 × 1440 internally and presented at 3840 × 2160. The command
-relay was enabled at level 2. The ray-tracing structure builder and texture
-prefetching were disabled.
+### Test system
 
-| Scene | Measurement | FPS | Frame timing |
-|-------|-------------|----:|--------------|
-| Prologue room, camera still | PresentMon, 268 presents over 35.76 s | 7.47 | 132.2 ms median, 157.2 ms at the 95th percentile |
-| Turning the camera in the prologue room | Renderer log, 248 frames over 41.2 s | 6.01 | 166.3 ms average |
+| Component | Test system |
+| --- | --- |
+| OS | Windows 11 Pro 26H2, build 26300.10075 |
+| CPU | AMD Ryzen 9 9950X3D |
+| GPU | NVIDIA GeForce RTX 4090, 24 GB |
+| GPU driver | NVIDIA 621.40 |
+| RAM | 48 GiB DDR5 |
+
+### 25 November 2026 — `main` at [`b033e17a`](https://github.com/TaynanGT/Vice-Tay/commit/b033e17a)
+
+This was a diagnostics build in Series X mode with command relay level 2 (`VICTORY_RELAY=2`), frame capture enabled, and a 1920 × 1080 window limit. The run started with an existing host pipeline library and an empty shader cache. The renderer was still compiling shaders during the test.
+
+| Segment | UTC sample times | Samples | Median FPS | FPS range | Median frame time |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Early startup and loading | 20:40:25–20:41:01 | 8 | 28.0 | 25.5–30.7 | 35.7 ms |
+| Later loading intervals | 20:41:06–20:41:39 | 7 | 15.2 | 0.6–22.3 | 65.6 ms |
+| Opening 3D cinematic | 20:41:46–20:43:01 | 11 | 0.8 | 0.1–1.1 | 1,207 ms |
+
+Each row summarises the renderer's periodic FPS and frame-time samples. The cinematic row includes intervals with at least 500 draw calls per frame. The first of those intervals appeared **88.5 s** after the first runtime log entry. The window was closed at **2 min 56 s**, during the cinematic, and the process exited with code 0.
+
+### Earlier camera and transition measurements
+
+The 24 November 2026 run used revision [`05a78e3`](https://github.com/TaynanGT/Vice-Tay/commit/05a78e37) in Series X mode at 2560 × 1440 internal resolution and 3840 × 2160 output. The command relay was set to level 2. Texture prefetching and the ray-tracing structure builder were disabled.
+
+| Prologue segment | Method | FPS | Frame time |
+| --- | --- | ---: | --- |
+| Camera stationary | PresentMon, 268 presents over 35.76 s | 7.47 | 132.2 ms median, 157.2 ms at the 95th percentile |
+| Turning the camera | Renderer log, 248 frames over 41.2 s | 6.01 | 166.3 ms mean |
 | Scene transition | PresentMon, 155 presents over 35.51 s | 4.34 | 152.9 ms median, 521.7 ms at the 95th percentile |
 
-For PresentMon, FPS is the number of intervals between presents divided by the
-elapsed time. Frame timing uses the interval between presents. The stationary
-capture showed the GPU busy for about 100 ms per frame. The renderer log
-reported about 52 ms per frame preparing copies in the same interval.
+PresentMon FPS uses the intervals between presents over the sampled segment. These three segments describe different types of work. A matched before-and-after route is still needed to quantify the effect of the latest renderer changes.
 
-A separate Series X run on November 25 showed 30 FPS in the early low-draw
-samples. Six in-world samples between 00:53:02 and 00:53:29 local time
-reported 7.1–7.3 FPS (136.5–141.7 ms per frame).
+### Regression checks
 
-### Observed rendering problems
+On [`b033e17a`](https://github.com/TaynanGT/Vice-Tay/commit/b033e17a), the local graphics suite passed **262 tests** with **0 failures** and **9 ignored**. A Series X load-only check resolved every import in the executable and its four DLLs. [Windows CI](https://github.com/TaynanGT/Vice-Tay/actions/runs/45694584789) passed the workspace suite and Clippy in the normal and diagnostics configurations.
 
-The test reached the controllable prologue room and showed the character,
-the room geometry, and the control prompt. Camera movement and scene
-transitions slowed the frame rate. The captures showed an overexposed window
-and sky, stepped shadow edges, missing details near the window, and dark
-patches in an exterior shot.
+## Build and run
 
-## Getting started
+### Requirements
 
-Requirements: Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with
-shader model 6.6 (and mesh shaders for the world), Rust (pinned in
-`rust-toolchain.toml`).
+- Windows 10 or 11 x64 and an AVX2-capable CPU.
+- A Direct3D 12 GPU with Shader Model 6.6. Rendering the game world needs mesh shader support.
+- [Rustup](https://rustup.rs/) and the Visual Studio C++ build tools. The Rust release is pinned in [`rust-toolchain.toml`](rust-toolchain.toml).
+- Your own compatible Xbox Series game files, stored outside this repository.
 
-To install Rust, use rustup (`winget install --id Rustlang.Rustup -e`, or
-the installer from https://rustup.rs). The first `cargo` command in this
-repository then fetches the pinned toolchain. Building needs the MSVC C++
-build tools: Visual Studio or its Build Tools with the "Desktop development
-with C++" workload.
+### Configuration
 
-A run in the world takes about 33 GB of Windows commit (RAM plus paging
-file) and about 10 GB of video memory. The tested machine has 32 GB of RAM
-and a commit limit of about 80 GB. Check **Committed** under **Task Manager →
-Performance → Memory**. If `crashes.log` reports Windows error 1455, close
-other applications or increase the Windows paging file size, then retry.
+Copy the example configuration and set the paths in `victory.toml`. Game files, saves and generated caches belong outside the repository. The default cache and data folders are `%LOCALAPPDATA%\victory\cache` and `%LOCALAPPDATA%\victory\data`.
 
 ```powershell
-cargo xtask install-hooks                # asset-policy check on every commit
-copy victory.example.toml victory.toml   # then set your paths (outside the repo)
-cargo test --workspace                   # needs no game data
-cargo run -p victory -- config           # check your paths
+Copy-Item .\victory.example.toml .\victory.toml
+cargo build --locked --release -p victory
+$victory = '.\target\release\victory.exe'
+& $victory config
 ```
 
-To check title-window shutdown on Windows, run
-`cargo test -p victory-hle --lib --locked direct_close_suspends_and_exits`.
-The test checks that closing the title window runs the suspend routine
-and exits cleanly. It waits for the child process with a separate test timeout.
-The DirectStorage test `a_page_list_filled_after_its_request_starts` checks
-that a page list populated after the first read is picked up on retry.
+`VICTORY_CONFIG` selects a different configuration file. `VICTORY_GAME_DIR`, `VICTORY_CACHE_DIR`, and `VICTORY_DATA_DIR` override the corresponding entries. See [`victory.example.toml`](victory.example.toml) for the optional settings.
 
-Run the title:
+### Launch
+
+Set `$title` to the actual executable in your game folder. The first command checks module loading and import resolution. Add `--execute` to launch. Series X is the default console profile.
 
 ```powershell
-cargo build --release -p victory
-target\release\victory.exe translate --cache --pipelines <game dir>\shaders.rpf <game dir>\<the title's exe> <game dir>\XboxBvhBuilder.dll <game dir>\amd_fidelityfx_upscaler_xbox.dll
-target\release\victory.exe run <game dir>\<the title's exe> --execute
+$title = 'D:\victory-data\game\game.exe'
+& $victory run $title --console series-x
+& $victory run $title --console series-x --execute
 ```
 
-The `translate --cache` step (minutes; again after a change of the shader
-translator) translates every shader the title can ask for into the cache
-(about 1.3 GB), so a run does not translate them while it plays; without it
-they are translated at first use, and their draws wait. With `--pipelines`
-it then makes every pipeline in the title's shader pack (inside
-`shaders.rpf`) into the host pipeline library (about 27,000 pipelines, 4 MB;
-estimated at 20 minutes on 16 threads, but about 2 pipelines a second after a
-translator change that touches most programs, which is hours), so a run
-compiles none of those either; the library belongs to the GPU and driver it
-was made on. Run again, it skips what is there in seconds; stopped
-early, it keeps what it made. Without it, a run makes the pipelines it needs
-on worker threads and keeps them, so the first runs after a translator
-change are slower and show missing draws for a while.
-
-To get into the game, press A (Enter) on each first-boot screen and again on
-the start screen. Loading the world takes about a minute; the intro cutscene
-plays, then the prologue starts.
-
-Upscaling (Series S mode): the title upscales with AMD FidelityFX. To run
-it with the PC build on your GPU instead of the console build, get the
-[FidelityFX SDK](https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK)
-and point `VICTORY_FIDELITYFX_DIR` (or `[paths].fidelityfx_dir`) at its
-`Kits/FidelityFX/signedbin` folder, which holds
-`amd_fidelityfx_upscaler_dx12.dll`. Without it, or if that DLL offers no
-upscaler for your GPU (the log says so), the title's own DLLs run.
-
-The window caption shows the framerate. Saves, settings and `crashes.log`
-are kept under the data folder (default `%LOCALAPPDATA%\victory\data`), derived
-data under the cache folder.
-
-Set `VICTORY_WINDOW_MAX=1920x1080` before launching to limit the title's
-top-level window to that bounding box. Smaller windows keep their size,
-larger windows keep their proportions, and the monitor's work area still
-limits them. This scales the displayed image; it does not change the
-console render resolution or the swap-chain buffers. With the variable
-unset, window sizing is unchanged.
-
-Input: XInput pads. With none connected the keyboard is a pad while the
-title's window has focus:
-
-| Keys | Pad |
-|------|-----|
-| W A S D / I J K L | left / right stick |
-| arrows | D-pad |
-| Enter, Backspace, X, Y | A, B, X, Y |
-| Q / E, Z / C | shoulders, triggers |
-| F / H | stick clicks |
-| Esc, Tab | Menu, View |
-
-## Commands
-
-```
-victory inspect <exe|dll> [--imports] [--exports]
-victory census [paths...] [--missing] [--strict]
-victory lib-exports <import.lib> [--list]
-victory shader-info [paths...] [--verbose] [--disasm] [--effects]
-victory translate [paths...] [--validate] [--pipelines] [--list] [--jobs N]
-victory translate [paths...] --cache [--pipelines] [--jobs N]
-victory run <exe> [--execute] [--unimplemented trap|zero] [--strict]
-            [--console series-x|series-s] [-- <title arguments>]
-victory config
-```
-
-Logging: `VICTORY_LOG=victory_loader=trace,info` (a release build logs
-info and above).
-
-### Windows shader-test validator
-
-The shader tests use `dxil.dll` to validate Shader Model 6.6 containers.
-An older Windows SDK validator can load successfully but reject them with
-`Unknown shader model 'ps_6_6'`. If this happens, use a current x64 validator
-from [Microsoft's DirectX Shader Compiler releases](https://github.com/microsoft/DirectXShaderCompiler/releases)
-or a current Windows SDK. Set its path for the test session:
+Prebuilding shaders and pipelines is optional. To fill the same cache used by `run`, pass the shader archive, executable and applicable shader DLLs to `translate`. The host pipeline library is specific to the GPU and driver. New configurations may spend time compiling pipelines as scenes load.
 
 ```powershell
-$env:VICTORY_DXIL = 'C:\tools\dxc\bin\x64\dxil.dll'
-cargo test -p victory-shader --lib --locked -- --test-threads=1
+$game = Split-Path -Parent $title
+& $victory translate --cache --pipelines "$game\shaders.rpf" $title `
+    "$game\XboxBvhBuilder.dll" "$game\amd_fidelityfx_upscaler_xbox.dll"
 ```
 
-Without this override, the validator loader selects the newest installed
-Windows SDK's `bin/<version>/x64/dxil.dll`, then falls back to the DLL search
-path when no SDK copy is found. This is a test/offline-validation dependency;
-the translated shaders do not require it at runtime.
+Use `--console series-s` to select the Series S profile. To use AMD's PC upscaler with that profile, set `VICTORY_FIDELITYFX_DIR` or `paths.fidelityfx_dir` to a [FidelityFX SDK](https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK) directory containing `amd_fidelityfx_upscaler_dx12.dll`. The log reports which implementation loads.
 
-## Debugging
+`VICTORY_WINDOW_MAX=1920x1080` limits the displayed window size while preserving its aspect ratio. It leaves the render resolution and swap-chain buffers at their original size.
 
-A release build has no debugging aids. Build them in with
+### Controls
+
+Use an XInput gamepad or the following keyboard controls while the title window has focus.
+
+| Keyboard | Gamepad |
+| --- | --- |
+| `W A S D` / `I J K L` | Left / right stick |
+| Arrow keys | D-pad |
+| `Enter`, `Backspace`, `X`, `Y` | A, B, X, Y |
+| `Q` / `E`, `Z` / `C` | Shoulders, triggers |
+| `F` / `H` | Stick clicks |
+| `Esc`, `Tab` | Menu, View |
+
+## Development and diagnostics
+
+[Architecture](docs/architecture.md) describes the loader, Xbox services, shader translator and renderer. Run `cargo xtask install-hooks` to enable the asset-policy check before each commit. [Asset policy](docs/asset-policy.md) covers what can be committed. Keep game-derived files, captures and dumps outside the repository.
 
 ```powershell
-cargo build --profile diag -p victory --features diagnostics   # target\diag\victory.exe
+cargo test --workspace --locked
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+cargo build --profile diag --locked -p victory --features diagnostics
 ```
 
-The on/off switches below (`...=1`) are off when unset or set to `0`.
+Shader validation uses `dxil.dll`. Set `VICTORY_DXIL` to a current x64 validator from a Windows SDK or the [DirectX Shader Compiler](https://github.com/microsoft/DirectXShaderCompiler/releases) if the installed validator rejects Shader Model 6.6.
 
-| Variable | Effect |
-|----------|--------|
-| `VICTORY_LOG=<target>=debug,...` | debug and trace output |
-| `VICTORY_STACKS=20,60` | every thread's stack at those seconds |
-| `VICTORY_WATCH=<rva>,...` | logs a title u32 when it changes |
-| `VICTORY_POKE=<rva>:<byte>,...` | writes a title byte twice a second (a hang watchdog's tick, say) |
-| `VICTORY_KEYS=30:Enter,35:X` | presses keys at those seconds, focus or not |
-| `VICTORY_CRASH_BREAKPOINTS=1` | appends first-chance breakpoints to `crashes.log`, including ones a handler may recover from |
-| `VICTORY_CRASH_SAVE=<rva>:<len>,...` | saves title memory to the cache folder on a crash |
-| `VICTORY_CAPTURE=<dir>` | saves presented frames (powers of two, or `VICTORY_CAPTURE_FRAMES=<list>`) |
-| `VICTORY_DUMP_TARGETS=1` | with the two above, saves every render target of those frames |
-| `VICTORY_CAPTURE_WORLD=<list>` | with `VICTORY_CAPTURE`, also saves (and with `VICTORY_DUMP_TARGETS` dumps) the frames at these offsets from the first frame that ran 500 draws (the world's first; its number depends on how fast the title loaded) |
-| `VICTORY_DUMP_WRITERS=<hash>,...` | with the two above, also the textures a pipeline containing a listed shader hash writes, the first frame it runs, and for its buffers a log line (dwords changed, dwords not zero) |
-| `VICTORY_PEEK=<hex address>[:<bytes>],...` | in listed frames, those bytes of title memory logged after each submission. Listed frames also log targets of 16 texels or fewer as values, each table view's view words and whether its host slot is null, the host copy of every buffer of 64 bytes or fewer a draw reads (at submission and after its list), and each 1D or 3D texture a dispatch writes, read back right after it |
-| `VICTORY_D3D12_DEBUG=1` | host debug layer |
-| `VICTORY_D3D12_GBV=1` | with the above, GPU-based validation (bad descriptor use reported, not faulted; slow) |
-| `VICTORY_D3D12_DRED=1` | on a GPU failure, the allocation hit and the commands in flight |
-| `VICTORY_SKIP_PIPELINES=<hash>,...` | omit draws and dispatches, including indirect ones, whose pipeline contains a listed 16-digit shader hash |
-| `VICTORY_GPU_TIMING=1` | with the above, each list of a submission run and timed on its own; slow lists logged with their slowest commands; a device removal names the list it happened in and lists all its commands |
-| `VICTORY_TRACE_SHADERS=<hash>,...` | with `VICTORY_D3D12_DRED`, every draw and dispatch of a listed shader logged with what it binds (user data, heap slots, root views and their first dwords; the first 500, and all of them in listed capture frames); the records of its indirect executions are read back and logged in every frame (records with work, the first four, the frame) |
-| `VICTORY_D3D12_WARP=1` | host device on the software adapter (slow; cannot reset the driver) |
-| `VICTORY_PIPELINE_LOG=<file>` | a line per title pipeline created (key, shaders, state), first used, and made or loaded (library name); `translate --cache --pipelines` writes the last kind too |
-| `VICTORY_PREBUILD_KEYS=<file>` | `translate --cache --pipelines` makes nothing and lists each pack record's key, shaders and state (or why it is skipped) |
-| `VICTORY_SHADER_LOOP_LIMIT=<n>` | translated shader loops stop after `n` iterations per lane instead of 2^20 (own shader cache entries); if a lower `n` makes world frames much faster, loops hitting the limit are what makes them slow |
-| `VICTORY_AUDIO_CAPTURE=<file.wav>` | records what the title plays (our process only) |
-| `VICTORY_XMA_DUMP=<dir>` | saves the first 32 XMA voices' context and input |
+Use `victory --help` or `victory <command> --help` for the complete options. `inspect` reports executable structure and imports, `census` checks import coverage, `lib-exports` lists import-library symbols, and `shader-info` and `translate` describe or translate shader programs.
 
-Every build appends unhandled exceptions, panics, and host GPU failures to
-`crashes.log` in the title's data folder.
+### Investigating a run
 
-For a startup breakpoint (`0x80000003`), run the diagnostics build with
-`VICTORY_CRASH_BREAKPOINTS=1`. Keep the console output along with the new
-`crashes.log` entries. A host DLL refusal includes the caller stack in the
-console output. The refusal is expected for DLLs outside the host policy,
-including `rpcrt4.dll`.
+Report the Vice-Tay revision, Windows build, GPU and driver, console profile, renderer settings, and the scene that reproduces the problem. For performance reports, include the measured interval, the measurement tool, and whether the camera was moving. `crashes.log` is stored under the title's data directory.
 
-On Series 1.0.2.1, a missing `appdata0.rpf` reproduced the breakpoint at
-`+0x2237178` before the first window. Restore the archive from the same
-package beside the title executable. `run --execute` checks that it can
-read the RPF9 header before starting this build.
+| Setting | Use |
+| --- | --- |
+| `VICTORY_LOG` | Controls logging levels, for example `victory_loader=trace,info`. |
+| `VICTORY_KEYS` | Schedules diagnostic input, for example `30:Enter,35:X`. |
+| `VICTORY_CAPTURE` | Saves selected presented frames outside the repo in a diagnostics build. Set `VICTORY_CAPTURE_FRAMES` to choose frame numbers. |
+| `VICTORY_CAPTURE_WORLD` | Also captures frames at offsets from the first frame with 500 draws. |
+| `VICTORY_D3D12_DEBUG=1` | Enables the D3D12 debug layer. |
+| `VICTORY_D3D12_DRED=1` | Records device removal data after a GPU failure. |
+| `VICTORY_D3D12_WARP=1` | Uses the software D3D12 adapter for hardware versus software comparisons. |
+| `VICTORY_CRASH_BREAKPOINTS=1` | Records first-chance breakpoints in `crashes.log`. |
+| `VICTORY_PIPELINE_LOG` | Records pipeline creation, first use, and cache activity. |
 
-To compare hardware and software rendering, repeat with
-`VICTORY_D3D12_WARP=1` and check the console for
-`host device on the software adapter (WARP)` to confirm the WARP device was
-created. Compare the exception's module and offset, stack frames, and
-preceding messages across the two runs.
+If the loader reports a startup breakpoint at `+0x2237178` on Series 1.0.2.1, check that `appdata0.rpf` from the same package is present beside the executable. If Windows reports error 1455, check the system commit limit and paging-file capacity.
 
-## License
+## Credits and licence
 
-GPL-3.0-or-later. See [LICENSE](LICENSE).
+Vice-Tay builds on [VIctory](https://github.com/Marvisak/VIctory), with contributions and adaptations from [victory-fork](https://github.com/fxceless/victory-fork), [VItoriaBr](https://github.com/uiliannn/VItoriaBr), [KLBF Lab](https://github.com/PastiiJay/klbf-lab), and [VIctory-Belobug-AMD](https://github.com/Belobug/VIctory-Belobug-AMD). Commit history records the sources of individual changes.
+
+Vice-Tay is an independent project. Its source code is licensed under GPL-3.0-or-later. See [LICENSE](LICENSE).
