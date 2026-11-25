@@ -79,8 +79,8 @@ shaders and emulates the one instruction.
   bundles (34f0ff8) crashes with a segmentation fault on each of their DXIL
   (`dxil-spirv <file>.dxil --bindless --ssbo-uav --ssbo-srv`, run on the files
   `VKD3D_SHADER_DUMP_PATH` writes); dxil-spirv b540c8a converts all three.
-  A vkd3d-proton with a newer dxil-spirv is expected to fix it; not yet
-  tested in game.
+  The same vkd3d-proton commit built with dxil-spirv b540c8a makes all three
+  pipelines in game, and no dispatch is dropped as "being made" any more.
 - An access to a title page that has no host copy is lost (a read gives zero, a
   store is dropped).
 - Not publicly documented, and assumed: the instruction's rounding, the order
