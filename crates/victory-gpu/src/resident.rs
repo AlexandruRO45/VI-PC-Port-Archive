@@ -257,6 +257,17 @@ static BYTES: AtomicU64 = AtomicU64::new(0);
 /// had work for residents.
 static STATS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
 
+/// Since the start: windows in place handed a resident for being hot
+/// (`shadow::hot_window`); asks for a new resident that made none (not in
+/// an arena, or over a budget: a copy in the card's memory, or in place,
+/// as before).
+static HOT: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// A window in place was handed a resident for being hot.
+pub(crate) fn hot_window_made() {
+    HOT[0].fetch_add(1, Ordering::Relaxed);
+}
+
 /// The most bytes of residents, `R` and `B` together
 /// (`VICTORY_RESIDENT_MB`; by default 60% of the card's budget for this
 /// process when first asked). Each resident is also made only while the
@@ -325,14 +336,18 @@ pub(crate) fn find(start: u64, len: u64, new: bool) -> Option<Found> {
     if !ready(&host.device) {
         return None;
     }
-    let (resident, replaced) = make_over(from, to, most(), &mut crate::arena::resolve_waiting, &mut |bytes| {
+    let made = make_over(from, to, most(), &mut crate::arena::resolve_waiting, &mut |bytes| {
         if let Some([budget, used, ..]) = host.video_memory()
             && used + 2 * bytes > budget / 10 * 8
         {
             return None;
         }
         host.uav_buffer(bytes)
-    })?;
+    });
+    let Some((resident, replaced)) = made else {
+        HOT[1].fetch_add(1, Ordering::Relaxed);
+        return None;
+    };
     tracing::info!(
         start = format_args!("{:#x}", resident.start),
         mb = resident.len >> 20,
@@ -858,7 +873,8 @@ pub(crate) fn line(frames: f64) {
     tracing::info!(
         "residents (VICTORY_INPLACE=4): {alive} alive, {} MB in the card's memory and {} MB of twins (budget {} MB); per frame: \
          {:.1} MB uploaded from arenas in {:.0} ranges, {:.1} MB compared in {:.0} merge passes, {:.2} MB merged into arenas \
-         ({:.0} partial dwords), {:.1} MB marked to go up again after writes through other copies, {:.1} submissions with work for residents",
+         ({:.0} partial dwords), {:.1} MB marked to go up again after writes through other copies, {:.1} submissions with work for residents; \
+         since the start {} hot windows in place handed residents and {} asks for a new resident turned down (not in an arena, or over a budget)",
         bytes >> 20,
         bytes >> 20,
         most() >> 20,
@@ -870,6 +886,8 @@ pub(crate) fn line(frames: f64) {
         f64::from(partial) / frames,
         mb(s[4]),
         s[5],
+        HOT[0].load(Ordering::Relaxed),
+        HOT[1].load(Ordering::Relaxed),
     );
 }
 

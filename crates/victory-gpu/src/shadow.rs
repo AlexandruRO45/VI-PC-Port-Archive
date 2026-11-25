@@ -3999,6 +3999,7 @@ fn hot_window(map: &mut BTreeMap<(u64, u64), Arc<Shadow>>, key: (u64, u64)) -> A
     let Some(found) = crate::resident::find(shadow.start, shadow.len, true) else {
         return shadow;
     };
+    crate::resident::hot_window_made();
     let gone: Vec<(u64, u64)> =
         map.iter().filter(|(_, s)| s.in_resident().is_some_and(|r| found.replaced.iter().any(|x| Arc::ptr_eq(x, r)))).map(|(k, _)| *k).collect();
     for k in gone {
