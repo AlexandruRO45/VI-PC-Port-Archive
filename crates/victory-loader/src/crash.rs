@@ -1210,7 +1210,7 @@ mod tests {
     fn decoded_clzero_loop_leaves_the_state_of_its_last_pass() {
         #[repr(align(64))]
         struct Lines([u8; 192]);
-        let code = [
+        let code: [u8; 16] = [
             0x0f, 0x01, 0xfc, 0x48, 0x83, 0xc0, 0x40, 0x4c, 0x39, 0xd0, 0x72, 0xf4, 0xcc, 0xcc,
             0xcc, 0xcc,
         ];
