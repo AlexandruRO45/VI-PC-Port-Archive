@@ -273,3 +273,63 @@ fn a_program_asking_for_the_console_flow_only_pruned_is_emitted_as_it_is() {
     assert!(emitted.dxil == plain.dxil, "pruned");
     validate(&emitted);
 }
+
+/// A program that lowers only threaded: one way of a uniform branch sets
+/// m0 and a flag, and the join reads m0 only where the flag is set.
+/// Unthreaded, the join takes m0 from both ways, from the other as the
+/// hardware left it, which a compute program has no value for. Pruned, it
+/// would lower (pruning threads too), but [`super::emit`] prunes only what
+/// lowers as it is: it is emitted threaded, with the branch no lane takes
+/// one way of left in.
+#[test]
+fn a_program_that_lowers_only_threaded_is_emitted_threaded_not_pruned() {
+    let mut body = ONE_WAY.to_vec();
+    body.extend_from_slice(&[
+        0x7E02_0280, // v_mov_b32 v1, 0
+        0xBF06_8001, // s_cmp_eq_u32 s1, 0 (the group's x)
+        0xBF85_0002, // s_cbranch_scc1 join
+        0xBEFC_0301, // s_mov_b32 m0, s1
+        0x7E02_0281, // v_mov_b32 v1, 1
+        0x7D84_0280, // join: v_cmp_eq_u32 vcc, 0, v1
+        0xBF87_0002, // s_cbranch_vccnz constant
+        0x7E08_027C, // v_mov_b32 v4, m0
+        0xBF82_0001, // s_branch end
+        0x7E08_0293, // constant: v_mov_b32 v4, 19
+        0x4A04_0504, // end: v_add_nc_u32 v2, v4, v2
+    ]);
+    let mut native = program(&body);
+    native.io = StageIo::Cs(ComputeIo {
+        rsrc2: 1 << 1 | 1 << 7, // the UAV table, then the group's x in s1
+        threads: [32, 1, 1],
+    });
+    let s = stages(&native);
+    assert_eq!(s.st.one_way().len(), 1);
+    let unthreaded = super::emit_program(
+        &CONTAINER, &native, &s.p, &s.st, &s.io, &s.res, ALL_WAVES, true,
+    );
+    assert!(
+        matches!(
+            unthreaded,
+            Err(super::ShaderError::Unsupported {
+                what: "a hardware SGPR input",
+                ..
+            })
+        ),
+        "{:?}",
+        unthreaded.map(|_| ())
+    );
+    let threaded = super::emit_threaded(
+        &CONTAINER, &native, &s.p, &s.st, &s.io, &s.res, ALL_WAVES, true,
+    )
+    .unwrap();
+    let emitted = super::emit(&CONTAINER, &native, &s.p, &s.st, &s.io, &s.res, ALL_WAVES).unwrap();
+    assert!(emitted == threaded, "pruned");
+    // Without the check, `emit` would have given the pruned form.
+    let pruned = super::emit_without_dead_branches(
+        &CONTAINER, &native, &s.p, &s.st, &s.io, &s.res, ALL_WAVES,
+    )
+    .expect("not pruned");
+    assert!(pruned.dxil != threaded.dxil, "pruned as it is");
+    validate(&emitted);
+    validate(&pruned);
+}
