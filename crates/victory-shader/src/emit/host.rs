@@ -62,6 +62,35 @@ fn err(e: windows::core::Error) -> String {
     e.message().to_string()
 }
 
+/// The first adapter that is a GPU: not flagged software, and with video
+/// memory of its own. A machine without one (GitHub's Windows runner has only
+/// `Microsoft Basic Render Driver`) has nothing to run the hardware-only
+/// checks on, and CI proved that the flag of adapter 0 alone is not enough:
+/// the runner's default adapter is not flagged software and its device still
+/// refuses a wave of 32
+/// (`permutes_read_the_lane_named_and_zero_from_lanes_left_out`). WARP and the
+/// basic render driver report no dedicated video memory, which is what this
+/// asks for as well.
+fn hardware_adapter(factory: &IDXGIFactory4) -> windows::core::Result<IDXGIAdapter1> {
+    // SAFETY: plain DXGI adapter enumeration.
+    unsafe {
+        for index in 0.. {
+            let Ok(adapter) = factory.EnumAdapters1(index) else {
+                break;
+            };
+            let desc = adapter.GetDesc1()?;
+            let software = desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0;
+            if !software && desc.DedicatedVideoMemory > 0 {
+                return Ok(adapter);
+            }
+        }
+    }
+    Err(windows::core::Error::new(
+        windows::Win32::Foundation::E_FAIL,
+        "no hardware adapter",
+    ))
+}
+
 /// `VICTORY_ADAPTER`'s value: unset or empty is the default adapter.
 fn adapter_index(value: Option<&str>) -> Result<Option<u32>, String> {
     match value.map(str::trim) {
@@ -88,23 +117,22 @@ mod adapter_tests {
 
 impl Host {
     /// The default adapter, or WARP with `warp` (or `VICTORY_WARP=1`).
-    /// `VICTORY_ADAPTER=<n>` picks DXGI's `n`th adapter instead of the
-    /// default (0 is the default one), so a machine's second GPU, an iGPU
-    /// beside a graphics card say, runs the same tests.
+    /// A software default adapter (a machine without a GPU, as CI) is
+    /// refused, so hardware-only checks never run on WARP.
+    /// `VICTORY_ADAPTER=<n>` takes DXGI's `n`th adapter (counting from 0)
+    /// instead, so a machine's second GPU, an iGPU beside a graphics card
+    /// say, runs the same tests.
     pub fn new(warp: bool) -> Result<Self, String> {
         let warp = warp || std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1");
         let index = adapter_index(std::env::var("VICTORY_ADAPTER").ok().as_deref())?;
         // SAFETY: plain D3D12/DXGI calls with valid out pointers.
         unsafe {
             let mut device: Option<ID3D12Device> = None;
-            if warp {
-                let factory: IDXGIFactory4 =
-                    CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(err)?;
-                let adapter: IDXGIAdapter = factory.EnumWarpAdapter().map_err(err)?;
-                D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
+            let factory: IDXGIFactory4 =
+                CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(err)?;
+            let adapter: IDXGIAdapter1 = if warp {
+                factory.EnumWarpAdapter().map_err(err)?
             } else if let Some(n) = index {
-                let factory: IDXGIFactory4 =
-                    CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(err)?;
                 // Said once per run, so a mistyped index (whose tests then
                 // skip as on a machine without the device) does not pass
                 // unnoticed.
@@ -119,10 +147,11 @@ impl Host {
                 NAMED.call_once(|| {
                     eprintln!("VICTORY_ADAPTER={n}: {}", name.trim_end_matches('\0'));
                 });
-                D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
+                adapter
             } else {
-                D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
-            }
+                hardware_adapter(&factory).map_err(err)?
+            };
+            D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
             let device = device.ok_or("no device")?;
             let mut sm = D3D12_FEATURE_DATA_SHADER_MODEL {
                 HighestShaderModel: D3D_SHADER_MODEL_6_6,
@@ -204,6 +233,10 @@ impl Host {
         if stages.iter().any(|(s, _)| s.view_addresses) {
             views.push((1, super::MEMORY_SPACE, 1));
         }
+        if stages.iter().any(|(s, _)| s.view_marks) {
+            views.push((super::VIEW_MARKS, super::MEMORY_SPACE, 1));
+            views.push((super::VIEW_WRITES, super::MEMORY_SPACE, 2));
+        }
         for (register, space, kind) in views {
             params.push(D3D12_ROOT_PARAMETER1 {
                 ParameterType: match kind {
@@ -221,12 +254,24 @@ impl Host {
                 ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
             });
         }
+        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS19::default();
+        // SAFETY: the feature query writes the structure of the given size.
+        // Older runtimes may not recognize OPTIONS19; that means no support.
+        let aniso_point_mip_supported = unsafe {
+            self.device.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS19,
+                (&raw mut options).cast(),
+                size_of_val(&options) as u32,
+            )
+        }
+        .is_ok()
+            && options.AnisoFilterWithPointMipSupported.as_bool();
         let mut samplers = Vec::new();
         for &(s, vis) in stages {
             for (n, d) in s.static_samplers.iter().enumerate() {
                 let [u, v, w] = d.address.map(|a| D3D12_TEXTURE_ADDRESS_MODE(a as i32));
                 samplers.push(D3D12_STATIC_SAMPLER_DESC {
-                    Filter: D3D12_FILTER(d.filter as i32),
+                    Filter: D3D12_FILTER(d.filter_for_host(aniso_point_mip_supported) as i32),
                     AddressU: u,
                     AddressV: v,
                     AddressW: w,
@@ -716,6 +761,7 @@ fn fmad_probe() -> Result<HostShader, crate::ShaderError> {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        view_marks: false,
     })?;
     Ok(HostShader {
         stage: HwStage::Cs,
@@ -731,6 +777,7 @@ fn fmad_probe() -> Result<HostShader, crate::ShaderError> {
         view_addresses: lowered.view_addresses,
         heap: lowered.heap,
         heap_writes: lowered.heap_writes,
+        view_marks: lowered.view_marks,
     })
 }
 
@@ -829,6 +876,7 @@ fn stub(pixel: bool, outputs: Vec<SigElement>) -> HostShader {
         view_addresses: false,
         heap: false,
         heap_writes: false,
+        view_marks: false,
     }
 }
 
