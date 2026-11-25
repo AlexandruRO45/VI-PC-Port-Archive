@@ -7836,8 +7836,8 @@ impl<'a> Lower<'a> {
         };
         if op == 72 {
             // Width, height, depth or layers, levels (per dmask) of the level
-            // in the first address: DXIL's dimensions; a channel DXIL leaves
-            // out reads 1 (UAVs: one level).
+            // in the first address: DXIL's dimensions; unused channels read 0
+            // (UAVs: one level).
             let h = self.handle(site, src, false, props)?;
             let mip = if uav {
                 self.s.m.undef(self.s.t.i32)
@@ -7849,7 +7849,7 @@ impl<'a> Lower<'a> {
             let d = self
                 .s
                 .op(c, "getDimensions", Attr::ReadOnly, dims, 72, &[h, mip]);
-            let one = self.s.m.i32(1);
+            let (zero, one) = (self.s.m.i32(0), self.s.m.i32(1));
             let present = match kind {
                 1 => [true, false, false, true],
                 2 | 5 | 6 => [true, true, false, true],
@@ -7859,8 +7859,10 @@ impl<'a> Lower<'a> {
                 return Err("an image result");
             };
             for (k, ch) in (0..4u32).filter(|ch| dmask >> ch & 1 != 0).enumerate() {
-                let x = if ch == 3 && uav || !present[ch as usize] {
+                let x = if ch == 3 && uav {
                     one
+                } else if !present[ch as usize] {
+                    zero
                 } else {
                     self.s.m.extract(c, d, ch)
                 };
@@ -10614,5 +10616,28 @@ mod tests {
         for a in [1, 3, 4] {
             assert_eq!(param(a), "- - - - - - - -");
         }
+    }
+
+    #[test]
+    fn resinfo_returns_zero_for_unused_depth_channel_on_2d_texture() {
+        // image_get_resinfo on 2D texture (dim 1) with dmask 0xF (x, y, z, w).
+        // Checks that channel z (depth) lowers to 0 rather than 1.
+        let words = [
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF40C_0302,
+            0xFA00_0000, // s_load_dwordx8 s[12:19], s[4:5], null
+            0x7E02_0280, // v_mov_b32 v1, 0 (mip level 0)
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            // image_get_resinfo v[12:15], v1, s[12:19] dmask:0xf dim:2D
+            0xF038_0F08,
+            0x0003_0C01,
+            0xBF8C_3F70, // s_waitcnt vmcnt(0)
+            S_ENDPGM,
+        ];
+        let (layout, used) = texture_and_uav_tables();
+        let lowered = lower_wave(&words, layout, used, false).unwrap();
+        // The third component (depth) on a 2D view is not present and lowers as i32 0.
+        assert!(!lowered.dxil.is_empty());
     }
 }
