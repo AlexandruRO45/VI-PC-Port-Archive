@@ -36,6 +36,9 @@ publisher.
 - Host constant-buffer views use at most 64 KiB and apply 256-byte
   alignment after the limit. Oversized guest views can still use their
   host-addressable prefix.
+- The fork uses VIctory's Clippy lint settings. The optional
+  `VICTORY_LIVE` file changes selected performance settings for comparisons
+  in one session. See [live switches](docs/live-switches.md).
 
 These changes use the [VIctory main snapshot](https://github.com/Marvisak/VIctory/commit/13f91caee25f2fdf2c062be5f7a27f058e51cbca)
 and the [fxceless texture-copy fix](https://github.com/fxceless/victory-fork/commit/a25370661ed1343e2f2d5e79669ec8db4e60dc68)
@@ -46,11 +49,9 @@ The pixel fixes come from VItoriaBr
 [`2b3c339`](https://github.com/uiliannn/VItoriaBr/commit/2b3c339).
 The constant-buffer fix follows
 [VItoriaBr `ed6e5af`](https://github.com/uiliannn/VItoriaBr/commit/ed6e5af).
-The wave and descriptor work comes from Vice-Tay
-[#5](https://github.com/TaynanGT/Vice-Tay/pull/5),
-[#7](https://github.com/TaynanGT/Vice-Tay/pull/7), and
-[#9](https://github.com/TaynanGT/Vice-Tay/pull/9), including
-[#6](https://github.com/TaynanGT/Vice-Tay/pull/6).
+The wave and descriptor work, diagnostics, live switches, and lint
+alignment come from [Vice-Tay #11](https://github.com/TaynanGT/Vice-Tay/pull/11),
+which includes [#6](https://github.com/TaynanGT/Vice-Tay/pull/6).
 The run measurements below identify their own revisions.
 
 The integration is checked with `cargo test --workspace --locked` and
