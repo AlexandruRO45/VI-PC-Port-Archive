@@ -167,20 +167,32 @@ pub(crate) fn retire<T: 'static>(object: T) {
         .push((started, Retired(Box::new(object))));
 }
 
-/// Drops what waited for submissions up to `finished`.
+/// Drops what waited for submissions up to `finished`: moved out under the
+/// lock into a list this thread keeps, and dropped after it. The waiting
+/// list keeps its room too. (Splitting it into two new lists at every
+/// landing made and freed some 400 MB in 36 s of play, tens of thousands
+/// of objects a time.)
 fn bury(finished: u64) {
-    let done: Vec<(u64, Retired)> = {
-        let mut retired = RETIRED.lock().unwrap_or_else(|e| e.into_inner());
-        if retired.is_empty() {
+    thread_local! {
+        static DONE: std::cell::RefCell<Vec<(u64, Retired)>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    DONE.with(|done| {
+        let Ok(mut done) = done.try_borrow_mut() else {
             return;
+        };
+        {
+            let mut retired = RETIRED.lock().unwrap_or_else(|e| e.into_inner());
+            let mut i = 0;
+            while i < retired.len() {
+                if retired[i].0 <= finished {
+                    done.push(retired.swap_remove(i));
+                } else {
+                    i += 1;
+                }
+            }
         }
-        let (done, keep) = std::mem::take(&mut *retired)
-            .into_iter()
-            .partition(|(at, _)| *at <= finished);
-        *retired = keep;
-        done
-    };
-    drop(done);
+        done.clear();
+    });
 }
 
 /// Objects [`retire`] dropped at once (no submission was running) and
