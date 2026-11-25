@@ -174,6 +174,9 @@ pub(crate) fn sync_heaps() {
             continue;
         };
         let step = u64::from(step);
+        // Capped host heaps have no counterparts for the title slots reserved
+        // for per-draw tables; raw writes there must not be mirrored.
+        let mirrored_count = heap.desc.count.min(host.count());
         for (range_from, range_end) in written.take(start as usize, end as usize) {
             let mut page = range_from & !(crate::watch::PAGE - 1);
             while page < range_end {
@@ -181,9 +184,8 @@ pub(crate) fn sync_heaps() {
                 let to = (page + crate::watch::PAGE).min(range_end);
                 let mut probe = [0u8; 4];
                 if crate::host::read_into(from as *const u8, &mut probe) {
-                    let first = (from as u64 - start) / step;
-                    let last = (to as u64 - start).div_ceil(step);
-                    for index in first..last.min(u64::from(heap.desc.count)) {
+                    let slots = changed_slots(from, to, start as usize, step, mirrored_count);
+                    for index in slots {
                         host.mirror(index as u32, start + index * step, false);
                     }
                 }
@@ -191,6 +193,23 @@ pub(crate) fn sync_heaps() {
             }
         }
     }
+}
+
+/// Title descriptor slots in a changed byte range that have host counterparts.
+/// `range_end` is exclusive.
+#[cfg(windows)]
+fn changed_slots(
+    range_from: usize,
+    range_end: usize,
+    heap_start: usize,
+    step: u64,
+    mirrored_count: u32,
+) -> std::ops::Range<u64> {
+    let from = (range_from - heap_start) as u64;
+    let to = (range_end - heap_start) as u64;
+    let first = from / step;
+    let last = to.div_ceil(step).min(u64::from(mirrored_count));
+    first.min(last)..last
 }
 
 /// Gives back dynamic slots of the host heap behind the title heap at
@@ -1043,6 +1062,34 @@ mod tests {
     fn create(desc: HeapDesc, placement: Placement, out: &mut This) -> HRESULT {
         let extended = Extended(desc, placement);
         create_heap(std::ptr::null(), &extended.0, &HEAP_IIDS[0], out)
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn raw_heap_sync_stops_before_dynamic_host_slots() {
+        let start = 0x1000usize;
+        let step = 32;
+        let capped = 5;
+        assert_eq!(
+            changed_slots(
+                start + 3 * step + 4,
+                start + 4 * step + 8,
+                start,
+                step as u64,
+                capped
+            ),
+            3..5
+        );
+        assert_eq!(
+            changed_slots(
+                start + 6 * step,
+                start + 9 * step,
+                start,
+                step as u64,
+                capped
+            ),
+            5..5
+        );
     }
 
     #[test]
