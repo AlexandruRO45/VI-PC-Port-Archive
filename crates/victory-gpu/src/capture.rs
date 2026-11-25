@@ -621,7 +621,7 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
     // Channel values as floats, then scaled.
     type Decode = Box<dyn Fn(&[u8]) -> [f32; 3]>;
     let (n, decode): (usize, Decode) = match format {
-        27..=32 => {
+        27..=30 => {
             // The PNG drops alpha: its range and how many texels have each
             // channel zero are logged.
             let (mut low, mut high, mut zero) = ([255u8; 4], [0u8; 4], [0usize; 4]);
@@ -657,21 +657,29 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
             [small_float(v & 0x7ff, 6), small_float(v >> 11 & 0x7ff, 6), small_float(v >> 22, 5)]
         })),
         9..=10 => (8, Box::new(move |b| [half(u16_at(b, 0)), half(u16_at(b, 1)), half(u16_at(b, 2))])),
-        11..=14 => (8, Box::new(move |b| [0, 1, 2].map(|i| f32::from(u16_at(b, i))))),
+        11..=12 => (8, Box::new(move |b| [0, 1, 2].map(|i| f32::from(u16_at(b, i))))),
         33..=34 => (4, Box::new(move |b| [half(u16_at(b, 0)), half(u16_at(b, 1)), 0.0])),
         1..=2 => (16, Box::new(move |b| {
             [0, 1, 2].map(|i| f32::from_bits(u32_at(b, i)))
         })),
         15..=16 => (8, Box::new(move |b| [f32::from_bits(u32_at(b, 0)), f32::from_bits(u32_at(b, 1)), 0.0])),
-        35..=38 => (4, Box::new(move |b| [f32::from(u16_at(b, 0)), f32::from(u16_at(b, 1)), 0.0])),
-        48..=52 => (2, Box::new(move |b| [f32::from(b[0]), f32::from(b[1]), 0.0])),
+        35..=36 => (4, Box::new(move |b| [f32::from(u16_at(b, 0)), f32::from(u16_at(b, 1)), 0.0])),
+        48..=50 => (2, Box::new(move |b| [f32::from(b[0]), f32::from(b[1]), 0.0])),
+        13 | 14 => (8, Box::new(move |b| [0, 1, 2].map(|i| f32::from(u16_at(b, i) as i16)))),
+        37 | 38 => (4, Box::new(move |b| [f32::from(u16_at(b, 0) as i16), f32::from(u16_at(b, 1) as i16), 0.0])),
+        51 | 52 => (2, Box::new(|b| [f32::from(b[0] as i8), f32::from(b[1] as i8), 0.0])),
+        31 | 32 => (4, Box::new(|b| [0, 1, 2].map(|i| f32::from(b[i] as i8)))),
         // Single channels (and depth planes): shown as grey.
-        39..=43 => (4, Box::new(move |b| [f32::from_bits(u32_at(b, 0)); 3])),
+        39..=41 => (4, Box::new(move |b| [f32::from_bits(u32_at(b, 0)); 3])),
+        42 => (4, Box::new(move |b| [u32_at(b, 0) as f32; 3])),
+        43 => (4, Box::new(move |b| [(u32_at(b, 0) as i32) as f32; 3])),
         19..=22 => (8, Box::new(move |b| [f32::from_bits(u32_at(b, 0)); 3])),
         44..=47 => (4, Box::new(move |b| [(u32_at(b, 0) & 0xff_ffff) as f32; 3])),
         53..=54 => (2, Box::new(move |b| [half(u16_at(b, 0)); 3])),
-        55..=59 => (2, Box::new(move |b| [f32::from(u16_at(b, 0)); 3])),
-        60..=65 => (1, Box::new(move |b| [f32::from(b[0]); 3])),
+        55..=57 => (2, Box::new(move |b| [f32::from(u16_at(b, 0)); 3])),
+        60..=62 | 65 => (1, Box::new(move |b| [f32::from(b[0]); 3])),
+        58 | 59 => (2, Box::new(move |b| [f32::from(u16_at(b, 0) as i16); 3])),
+        63 | 64 => (1, Box::new(|b| [f32::from(b[0] as i8); 3])),
         _ => return None,
     };
     let values: Vec<[f32; 3]> = (0..h)
@@ -705,10 +713,10 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
     let (p50, p99) = (at(0.5), at(0.99));
     let not_finite = values.iter().flatten().filter(|v| !v.is_finite()).count();
     let high = if grey || p99 == 0.0 { max } else { p99 };
-    let range = (high - low).max(1e-20);
+    let range = f64::from(high) - f64::from(low);
     tracing::info!(format, low, high = max, p50, p99, nonzero, not_finite, "target values");
     for v in values {
-        let c = v.map(|c| (((c - low) / range).clamp(0.0, 1.0) * 255.0) as u8);
+        let c = v.map(|c| (((f64::from(c) - f64::from(low)) / range).clamp(0.0, 1.0) * 255.0) as u8);
         out.extend([c[0], c[1], c[2], 255]);
     }
     Some(out)
@@ -868,5 +876,35 @@ mod tests {
         assert_eq!(super::to_rgba(89, 1, 1, 4, &xr), Some(vec![255, 127, 0, 255]));
         // B8G8R8A8 still swaps to RGBA.
         assert_eq!(super::to_rgba(87, 1, 1, 4, &[1, 2, 3, 4]), Some(vec![3, 2, 1, 255]));
+    }
+    #[test]
+    fn integer_targets_keep_their_numeric_order() {
+        let ramp = [0, 0, 0, 255, 127, 127, 127, 255, 255, 255, 255, 255];
+        let uint: Vec<_> = [0u32, 1, 2].into_iter().flat_map(u32::to_le_bytes).collect();
+        assert_eq!(super::to_rgba(42, 3, 1, 12, &uint).unwrap(), ramp);
+        for format in [43, 58, 59, 63, 64] {
+            let n = match format { 43 => 4, 58 | 59 => 2, _ => 1 };
+            let bytes: Vec<_> = [-1i32, 0, 1].into_iter()
+                .flat_map(|v| v.to_le_bytes().into_iter().take(n)).collect();
+            assert_eq!(super::to_rgba(format, 3, 1, 3 * n, &bytes).unwrap(), ramp, "{format}");
+        }
+    }
+
+    #[test]
+    fn finite_float_ranges_span_the_full_grey_scale() {
+        for scale in [1e-30f32, f32::MAX] {
+            let bytes: Vec<_> = [-scale, 0.0, scale].into_iter().flat_map(f32::to_le_bytes).collect();
+            let rgba = super::to_rgba(41, 3, 1, 12, &bytes).unwrap();
+            assert_eq!([rgba[0], rgba[4], rgba[8]], [0, 127, 255]);
+        }
+    }
+
+    #[test]
+    fn signed_colour_channels_do_not_wrap_to_white() {
+        for (format, n, channels) in [(13,2,4), (14,2,4), (37,2,2), (38,2,2), (51,1,2), (52,1,2), (31,1,4), (32,1,4)] {
+            let bytes: Vec<_> = [-1i16, 1, 0, 0].into_iter().take(channels)
+                .flat_map(|v| v.to_le_bytes().into_iter().take(n)).collect();
+            assert_eq!(super::to_rgba(format, 1, 1, bytes.len(), &bytes).unwrap(), [0,255,0,255], "{format}");
+        }
     }
 }
