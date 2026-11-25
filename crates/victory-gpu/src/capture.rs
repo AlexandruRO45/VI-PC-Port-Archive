@@ -60,13 +60,32 @@ pub(crate) fn wanted(n: u64) -> bool {
     folder().is_some() && (n.is_power_of_two() || listed(n))
 }
 
-/// Saves 8-bit RGBA or BGRA rows (`pitch` bytes apart) as frame `n`.
-pub(crate) fn save(n: u64, width: u32, height: u32, pitch: usize, bgra: bool, rows: &[u8]) {
-    save_as(&format!("frame-{n}"), width, height, pitch, bgra, rows);
+/// Byte layout of the four-byte pixels passed to the PNG writer.
+#[derive(Clone, Copy)]
+enum PngPixel {
+    Rgba8,
+    Bgra8,
+    Rgb10A2,
 }
 
-/// Saves 8-bit RGBA or BGRA rows as `<name>.png`, at half size.
-fn save_as(name: &str, width: u32, height: u32, pitch: usize, bgra: bool, rows: &[u8]) {
+impl PngPixel {
+    fn rgb(self, pixel: [u8; 4]) -> [u8; 3] {
+        match self {
+            Self::Rgba8 => [pixel[0], pixel[1], pixel[2]],
+            Self::Bgra8 => [pixel[2], pixel[1], pixel[0]],
+            Self::Rgb10A2 => {
+                let packed = u32::from_le_bytes(pixel);
+                [0, 10, 20].map(|shift| {
+                    let channel = (packed >> shift) & 0x3ff;
+                    ((channel * 255 + 511) / 1023) as u8
+                })
+            }
+        }
+    }
+}
+
+/// Saves four-byte color pixels to an 8-bit RGB PNG at half size.
+fn save_as(name: &str, width: u32, height: u32, pitch: usize, format: PngPixel, rows: &[u8]) {
     let Some(folder) = folder() else { return };
     let (w, h) = ((width / 2).max(1), (height / 2).max(1));
     // Filter byte 0 per row, then RGB of every other pixel of every other row.
@@ -75,12 +94,8 @@ fn save_as(name: &str, width: u32, height: u32, pitch: usize, bgra: bool, rows: 
         raw.push(0);
         let row = &rows[(2 * y).min(height as usize - 1) * pitch..];
         for x in 0..w as usize {
-            let p = &row[(2 * x).min(width as usize - 1) * 4..][..3];
-            if bgra {
-                raw.extend([p[2], p[1], p[0]]);
-            } else {
-                raw.extend_from_slice(p);
-            }
+            let p = &row[(2 * x).min(width as usize - 1) * 4..][..4];
+            raw.extend(format.rgb(p.try_into().unwrap()));
         }
     }
     let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
@@ -195,18 +210,25 @@ pub(crate) fn read_back(
     }
 }
 
-/// Saves a frame read back by [`read_back`] (8-bit color only).
+/// Saves a frame read back from a four-byte color format.
 pub(crate) fn save_read_back(
     frame: u64,
     buffer: &ID3D12Resource,
     footprint: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
 ) {
     let f = footprint.Footprint;
-    let bgra = match f.Format {
-        DXGI_FORMAT_R8G8B8A8_UNORM | DXGI_FORMAT_R8G8B8A8_UNORM_SRGB => false,
-        DXGI_FORMAT_B8G8R8A8_UNORM | DXGI_FORMAT_B8G8R8A8_UNORM_SRGB => true,
+    let format = match f.Format {
+        DXGI_FORMAT_R8G8B8A8_UNORM | DXGI_FORMAT_R8G8B8A8_UNORM_SRGB => PngPixel::Rgba8,
+        DXGI_FORMAT_B8G8R8A8_UNORM | DXGI_FORMAT_B8G8R8A8_UNORM_SRGB => PngPixel::Bgra8,
+        // The display copy interprets every member of this family as UNORM.
+        DXGI_FORMAT_R10G10B10A2_TYPELESS
+        | DXGI_FORMAT_R10G10B10A2_UNORM
+        | DXGI_FORMAT_R10G10B10A2_UINT => PngPixel::Rgb10A2,
         other => {
-            tracing::warn!(format = other.0, "frame not saved: not 8-bit color");
+            tracing::warn!(
+                format = other.0,
+                "frame not saved: unsupported color format"
+            );
             return;
         }
     };
@@ -217,9 +239,15 @@ pub(crate) fn save_read_back(
         if buffer.Map(0, None, Some(&mut data)).is_err() {
             return;
         }
-        let len = f.RowPitch as usize * f.Height as usize;
-        let rows = std::slice::from_raw_parts(data.cast::<u8>(), len);
-        save(frame, f.Width, f.Height, f.RowPitch as usize, bgra, rows);
+        let rows = std::slice::from_raw_parts(data.cast::<u8>(), buffer.GetDesc().Width as usize);
+        save_as(
+            &format!("frame-{frame}"),
+            f.Width,
+            f.Height,
+            f.RowPitch as usize,
+            format,
+            rows,
+        );
         buffer.Unmap(0, None);
     }
 }
@@ -580,7 +608,14 @@ fn dump_one(
             if rgba.chunks(4).all(|p| p[..3] == [0, 0, 0]) {
                 name.push_str("-black");
             }
-            save_as(&name, f.Width, f.Height, f.Width as usize * 4, false, &rgba);
+            save_as(
+                &name,
+                f.Width,
+                f.Height,
+                f.Width as usize * 4,
+                PngPixel::Rgba8,
+                &rgba,
+            );
         } else {
             tracing::info!(format = f.Format.0, ?resource, "target not dumped: format");
         }
@@ -854,6 +889,122 @@ mod tests {
     #[test]
     fn crc_matches_the_png_check_value() {
         assert_eq!(super::crc32(b"IEND"), 0xae42_6082);
+    }
+
+    #[test]
+    fn packed_10_bit_frames_are_saved_as_rgb_pngs() {
+        use super::*;
+        use windows::Win32::Foundation::RECT;
+
+        const TEST: &str = "capture::tests::packed_10_bit_frames_are_saved_as_rgb_pngs";
+        const CHILD: &str = "VICTORY_TEST_PACKED_FRAME";
+        const UNAVAILABLE: &str = "WARP unavailable for packed frame capture";
+        if std::env::var_os(CHILD).is_some() {
+            let Some(host) = crate::host::host() else {
+                println!("{UNAVAILABLE}");
+                return;
+            };
+            for (frame, format) in [
+                (1, DXGI_FORMAT_R8G8B8A8_UNORM),
+                (2, DXGI_FORMAT_R10G10B10A2_UNORM),
+                (3, DXGI_FORMAT_R10G10B10A2_TYPELESS),
+            ] {
+                let mut texture = None;
+                let desc = D3D12_RESOURCE_DESC {
+                    Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                    Width: 4,
+                    Height: 2,
+                    DepthOrArraySize: 1,
+                    MipLevels: 1,
+                    Format: format,
+                    SampleDesc: DXGI_SAMPLE_DESC {
+                        Count: 1,
+                        Quality: 0,
+                    },
+                    Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                    ..Default::default()
+                };
+                let heap = D3D12_HEAP_PROPERTIES {
+                    Type: D3D12_HEAP_TYPE_DEFAULT,
+                    ..Default::default()
+                };
+                let list = host.new_list().unwrap();
+                // SAFETY: valid descriptions, and the texture and list remain live through execution.
+                let (buffer, footprint) = unsafe {
+                    host.device
+                        .CreateCommittedResource(
+                            &heap,
+                            D3D12_HEAP_FLAG_NONE,
+                            &desc,
+                            D3D12_RESOURCE_STATE_RENDER_TARGET,
+                            None,
+                            &mut texture,
+                        )
+                        .unwrap();
+                    let texture = texture.as_ref().unwrap();
+                    let view = D3D12_RENDER_TARGET_VIEW_DESC {
+                        Format: if format == DXGI_FORMAT_R10G10B10A2_TYPELESS {
+                            DXGI_FORMAT_R10G10B10A2_UNORM
+                        } else {
+                            format
+                        },
+                        ViewDimension: D3D12_RTV_DIMENSION_TEXTURE2D,
+                        ..Default::default()
+                    };
+                    let handle = host.rtv(texture, Some(&view));
+                    let left = RECT {
+                        left: 0,
+                        top: 0,
+                        right: 2,
+                        bottom: 2,
+                    };
+                    list.list
+                        .ClearRenderTargetView(handle, &[0.0, 0.25, 1.0, 0.0], None);
+                    list.list
+                        .ClearRenderTargetView(handle, &[1.0, 0.5, 0.0, 1.0], Some(&[left]));
+                    list.list.ResourceBarrier(&[crate::host::transition(
+                        texture,
+                        D3D12_RESOURCE_STATE_RENDER_TARGET,
+                        D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    )]);
+                    read_back(&host.device, &list.list, texture).unwrap()
+                };
+                list.close();
+                host.execute(&[&list]);
+                save_read_back(frame, &buffer, &footprint);
+            }
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", TEST, "--nocapture"])
+            .env(CHILD, "1")
+            .env("VICTORY_CAPTURE", dir.path())
+            .env("VICTORY_D3D12_WARP", "1")
+            .env("VICTORY_D3D12_DEBUG", "0")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if stdout.contains(UNAVAILABLE) {
+            eprintln!("{UNAVAILABLE}; skipped");
+            return;
+        }
+        for frame in 1..=3 {
+            let png = std::fs::read(dir.path().join(format!("frame-{frame}.png")))
+                .unwrap_or_else(|e| panic!("frame {frame} did not produce a PNG: {e}"));
+            let word = |at| u32::from_be_bytes(png[at..at + 4].try_into().unwrap());
+            assert_eq!([word(16), word(20)], [2, 1]);
+            let pixels =
+                miniz_oxide::inflate::decompress_to_vec_zlib(&png[41..41 + word(33) as usize])
+                    .unwrap();
+            assert_eq!(pixels, [0, 255, 128, 0, 0, 64, 255], "frame {frame}");
+        }
     }
 
     /// R16G16B16A16_UNORM is integers, not half floats; 89 is 10:10:10:2,
