@@ -77,6 +77,7 @@ pub(crate) struct Parts<'a> {
     pub mesh_stride: u32,
     /// Writes through buffer views mark their pages (`emit`, "Write marks").
     pub view_marks: bool,
+    pub host_wave32: bool,
 }
 
 enum Stop {
@@ -529,8 +530,8 @@ impl<'a> Lower<'a> {
             let one_wave = cs.threads.iter().product::<u32>() <= wave;
             if console_lanes || one_wave && s.lds_dwords > 0 {
                 // A host of 32-lane waves runs each console wave as two
-                // halves (`super::host_wave32`).
-                s.wave_size = Some(if super::host_wave32() { 32 } else { wave });
+                // halves (`x.host_wave32`).
+                s.wave_size = Some(if x.host_wave32 { 32 } else { wave });
             }
         }
         let mut no_barrier = HashSet::new();
@@ -1223,6 +1224,17 @@ impl<'a> Lower<'a> {
     }
 
     fn run(mut self) -> Result<Lowered, Stop> {
+        if let Some(threads) = self.s.threads
+            && self.x.native.wave64
+            && self.x.host_wave32
+            && threads.iter().product::<u32>() <= 64
+            && self.s.lds_dwords > 0
+        {
+            return Err(unsupported(
+                0,
+                "wave64 compute shader sharing LDS within one wave on a 32-lane host",
+            ));
+        }
         let p = self.x.p;
         let order = crate::ir::reverse_postorder(&p.blocks);
         for (n, &b) in order.iter().enumerate() {
@@ -2853,9 +2865,9 @@ impl<'a> Lower<'a> {
     }
 
     /// The lanes of a host wave running this program: the console's, or
-    /// 32 on a host of 32-lane waves (`super::host_wave32`).
+    /// 32 on a host of 32-lane waves (`self.x.host_wave32`).
     fn host_wave(&self) -> u32 {
-        if super::host_wave32() { 32 } else { self.wave() }
+        if self.x.host_wave32 { 32 } else { self.wave() }
     }
 
     /// A lane number as the host wave can take it: on a host of 32-lane
@@ -9976,6 +9988,7 @@ mod tests {
             prims: vec![],
             mesh_stride: 0,
             view_marks: false,
+            host_wave32: false,
         })
         .map(|_| ())
     }
@@ -10027,6 +10040,7 @@ mod tests {
             prims: vec![],
             mesh_stride: 0,
             view_marks: false,
+            host_wave32: false,
         })
     }
 
@@ -10217,6 +10231,7 @@ mod tests {
             prims: vec![],
             mesh_stride: 0,
             view_marks: false,
+            host_wave32: false,
         })
         .unwrap();
 

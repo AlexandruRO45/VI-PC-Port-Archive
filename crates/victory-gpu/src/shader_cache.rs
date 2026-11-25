@@ -65,7 +65,6 @@ fn build() -> &'static [u8; 32] {
             );
         }
         let wave32 = crate::host::host_wave32();
-        victory_shader::emit::set_host_wave32(wave32);
         key(victory_shader::SOURCE_HASH, ENCODING, limit, wave32)
     })
 }
@@ -92,7 +91,10 @@ pub fn host_shader(container: &[u8]) -> (Result<HostShader, String>, bool) {
     let build = build();
     // Writes through views mark their pages: copy-backs compare only those
     // (`crate::shadow::copy_back_marks`).
-    let options = victory_shader::emit::Options { view_marks: true };
+    let options = victory_shader::emit::Options {
+        view_marks: true,
+        host_wave32: crate::host::host_wave32(),
+    };
     let translate = |c: &[u8]| victory_shader::emit::translate_with(c, options).map_err(|e| e.to_string());
     match CACHE.get() {
         Some(cache) => cached(cache, build, container, translate),
