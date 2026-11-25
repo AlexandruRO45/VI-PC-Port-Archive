@@ -805,7 +805,10 @@ fn straddling_writes_across_256mib_and_4gib_boundaries_mark_exact_pages() {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
-        view_marks: false,
+        options: crate::emit::Options {
+            view_marks: false,
+            ..Default::default()
+        },
     })
     .expect("lower");
     assert!(l.memory && l.memory_writes);

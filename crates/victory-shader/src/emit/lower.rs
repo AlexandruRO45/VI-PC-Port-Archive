@@ -12193,7 +12193,10 @@ mod tests {
                 outputs: vec![],
                 prims: vec![],
                 mesh_stride: 0,
-                view_marks: false,
+                options: crate::emit::Options {
+                    view_marks: false,
+                    ..Default::default()
+                },
             })
             .unwrap();
             assert!(lowered.wave_ops);

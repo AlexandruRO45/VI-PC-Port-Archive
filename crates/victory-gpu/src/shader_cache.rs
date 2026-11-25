@@ -573,7 +573,7 @@ mod tests {
             Ok(shader())
         };
         assert_eq!(
-            cached(&cache, &[7; 32], b"a container", translate),
+            cached(&cache, &[7; 32], Wave64Mode::Native, b"a container", translate),
             (Ok(shader()), false)
         );
         assert_eq!(runs.load(Ordering::Relaxed), 1);

@@ -196,6 +196,7 @@ impl Host {
         Host { device, warp }
     }
 
+    #[cfg(test)]
     fn check_sm66(device: &ID3D12Device) -> Result<(), String> {
         let mut sm = D3D12_FEATURE_DATA_SHADER_MODEL {
             HighestShaderModel: D3D_SHADER_MODEL_6_6,

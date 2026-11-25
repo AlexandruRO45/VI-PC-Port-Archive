@@ -889,7 +889,10 @@ fn pops_wait_loop_exits_immediately_for_inactive_lanes() {
             outputs,
             prims: Vec::new(),
             mesh_stride: 0,
-            view_marks: false,
+            options: crate::emit::Options {
+                view_marks: false,
+                ..Default::default()
+            },
         })
         .expect("lower");
         if let Ok(mut v) =
