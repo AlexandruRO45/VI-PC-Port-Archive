@@ -236,6 +236,26 @@ fn set(roots: &mut Vec<Root>, slot: u32, root: Root) {
 }
 
 impl State {
+    /// Root CBVs that must use a CPU fill instead of naming the shadow.
+    pub(crate) fn needs_cbv_boundary(&self, list: &HostList, compute: bool) -> bool {
+        let Some(pipeline) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+            return false;
+        };
+        if !pipeline.stages.iter().any(|stage| !stage.root_cbvs.is_empty()) || !list.has_recorded_writes() {
+            return false;
+        }
+        pipeline.stages.iter().flat_map(|s| &s.root_cbvs).any(|&(slot, _)| {
+            let Some(Root::View(address)) = self.roots_ref(compute).get(usize::from(slot)) else {
+                return false;
+            };
+            let Some(shadow) = crate::shadow::find(*address, 1) else {
+                return false;
+            };
+            !shadow.gpu(*address).is_multiple_of(256)
+                && list.writes_for_cpu_reads(&[(*address as usize, shadow.left(*address).min(1 << 16) as usize)])
+        })
+    }
+
     pub(crate) fn reset(&mut self, pipeline: This) {
         *self = State::default();
         self.pipeline = pipeline as usize;
@@ -2170,10 +2190,33 @@ RWByteAddressBuffer target : register(u0);
 void main() { target.Store(0, 29); }
 "#;
 
+    fn title_list() -> (This, This) {
+        let null = std::ptr::null();
+        let alloc_iid = crate::object::guid(
+            0x6102dee4, 0xaf59, 0x4b09, [0xb9, 0x99, 0xb4, 0x4d, 0x73, 0xf0, 0x9b, 0x24],
+        );
+        let list_iid = crate::object::guid(
+            0x5b160d0f, 0xac1b, 0x4185, [0x8b, 0xa8, 0xb3, 0xae, 0x42, 0xa5, 0xa4, 0x55],
+        );
+        let (mut allocator, mut list) = (null, null);
+        assert_eq!(crate::list::create_allocator(null, 0, &alloc_iid, &mut allocator), S_OK);
+        assert_eq!(crate::list::create_list(null, 0, 0, allocator, null, &list_iid, &mut list), S_OK);
+        (list, allocator)
+    }
+
+    fn title_queue() -> This {
+        let iid = crate::object::guid(
+            0x0ec870a6, 0x5d7e, 0x4c22, [0x8c, 0xfc, 0x5b, 0xaa, 0xe0, 0x76, 0x16, 0xed],
+        );
+        let mut queue = std::ptr::null();
+        let desc = [0u32, 0, 0, 1];
+        assert_eq!(crate::queue::create(std::ptr::null(), desc.as_ptr().cast(), &iid, &mut queue), S_OK);
+        queue
+    }
+
     /// Root CBVs at a console-aligned but host-unaligned address stage
     /// title bytes on the CPU. A preceding GPU write must reach that fill.
     #[test]
-    #[ignore = "ordering regression on 70564ae; run on a host D3D12 device"]
     fn a_gpu_producer_feeds_the_real_root_cbv_staging_path() {
         const READ: &str = r#"
 cbuffer Input : register(b0) { uint value; }
@@ -2182,7 +2225,10 @@ RWByteAddressBuffer target : register(u0);
 [numthreads(1, 1, 1)]
 void main() { target.Store(0, value); }
 "#;
-        let host = crate::host::host().expect("native D3D12 device");
+        let Some(host) = crate::host::host() else {
+            assert!(std::env::var_os("VICTORY_TEST_ORDERING_REQUIRE_GPU").is_none());
+            return;
+        };
         let (write_root, writer) = compile_cs(WRITE_29);
         let (read_root, reader) = compile_cs(READ);
         let mut observed = Vec::new();
@@ -2199,9 +2245,10 @@ void main() { target.Store(0, value); }
             }
             let produced = crate::shadow::find(input_address, 4).unwrap();
             let result = crate::shadow::find(output_address, 4).unwrap();
-            let first = host.new_list().unwrap();
-            produced.refresh(&first, input_address, 4);
-            produced.gpu_writes(&first, input_address, 4);
+            let (title_list, allocator) = title_list();
+            let first = crate::list::host_list(title_list).unwrap();
+            produced.refresh(first, input_address, 4);
+            produced.gpu_writes(first, input_address, 4, false);
             // SAFETY: the open list holds the producer's mapped shadow.
             unsafe {
                 first.list.SetComputeRootSignature(&write_root);
@@ -2220,16 +2267,18 @@ void main() { target.Store(0, value); }
             let consumer = if scope != "same list" {
                 first.close();
                 if scope == "separate submissions" {
-                    host.execute(&[&first]);
+                    host.execute(&[first]);
                 }
                 &second
+            } else if offset != 0 {
+                crate::list::cpu_source_list(title_list, input_address as usize, produced.left(input_address) as usize).unwrap()
             } else {
-                &first
+                first
             };
             let constant = root_view(consumer, input_address, false, false).unwrap();
             assert_eq!(constant == produced.gpu(input_address), offset == 0);
             result.refresh(consumer, output_address, 4);
-            result.gpu_writes(consumer, output_address, 4);
+            result.gpu_writes(consumer, output_address, 4, false);
             // SAFETY: the recording owns the root CBV backing and output shadow.
             unsafe {
                 consumer.list.SetComputeRootSignature(&read_root);
@@ -2239,8 +2288,8 @@ void main() { target.Store(0, value); }
                 consumer.list.Dispatch(1, 1, 1);
             }
             consumer.close();
-            if scope == "same batch" {
-                host.execute(&[&first, consumer]);
+            if scope == "same batch" || (scope == "same list" && offset != 0) {
+                host.execute(&[first, consumer]);
             } else {
                 host.execute(&[consumer]);
             }
@@ -2251,7 +2300,7 @@ void main() { target.Store(0, value); }
             println!("root CBV byte offset {offset}, {scope}: producer={producer}, consumer={read}");
             assert_eq!(producer, 29, "the producer executed and copied back");
             observed.push(read);
-            for resource in [input, output] {
+            for resource in [input, output, title_list, allocator] {
                 crate::object::slot::<extern "system" fn(This) -> u32>(resource, 0x10)(resource);
             }
         }
@@ -2259,9 +2308,11 @@ void main() { target.Store(0, value); }
     }
 
     #[test]
-    #[ignore = "ordering regression on 70564ae; run on a host D3D12 device"]
     fn title_copy_buffer_region_reads_its_earlier_gpu_producer() {
-        let host = crate::host::host().expect("native D3D12 device");
+        if crate::host::host().is_none() {
+            assert!(std::env::var_os("VICTORY_TEST_ORDERING_REQUIRE_GPU").is_none());
+            return;
+        }
         let (root, pipeline) = compile_cs(WRITE_29);
         let (source, dest) = (buffer(4), buffer(4));
         let (source_bytes, _) = crate::resource::buffer_bytes(source).unwrap();
@@ -2272,23 +2323,11 @@ void main() { target.Store(0, value); }
             source_bytes.cast::<u32>().write(11);
             dest_bytes.cast::<u32>().write(0);
         }
-        let null = std::ptr::null();
-        let alloc_iid = crate::object::guid(
-            0x6102dee4, 0xaf59, 0x4b09, [0xb9, 0x99, 0xb4, 0x4d, 0x73, 0xf0, 0x9b, 0x24],
-        );
-        let list_iid = crate::object::guid(
-            0x5b160d0f, 0xac1b, 0x4185, [0x8b, 0xa8, 0xb3, 0xae, 0x42, 0xa5, 0xa4, 0x55],
-        );
-        let (mut allocator, mut title_list) = (null, null);
-        assert_eq!(crate::list::create_allocator(null, 0, &alloc_iid, &mut allocator), S_OK);
-        assert_eq!(
-            crate::list::create_list(null, 0, 0, allocator, null, &list_iid, &mut title_list),
-            S_OK
-        );
+        let (title_list, allocator) = title_list();
         let list = crate::list::host_list(title_list).unwrap();
         let shadow = crate::shadow::find(source_address, 4).unwrap();
         shadow.refresh(list, source_address, 4);
-        shadow.gpu_writes(list, source_address, 4);
+        shadow.gpu_writes(list, source_address, 4, false);
         // SAFETY: the producer names a live native UAV shadow.
         unsafe {
             list.list.SetComputeRootSignature(&root);
@@ -2300,14 +2339,18 @@ void main() { target.Store(0, value); }
             title_list, 0x78,
         );
         copy(title_list, dest, 0, source, 0, 4);
-        list.close();
-        host.execute(&[list]);
+        assert_eq!(crate::list::segments(title_list).len(), 2);
+        let close = crate::object::slot::<extern "system" fn(This) -> HRESULT>(title_list, 0x48);
+        assert_eq!(close(title_list), S_OK);
+        let queue = title_queue();
+        let execute = crate::object::slot::<extern "system" fn(This, u32, *const This)>(queue, 0x50);
+        execute(queue, 1, &title_list);
         // SAFETY: both resources remain live and the submission completed.
         let (produced, copied) = unsafe {
             (source_bytes.cast::<u32>().read(), dest_bytes.cast::<u32>().read())
         };
         println!("title CopyBufferRegion: producer={produced}, destination={copied}");
-        for object in [source, dest, title_list, allocator] {
+        for object in [source, dest, title_list, allocator, queue] {
             crate::object::slot::<extern "system" fn(This) -> u32>(object, 0x10)(object);
         }
         assert_eq!(produced, 29, "the producer ran");
