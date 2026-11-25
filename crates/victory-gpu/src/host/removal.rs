@@ -132,7 +132,8 @@ pub(super) fn watch() {
         if found.test == test_name() {
             eprintln!(
                 "note: the host device is removed ({}); this test was the first to find it so, \
-                 and it was removed here or in a test before this one",
+                 and it was removed here, in a test before this one, or in one running \
+                 alongside it",
                 found.reason
             );
         } else {
@@ -207,7 +208,11 @@ mod tests {
     /// one device), each way of removing the device fails the one test that
     /// found it removed, saying why, the tests after it skip the host GPU,
     /// and the process ends as a run with a failed test, not an abort.
+    ///
+    /// It starts this test binary again (three times), so it is left out of
+    /// a plain `cargo test`; run it with `--ignored`.
     #[test]
+    #[ignore = "starts this test binary again; run with --ignored"]
     fn a_test_that_removes_the_device_fails_alone() {
         if std::env::var_os(CHILD).is_some() || host().is_none() {
             return;
