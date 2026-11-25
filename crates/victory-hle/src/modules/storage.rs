@@ -93,10 +93,10 @@ fn used_bytes(dir: &Path) -> u64 {
     };
     entries
         .flatten()
-        .map(|e| match e.metadata() {
+        .map(|e| match std::fs::symlink_metadata(e.path()) {
             Ok(m) if m.is_dir() => used_bytes(&e.path()),
-            Ok(m) => m.len(),
-            Err(_) => 0,
+            Ok(m) if m.is_file() => m.len(),
+            _ => 0,
         })
         .sum()
 }
@@ -236,5 +236,20 @@ mod tests {
             assert_eq!(xasync::XAsyncGetStatus(&mut block, true), expect);
             assert_eq!(result(this, &mut block), expect, "{bytes} bytes");
         }
+    }
+
+    #[test]
+    fn used_bytes_does_not_follow_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::write(sub.join("file.bin"), [0u8; 128]).unwrap();
+
+        #[cfg(windows)]
+        let _ = std::os::windows::fs::symlink_dir(dir.path(), sub.join("loop"));
+        #[cfg(unix)]
+        let _ = std::os::unix::fs::symlink(dir.path(), sub.join("loop"));
+
+        assert_eq!(used_bytes(dir.path()), 128);
     }
 }
