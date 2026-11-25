@@ -126,6 +126,12 @@ impl Cursor<'_> {
 /// Reads the frame starting at bit `start` (a frame start inside a packet's
 /// payload) of `data`, a buffer of whole packets of one stream.
 pub fn read_frame(data: &[u8], start: usize) -> Option<Frame> {
+    // A frame's first bit must be in the payload, not the packet header.
+    // Cursor skips a header when crossing a packet boundary, but accepting
+    // that boundary as a frame start would record an incorrect start offset.
+    if start % PACKET_BITS < HEADER_BITS || start / 8 >= data.len() {
+        return None;
+    }
     let mut cursor = Cursor { data, pos: start };
     let bits = cursor.bits(LENGTH_BITS)? as usize;
     if bits <= LENGTH_BITS as usize || bits == 0x7fff {
@@ -161,10 +167,8 @@ fn next_frame(data: &[u8], start: usize, end: usize) -> Option<usize> {
     while at < start {
         let mut cursor = Cursor { data, pos: at };
         let bits = cursor.bits(LENGTH_BITS)? as usize;
-        // The same rule as `read_frame`: a length that does not cover its own
-        // field is not a frame. A zero length would never move `at`, so a
-        // damaged packet would loop here for good.
-        if bits <= LENGTH_BITS as usize {
+        // Match `read_frame`: reject short lengths and the padding marker.
+        if bits <= LENGTH_BITS as usize || bits == 0x7fff {
             return None;
         }
         at += bits;
@@ -1462,6 +1466,46 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn frame_starts_must_be_inside_packet_payloads() {
+        let mut data = vec![0u8; 2 * PACKET_BYTES];
+        for packet_start in [0, PACKET_BITS] {
+            put_bits(&mut data, packet_start, 32, 1 << 26);
+            let payload = packet_start + HEADER_BITS;
+            put_bits(&mut data, payload, LENGTH_BITS, 100);
+            let frame = read_frame(&data, payload).unwrap();
+            assert_eq!(frame.start, payload);
+            assert_eq!(frame.bits, 100);
+            for offset in 0..HEADER_BITS {
+                assert!(read_frame(&data, packet_start + offset).is_none());
+            }
+        }
+        assert!(read_frame(&data, 2 * PACKET_BITS).is_none());
+    }
+
+    #[test]
+    fn padding_marker_before_start_ends_the_search() {
+        let mut data = vec![0u8; 2 * PACKET_BYTES];
+        put_bits(&mut data, 0, 32, 2 << 26);
+        put_bits(&mut data, HEADER_BITS, LENGTH_BITS, 0x7fff);
+        let start = HEADER_BITS + 100;
+        put_bits(&mut data, start, LENGTH_BITS, 100);
+        put_bits(&mut data, PACKET_BITS, 32, 1 << 26);
+        put_bits(&mut data, PACKET_BITS + HEADER_BITS, LENGTH_BITS, 100);
+        let frame = read_frame(&data, start).unwrap();
+        assert_eq!(frame.start, start);
+        assert_eq!(frame.next, None);
+    }
+
+    #[test]
+    fn truncated_frame_and_out_of_range_starts_are_rejected() {
+        let mut data = vec![0u8; 8];
+        put_bits(&mut data, HEADER_BITS, LENGTH_BITS, 100);
+        assert!(read_frame(&data, HEADER_BITS).is_none());
+        assert!(read_frame(&data, data.len() * 8).is_none());
+        assert!(read_frame(&data, usize::MAX).is_none());
     }
 
     #[test]
