@@ -381,7 +381,7 @@ fn show(shown: Option<object::Ref>, over: Option<object::Ref>) {
             std::env::var("VICTORY_SCAN_BUDGET")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(32768)
+                .unwrap_or(0)
         });
         static AFTER: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
         let after = *AFTER.get_or_init(|| {
