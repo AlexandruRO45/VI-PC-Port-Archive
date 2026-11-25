@@ -2076,11 +2076,48 @@ impl Shadow {
     }
 }
 
+/// Which merge `copy_back` uses (`VICTORY_MERGE`): `legacy` is the code
+/// before the AVX2 change (every unchanged word written back to the copy),
+/// `scalar` skips unchanged words without AVX2, anything else (default)
+/// takes AVX2 when the processor has it. For telling a rendering problem of
+/// the skipped writes from one of the AVX2 path.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MergeMode {
+    Legacy,
+    Scalar,
+    Fast,
+}
+
+fn merge_mode() -> MergeMode {
+    static MODE: std::sync::OnceLock<MergeMode> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| {
+        let mode = match std::env::var("VICTORY_MERGE").as_deref() {
+            Ok("legacy") => MergeMode::Legacy,
+            Ok("scalar") => MergeMode::Scalar,
+            _ => MergeMode::Fast,
+        };
+        tracing::info!(
+            mode = match mode {
+                MergeMode::Legacy => "legacy",
+                MergeMode::Scalar => "scalar",
+                MergeMode::Fast => "fast",
+            },
+            "copy-back merge"
+        );
+        mode
+    })
+}
+
 /// Merges bytes the GPU changed (`host != old`) into `title`, syncs `host` to
 /// `title`, and returns the tight `[first, last)` byte span where `title` was
 /// modified (or `None` if nothing changed). Uses AVX2 (32 bytes/iter) when
 /// available and skips writes on chunks where `host == old == title`.
 fn merge_gpu_writes(title: &mut [u8], host: &mut [u8], old: &[u8]) -> Option<(usize, usize)> {
+    match merge_mode() {
+        MergeMode::Legacy => return merge_gpu_writes_legacy(title, host, old),
+        MergeMode::Scalar => return merge_gpu_writes_scalar(title, host, old),
+        MergeMode::Fast => {}
+    }
     #[cfg(target_arch = "x86_64")]
     if std::arch::is_x86_feature_detected!("avx2") {
         // SAFETY: `is_x86_feature_detected!("avx2")` confirmed AVX2 support.
@@ -2192,6 +2229,11 @@ fn merge_gpu_writes_mut(
     host: &mut [u8],
     old: &mut [u8],
 ) -> Option<(usize, usize)> {
+    match merge_mode() {
+        MergeMode::Legacy => return merge_gpu_writes_mut_legacy(title, host, old),
+        MergeMode::Scalar => return merge_gpu_writes_mut_scalar(title, host, old),
+        MergeMode::Fast => {}
+    }
     #[cfg(target_arch = "x86_64")]
     if std::arch::is_x86_feature_detected!("avx2") {
         // SAFETY: `is_x86_feature_detected!("avx2")` confirmed AVX2 support.
@@ -2318,6 +2360,9 @@ fn merge_gpu_writes_card(
     staging_old: &mut [u8],
     gpu_new: &[u8],
 ) -> (Option<(usize, usize)>, bool) {
+    if merge_mode() != MergeMode::Fast {
+        return merge_gpu_writes_card_scalar(title, staging_old, gpu_new);
+    }
     #[cfg(target_arch = "x86_64")]
     if std::arch::is_x86_feature_detected!("avx2") {
         // SAFETY: `is_x86_feature_detected!("avx2")` confirmed AVX2 support.
@@ -2443,6 +2488,88 @@ unsafe fn merge_gpu_writes_card_avx2(
         }
     }
     ((first < last).then_some((first, last)), cpu_modified)
+}
+
+/// [`merge_gpu_writes`] as it was before the AVX2 change (`VICTORY_MERGE=legacy`).
+fn merge_gpu_writes_legacy(title: &mut [u8], host: &mut [u8], old: &[u8]) -> Option<(usize, usize)> {
+    let n = title.len().min(host.len()).min(old.len());
+    let mut first = usize::MAX;
+    let mut last = 0usize;
+    let mut i = 0;
+    while i + 8 <= n {
+        let hw = u64::from_ne_bytes(host[i..i + 8].try_into().unwrap());
+        let ow = u64::from_ne_bytes(old[i..i + 8].try_into().unwrap());
+        if hw == ow {
+            host[i..i + 8].copy_from_slice(&title[i..i + 8]);
+        } else {
+            for k in i..i + 8 {
+                let h = host[k];
+                if h != old[k] && title[k] != h {
+                    title[k] = h;
+                    first = first.min(k);
+                    last = k + 1;
+                }
+                host[k] = title[k];
+            }
+        }
+        i += 8;
+    }
+    for k in i..n {
+        let h = host[k];
+        if h != old[k] && title[k] != h {
+            title[k] = h;
+            first = first.min(k);
+            last = k + 1;
+        }
+        host[k] = title[k];
+    }
+    (first < last).then_some((first, last))
+}
+
+/// [`merge_gpu_writes_mut`] as it was before the AVX2 change (`VICTORY_MERGE=legacy`).
+fn merge_gpu_writes_mut_legacy(
+    title: &mut [u8],
+    host: &mut [u8],
+    old: &mut [u8],
+) -> Option<(usize, usize)> {
+    let n = title.len().min(host.len()).min(old.len());
+    let mut first = usize::MAX;
+    let mut last = 0usize;
+    let mut i = 0;
+    while i + 8 <= n {
+        let hw = u64::from_ne_bytes(host[i..i + 8].try_into().unwrap());
+        let ow = u64::from_ne_bytes(old[i..i + 8].try_into().unwrap());
+        if hw == ow {
+            let tw = &title[i..i + 8];
+            host[i..i + 8].copy_from_slice(tw);
+            old[i..i + 8].copy_from_slice(tw);
+        } else {
+            for k in i..i + 8 {
+                let h = host[k];
+                if h != old[k] && title[k] != h {
+                    title[k] = h;
+                    first = first.min(k);
+                    last = k + 1;
+                }
+                let t = title[k];
+                host[k] = t;
+                old[k] = t;
+            }
+        }
+        i += 8;
+    }
+    for k in i..n {
+        let h = host[k];
+        if h != old[k] && title[k] != h {
+            title[k] = h;
+            first = first.min(k);
+            last = k + 1;
+        }
+        let t = title[k];
+        host[k] = t;
+        old[k] = t;
+    }
+    (first < last).then_some((first, last))
 }
 
 struct Entry {
@@ -2864,6 +2991,12 @@ mod tests {
                     merge_gpu_writes(&mut t2, &mut h2, &old),
                 );
                 assert_eq!((&t1, &h1), (&t2, &h2));
+                let (mut t3, mut h3) = (title.clone(), host.clone());
+                assert_eq!(
+                    merge_gpu_writes_legacy(&mut t3, &mut h3, &old),
+                    merge_gpu_writes_scalar(&mut title.clone(), &mut host.clone(), &old),
+                );
+                assert_eq!((&t3, &h3), (&t1, &h1));
 
                 let (mut t1, mut h1, mut o1) = (title.clone(), host.clone(), old.clone());
                 let (mut t2, mut h2, mut o2) = (title.clone(), host.clone(), old.clone());
@@ -2872,6 +3005,9 @@ mod tests {
                     merge_gpu_writes_mut(&mut t2, &mut h2, &mut o2),
                 );
                 assert_eq!((&t1, &h1, &o1), (&t2, &h2, &o2));
+                let (mut t3, mut h3, mut o3) = (title.clone(), host.clone(), old.clone());
+                merge_gpu_writes_mut_legacy(&mut t3, &mut h3, &mut o3);
+                assert_eq!((&t3, &h3, &o3), (&t1, &h1, &o1));
 
                 let (mut t1, mut o1) = (title.clone(), old.clone());
                 let (mut t2, mut o2) = (title.clone(), old.clone());
