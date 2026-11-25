@@ -121,7 +121,7 @@ static STATS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 /// A buffer placed over title memory, and its heap.
 pub(crate) struct Placed {
     pub(crate) buffer: ID3D12Resource,
-    pub(crate) heap: ID3D12Heap,
+    pub(crate) heap: crate::arena::Heap,
     /// The host GPU address of the title memory's first byte.
     pub(crate) gpu: u64,
     /// Bytes from the buffer's first byte to the title memory's first.
@@ -145,7 +145,7 @@ pub(crate) fn place_part(device: &ID3D12Device, start: u64, len: u64) -> Result<
     let buffer = place(device, &heap, 0, bytes).map_err(Some)?;
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() } + (start - at);
-    Ok(Placed { buffer, heap, gpu, bias: start - at, section: None })
+    Ok(Placed { buffer, heap: heap.into(), gpu, bias: start - at, section: None })
 }
 
 /// Title memory `[start, start + len)` in place, for a window outside
@@ -290,12 +290,31 @@ pub(crate) enum From {
     Region(usize),
     /// A committed part of one: address and bytes.
     Part(usize, usize),
-    /// A section made with `SEC_COMMIT`, by its handle.
+    /// A section made with `SEC_COMMIT`, by its handle. Refused unless
+    /// `VICTORY_ALLOW_SECTION_HEAPS=1` ([`section_heaps_allowed`]).
     Section(usize),
+}
+
+/// Whether a heap may be opened on a section by its handle
+/// (`OpenExistingHeapFromFileMapping`): only with
+/// `VICTORY_ALLOW_SECTION_HEAPS=1`. A section opened so keeps its commit
+/// until the PC restarts, however the heap and the section are let go, on
+/// the card and on the software adapter alike
+/// (`tests::section_heap_commit_comes_back`); a view of it opened by its
+/// address does not ([`From::Part`], what the arenas do).
+pub(crate) fn section_heaps_allowed() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ALLOW_SECTION_HEAPS").is_some_and(|v| v == "1"))
 }
 
 /// Opens a heap on memory the process has.
 pub(crate) fn open(device: &ID3D12Device, from: From) -> windows::core::Result<ID3D12Heap> {
+    if matches!(from, From::Section(_)) && !section_heaps_allowed() {
+        return Err(windows::core::Error::new(
+            windows::Win32::Foundation::E_ACCESSDENIED,
+            "not opened: a section opened as a heap by its handle keeps its commit until the PC restarts (VICTORY_ALLOW_SECTION_HEAPS=1 to try)",
+        ));
+    }
     // SAFETY: the calls take an address or a handle and check both
     // themselves; a refusal is an error code.
     unsafe {
@@ -904,10 +923,16 @@ unsafe fn section(p: &mut Probe, rig: &mut Rig) {
         let invalid = windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
         let reserved = mem::CreateFileMappingW(invalid, std::ptr::null(), mem::PAGE_READWRITE | mem::SEC_RESERVE, 0, SIZE as u32, std::ptr::null());
         if !reserved.is_null() {
-            let opened = open(&rig.device, From::Section(reserved as usize));
+            // As the arenas open a section: a view of all of it, by its
+            // address.
+            let whole = mem::MapViewOfFile(reserved, mem::FILE_MAP_WRITE, 0, 0, SIZE);
+            let opened = if whole.Value.is_null() { Err(windows::core::Error::from_thread()) } else { open(&rig.device, From::Part(whole.Value as usize, SIZE)) };
             p.reserved_section_refused = opened.is_err();
-            p.lines.push(format!("a section made reserved, as the page pool is today (OpenExistingHeapFromFileMapping): {}", hr(&opened)));
+            p.lines.push(format!("a section made reserved, as the page pool is without VICTORY_INPLACE_POOL (a view of it, by its address): {}", hr(&opened)));
             drop(opened);
+            if !whole.Value.is_null() {
+                mem::UnmapViewOfFile(whole);
+            }
             windows_sys::Win32::Foundation::CloseHandle(reserved);
         }
         let handle = mem::CreateFileMappingW(invalid, std::ptr::null(), mem::PAGE_READWRITE | mem::SEC_COMMIT, 0, SIZE as u32, std::ptr::null());
@@ -919,8 +944,11 @@ unsafe fn section(p: &mut Probe, rig: &mut Rig) {
         // Pages 4..12 of the section at the placeholder's start.
         mem::VirtualFree(hole.cast(), 8 * K64, mem::MEM_RELEASE | mem::MEM_PRESERVE_PLACEHOLDER);
         let view = mem::MapViewOfFile3(handle, process, hole.cast(), (4 * K64) as u64, 8 * K64, mem::MEM_REPLACE_PLACEHOLDER, mem::PAGE_READWRITE, std::ptr::null_mut(), 0);
-        let opened = open(&rig.device, From::Section(handle as usize));
-        p.lines.push(format!("a section made committed (OpenExistingHeapFromFileMapping): {}", hr(&opened)));
+        // As the arenas open a section: a view of all of it of their own, by
+        // its address; the title's view below shows the same pages.
+        let whole = mem::MapViewOfFile(handle, mem::FILE_MAP_WRITE, 0, 0, SIZE);
+        let opened = if whole.Value.is_null() { Err(windows::core::Error::from_thread()) } else { open(&rig.device, From::Part(whole.Value as usize, SIZE)) };
+        p.lines.push(format!("a section made committed (a view of all of it, by its address): {}", hr(&opened)));
         let mut unmapped = false;
         if let (Ok(heap), false) = (&opened, view.Value.is_null()) {
             p.lines.push(format!("  {}", describe(heap)));
@@ -957,6 +985,9 @@ unsafe fn section(p: &mut Probe, rig: &mut Rig) {
         drop(opened);
         if !unmapped && !view.Value.is_null() {
             mem::UnmapViewOfFile2(process, view, mem::MEM_PRESERVE_PLACEHOLDER);
+        }
+        if !whole.Value.is_null() {
+            mem::UnmapViewOfFile(whole);
         }
         windows_sys::Win32::Foundation::CloseHandle(handle);
         // The placeholder was split in two: each half is released.
@@ -1364,7 +1395,7 @@ pub(crate) mod tests {
         assert!(probe.part_reads, "the GPU reads private memory in place");
         assert!(probe.part_writes, "GPU writes land in private memory");
         assert!(probe.section_reads && probe.section_writes, "a committed section in place");
-        assert!(probe.section_outlives_views, "the section's heap does not depend on views");
+        assert!(probe.section_outlives_views, "the section's heap does not depend on the title's views");
         assert!(probe.reserved_section_refused, "a reserved section is refused");
     }
 
@@ -1398,6 +1429,188 @@ pub(crate) mod tests {
     fn probe_on_hardware() {
         for line in crate::inplace_probes::run_alone(1024, true, false, false) {
             eprintln!("in place probe: {line}");
+        }
+    }
+
+    /// The system's shared commit (pagefile-backed sections), in MB.
+    pub(crate) fn shared_commit_mb() -> u64 {
+        #[link(name = "ntdll")]
+        unsafe extern "system" {
+            fn NtQuerySystemInformation(class: u32, info: *mut u8, len: u32, returned: *mut u32) -> i32;
+        }
+        let mut buf = [0u8; 512];
+        let mut returned = 0;
+        // SAFETY: SystemPerformanceInformation into a buffer big enough.
+        let status = unsafe { NtQuerySystemInformation(2, buf.as_mut_ptr(), buf.len() as u32, &mut returned) };
+        assert_eq!(status, 0, "NtQuerySystemInformation");
+        // SharedCommittedPages, in pages of 4 KiB.
+        (u64::from(u32::from_le_bytes(buf[336..340].try_into().unwrap())) * 4096) >> 20
+    }
+
+    fn card() -> ID3D12Device {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
+        use windows::Win32::Graphics::Dxgi::*;
+        // SAFETY: plain DXGI queries and device creation.
+        unsafe {
+            let factory: IDXGIFactory6 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).unwrap();
+            let adapter: IDXGIAdapter1 = factory.EnumAdapterByGpuPreference(0, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE).unwrap();
+            let mut device: Option<ID3D12Device> = None;
+            D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).unwrap();
+            device.unwrap()
+        }
+    }
+
+    const LEAK_MB: usize = 256;
+
+    /// A committed section of [`LEAK_MB`] opened as a heap on the card, a
+    /// buffer placed over it and read by the card once.
+    fn section_heap(rig: &mut Rig) -> (HANDLE, ID3D12Heap, ID3D12Resource) {
+        let bytes = LEAK_MB << 20;
+        // SAFETY: plain section creation.
+        let handle = unsafe {
+            mem::CreateFileMappingW(windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE, std::ptr::null(), mem::PAGE_READWRITE | mem::SEC_COMMIT, 0, bytes as u32, std::ptr::null())
+        };
+        assert!(!handle.is_null());
+        let heap = open(&rig.device, From::Section(handle as usize)).unwrap();
+        let buffer = place(&rig.device, &heap, 0, bytes as u64).unwrap();
+        rig.copy_ms(&buffer, bytes as u64).unwrap();
+        (HANDLE(handle), heap, buffer)
+    }
+
+    /// Whether the shared commit of a committed section opened as a heap on
+    /// the card comes back: released in the process, and in a child that is
+    /// killed holding it, killed after letting the heap go, or exits without
+    /// letting it go (`VICTORY_ALLOW_SECTION_HEAPS=1 cargo test -p
+    /// victory-gpu --release -- --ignored section_heap_commit_comes_back
+    /// --nocapture`); with `VICTORY_LEAK_VIEW=1`, a view of it opened by its
+    /// address instead. On the RTX 4090 (2026-11-24) every case by the
+    /// handle kept the 256 MB until a restart; the view kept none. A case
+    /// that leaks keeps [`LEAK_MB`] until the PC restarts.
+    #[test]
+    #[ignore = "may leak shared commit on the card's driver until a restart"]
+    fn section_heap_commit_comes_back() {
+        use std::io::BufRead;
+        if std::env::var_os("VICTORY_LEAK_VIEW").is_none() && !section_heaps_allowed() {
+            eprintln!("VICTORY_ALLOW_SECTION_HEAPS=1 to open sections by their handle on the card");
+            return;
+        }
+        if let Ok(mode) = std::env::var("VICTORY_LEAK_CHILD") {
+            let mut rig = Rig::new(&card()).unwrap();
+            let (handle, heap, buffer) = section_heap(&mut rig);
+            if mode == "release" {
+                drop((buffer, heap));
+                rig.run(|_| {}).unwrap();
+                println!("READY");
+            } else if mode == "exit" {
+                println!("READY");
+                std::process::exit(0);
+            } else {
+                println!("READY");
+                std::mem::forget((buffer, heap));
+            }
+            let _ = handle;
+            std::thread::sleep(std::time::Duration::from_secs(120));
+            return;
+        }
+        let settle = |before: u64| {
+            let mut now = shared_commit_mb();
+            for _ in 0..20 {
+                if now <= before + 32 {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                now = shared_commit_mb();
+            }
+            now
+        };
+        // A0, A1: opened only; opened and placed, the card never touching it.
+        let opens: &[bool] = if std::env::var_os("VICTORY_LEAK_VIEW").is_some() { &[] } else { &[false, true] };
+        for &place_it in opens {
+            let before = shared_commit_mb();
+            let rig = Rig::new(&card()).unwrap();
+            let bytes = LEAK_MB << 20;
+            // SAFETY: plain section creation.
+            let handle = unsafe {
+                mem::CreateFileMappingW(windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE, std::ptr::null(), mem::PAGE_READWRITE | mem::SEC_COMMIT, 0, bytes as u32, std::ptr::null())
+            };
+            let heap = open(&rig.device, From::Section(handle as usize)).unwrap();
+            let buffer = place_it.then(|| place(&rig.device, &heap, 0, bytes as u64).unwrap());
+            drop((buffer, heap, rig));
+            // SAFETY: our handle.
+            unsafe { windows_sys::Win32::Foundation::CloseHandle(handle) };
+            let after = settle(before);
+            eprintln!("leak case A{} (opened{}, never used): shared commit {before} -> after {after} MB (leaked {} MB)", place_it as u8, if place_it { " and placed" } else { "" }, after as i64 - before as i64);
+        }
+        // V: a view of the section, opened by its address.
+        if std::env::var_os("VICTORY_LEAK_VIEW").is_some() {
+            let before = shared_commit_mb();
+            let mut rig = Rig::new(&card()).unwrap();
+            let bytes = LEAK_MB << 20;
+            // SAFETY: plain section creation and a view of all of it.
+            let (handle, view) = unsafe {
+                let handle = mem::CreateFileMappingW(windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE, std::ptr::null(), mem::PAGE_READWRITE | mem::SEC_COMMIT, 0, bytes as u32, std::ptr::null());
+                (handle, mem::MapViewOfFile(handle, mem::FILE_MAP_WRITE, 0, 0, bytes))
+            };
+            fill(view.Value.cast(), 4096, 7);
+            let opened = open(&rig.device, From::Part(view.Value as usize, bytes));
+            let mut line = format!("open by address of a view: {}", hr(&opened));
+            if let Ok(heap) = &opened {
+                let buffer = place(&rig.device, heap, 0, bytes as u64).unwrap();
+                let seen = rig.fetch(&buffer, 0, 4096).unwrap();
+                line += &format!("; the card reads the view's bytes {}", same(view.Value.cast(), &seen));
+                rig.store(&buffer, 8192, &[0xAB; 64]).unwrap();
+                // SAFETY: inside the view.
+                line += &format!("; its write lands in the view {}", unsafe { *view.Value.cast::<u8>().add(8192 + 63) } == 0xAB);
+                drop(buffer);
+            }
+            drop((opened, rig));
+            // SAFETY: our view and handle.
+            unsafe {
+                mem::UnmapViewOfFile(view);
+                windows_sys::Win32::Foundation::CloseHandle(handle);
+            }
+            let after = settle(before);
+            eprintln!("leak case V ({line}): shared commit {before} -> after {after} MB (leaked {} MB)", after as i64 - before as i64);
+            return;
+        }
+        if std::env::var_os("VICTORY_LEAK_ONLY_OPEN").is_some() {
+            return;
+        }
+        // A: in the process, everything let go in order.
+        {
+            let before = shared_commit_mb();
+            let mut rig = Rig::new(&card()).unwrap();
+            let (handle, heap, buffer) = section_heap(&mut rig);
+            let held = shared_commit_mb();
+            drop((buffer, heap));
+            rig.run(|_| {}).unwrap();
+            // SAFETY: our handle.
+            unsafe { windows::Win32::Foundation::CloseHandle(handle).unwrap() };
+            drop(rig);
+            let after = settle(before);
+            eprintln!("leak case A (released in the process): shared commit {before} -> held {held} -> after {after} MB (leaked {} MB)", after as i64 - before as i64);
+        }
+        for mode in ["kill", "release", "exit"] {
+            let before = shared_commit_mb();
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "inplace::tests::section_heap_commit_comes_back", "--ignored", "--nocapture", "--test-threads=1"])
+                .env("VICTORY_LEAK_CHILD", mode)
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            let out = std::io::BufReader::new(child.stdout.take().unwrap());
+            let ready = out.lines().map_while(Result::ok).any(|l| l.contains("READY"));
+            let held = shared_commit_mb();
+            if mode != "exit" {
+                child.kill().unwrap();
+            }
+            let status = child.wait().unwrap();
+            let after = settle(before);
+            eprintln!(
+                "leak case {mode} (child {}, {status}): shared commit {before} -> held {held} -> after {after} MB (leaked {} MB)",
+                if ready { "ready" } else { "NOT ready" },
+                after as i64 - before as i64
+            );
         }
     }
 

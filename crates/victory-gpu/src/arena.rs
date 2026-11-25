@@ -21,8 +21,14 @@
 //!   before;
 //! - **sections** of the physical page pool made with `SEC_COMMIT`
 //!   (`VICTORY_INPLACE_POOL=1` in the runtime; a section made reserved is
-//!   refused), opened with `OpenExistingHeapFromFileMapping`. The heap is
-//!   the section: views come and go under it. View memory is in place where
+//!   refused), opened through a view of the whole section of the arena's
+//!   own ([`SectionView`]) with `OpenExistingHeapFromAddress1`: an offset in
+//!   the heap is the offset in the section, and the title's views come and
+//!   go over the same pages. Not with `OpenExistingHeapFromFileMapping`: on
+//!   the card's driver a section opened so keeps its commit until the PC
+//!   restarts, released in order or not (`inplace::tests::
+//!   section_heap_commit_comes_back`: 256 MB kept in every case; opened by
+//!   the address of a view, none). View memory is in place where
 //!   the range is one run of one section (`inplace::Cover::Run`); the GPU
 //!   then reads the section's pages, never through a tile mapping (into an
 //!   opened heap one removes the device: probe "tiles"). A section must be
@@ -59,12 +65,68 @@ pub(crate) enum Kind {
     Section,
 }
 
+/// An opened heap, and the view of a section it was opened on, if any: the
+/// view stays mapped while anything holds the heap this way.
+#[derive(Clone)]
+pub(crate) struct Heap {
+    _heap: ID3D12Heap,
+    _view: Option<Arc<SectionView>>,
+}
+
+impl std::convert::From<ID3D12Heap> for Heap {
+    fn from(heap: ID3D12Heap) -> Heap {
+        Heap { _heap: heap, _view: None }
+    }
+}
+
+/// The arena's own view of a whole section, at its address. When the last
+/// holder lets go it is unmapped [`VIEW_GRACE`] later, not at once: a
+/// submission still in the air may hold the arena's buffer alone.
+pub(crate) struct SectionView(usize);
+
+/// How long a view a section's heap was opened on stays mapped after the
+/// heap is let go.
+const VIEW_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
+static VIEWS_GOING: Mutex<Vec<(usize, std::time::Instant)>> = Mutex::new(Vec::new());
+
+impl Drop for SectionView {
+    fn drop(&mut self) {
+        VIEWS_GOING.lock().unwrap_or_else(|e| e.into_inner()).push((self.0, std::time::Instant::now()));
+    }
+}
+
+/// Unmaps the views let go more than [`VIEW_GRACE`] ago.
+fn unmap_views_gone() {
+    let mut going = VIEWS_GOING.lock().unwrap_or_else(|e| e.into_inner());
+    going.retain(|&(at, since)| {
+        if since.elapsed() < VIEW_GRACE {
+            return true;
+        }
+        // SAFETY: a view of ours, mapped by `map_section`, that nothing
+        // holds a heap on any more.
+        unsafe { windows_sys::Win32::System::Memory::UnmapViewOfFile(windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS { Value: at as *mut _ }) };
+        false
+    });
+}
+
+/// A read-write view of the first `bytes` of `section`, at an address of
+/// its own.
+fn map_section(section: usize, bytes: u64) -> Option<SectionView> {
+    use windows_sys::Win32::System::Memory as mem;
+    unmap_views_gone();
+    // SAFETY: the runtime's section handle, alive while the runtime has the
+    // section (it tells `title_memory_section_gone` before closing it).
+    let view = unsafe { mem::MapViewOfFile(section as windows_sys::Win32::Foundation::HANDLE, mem::FILE_MAP_WRITE, 0, 0, bytes as usize) };
+    (!view.Value.is_null()).then(|| SectionView(view.Value as usize))
+}
+
 /// One opened heap and the buffer over all of it.
 pub(crate) struct Arena {
     /// The title address of the buffer's first byte (a section: none, 0).
     pub(crate) base: u64,
     pub(crate) bytes: u64,
-    pub(crate) heap: ID3D12Heap,
+    pub(crate) heap: Heap,
     pub(crate) buffer: ID3D12Resource,
     pub(crate) gpu: u64,
 }
@@ -77,7 +139,7 @@ unsafe impl Sync for Arena {}
 /// What [`resolve`] gives for a title range.
 pub(crate) struct Resolved {
     pub(crate) resource: ID3D12Resource,
-    pub(crate) heap: ID3D12Heap,
+    pub(crate) heap: Heap,
     /// The range's first byte in `resource`.
     pub(crate) offset: u64,
     /// Its host GPU address.
@@ -597,6 +659,7 @@ impl Arenas {
 
     /// The section is gone: its heap goes when what is in place in it does.
     pub(crate) fn section_gone(&mut self, section: usize) {
+        unmap_views_gone();
         match self.sections.remove(&section) {
             Some(Slot::Open(arena)) => {
                 self.locked -= arena.bytes;
@@ -677,7 +740,7 @@ fn open_part(device: &ID3D12Device, start: u64, bytes: u64) -> Slot {
                 ms = format_args!("{:.1}", started.elapsed().as_secs_f64() * 1000.0),
                 "arena: a part of the title's private memory opened in place"
             );
-            Slot::Open(Arc::new(Arena { base: start, bytes, heap, buffer, gpu }))
+            Slot::Open(Arc::new(Arena { base: start, bytes, heap: heap.into(), buffer, gpu }))
         }
         Err(e) => {
             note_refused(format_args!("part {start:#x}+{bytes:#x}: the host refused ({e})"));
@@ -690,9 +753,14 @@ fn open_part(device: &ID3D12Device, start: u64, bytes: u64) -> Slot {
 /// caller's.
 fn open_section(device: &ID3D12Device, section: usize, bytes: u64) -> Slot {
     let started = std::time::Instant::now();
-    let made = open(device, From::Section(section)).and_then(|heap| place(device, &heap, 0, bytes).map(|b| (heap, b)));
+    let Some(view) = map_section(section, bytes) else {
+        note_refused(format_args!("section of {} MB: no view of it ({})", bytes >> 20, std::io::Error::last_os_error()));
+        return Slot::Refused(Why::Host);
+    };
+    let made = open(device, From::Part(view.0, bytes as usize)).and_then(|heap| place(device, &heap, 0, bytes).map(|b| (heap, b)));
     match made {
         Ok((heap, buffer)) => {
+            let heap = Heap { _heap: heap, _view: Some(Arc::new(view)) };
             crate::host::name(&buffer, || format!("arena: a section of physical pages, {} MB", bytes >> 20));
             // SAFETY: a live buffer.
             let gpu = unsafe { buffer.GetGPUVirtualAddress() };
@@ -1143,9 +1211,34 @@ mod tests {
     #[test]
     fn warp_a_run_of_a_committed_section_is_in_place() {
         let Some(device) = crate::inplace::tests::warp() else { return };
+        through_a_section(&device, 8 * K64);
+    }
+
+    /// The same on this PC's card, with a section of 256 MB: and once let
+    /// go, the section's commit comes back (`cargo test -p victory-gpu
+    /// --release -- --ignored section_arena_on_hardware --nocapture`).
+    #[test]
+    #[ignore = "opens a device on the card"]
+    fn section_arena_on_hardware() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
+        let mut device: Option<ID3D12Device> = None;
+        // SAFETY: plain device creation on the default adapter.
+        unsafe { windows::Win32::Graphics::Direct3D12::D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device).unwrap() };
+        let device = device.unwrap();
+        let before = crate::inplace::tests::shared_commit_mb();
+        through_a_section(&device, 256 << 20);
+        drop(device);
+        std::thread::sleep(VIEW_GRACE + std::time::Duration::from_secs(1));
+        unmap_views_gone();
+        let after = crate::inplace::tests::shared_commit_mb();
+        eprintln!("section arena on the card: shared commit {before} -> {after} MB");
+        assert!(after < before + 64, "the section's commit stays: {before} -> {after} MB");
+    }
+
+    fn through_a_section(device: &ID3D12Device, size: usize) {
+        let device = device.clone();
         // SAFETY: the section, placeholder and view of the test's own.
         unsafe {
-            let size = 8 * K64;
             let invalid = windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
             let handle = mem::CreateFileMappingW(invalid, std::ptr::null(), mem::PAGE_READWRITE | mem::SEC_COMMIT, 0, size as u32, std::ptr::null());
             assert!(!handle.is_null());

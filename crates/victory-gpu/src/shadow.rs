@@ -76,7 +76,7 @@ pub(crate) struct Shadow {
     /// the title's own bytes and nothing is copied either way. The heap,
     /// and the bytes from the buffer's first byte to `start` (the heap
     /// begins on a 64 KiB line; a title buffer need not).
-    place: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64)>,
+    place: Option<(crate::arena::Heap, u64)>,
     /// In place in a section's arena (view memory): the section. Such a
     /// window is not let go when the title remaps its pages; it is marked
     /// (`remapped`) and looked at again when next asked for
@@ -3820,14 +3820,16 @@ mod remap_tests {
             let invalid = windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
             let handle = mem::CreateFileMappingW(invalid, std::ptr::null(), mem::PAGE_READWRITE | mem::SEC_COMMIT, 0, (8 * K) as u32, std::ptr::null());
             assert!(!handle.is_null());
-            let heap = crate::inplace::open(&device, crate::inplace::From::Section(handle as usize)).unwrap();
+            // As the arenas open a section: a view of all of it, by its address.
+            let whole = mem::MapViewOfFile(handle, mem::FILE_MAP_WRITE, 0, 0, 8 * K);
+            let heap = crate::inplace::open(&device, crate::inplace::From::Part(whole.Value as usize, 8 * K)).unwrap();
             let buffer = crate::inplace::place(&device, &heap, 0, 8 * K as u64).unwrap();
             let gpu = buffer.GetGPUVirtualAddress();
             // A made-up view address: only the runtime's table is looked at.
             let at = 0x7_e000_0000usize;
             let section = handle as usize;
             crate::inplace::title_memory_view(at, 2 * K, section, 3 * K as u64);
-            let placed = crate::inplace::Placed { buffer, heap, gpu: gpu + 3 * K as u64, bias: 3 * K as u64, section: Some(section) };
+            let placed = crate::inplace::Placed { buffer, heap: heap.into(), gpu: gpu + 3 * K as u64, bias: 3 * K as u64, section: Some(section) };
             let shadow = Shadow::test_in_place(placed, at as u64, 2 * K as u64);
             let before = [REMAPS[0].load(Ordering::Relaxed), REMAPS[1].load(Ordering::Relaxed)];
             assert!(still_good(&shadow), "not remapped");
@@ -3846,6 +3848,7 @@ mod remap_tests {
             assert!(REMAPS[0].load(Ordering::Relaxed) > before[0] && REMAPS[1].load(Ordering::Relaxed) > before[1]);
             crate::inplace::views_gone(at, 2 * K);
             drop(shadow);
+            mem::UnmapViewOfFile(whole);
             windows_sys::Win32::Foundation::CloseHandle(handle);
         }
     }
