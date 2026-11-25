@@ -836,24 +836,6 @@ extern "system" fn enqueue_status(this: QueueRef, array: Array, index: u32) {
     queue(this, Command::Status(Status { array, index }));
 }
 
-/// Capture on the submitting thread only when a read has the requested size.
-#[cfg(feature = "diagnostics")]
-fn request_callers(r: &Request) -> Option<String> {
-    use std::num::NonZeroU32;
-    static SIZE: OnceLock<Option<NonZeroU32>> = OnceLock::new();
-    let size = (*SIZE.get_or_init(|| {
-        let raw = std::env::var("VICTORY_DSTORAGE_CALLER_SIZE").ok()?;
-        let size = raw.parse().ok();
-        if size.is_none() {
-            tracing::warn!("VICTORY_DSTORAGE_CALLER_SIZE needs a positive decimal byte count");
-        }
-        size
-    }))?;
-    [r.source_size, r.destination_size, r.intermediate_size]
-        .contains(&size.get())
-        .then(super::kernel::module_callers)
-}
-
 /// Adds a command to the queue; blocks while the queue is full, and
 /// submits on its own once half of it is enqueued, as the console does.
 fn queue(this: QueueRef, command: Command) -> bool {
@@ -871,7 +853,6 @@ fn queue(this: QueueRef, command: Command) -> bool {
             destination_size = r.destination_size,
             intermediate_size = r.intermediate_size,
             offset = r.offset,
-            from = request_callers(r).as_deref(),
             "enqueue requested"
         );
     }
