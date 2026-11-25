@@ -463,6 +463,12 @@ mod tests {
 pub(crate) struct HostList {
     allocator: ID3D12CommandAllocator,
     pub(crate) list: ID3D12GraphicsCommandList,
+    /// Cached `ID3D12GraphicsCommandList6` interface for `DispatchMesh`.
+    pub(crate) list6: Option<ID3D12GraphicsCommandList6>,
+    /// Bumped whenever the list records a deferred title copy, title-writing
+    /// work, or GPU buffer write, so draw state caches re-refresh and re-bind
+    /// vertex and index buffers.
+    copy_epoch: std::sync::atomic::AtomicU64,
     /// Work for submission time, in recorded order.
     deferred: Mutex<Deferred>,
     /// Upload memory for data the list's draws make (expanded vertices),
@@ -775,9 +781,12 @@ impl Host {
             prelude.Close()?;
             let id = NEXT_LIST.fetch_add(1, Ordering::Relaxed);
             name(&list, || list_name(id));
+            let list6 = list.cast().ok();
             Ok(HostList {
                 allocator,
                 list,
+                list6,
+                copy_epoch: std::sync::atomic::AtomicU64::new(0),
                 deferred: Mutex::default(),
                 scratch: Mutex::default(),
                 states: Mutex::default(),
@@ -1366,6 +1375,7 @@ impl HostList {
     /// for).
     pub(crate) fn reset(&self) {
         *self.deferred() = Deferred::default();
+        self.copy_epoch.fetch_add(1, Ordering::Relaxed);
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -1600,6 +1610,12 @@ impl HostList {
         self.deferred.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// Monotonic counter bumped whenever the list records a deferred copy,
+    /// title-writing work, GPU buffer write, or reset.
+    pub(crate) fn copy_epoch(&self) -> u64 {
+        self.copy_epoch.load(Ordering::Relaxed)
+    }
+
     /// Copies `len` bytes from `src` to `dst` when the list is submitted.
     pub(crate) fn defer_copy(&self, dst: *mut u8, src: *const u8, len: usize) {
         let mut deferred = self.deferred();
@@ -1607,6 +1623,7 @@ impl HostList {
             .copies
             .push(Step::Copy(dst as usize, src as usize, len));
         deferred.refreshed.clear();
+        self.copy_epoch.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Copies `len` bytes of title memory at `src` into the list's upload
@@ -1648,6 +1665,7 @@ impl HostList {
         self.deferred()
             .copies
             .push(Step::GpuWrite(shadow.clone(), address, len, marked));
+        self.copy_epoch.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Shaders of the list take views from the heap itself
@@ -1774,8 +1792,10 @@ impl HostList {
     /// Runs `work` when the list is submitted, in order with its copies.
     /// `work` may write title memory (refreshes after it copy again).
     pub(crate) fn defer(&self, work: impl Fn() + Send + 'static) {
-        self.deferred().copies.push(Step::Run(Box::new(work)));
-        self.deferred().refreshed.clear();
+        let mut deferred = self.deferred();
+        deferred.copies.push(Step::Run(Box::new(work)));
+        deferred.refreshed.clear();
+        self.copy_epoch.fetch_add(1, Ordering::Relaxed);
     }
 
     /// As [`HostList::defer`], for work that writes only host memory.
