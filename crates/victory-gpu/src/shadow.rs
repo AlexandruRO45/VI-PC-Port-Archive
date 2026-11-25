@@ -1016,6 +1016,9 @@ fn pooled(n: usize) -> Vec<u8> {
 /// Returns a snapshot buffer to the pool: at most 8 kept, the largest, and
 /// of those the largest one and the next ones up to `KEPT` bytes in all.
 fn give_back(v: Vec<u8>) {
+    if crate::host::memory_pressure() {
+        return;
+    }
     const KEPT: usize = 512 << 20;
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
     pool.push(v);
@@ -1763,8 +1766,19 @@ pub(crate) fn window_use() -> [u64; 8] {
 /// The next read of that memory makes a new copy and copies the window
 /// again. Called before a submission starts, by the thread that submits.
 pub(crate) fn let_go_idle() {
-    const IDLE_MS: u64 = 10_000;
-    const IDLE_FRAMES: u64 = 4;
+    let pressure = crate::host::memory_pressure();
+    if pressure {
+        let drained = std::mem::take(&mut *POOL.lock().unwrap_or_else(|e| e.into_inner()));
+        if !drained.is_empty() {
+            let bytes: usize = drained.iter().map(Vec::capacity).sum();
+            let count = drained.len();
+            crate::host::trail(|| {
+                format!("sweep: drained {count} pooled snapshot buffers ({} KiB) under commit pressure", bytes >> 10)
+            });
+            drop(drained);
+        }
+    }
+    let (idle_ms, idle_frames) = if pressure { (2_000, 2) } else { (10_000, 4) };
     let gone: Vec<Arc<Shadow>> = {
         // Held from the look to the removal: `loose` hands a copy out
         // under the same lock, so none is handed out in between.
@@ -1773,7 +1787,7 @@ pub(crate) fn let_go_idle() {
             .iter()
             .filter(|(_, s)| {
                 Arc::strong_count(s) == 1
-                    && crate::host::long_ago(s.used.load(Ordering::Relaxed), IDLE_MS, IDLE_FRAMES)
+                    && crate::host::long_ago(s.used.load(Ordering::Relaxed), idle_ms, idle_frames)
                     && crate::host::references(&s.buffer) == 1
             })
             .map(|(key, _)| *key)

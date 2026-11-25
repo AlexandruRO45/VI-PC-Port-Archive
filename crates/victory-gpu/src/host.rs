@@ -5,7 +5,7 @@
 //! (unless `VICTORY_LATE_WAIT=1`, see [`late`]);
 //! overlap them with per-submission fences once more than clears run.
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
@@ -123,6 +123,47 @@ pub(crate) fn references(object: &impl Interface) -> u32 {
     }
 }
 
+static LOW_COMMIT: AtomicBool = AtomicBool::new(false);
+
+fn low_commit_threshold() -> u64 {
+    static BYTES: OnceLock<u64> = OnceLock::new();
+    *BYTES.get_or_init(|| {
+        std::env::var("VICTORY_LOW_COMMIT_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(4096)
+            << 20
+    })
+}
+
+fn is_low_commit(avail_bytes: u64, threshold_bytes: u64) -> bool {
+    threshold_bytes > 0 && avail_bytes < threshold_bytes
+}
+
+fn refresh_memory_pressure() -> bool {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    // SAFETY: plain zeroed Win32 output struct with `dwLength` initialized.
+    let mut mem: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    mem.dwLength = size_of::<MEMORYSTATUSEX>() as u32;
+    let low = if unsafe { GlobalMemoryStatusEx(&mut mem) } != 0 {
+        is_low_commit(mem.ullAvailPageFile, low_commit_threshold())
+    } else {
+        false
+    };
+    let prev = LOW_COMMIT.swap(low, Ordering::Relaxed);
+    if low && !prev {
+        let avail_mb = mem.ullAvailPageFile >> 20;
+        tracing::info!(avail_mb, "low system commit; trimming idle GPU caches");
+        trail(|| format!("low system commit ({avail_mb} MiB available); trimming idle GPU caches"));
+    }
+    low
+}
+
+/// Whether the host recently observed low available system commit charge.
+pub(crate) fn memory_pressure() -> bool {
+    LOW_COMMIT.load(Ordering::Relaxed)
+}
+
 /// Once a second, before a submission starts: lets go of what nothing
 /// names any more (copies of windows of title memory, staging buffers,
 /// host copies of textures the title fills).
@@ -144,10 +185,14 @@ fn sweep() {
     {
         return;
     }
+    let pressure = refresh_memory_pressure();
     crate::pipeline::trim_library();
     crate::shadow::let_go_idle();
     crate::texture::let_go_idle();
     crate::resource::let_go_idle();
+    if pressure {
+        trim_spare();
+    }
 }
 
 /// Drops `object` once every submission running now has finished: at once
@@ -1385,8 +1430,9 @@ fn give_chunks(chunks: Vec<(Chunk, u64)>) {
     let mut freed = Vec::new();
     {
         let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
+        let cache = scratch_pool() && !memory_pressure();
         for (chunk, size) in chunks {
-            let back = if scratch_pool() {
+            let back = if cache {
                 spare.give(chunk, size, SPARE_MOST)
             } else {
                 Some(chunk)
@@ -1406,6 +1452,26 @@ fn give_chunks(chunks: Vec<(Chunk, u64)>) {
     }
     // Freed outside the lock.
     drop(freed);
+}
+
+/// Drops all spare scratch chunks held for reuse when system commit is low.
+fn trim_spare() {
+    let drained: Vec<(Chunk, u64)> = {
+        let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
+        spare.bytes = 0;
+        std::mem::take(&mut spare.kept)
+    };
+    if drained.is_empty() {
+        return;
+    }
+    let count = drained.len() as u64;
+    let total: u64 = drained.iter().map(|(_, s)| *s).sum();
+    ALIVE[3].fetch_sub(count, Ordering::Relaxed);
+    ALIVE[4].fetch_sub(total, Ordering::Relaxed);
+    ALIVE[1].fetch_sub(count, Ordering::Relaxed);
+    ALIVE[2].fetch_sub(total, Ordering::Relaxed);
+    trail(|| format!("sweep: trimmed {count} spare scratch chunks ({} KiB)", total >> 10));
+    drop(drained);
 }
 
 /// What the host keeps for copies in the card's own memory
@@ -3474,6 +3540,9 @@ impl Host {
         COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
         // Sends up to `after` are of no use to any later merge.
         crate::shadow::relay_fetched(after);
+        if memory_pressure() && f.buffer.as_ref().is_some_and(|b| b.2 > (32 << 20)) {
+            f.buffer = None;
+        }
     }
 
     /// [`relay`], on the thread that lands flights: `items` are the first
@@ -6530,6 +6599,15 @@ mod spare {
         assert_eq!(spare.take(1), Some(2));
         assert_eq!(spare.bytes, 0);
         assert!(spare.kept.is_empty());
+    }
+
+    #[test]
+    fn low_commit_threshold_triggers_only_when_enabled_and_below() {
+        assert!(!super::is_low_commit(0, 0));
+        assert!(!super::is_low_commit(1024, 0));
+        assert!(super::is_low_commit(4095 << 20, 4096 << 20));
+        assert!(!super::is_low_commit(4096 << 20, 4096 << 20));
+        assert!(!super::is_low_commit(8192 << 20, 4096 << 20));
     }
 }
 
