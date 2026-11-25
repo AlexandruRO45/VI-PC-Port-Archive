@@ -330,13 +330,18 @@ impl Layout {
         let element_log2 = d.element_bytes.trailing_zeros();
         let bpe = u64::from(d.element_bytes);
         let block_bytes = 1u64 << block_log2;
-        let thick = d.dimension == Dimension::Tex3d && (d.swizzle.standard() || d.swizzle.display());
+        let thick =
+            d.dimension == Dimension::Tex3d && (d.swizzle.standard() || d.swizzle.display());
         let block = if thick {
             // ComputeThickBlockDimension
             let amp = (block_log2 - 10) / 3;
             let rest = (block_log2 - 10) % 3;
             let b = BLOCK_1K_3D[element_log2 as usize];
-            [b[0] << amp, b[1] << (amp + rest / 2), b[2] << (amp + u32::from(rest != 0))]
+            [
+                b[0] << amp,
+                b[1] << (amp + rest / 2),
+                b[2] << (amp + u32::from(rest != 0)),
+            ]
         } else {
             // ComputeThinBlockDimension
             let samples_log2 = d.samples.trailing_zeros();
@@ -352,7 +357,12 @@ impl Layout {
         let mip_depth = |i: u32| if thick { padded_dim(d.depth, i, 1) } else { 1 };
         let depth_of = |i: u32| if three_d { dim(d.depth, i, 1) } else { 1 };
         let (width, height) = (|i| dim(d.width, i, d.block), |i| dim(d.height, i, d.block));
-        let padded = |i| (padded_dim(d.width, i, d.block), padded_dim(d.height, i, d.block));
+        let padded = |i| {
+            (
+                padded_dim(d.width, i, d.block),
+                padded_dim(d.height, i, d.block),
+            )
+        };
         let mut mips = Vec::with_capacity(d.mips as usize);
         let mut first_tail_mip = d.mips;
         let mut slice_size = 0u64;
@@ -367,10 +377,8 @@ impl Layout {
                 offset: 0,
                 tail: None,
             });
-            slice_size = u64::from(mips[0].pitch)
-                * u64::from(mips[0].rows)
-                * bpe
-                * u64::from(d.samples);
+            slice_size =
+                u64::from(mips[0].pitch) * u64::from(mips[0].rows) * bpe * u64::from(d.samples);
         } else {
             // GetMipTailDim: the largest mip the tail takes.
             let mut tail_max = block;
@@ -516,7 +524,15 @@ impl Layout {
     /// differ). Titles use them for render targets and depth, which the
     /// host renders; add them when a title copies into or out of one.
     pub fn addressable(&self) -> bool {
-        self.desc.swizzle == Swizzle::LINEAR || !self.pattern[0].is_empty()
+        // The same test `Layout::new` uses to decide whether to build a
+        // pattern at all. It used to read `swizzle == LINEAR ||
+        // !pattern[0].is_empty()`, which answers `true` for a linear layout
+        // with more than one sample: `Layout::new` clears the pattern there
+        // (`!xor && samples == 1`), so `offset` went on to take its linear
+        // branch and compute an address with no sample dimension in it — a
+        // wrong address rather than the `Unsupported` the shortcut above
+        // promises.
+        !self.desc.swizzle.xor() && self.desc.samples == 1
     }
 
     /// The slice and the depth inside it for `z` (an array slice or a 3D
@@ -564,7 +580,8 @@ impl Layout {
         // offset inside the tail block.
         let y = y + m.tail.map_or(0, |t| t.y);
         let blocks = u64::from(y / bh) * u64::from(m.pitch / bw);
-        (blocks << log2) + u64::from(self.pattern[1][(y % bh) as usize] | self.pattern[2][z as usize])
+        (blocks << log2)
+            + u64::from(self.pattern[1][(y % bh) as usize] | self.pattern[2][z as usize])
     }
 
     /// The part of an address that depends on the column.
@@ -594,9 +611,17 @@ impl Layout {
         row_pitch: usize,
         depth_pitch: usize,
     ) -> Result<(), Error> {
-        self.walk(tiled.len(), mip, slice, linear.len(), row_pitch, depth_pitch, |t, l, len| {
-            linear[l..][..len].copy_from_slice(&tiled[t..][..len]);
-        })
+        self.walk(
+            tiled.len(),
+            mip,
+            slice,
+            linear.len(),
+            row_pitch,
+            depth_pitch,
+            |t, l, len| {
+                linear[l..][..len].copy_from_slice(&tiled[t..][..len]);
+            },
+        )
     }
 
     /// The reverse of [`Layout::detile`]: linear rows into tiled memory.
@@ -609,9 +634,17 @@ impl Layout {
         row_pitch: usize,
         depth_pitch: usize,
     ) -> Result<(), Error> {
-        self.walk(tiled.len(), mip, slice, linear.len(), row_pitch, depth_pitch, |t, l, len| {
-            tiled[t..][..len].copy_from_slice(&linear[l..][..len]);
-        })
+        self.walk(
+            tiled.len(),
+            mip,
+            slice,
+            linear.len(),
+            row_pitch,
+            depth_pitch,
+            |t, l, len| {
+                tiled[t..][..len].copy_from_slice(&linear[l..][..len]);
+            },
+        )
     }
 
     /// Visits contiguous runs as (tiled byte offset, linear byte offset, length).
@@ -800,7 +833,14 @@ impl Texture {
             1
         };
         let mips = match desc.mips {
-            0 => 32 - desc.width.max(desc.height).max(depth3d).max(1).leading_zeros(),
+            0 => {
+                32 - desc
+                    .width
+                    .max(desc.height)
+                    .max(depth3d)
+                    .max(1)
+                    .leading_zeros()
+            }
             n => n,
         };
         let plane = |bytes| Desc {
@@ -932,7 +972,11 @@ mod tests {
             let mut seen = vec![false; l.size as usize];
             let mut tiled = vec![0u8; l.size as usize];
             let n = d.element_bytes as usize;
-            let slices = if d.dimension == Dimension::Tex3d { 1 } else { d.depth };
+            let slices = if d.dimension == Dimension::Tex3d {
+                1
+            } else {
+                d.depth
+            };
             for slice in 0..slices {
                 for mip in 0..d.mips {
                     let m = l.mips[mip as usize];
@@ -961,7 +1005,11 @@ mod tests {
                                 seen[at] = true;
                             }
                         }
-                        assert!(back[base + plane - 11..base + plane].iter().all(|&b| b == 0xcc));
+                        assert!(
+                            back[base + plane - 11..base + plane]
+                                .iter()
+                                .all(|&b| b == 0xcc)
+                        );
                     }
                 }
             }
@@ -1086,5 +1134,314 @@ mod tests {
             Err(Error::TooSmall)
         );
         assert_eq!(l.offset(0, 64, 0, 0), Err(Error::Invalid));
+    }
+
+    /// What `format` says every DXGI number stores, held against the numbers
+    /// themselves.
+    ///
+    /// It had no test at all. 93 of the 121 numbers the Windows SDK defines
+    /// are grouped by size in one `match`, so one bound moved by one —
+    /// `19..=22` narrowed to `19..=21`, say — changes which formats are given
+    /// a stencil plane, and nothing here would have noticed. A depth format
+    /// read as having no stencil is a texture allocated half the size it
+    /// needs.
+    ///
+    /// The names are from `dxgiformat.h` (Windows SDK 10.0.22621.0), so a row
+    /// that is wrong is wrong about a number Microsoft names.
+    #[test]
+    fn every_format_group_stores_what_the_sdk_says_it_does() {
+        // (number, SDK name, bytes, texels a block side, stencil)
+        const ROWS: &[(u32, &str, u32, u32, bool)] = &[
+            // 1..=4: 128-bit colour, four channels of 32 bits.
+            (1, "R32G32B32A32_TYPELESS", 16, 1, false),
+            (4, "R32G32B32A32_SINT", 16, 1, false),
+            // 9..=18: 64-bit colour.
+            (9, "R16G16B16A16_TYPELESS", 8, 1, false),
+            (18, "R32G32_SINT", 8, 1, false),
+            // 19..=22: 32-bit, a depth format with its stencil packed in.
+            (19, "R32G8X24_TYPELESS", 4, 1, true),
+            (20, "D32_FLOAT_S8X24_UINT", 4, 1, true),
+            (21, "R32_FLOAT_X8X24_TYPELESS", 4, 1, true),
+            (22, "X32_TYPELESS_G8X24_UINT", 4, 1, true),
+            // 23..=43: 32-bit colour, no stencil.
+            (23, "R10G10B10A2_TYPELESS", 4, 1, false),
+            (28, "R8G8B8A8_UNORM", 4, 1, false),
+            (43, "R32_SINT", 4, 1, false),
+            // 44..=47: the 24-bit depth family with 8-bit stencil.
+            (44, "R24G8_TYPELESS", 4, 1, true),
+            (47, "X24_TYPELESS_G8_UINT", 4, 1, true),
+            // 48..=59: 16-bit colour.
+            (48, "R8G8_TYPELESS", 2, 1, false),
+            (59, "R16_SINT", 2, 1, false),
+            // 60..=65: 8-bit colour.
+            (60, "R8_TYPELESS", 1, 1, false),
+            (65, "A8_UNORM", 1, 1, false),
+            // 67: R9G9B9E5, a shared-exponent colour in 32 bits.
+            (67, "R9G9B9E5_SHAREDEXP", 4, 1, false),
+            // 70..=72, 79..=81: BC1 and BC4, 8 bytes a 4 by 4 block.
+            (70, "BC1_TYPELESS", 8, 4, false),
+            (72, "BC1_UNORM_SRGB", 8, 4, false),
+            (79, "BC4_TYPELESS", 8, 4, false),
+            (81, "BC4_SNORM", 8, 4, false),
+            // 73..=78, 82..=84: BC2, BC3, BC5, 16 bytes a block.
+            (73, "BC2_TYPELESS", 16, 4, false),
+            (78, "BC3_UNORM_SRGB", 16, 4, false),
+            (82, "BC5_TYPELESS", 16, 4, false),
+            (84, "BC5_SNORM", 16, 4, false),
+            // 85, 86, 115: packed 16-bit colour.
+            (85, "B5G6R5_UNORM", 2, 1, false),
+            (86, "B5G5R5A1_UNORM", 2, 1, false),
+            (115, "B4G4R4A4_UNORM", 2, 1, false),
+            // 87..=93: BGRA and its family, 32-bit.
+            (87, "B8G8R8A8_UNORM", 4, 1, false),
+            (93, "B8G8R8X8_UNORM_SRGB", 4, 1, false),
+            // 94..=99: BC6H and BC7, 16 bytes a block.
+            (94, "BC6H_TYPELESS", 16, 4, false),
+            (99, "BC7_UNORM_SRGB", 16, 4, false),
+        ];
+        for &(n, name, bytes, block, stencil) in ROWS {
+            let f = super::format(n).unwrap_or_else(|| panic!("{n} ({name}) is refused"));
+            assert_eq!(f.bytes, bytes, "{n} ({name}) bytes");
+            assert_eq!(f.block, block, "{n} ({name}) texels a block side");
+            assert_eq!(f.stencil, stencil, "{n} ({name}) stencil");
+        }
+    }
+
+    /// The numbers `format` refuses on purpose, so a change that starts
+    /// answering one has to say why.
+    #[test]
+    fn the_formats_it_declines_are_the_ones_it_names() {
+        // 5..=8: 96-bit colour. 12 bytes an element is not a size the tiling
+        // here addresses, and no console texture is one.
+        for n in 5..=8 {
+            assert!(super::format(n).is_none(), "{n} (96-bit) answered");
+        }
+        // 0 is FORCE_UINT, not a format.
+        assert!(super::format(0).is_none());
+        // 66, 68, 69: R1 and the two packed 4:2:2 YUV formats.
+        for n in [66, 68, 69] {
+            assert!(super::format(n).is_none(), "{n} answered");
+        }
+        // 100..=114: the video formats (NV12, P010, YUY2, …). Sampled, not
+        // tiled; no texture here is one.
+        for n in 100..=114 {
+            assert!(super::format(n).is_none(), "{n} (video) answered");
+        }
+        // 130..=132, 189..=190: the SDK's newer video and sampler-feedback
+        // numbers, neither a texture this code addresses.
+        for n in [130, 131, 132, 189, 190] {
+            assert!(super::format(n).is_none(), "{n} answered");
+        }
+        // Nothing the SDK does not define, either.
+        for n in [121, 129, 133, 200, 1000] {
+            assert!(super::format(n).is_none(), "{n} answered");
+        }
+    }
+
+    /// 116..=120 are answered but the Windows SDK does not name them: they
+    /// are console numbers the GDK adds, and the sizes here are what this
+    /// code was written against. Recorded rather than asserted against a
+    /// name, so anyone who finds the real ones can correct this row.
+    #[test]
+    fn the_console_only_numbers_are_the_sizes_this_code_assumes() {
+        for n in [116, 117] {
+            let f = super::format(n).unwrap_or_else(|| panic!("{n} is refused"));
+            assert_eq!((f.bytes, f.block, f.stencil), (4, 1, false), "{n}");
+        }
+        for n in 118..=120 {
+            let f = super::format(n).unwrap_or_else(|| panic!("{n} is refused"));
+            assert_eq!((f.bytes, f.block, f.stencil), (2, 1, true), "{n}");
+        }
+    }
+
+    /// Which swizzle modes a layout can address, and which it cannot.
+    ///
+    /// `addressable` is `!swizzle.xor() && samples == 1` in `Layout::new`, and
+    /// the tile pattern is only built when it holds — so a mode wrongly judged
+    /// addressable gets an empty pattern and `offset` answers nonsense, and one
+    /// wrongly judged unaddressable refuses a copy the title needs. Only the
+    /// `SW_64KB_Z_X` case was covered, by one assertion inside an unrelated
+    /// depth-stencil test.
+    ///
+    /// The split is the naming: `_T` and `_X` are the pipe-and-bank XOR modes
+    /// (`Swizzle::xor` is `self.0 >= 16`, and every constant at or above 16 is
+    /// named `_T` or `_X`), and MSAA of any mode.
+    #[test]
+    fn only_the_modes_without_pipe_xor_are_addressable() {
+        use super::Swizzle;
+        // (mode, name, addressable at one sample)
+        const MODES: &[(Swizzle, &str, bool)] = &[
+            (Swizzle::LINEAR, "LINEAR", true),
+            (Swizzle::SW_256B_S, "SW_256B_S", true),
+            (Swizzle::SW_256B_D, "SW_256B_D", true),
+            (Swizzle::SW_4KB_S, "SW_4KB_S", true),
+            (Swizzle::SW_4KB_D, "SW_4KB_D", true),
+            (Swizzle::SW_64KB_S, "SW_64KB_S", true),
+            (Swizzle::SW_64KB_D, "SW_64KB_D", true),
+            // `_T`: pipe XOR.
+            (Swizzle::SW_64KB_S_T, "SW_64KB_S_T", false),
+            (Swizzle::SW_64KB_D_T, "SW_64KB_D_T", false),
+            // `_X`: pipe and bank XOR.
+            (Swizzle::SW_4KB_S_X, "SW_4KB_S_X", false),
+            (Swizzle::SW_4KB_D_X, "SW_4KB_D_X", false),
+            (Swizzle::SW_4KB_R_X, "SW_4KB_R_X", false),
+            (Swizzle::SW_64KB_Z_X, "SW_64KB_Z_X", false),
+            (Swizzle::SW_64KB_S_X, "SW_64KB_S_X", false),
+            (Swizzle::SW_64KB_D_X, "SW_64KB_D_X", false),
+            (Swizzle::SW_64KB_R_X, "SW_64KB_R_X", false),
+        ];
+        for &(swizzle, name, want) in MODES {
+            let t = super::Texture::new(&super::TextureDesc {
+                dimension: super::Dimension::Tex2d,
+                width: 64,
+                height: 64,
+                depth_or_array: 1,
+                mips: 1,
+                format: 28, // R8G8B8A8_UNORM, so every mode has a layout
+                samples: 1,
+                swizzle,
+            })
+            .unwrap_or_else(|e| panic!("{name} has no layout: {e:?}"));
+            assert_eq!(t.planes[0].layout.addressable(), want, "{name} addressable");
+        }
+    }
+
+    /// MSAA is unaddressable whatever the swizzle, and a linear layout is the
+    /// one exception that still is not: `Layout::new` clears the pattern for
+    /// `samples != 1` even when the mode has no pipe XOR.
+    #[test]
+    fn multisampling_is_unaddressable_even_without_pipe_xor() {
+        use super::{Dimension, Swizzle, TextureDesc};
+        for swizzle in [Swizzle::LINEAR, Swizzle::SW_64KB_S] {
+            let t = super::Texture::new(&TextureDesc {
+                dimension: Dimension::Tex2d,
+                width: 64,
+                height: 64,
+                depth_or_array: 1,
+                mips: 1,
+                format: 28,
+                samples: 4,
+                swizzle,
+            })
+            .unwrap_or_else(|e| panic!("{swizzle:?} with 4 samples has no layout: {e:?}"));
+            assert!(
+                !t.planes[0].layout.addressable(),
+                "{swizzle:?} with 4 samples reported addressable"
+            );
+        }
+    }
+
+    /// A swizzle number GFX10 does not have is refused where the layout is
+    /// made, rather than reaching `addressable` with no block size.
+    #[test]
+    fn a_swizzle_gfx10_does_not_have_is_refused() {
+        use super::{Dimension, Swizzle, TextureDesc};
+        for n in [3, 4, 7, 8, 11, 16, 20, 28, 100] {
+            let desc = TextureDesc {
+                dimension: Dimension::Tex2d,
+                width: 64,
+                height: 64,
+                depth_or_array: 1,
+                mips: 1,
+                format: 28,
+                samples: 1,
+                swizzle: Swizzle(n),
+            };
+            assert!(
+                super::Texture::new(&desc).is_err(),
+                "swizzle {n} has a layout, but block_log2 says GFX10 has no such mode"
+            );
+        }
+    }
+
+    /// Every `detile` of a mip writes inside the buffers it was given: the
+    /// tiled one exactly `size` long, the linear one exactly the rows the
+    /// caller asked for.
+    ///
+    /// `walk` checks `tiled_len >= self.size` once, then computes each row's
+    /// offset as `base + row(...)` and hands `tiled_row + tiled` to the copy
+    /// closure, which indexes with `[..]`. Nothing bounds those against
+    /// `tiled_len` per row, so an offset that lands past `size` is a panic
+    /// rather than a `TooSmall`. This walks every mip of every swizzle at the
+    /// exact size and asserts the closure never sees an out-of-range index —
+    /// a mip chain whose tail is placed wrong would show up here.
+    #[test]
+    fn every_mip_writes_inside_the_buffers_it_was_given() {
+        use super::{Dimension, Swizzle};
+        const MODES: &[(Swizzle, &str)] = &[
+            (Swizzle::LINEAR, "LINEAR"),
+            (Swizzle::SW_256B_S, "SW_256B_S"),
+            (Swizzle::SW_256B_D, "SW_256B_D"),
+            (Swizzle::SW_4KB_S, "SW_4KB_S"),
+            (Swizzle::SW_4KB_D, "SW_4KB_D"),
+            (Swizzle::SW_64KB_S, "SW_64KB_S"),
+            (Swizzle::SW_64KB_D, "SW_64KB_D"),
+        ];
+        for &(swizzle, name) in MODES {
+            for (w, h, mips) in [(64u32, 64u32, 0u32), (64, 64, 3), (128, 32, 2), (16, 16, 4)] {
+                let t = super::Texture::new(&super::TextureDesc {
+                    dimension: Dimension::Tex2d,
+                    width: w,
+                    height: h,
+                    depth_or_array: 1,
+                    mips,
+                    format: 28,
+                    samples: 1,
+                    swizzle,
+                })
+                .unwrap_or_else(|e| panic!("{name} {w}x{h} mips={mips}: {e:?}"));
+                let layout = &t.planes[0].layout;
+                let tiled = vec![0u8; layout.size as usize];
+                for (index, m) in layout.mips.iter().enumerate() {
+                    // The rows the caller must hold for this mip.
+                    let n = layout.desc.element_bytes as usize;
+                    let row_pitch = m.width as usize * n;
+                    let depth_pitch = m.height as usize * row_pitch;
+                    let mut linear = vec![0u8; depth_pitch * m.depth as usize];
+                    layout
+                        .detile(&tiled, index as u32, 0, &mut linear, row_pitch, depth_pitch)
+                        .unwrap_or_else(|e| {
+                            panic!("{name} {w}x{h} mips={mips} mip {index}: {e:?}")
+                        });
+                }
+            }
+        }
+    }
+
+    /// A buffer one byte short of `size` is refused rather than indexed past,
+    /// for every swizzle — the check `walk` does make.
+    #[test]
+    fn a_short_tiled_buffer_is_refused_before_any_row_is_read() {
+        use super::{Dimension, Swizzle};
+        for swizzle in [Swizzle::LINEAR, Swizzle::SW_64KB_S] {
+            let t = super::Texture::new(&super::TextureDesc {
+                dimension: Dimension::Tex2d,
+                width: 64,
+                height: 64,
+                depth_or_array: 1,
+                mips: 0,
+                format: 28,
+                samples: 1,
+                swizzle,
+            })
+            .unwrap();
+            let layout = &t.planes[0].layout;
+            let short = vec![0u8; layout.size as usize - 1];
+            let m = &layout.mips[0];
+            let n = layout.desc.element_bytes as usize;
+            let mut linear = vec![0u8; m.width as usize * n * m.height as usize];
+            assert_eq!(
+                layout.detile(
+                    &short,
+                    0,
+                    0,
+                    &mut linear,
+                    m.width as usize * n,
+                    m.height as usize * m.width as usize * n,
+                ),
+                Err(super::Error::TooSmall),
+                "{swizzle:?}"
+            );
+        }
     }
 }
