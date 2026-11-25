@@ -1,0 +1,109 @@
+# Ce qui a changé, et ce qu'il reste à changer
+
+Note tenue au fil du travail, en français. Elle dit ce qui a été fait (avec
+les chiffres mesurés) puis, à la fin, ce qu'il faut encore changer, du plus
+utile au moins utile. La version anglaise d'avant ce soir reste à côté, dans
+`CHANGES-passage-de-vitesse.en.md`.
+
+---
+
+## 1. Fait : le passage de vitesse (commutateurs par défaut)
+
+Le fork portait déjà les bons commutateurs, mais tous éteints : une exécution
+normale prenait le chemin lent. Ils sont maintenant actifs par défaut, chacun
+remis à l'ancien comportement par sa variable.
+
+| Variable | Défaut maintenant | Ce qu'elle évite |
+|---|---|---|
+| `VICTORY_LATE_WAIT` | 3 | le titre et nous attendons chacun notre tour |
+| `VICTORY_RELAY` | actif | une copie de relais en trop par envoi |
+| `VICTORY_ASYNC_SUBMIT` | actif | l'envoi qui bloque le fil du titre |
+| `VICTORY_QUEUE2` | 1 | la file de copie non découpée |
+| `VICTORY_INDIRECT_WINDOW` (+ `_CHECK`) | actif | le bornage par enregistrement partout |
+| `VICTORY_COPY_PLAIN` | actif | la copie page par page |
+| `VICTORY_VIEW_KNOWN` | actif | les interrogations `VirtualQuery` ratées |
+| `VICTORY_WIDE_THREADS` | 8 (avant : 6) | le nombre de threads qui bridait l'image |
+| `VICTORY_FULL_CARD_PASS` | actif | la passe de textures quand la carte est pleine |
+| `VICTORY_LEVELS_ON_DEMAND` | actif | les niveaux de texture que le titre ne garde pas |
+
+## 2. Fait : le plafond d'images, de 30 à 120
+
+Le titre se limite à 30 images/s en prenant l'intervalle le plus long qui
+tombe juste sur des multiples de 16,67 ms. La couche répond maintenant comme
+un écran à 120 Hz : l'intervalle le plus court gardé est 8,33 ms.
+`VICTORY_MIN_INTERVAL_US` en règle un autre (16667 = 60, 33333 = 30 comme
+avant, 0 = ce que le titre demande).
+
+À savoir : cela enlève une attente, cela n'ajoute pas d'images quand c'est la
+carte qui limite.
+
+## 3. Fait : les niveaux à la demande (le gros gain)
+
+Le titre crée ses textures avec tous leurs niveaux, mais n'en remplit qu'une
+partie. La couche prenait la mémoire de la carte pour tous les niveaux :
+**2 130 ms de préparation de textures par image** et 3 images/s sur le dossier
+de test. Avec les niveaux à la demande, seuls les niveaux que le titre
+remplit prennent de la mémoire.
+
+| Mesure (même machine, même dossier) | avant | après |
+|---|---|---|
+| images/s | 3 | **27 à 34** (menus) |
+| ms par image | 3 034 | 29 à 37 |
+| préparation des textures | 2 130 ms | **5 à 12 ms** |
+| mémoire carte non allouée | — | 3,1 Go en moins |
+
+Son test sur la vraie carte passe (`cargo test -p victory-gpu --release tiles
+-- --ignored` avec `VICTORY_TILES_TEST_CARD=1` : « all steps passed ON THE
+CARD »).
+
+## 4. Fait : la manette PlayStation
+
+Le titre ne lit que XInput, et une manette DualSense ou DualShock 4 n'est pas
+un périphérique XInput : elle n'était donc pas là du tout. Le premier
+périphérique HID que Windows présente et qui se déclare « gamepad » est
+maintenant ouvert et lu en entier ; chaque usage est pris par son numéro, donc
+la disposition du rapport est celle de Windows et pas une table à nous. Ça
+couvre DualSense, DualShock 4 et Switch Pro. `VICTORY_HID_PAD=0` désactive.
+
+Non fait : les moteurs d'une manette HID ne sont pas encore écrits ; l'ancien
+chemin XInput les fait pour une manette Xbox.
+
+## 5. Fait : des sous-objets de pipeline en plus
+
+Le flux de pipeline du titre nomme deux choses que la couche ne savait pas
+lire (le nombre d'échantillons forcé du rasteriseur, et les formats de cible
+un par un). Elles sont lues ; un flux qui les nomme n'est plus refusé.
+
+## 6. Ce qui reste à changer, du plus utile au moins utile
+
+1. **Les zones à l'ombre sont noires** : le lancer de rayons (l'éclairage
+   indirect, les ombres) ne tourne pas. C'est ce que le fork de DexNom a en
+   plus, et ce n'est pas une question de pilote : c'est du D3D12 ordinaire,
+   donc ça marchera aussi sur NVIDIA. Son propre chiffre, en ville avec le RT
+   allumé, est **969 ms par image** : c'est de l'image avant d'être de la
+   vitesse. Gros chantier.
+2. **Les textures éparses** : une texture dont seules les pages du milieu sont
+   en mémoire n'est pas envoyée. DexNom le fait ; ici, non. C'est ce qui donne
+   des textures noires ou en basse résolution au chargement, et probablement
+   une partie des micro-freezes aux changements brusques d'image.
+3. **Le bornage par enregistrement** dans les listes du jeu reste l'essentiel
+   du temps de la carte (102 ms sur 130). Les fenêtres en enlèvent une part ;
+   le reste demande une autre façon d'émuler la lecture d'arguments de la
+   console. Pas un commutateur.
+4. **Les copies mémoire PC ↔ carte** restent le principal du temps de
+   soumission. La sortie est `VICTORY_INPLACE` (les tampons du titre utilisés
+   là où ils sont) ; seul son premier étage existe. `=2` est incompatible avec
+   `VICTORY_LATE_WAIT`, donc l'essayer demande aussi `VICTORY_LATE_WAIT=0`.
+5. **La passe sur les tampons du tas** (« heap buffers ») coûte 260 à
+   970 ms par image sur le dossier de test. Un budget par image a été essayé
+   et **n'aide pas** : quand la passe est coupée, les copies de l'image
+   suivante sont plus grosses, et le total ne bouge pas. Le vrai travail est de
+   ne pas copier du tout (point 4).
+6. **Les micro-freezes au lancement** viennent de deux choses mesurées : la
+   création des pipelines (`host pipeline refused`, et deux méthodes de
+   création que le titre appelle et que la couche refuse) et les textures qui
+   arrivent en retard. Le point 2 règle une partie des secondes ; les
+   pipelines demandent d'écrire les deux méthodes manquantes.
+7. **La base est en retard sur l'amont** : `fxceless/victory-fork` a un commit
+   de plus (`3973179`, 16 fichiers) que cette branche n'a pas encore. À
+   fusionner avant tout le reste, sinon les deux divergent.
