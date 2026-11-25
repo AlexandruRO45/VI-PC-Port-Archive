@@ -221,6 +221,15 @@ pub(crate) struct State {
 /// dispatches (a clamp each, ahead of the stretch).
 pub(crate) static EI_RUNS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
 
+/// Since the last frame-rate line (diagnostics), indirect calls by how the
+/// clamp window ([`windows`]) took them: read from a window; not windowed
+/// as a dispatch, as a call with a count buffer or several records, as a
+/// pipeline that stores; no window (the list's first, or after a dispatch
+/// or direct draw); a window of another buffer; of another kind or stride;
+/// a record before the window; off the window's step; past its records.
+#[cfg(feature = "diagnostics")]
+pub(crate) static WINDOW_WHY: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
+
 impl Drop for State {
     fn drop(&mut self) {
         for &(heap, first, n) in &self.dynamic {
@@ -2547,6 +2556,28 @@ impl State {
                         && (offset - w.base) / u64::from(w.step) < u64::from(w.records)
                 })
                 .map(|w| (w.scratch.clone(), offset - w.base));
+            #[cfg(feature = "diagnostics")]
+            {
+                let why = if hit.is_some() {
+                    0
+                } else if kind == DISPATCH {
+                    1
+                } else if count.is_some() || max != 1 {
+                    2
+                } else if p.stages.iter().any(|stage| stage.translated().stores) {
+                    3
+                } else {
+                    match &self.window {
+                        None => 4,
+                        Some(w) if w.copy != args.id() => 5,
+                        Some(w) if !same(w) => 6,
+                        Some(w) if offset < w.base => 7,
+                        Some(w) if (offset - w.base) % u64::from(w.step) != 0 => 8,
+                        Some(_) => 9,
+                    }
+                };
+                WINDOW_WHY[why].fetch_add(1, Ordering::Relaxed);
+            }
             match hit {
                 Some(hit) => hit,
                 None => {

@@ -6427,6 +6427,17 @@ impl Meter {
                 if f[0] > 0.0 { f[1] / f[0] } else { 0.0 },
                 f[2],
             );
+            let w: Vec<f64> =
+                crate::draw::WINDOW_WHY.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+            if w.iter().sum::<f64>() > 0.0 {
+                tracing::info!(
+                    "indirect calls and the clamp window per frame (VICTORY_INDIRECT_WINDOW=1): {:.0} read from a window; \
+                     not windowed: {:.0} dispatches, {:.0} with a count or several records, {:.0} of pipelines that store; \
+                     a new window: {:.0} with none (list start, after a dispatch or direct draw), {:.0} another buffer, \
+                     {:.0} another kind or stride, {:.0} before the window, {:.0} off its step, {:.0} past its records",
+                    w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7], w[8], w[9],
+                );
+            }
             let e: Vec<f64> = crate::draw::EI_RUNS.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames).collect();
             tracing::info!(
                 "indirect executions per frame: {:.0}; {:.0} of them right after another with the same state (pipeline, \
