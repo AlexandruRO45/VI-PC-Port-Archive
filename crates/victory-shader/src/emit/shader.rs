@@ -46,6 +46,8 @@ pub(crate) mod flags {
     pub const RAW_BUFFERS: u64 = 1 << 4;
     pub const STENCIL_REF: u64 = 1 << 11;
     pub const TYPED_UAV_LOADS: u64 = 1 << 13;
+    /// UAVs outside the pixel and compute stages (DXIL shader flag 16).
+    pub const UAVS_AT_EVERY_STAGE: u64 = 1 << 16;
     pub const ROVS: u64 = 1 << 18;
     pub const WAVE_OPS: u64 = 1 << 19;
     pub const INT64: u64 = 1 << 20;
@@ -737,6 +739,19 @@ impl Shader {
             self.m.named_md("dx.resources", vec![r]);
         }
 
+        // A vertex or geometry program that reads or writes a UAV (root
+        // UAVs, or the written-pages bitmaps that mark writes) declares
+        // UAVs at every stage, as the validator recomputes it.
+        let vertex_like = !self.pixel && self.threads.is_none() && self.mesh.is_none();
+        if vertex_like
+            && (!self.root_uavs.is_empty()
+                || self.memory_dirty.is_some()
+                || self.view_marks.is_some()
+                || self.view_writes.is_some())
+        {
+            self.flags |= flags::UAVS_AT_EVERY_STAGE;
+        }
+
         let graphics = self.threads.is_none() || self.mesh.is_some();
         if graphics {
             // shortcut: every output is declared to depend on every input; the
@@ -879,6 +894,9 @@ impl Shader {
         dxil.extend(&bitcode);
 
         let mut features = 0u64;
+        if self.flags & flags::UAVS_AT_EVERY_STAGE != 0 {
+            features |= 0x4;
+        }
         if self.flags & flags::STENCIL_REF != 0 {
             features |= 0x200;
         }
