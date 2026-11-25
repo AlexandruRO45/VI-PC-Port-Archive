@@ -1457,7 +1457,7 @@ mod tests {
                 if lane < live {
                     words.push(0x7E02_0200 | (24 + lane)); // v_mov_b32 v1, s<24 + lane>
                 } else {
-                    words.extend([0x7E02_02ff, DEAD_MARKER]); // leave s27 unused
+                    words.extend([0x7E02_02FF, DEAD_MARKER]); // leave s27 unused
                 }
                 words.extend([0xE070_0000 | (lane * 4), 0x8003_0100]); // buffer_store_dword
             }
