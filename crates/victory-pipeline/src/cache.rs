@@ -50,7 +50,12 @@ impl Cache {
     pub fn get_or_convert(&self, converter: &dyn Converter, input: &[u8]) -> Result<PathBuf> {
         let key = CacheKey::new(converter, input);
         let path = self.path_for(&key);
-        if path.is_file() {
+        // A reader can keep a mismatched result in place on Windows. Share
+        // the invalidation through the directory so reopened caches see it too.
+        let invalid = path.with_extension("invalid");
+        let found = path.is_file();
+        let was_invalid = invalid.try_exists()?;
+        if found && !was_invalid {
             tracing::trace!(converter = converter.id(), key = %key.to_hex(), "cache hit");
             return Ok(path);
         }
@@ -69,9 +74,28 @@ impl Cache {
         }
         if let Err(err) = std::fs::rename(&tmp, &path) {
             let _ = std::fs::remove_file(&tmp);
-            if !same_output(&path, &output).unwrap_or(false) {
-                return Err(err.into());
+            match same_output(&path, &output) {
+                Ok(true) => {}
+                Ok(false) => {
+                    if let Err(mark_error) = File::create_new(&invalid)
+                        && mark_error.kind() != io::ErrorKind::AlreadyExists
+                    {
+                        return Err(anyhow::Error::new(err).context(format!(
+                            "marking the mismatched cache entry invalid: {mark_error}"
+                        )));
+                    }
+                    return Err(err.into());
+                }
+                Err(_) => return Err(err.into()),
             }
+        }
+        // Leave any invalidation created during a normal miss for the next
+        // lookup to check. Clear one we observed only after valid publication.
+        if was_invalid
+            && let Err(err) = std::fs::remove_file(&invalid)
+            && err.kind() != io::ErrorKind::NotFound
+        {
+            return Err(err.into());
         }
         Ok(path)
     }
@@ -237,18 +261,48 @@ mod tests {
             let path = cache.path_for(&CacheKey::new(&conv, b"abc"));
             let result = cache.get_or_convert(&conv, b"abc");
             assert_eq!(std::fs::read(&path).unwrap(), published);
-            assert_eq!(
-                std::fs::read_dir(path.parent().unwrap()).unwrap().count(),
-                1
-            );
+            let retry_cache = Cache::open(tmp.path().join("cache")).unwrap();
+            let retry_converter = Upper {
+                version: 1,
+                runs: AtomicUsize::new(0),
+            };
             if expected {
                 assert_eq!(result.unwrap(), path);
+                assert_eq!(
+                    retry_cache
+                        .get_or_convert(&retry_converter, b"abc")
+                        .unwrap(),
+                    path
+                );
+                assert_eq!(retry_converter.runs.load(Ordering::Relaxed), 0);
             } else {
                 assert!(
                     result.is_err(),
                     "different content was accepted: {published:?}"
                 );
+                let retry = retry_cache.get_or_convert(&retry_converter, b"abc");
+                assert!(
+                    retry.is_err(),
+                    "a retry treated mismatched content as a hit: {:?}",
+                    retry.ok().and_then(|path| std::fs::read(path).ok())
+                );
+                assert_eq!(std::fs::read(&path).unwrap(), published);
+                drop(conv.held.lock().unwrap().take());
+                let repaired = retry_cache
+                    .get_or_convert(&retry_converter, b"abc")
+                    .unwrap();
+                assert_eq!(repaired, path);
+                assert_eq!(std::fs::read(&repaired).unwrap(), b"ABC");
+                assert_eq!(
+                    cache.get_or_convert(&retry_converter, b"abc").unwrap(),
+                    path
+                );
+                assert_eq!(retry_converter.runs.load(Ordering::Relaxed), 2);
             }
+            assert_eq!(
+                std::fs::read_dir(path.parent().unwrap()).unwrap().count(),
+                1
+            );
         }
     }
 
