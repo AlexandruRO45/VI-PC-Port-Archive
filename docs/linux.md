@@ -18,6 +18,14 @@ platform. These notes are what has worked for testers.
   `WINEDLLOVERRIDES="d3d12,d3d12core,dxgi=n,b"`, with vkd3d-proton's
   `d3d12.dll` and `d3d12core.dll` next to `victory.exe`. Wine's builtin
   `libvkd3d-1.dll` takes a different path and is not what has been tested.
+- NVIDIA: set `VKD3D_DISABLE_EXTENSIONS=VK_NV_raw_access_chains`. With
+  vkd3d-proton's raw access chains, compute `72f552f4553fb5f9` (first run
+  at the start of the first mission, around frame 950) does not finish:
+  the kernel logs `NVRM: Xid 109 ... CTX SWITCH TIMEOUT`, the desktop
+  stalls, and the title's own watchdog ends it (`Unsignaled
+  CrossQueueBarrier` in its crash log, under `T:`). Without the extension
+  the same build reached and stayed in the world (RTX 5080, driver
+  615.71); see also #844 and #1528.
 - NVIDIA: some translated shaders crash the driver's compiler, which ends
   the process. #491 (not merged yet) adds `VICTORY_PIPELINE_JOURNAL=1`:
   a pipeline whose creation ended a run is refused from the next run on,
