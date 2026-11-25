@@ -60,11 +60,24 @@ fn explicit_folder() -> Option<&'static PathBuf> {
     FOLDER.get_or_init(|| std::env::var_os("VICTORY_CAPTURE").map(PathBuf::from)).as_ref()
 }
 
+/// Largest single capture buffer we are willing to allocate: 512 MiB.
+const CAPTURE_LIMIT: u64 = 536_870_912;
+
+/// Whether a frame of this layout may be captured, without side effects.
+///
+/// `estimated_bytes` is `None` when the layout arithmetic overflowed, which
+/// is what a nonsense width or height produces. Testing this separately from
+/// [`within_limit`] keeps the decision readable and testable: the wrapper only
+/// adds the warn-once and the sticky disable.
+fn frame_fits(estimated_bytes: Option<u64>, valid: bool) -> bool {
+    valid && estimated_bytes.is_some_and(|n| n > 0 && n <= CAPTURE_LIMIT)
+}
+
 // Called only after capture is enabled. Bound each allocation to 512 MiB.
 fn within_limit(width: u64, height: u64, estimated_bytes: Option<u64>, valid: bool) -> bool {
     use std::sync::atomic::Ordering::Relaxed;
     if DISABLED.load(Relaxed) { return false; }
-    if valid && estimated_bytes.is_some_and(|n| n > 0 && n <= 536_870_912) {
+    if frame_fits(estimated_bytes, valid) {
         return true;
     }
     if !DISABLED.swap(true, Relaxed) {
@@ -1000,5 +1013,44 @@ mod tests {
         assert_eq!(super::to_rgba(89, 1, 1, 4, &xr), Some(vec![255, 127, 0, 255]));
         // B8G8R8A8 still swaps to RGBA.
         assert_eq!(super::to_rgba(87, 1, 1, 4, &[1, 2, 3, 4]), Some(vec![3, 2, 1, 255]));
+    }
+}
+
+#[cfg(test)]
+mod limit_tests {
+    use super::{frame_fits, CAPTURE_LIMIT};
+
+    fn bytes(width: u64, height: u64, per_pixel: u64) -> Option<u64> {
+        width.checked_mul(height).and_then(|n| n.checked_mul(per_pixel))
+    }
+
+    #[test]
+    fn ordinary_frames_fit() {
+        assert!(frame_fits(bytes(1920, 1080, 4), true));
+        assert!(frame_fits(bytes(3840, 2160, 4), true));
+        assert_eq!(bytes(1920, 1080, 4), Some(8_294_400));
+        assert_eq!(bytes(3840, 2160, 4), Some(33_177_600));
+    }
+
+    #[test]
+    fn the_ceiling_is_inclusive() {
+        assert!(frame_fits(Some(CAPTURE_LIMIT), true));
+        assert!(!frame_fits(Some(CAPTURE_LIMIT + 1), true));
+    }
+
+    #[test]
+    fn overflow_and_nonsense_do_not_fit() {
+        // 64K by 64K at four bytes per pixel is sixteen gigabytes.
+        assert!(!frame_fits(bytes(65_536, 65_536, 4), true));
+        // The arithmetic that produced 7.7 TB in the field: it overflows u64.
+        assert_eq!(bytes(u64::from(u32::MAX), u64::from(u32::MAX), 4), None);
+        assert!(!frame_fits(bytes(u64::from(u32::MAX), u64::from(u32::MAX), 4), true));
+    }
+
+    #[test]
+    fn zero_and_invalid_layouts_do_not_fit() {
+        assert!(!frame_fits(Some(0), true));
+        assert!(!frame_fits(None, true));
+        assert!(!frame_fits(Some(1024), false));
     }
 }
