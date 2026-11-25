@@ -322,13 +322,12 @@ fn round16(p: &crate::ir::Program) -> Vec<Option<u8>> {
 /// [`super::loop_limit`] says otherwise. The console runs a loop as long as
 /// its data says; data the host has not mirrored yet (a null view reads
 /// zeros) can make that four billion iterations, which hangs the host GPU
-/// until the driver resets it. A lane that reaches the limit leaves the
-/// program as killed (a pixel discards).
+/// until the driver resets it. A lane that reaches the limit on a
+/// conditional back edge leaves by the loop's own exit and runs on with
+/// what it has; on an unconditional back edge it leaves the program as
+/// killed (a pixel discards).
 // shortcut: a genuine loop of more iterations than this is cut short too.
-// 2^20 was not low enough: a loop walking a parent table that a dropped
-// dispatch never filled (a union-find in a GPU-driven compute pass) ran
-// past the NVIDIA driver's reset, the reset failed and the whole desktop
-// froze. 2^14 bounds such a loop to milliseconds per wave.
+// 2^14 keeps such a loop to milliseconds per wave, under the driver's reset.
 pub(super) const LOOP_LIMIT: u32 = 1 << 14;
 
 /// Lane masks read as numbers (`s_bcnt1`, `s_ff1`, `v_mbcnt`, scalar
