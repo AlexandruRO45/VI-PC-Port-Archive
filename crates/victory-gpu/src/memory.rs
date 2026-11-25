@@ -191,7 +191,24 @@ pub(crate) fn note_withheld(bytes: u64) {
 
 /// A draw or dispatch of `pipeline` uses title memory.
 pub(crate) fn note_use(pipeline: &str) {
-    stats(|s| *s.uses.entry(pipeline.to_owned()).or_default() += 1);
+    stats(|s| {
+        // A pipeline counted before is found by its name, without making
+        // a key (`VICTORY_NOTE_USE_LOOKUP=0`: a new name every draw).
+        if note_use_lookup()
+            && let Some(n) = s.uses.get_mut(pipeline)
+        {
+            *n += 1;
+            return;
+        }
+        *s.uses.entry(pipeline.to_owned()).or_default() += 1;
+    });
+}
+
+/// `VICTORY_NOTE_USE_LOOKUP` (default on): [`note_use`] finds a pipeline
+/// counted before by its name, not with an owned copy of it per draw.
+fn note_use_lookup() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_NOTE_USE_LOOKUP").is_none_or(|v| v != "0"))
 }
 
 /// Logs what title memory did since the last call, if anything: a line per
@@ -514,6 +531,16 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
 mod tests {
     use super::*;
 
+
+    #[test]
+    fn note_use_counts_each_pipeline_by_name() {
+        let names = ["note-use test pipeline a", "note-use test pipeline b"];
+        for name in [names[0], names[1], names[0], names[0]] {
+            super::note_use(name);
+        }
+        let counts = super::stats(|s| names.map(|n| s.uses.get(n).copied()));
+        assert_eq!(counts, [Some(3), Some(1)]);
+    }
     #[test]
     fn sparse_page_bitmap_matches_named_pages_and_misses() {
         let mut layout = Layout {

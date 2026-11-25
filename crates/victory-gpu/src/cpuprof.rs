@@ -1,10 +1,11 @@
 //! CPU time of the per-draw path and of submission preparation, by stage
 //! (`VICTORY_CPU_PROFILE=1`): cheap timers summed per stage and logged
 //! every 5 s as milliseconds and calls per frame. Measurement only; nothing
-//! else changes. Off, each timer costs one relaxed atomic load.
+//! else changes. Off, each timer costs one relaxed atomic load; on, about
+//! 0.1 us (two clock reads), so the finest stages read a little high.
 //!
 //! Times are inclusive: a stage's time holds the stages timed inside it
-//! (`bind` holds `tables`, which holds `readable`), as the indentation of
+//! (`bind` holds `tables`, which holds `table entries`), as the indentation of
 //! the log shows. Recording stages run on the title's threads (they may
 //! overlap each other); submission stages on the submitting thread, inside
 //! the frame line's "preparing".
@@ -36,7 +37,6 @@ pub(crate) enum Stage {
     EntryDefer,
     EntryTexture,
     FreshTables,
-    Readable,
     UserData,
     RootViewSlots,
     RootParamViews,
@@ -83,7 +83,6 @@ const NAMES: [(&str, u8); STAGES] = [
     ("entry deferred refresh + gpu write", 4),
     ("entry texture upload + state", 4),
     ("fresh tables", 3),
-    ("readable", 4),
     ("user data", 2),
     ("root-view slots", 3),
     ("root parameter views", 2),
@@ -115,8 +114,10 @@ pub(crate) enum Count {
     DeferredLock,
     Kept,
     Mirror,
+    Readable,
     Barrier,
     Steps,
+    CopyUpdates,
     SlotRemade,
     TableReused,
 }
@@ -127,8 +128,10 @@ const COUNT_NAMES: [&str; COUNTS] = [
     "deferred-step locks",
     "objects kept",
     "table mirrors",
+    "views made readable",
     "state checks",
     "deferred steps run",
+    "copy updates (range checks)",
     "slots remade",
     "tables reused",
 ];

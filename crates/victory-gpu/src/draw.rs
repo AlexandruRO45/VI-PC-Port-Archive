@@ -1823,7 +1823,7 @@ fn host_signature(kind: u32, stride: u32) -> Option<ID3D12CommandSignature> {
 /// writes through the view mark their pages (every translated shader's do);
 /// the host's own (clears) do not.
 fn readable(list: &HostList, u: &UsedResource, view: &View, marked: bool) {
-    let _timed = crate::cpuprof::time(crate::cpuprof::Stage::Readable);
+    crate::cpuprof::count(crate::cpuprof::Count::Readable);
     const SHADER_RESOURCE: u32 = 0x40 | 0x80;
     const UNORDERED_ACCESS: u32 = 0x8;
     let placing = crate::cpuprof::time(crate::cpuprof::Stage::EntryPlaced);

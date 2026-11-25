@@ -2547,7 +2547,11 @@ impl HostList {
                         add(C::Copies, 1);
                         add(C::CopyBytes, len as u64);
                     }
-                    batch.title_written();
+                    if batch_precise_copies() {
+                        batch.title_copied(dst, len);
+                    } else {
+                        batch.title_written();
+                    }
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
                     len
                 }
@@ -2580,7 +2584,11 @@ impl HostList {
                     // The shaders start from the title's data, which a
                     // snapshot must hold (marked ranges keep none).
                     if !marked {
-                        batch.flush();
+                        if batch_flush_one() {
+                            batch.flush_copy(shadow);
+                        } else {
+                            batch.flush();
+                        }
                     }
                     shadow.writing(*address, *len, *marked);
                     continue;
@@ -2642,6 +2650,38 @@ struct Batch {
     /// Shadows whose VRAM copies may have dirty pages to sync this submission
     /// (retained across `title_written` flushes).
     vram_dirty: std::collections::HashMap<usize, std::sync::Arc<crate::shadow::Shadow>>,
+    /// Copy updates done (each checks the copy's range for title changes).
+    updates: usize,
+}
+
+/// `VICTORY_BATCH_PRECISE_COPIES=1` (default off): a title copy at
+/// submission ([`Batch::title_copied`]) flushes and invalidates only the
+/// copies whose ranges it touches, not every copy's: the world's 60-90
+/// title copies per frame each made every later list check its big buffers
+/// again.
+fn batch_precise_copies() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = crate::switch::on("VICTORY_BATCH_PRECISE_COPIES");
+        if on {
+            tracing::info!("VICTORY_BATCH_PRECISE_COPIES: title copies flush and invalidate only the copies they touch");
+        }
+        on
+    })
+}
+
+/// `VICTORY_BATCH_FLUSH_ONE=1` (default off): a range shaders write
+/// ([`Step::GpuWrite`], not marked) flushes only its own copy's pending
+/// refresh before the snapshot, not every copy's.
+fn batch_flush_one() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = crate::switch::on("VICTORY_BATCH_FLUSH_ONE");
+        if on {
+            tracing::info!("VICTORY_BATCH_FLUSH_ONE: written ranges flush only their own copy");
+        }
+        on
+    })
 }
 
 impl Batch {
@@ -2676,6 +2716,56 @@ impl Batch {
         self.current.clear();
     }
 
+    /// Before a title copy into `[dst, dst + len)`
+    /// (`VICTORY_BATCH_PRECISE_COPIES`): as [`Batch::title_written`], for
+    /// the copies whose ranges it touches only. Pending refreshes reaching
+    /// the range are done first (the lists before the copy read what was
+    /// there); other pending ones stay, to merge with later lists' ranges.
+    /// Ranges brought up to date that the copy touches are dropped (later
+    /// refreshes take its bytes); the others stay up to date, as no step in
+    /// between wrote them. Textures are checked again, as after any title
+    /// write. With the same steps, shaders see the same bytes as after
+    /// [`Batch::title_written`] (`precise_flushes_give_shaders_the_same_bytes`).
+    fn title_copied(&mut self, dst: usize, len: usize) {
+        // By whole tracked pages: an update copies the changed pages its
+        // range reaches whole, bytes past the range included.
+        let page = crate::watch::PAGE;
+        let (dst, end) = (dst & !(page - 1), (dst + len).next_multiple_of(page));
+        let touched: Vec<usize> = self
+            .refreshes
+            .iter()
+            .filter(|(_, from, to)| *from < end && dst < *to)
+            .map(|(shadow, ..)| std::sync::Arc::as_ptr(shadow) as usize)
+            .collect();
+        for key in touched {
+            self.flush_key(key);
+        }
+        self.textures.clear();
+        self.current.retain(|_, (_, a, b)| !(*a < end && dst < *b));
+    }
+
+    /// Before shaders get a range of `shadow` (`VICTORY_BATCH_FLUSH_ONE`):
+    /// its pending refresh done; the other copies' stay, to merge with later
+    /// lists' ranges.
+    fn flush_copy(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>) -> usize {
+        self.flush_key(std::sync::Arc::as_ptr(shadow) as usize)
+    }
+
+    /// The pending refresh of the copy at `key`, if any, done now.
+    fn flush_key(&mut self, key: usize) -> usize {
+        let Some(i) = self.pending.remove(&key) else {
+            return 0;
+        };
+        let (shadow, from, to) = self.refreshes.swap_remove(i);
+        if let Some((moved, ..)) = self.refreshes.get(i) {
+            self.pending.insert(std::sync::Arc::as_ptr(moved) as usize, i);
+        }
+        let _flush = crate::cpuprof::time(crate::cpuprof::Stage::BatchFlush);
+        #[cfg(feature = "diagnostics")]
+        let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::FlushUs);
+        self.refreshed(shadow, from, to)
+    }
+
     /// Does the refreshes; returns the bytes copied.
     fn flush(&mut self) -> usize {
         let _flush = (!self.refreshes.is_empty()).then(|| crate::cpuprof::time(crate::cpuprof::Stage::BatchFlush));
@@ -2683,29 +2773,37 @@ impl Batch {
         let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::FlushUs);
         self.pending.clear();
         let mut total = 0;
-        for (shadow, from, to) in self.refreshes.drain(..) {
-            let started = std::time::Instant::now();
-            let copied = shadow.update(from, to - from);
-            let us = started.elapsed().as_micros() as u64;
-            #[cfg(feature = "diagnostics")]
-            crate::copystat::range(from, to - from, us, 0);
-            PREPARING[0].fetch_add(us, Ordering::Relaxed);
-            PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
-            total += copied;
-            let key = std::sync::Arc::as_ptr(&shadow) as usize;
-            if shadow.has_vram_dirty() {
-                self.vram_dirty.entry(key).or_insert_with(|| shadow.clone());
-            }
-            // Kept: the union with what was current if they touch, else
-            // the larger.
-            let (_, a, b) = self.current.entry(key).or_insert((shadow, from, to));
-            if from <= *b && *a <= to {
-                (*a, *b) = ((*a).min(from), (*b).max(to));
-            } else if to - from > *b - *a {
-                (*a, *b) = (from, to);
-            }
+        for (shadow, from, to) in std::mem::take(&mut self.refreshes) {
+            total += self.refreshed(shadow, from, to);
         }
         total
+    }
+
+    /// One merged refresh done: `[from, to)` of `shadow` brought up to date
+    /// and noted current. Returns the bytes copied.
+    fn refreshed(&mut self, shadow: std::sync::Arc<crate::shadow::Shadow>, from: usize, to: usize) -> usize {
+        let started = std::time::Instant::now();
+        let copied = shadow.update(from, to - from);
+        self.updates += 1;
+        let us = started.elapsed().as_micros() as u64;
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::range(from, to - from, us, 0);
+        PREPARING[0].fetch_add(us, Ordering::Relaxed);
+        PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+        crate::cpuprof::count(crate::cpuprof::Count::CopyUpdates);
+        let key = std::sync::Arc::as_ptr(&shadow) as usize;
+        if shadow.has_vram_dirty() {
+            self.vram_dirty.entry(key).or_insert_with(|| shadow.clone());
+        }
+        // Kept: the union with what was current if they touch, else
+        // the larger.
+        let (_, a, b) = self.current.entry(key).or_insert((shadow, from, to));
+        if from <= *b && *a <= to {
+            (*a, *b) = ((*a).min(from), (*b).max(to));
+        } else if to - from > *b - *a {
+            (*a, *b) = (from, to);
+        }
+        copied
     }
 
     fn take_vram_syncs(&mut self) -> Vec<(std::sync::Arc<crate::shadow::Shadow>, Vec<(u64, u64)>)> {
@@ -3959,6 +4057,292 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
             before.as_secs_f64() / after.as_secs_f64()
         );
     }
+    /// Tracked title memory of `pages` pages filled with `seed`'s pattern
+    /// and its host copy (None without a host GPU, the memory freed).
+    fn tracked_copy(pages: usize, seed: u8) -> Option<(usize, Arc<crate::shadow::Shadow>)> {
+        use crate::watch::PAGE;
+        let p = crate::watch::tests::pool(pages);
+        for i in 0..pages * PAGE {
+            // SAFETY: our pool.
+            unsafe { ((p + i) as *mut u8).write((i as u8).wrapping_mul(7) ^ seed) };
+        }
+        crate::shadow::register(p, p as u64, (pages * PAGE) as u64);
+        match crate::shadow::find(p as u64, (pages * PAGE) as u64) {
+            Some(copy) => Some((p, copy)),
+            None => {
+                crate::shadow::unregister(p, p as u64);
+                crate::watch::tests::free(p);
+                None
+            }
+        }
+    }
+
+    fn drop_copy(p: usize, copy: Arc<crate::shadow::Shadow>) {
+        crate::shadow::unregister(p, p as u64);
+        drop(copy);
+        crate::watch::tests::free(p);
+    }
+
+    /// `VICTORY_BATCH_PRECISE_COPIES`: a title copy into one host copy's
+    /// range flushes that copy's pending refresh (the lists before it read
+    /// the bytes from before) and makes it due again; another copy's pending
+    /// refresh stays pending and its current range stays current.
+    #[test]
+    fn a_title_copy_redoes_only_the_copies_it_touches() {
+        use crate::watch::PAGE;
+        let Some((p, a)) = tracked_copy(4, 1) else { return };
+        let Some((q, b)) = tracked_copy(4, 2) else {
+            drop_copy(p, a);
+            return;
+        };
+        let len = 4 * PAGE;
+        let mut batch = Batch::default();
+        batch.add(&a, p, len);
+        batch.add(&b, q, len);
+        assert_eq!(batch.flush(), 2 * len, "both whole at first");
+        assert_eq!(batch.updates, 2);
+        // A list asks for both again: both current, nothing pending.
+        batch.add(&a, p, len);
+        batch.add(&b, q + PAGE, PAGE);
+        assert!(batch.refreshes.is_empty());
+        // SAFETY: our pool.
+        let before = unsafe { ((p + PAGE) as *const u32).read() };
+        batch.title_copied(p + PAGE, 4);
+        assert_eq!(batch.updates, 2, "nothing pending reaches the copy");
+        // SAFETY: our pool; the copy's write.
+        unsafe { ((p + PAGE) as *mut u32).write_volatile(!before) };
+        batch.add(&a, p, len);
+        batch.add(&b, q, len);
+        assert_eq!(batch.flush(), PAGE, "the page the copy wrote, once");
+        assert_eq!(batch.updates, 3, "`b` stayed current");
+        assert_eq!(a.read_host((p + PAGE) as u64, 1)[0], !before);
+        // A pending refresh reaching the copy is done before it.
+        let mut batch = Batch::default();
+        batch.add(&a, p, len);
+        batch.add(&b, q, len);
+        batch.title_copied(p + PAGE, 4);
+        assert_eq!((batch.updates, batch.refreshes.len()), (1, 1), "`a` done, `b` pending");
+        // SAFETY: as above.
+        unsafe { ((p + PAGE) as *mut u32).write_volatile(before) };
+        assert_eq!(a.read_host((p + PAGE) as u64, 1)[0], !before, "taken before the copy");
+        batch.flush();
+        assert_eq!(batch.updates, 2);
+        drop_copy(p, a);
+        drop_copy(q, b);
+    }
+
+    /// `VICTORY_BATCH_FLUSH_ONE`: a written range flushes its own copy's
+    /// pending refresh; the others' stay pending (and keep merging).
+    #[test]
+    fn a_written_range_flushes_only_its_copy() {
+        use crate::watch::PAGE;
+        let Some((p, a)) = tracked_copy(2, 3) else { return };
+        let Some((q, b)) = tracked_copy(2, 4) else {
+            drop_copy(p, a);
+            return;
+        };
+        let Some((r, c)) = tracked_copy(2, 5) else {
+            drop_copy(p, a);
+            drop_copy(q, b);
+            return;
+        };
+        let mut batch = Batch::default();
+        batch.add(&a, p, PAGE);
+        batch.add(&b, q, PAGE);
+        batch.add(&c, r, PAGE);
+        assert_eq!(batch.flush_copy(&a), PAGE);
+        assert_eq!(batch.flush_copy(&a), 0, "nothing pending for it any more");
+        // `c` moved into `a`'s place: still found by its copy.
+        batch.add(&c, r + PAGE, PAGE);
+        assert_eq!(batch.refreshes.len(), 2);
+        assert_eq!(batch.flush_copy(&c), 2 * PAGE, "merged with the later range");
+        assert_eq!(batch.flush(), PAGE, "`b` at the end");
+        assert_eq!(batch.updates, 3);
+        drop_copy(p, a);
+        drop_copy(q, b);
+        drop_copy(r, c);
+    }
+
+    /// The same submission steps with the switches off and on, each run on
+    /// its own set of identical title memory: every range a list asked for
+    /// holds the same bytes when shaders get it (a written range's copy,
+    /// and every copy when the lists run), from fewer copy updates. Except
+    /// ranges a title copy wrote after a list asked for them, in the same
+    /// submission: with fewer flushes a copy's ranges merge into wider
+    /// hulls, whose update may bring the copy's bytes into such a range (the
+    /// switches off do the same where their hulls reach it). Bytes no list
+    /// asked for may differ too.
+    #[test]
+    fn precise_flushes_give_shaders_the_same_bytes() {
+        use crate::watch::PAGE;
+        const COPIES: usize = 3;
+        const PAGES: usize = 6;
+        const MODES: [(bool, bool); 4] = [(false, false), (true, false), (false, true), (true, true)];
+        let mut sets: Vec<Vec<(usize, Arc<crate::shadow::Shadow>)>> = Vec::new();
+        for _ in MODES {
+            let mut copies = Vec::new();
+            for k in 0..COPIES {
+                match tracked_copy(PAGES, 9 + k as u8) {
+                    Some(c) => copies.push(c),
+                    None => {
+                        for (p, c) in copies.into_iter().chain(sets.drain(..).flatten()) {
+                            drop_copy(p, c);
+                        }
+                        return; // no host GPU here
+                    }
+                }
+            }
+            sets.push(copies);
+        }
+        // The words of the ranges asked for (offsets in the copy).
+        // Not those a title copy wrote since they were asked for.
+        type Asked = Vec<(usize, usize, u32)>;
+        let read = |c: &Arc<crate::shadow::Shadow>, p: usize, asked: &Asked, written: &[(usize, u32)]| -> Vec<u32> {
+            let words = c.read_host(p as u64, PAGES * PAGE / 4);
+            asked
+                .iter()
+                .filter(|&&(a, b, at)| !written.iter().any(|&(w, step)| step > at && w < b && a < w + PAGE))
+                .flat_map(|&(a, b, _)| words[a / 4..b / 4].to_vec())
+                .collect()
+        };
+        // One run of the script: what shaders saw, and the updates done.
+        let run = |copies: &[(usize, Arc<crate::shadow::Shadow>)], (precise, one): (bool, bool)| {
+            let mut seen: Vec<Vec<u32>> = Vec::new();
+            let mut asked: Vec<Asked> = vec![Vec::new(); COPIES];
+            // Pages title copies wrote in the submission, by copy, and when.
+            let mut written: Vec<Vec<(usize, u32)>> = vec![Vec::new(); COPIES];
+            let mut updates = 0;
+            let mut batch = Batch::default();
+            let mut x: u64 = 0x2545_f491_4f6c_dd1d;
+            for step in 0..600u32 {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                let k = (x % COPIES as u64) as usize;
+                let page = (x >> 8) as usize % PAGES;
+                let n = (1 + (x >> 16) as usize % 3).min(PAGES - page);
+                let (p, c) = &copies[k];
+                match (x >> 24) % 8 {
+                    // A list asks for a range.
+                    0..=3 => {
+                        let (from, len) = (page * PAGE + 16 * ((x >> 40) as usize % 8), n * PAGE / 2);
+                        batch.add(c, p + from, len);
+                        asked[k].push((from, from + len, step));
+                    }
+                    // A title copy writes a word.
+                    4 | 5 => {
+                        let at = p + page * PAGE + 64 * ((x >> 32) as usize % (PAGE / 64));
+                        if precise {
+                            batch.title_copied(at, 4);
+                        } else {
+                            batch.title_written();
+                        }
+                        // SAFETY: our pool.
+                        unsafe { (at as *mut u32).write_volatile(step) };
+                        written[k].push((page * PAGE, step));
+                    }
+                    // Shaders get a range to write: its copy as they see it.
+                    6 => {
+                        if one {
+                            batch.flush_copy(c);
+                        } else {
+                            batch.flush();
+                        }
+                        seen.push(read(c, *p, &asked[k], &written[k]));
+                    }
+                    // The lists run: every copy as they see it.
+                    _ => {
+                        batch.flush();
+                        for (k, (p, c)) in copies.iter().enumerate() {
+                            seen.push(read(c, *p, &asked[k], &written[k]));
+                        }
+                        asked.iter_mut().for_each(Vec::clear);
+                        written.iter_mut().for_each(Vec::clear);
+                        updates += batch.updates;
+                        batch = Batch::default();
+                    }
+                }
+            }
+            batch.flush();
+            for (k, (p, c)) in copies.iter().enumerate() {
+                seen.push(read(c, *p, &asked[k], &written[k]));
+            }
+            (seen, updates + batch.updates)
+        };
+        let (old, old_updates) = run(&sets[0], MODES[0]);
+        let compared: usize = old.iter().map(Vec::len).sum();
+        assert!(compared > 1 << 20, "{compared} words compared");
+        for (set, mode) in sets.iter().zip(MODES).skip(1) {
+            let (new, new_updates) = run(set, mode);
+            assert_eq!(old.len(), new.len());
+            assert!(old == new, "{mode:?}: shaders see the same bytes");
+            assert!(new_updates <= old_updates, "{mode:?}: {new_updates} updates against {old_updates}");
+            println!("{mode:?}: {new_updates} copy updates against {old_updates}, {compared} words compared");
+            if mode == (true, true) {
+                assert!(new_updates < old_updates, "{new_updates} updates against {old_updates}");
+            }
+        }
+        for (p, c) in sets.into_iter().flatten() {
+            drop_copy(p, c);
+        }
+    }
+
+    /// A world-like submission: 12 lists each asking for a 64 MiB copy whole
+    /// (the world's big heap) and 72 title copies into another buffer in
+    /// between, while the title's threads write 8 pages of the big one
+    /// before each, with every title copy redoing every copy (the switch
+    /// off) and only those it touches (`VICTORY_BATCH_PRECISE_COPIES`: the
+    /// big copy's pages the title's threads wrote go to the next
+    /// submission, as those written after a list asked for them do). Run with
+    /// `cargo test --release -p victory-gpu --lib -- --ignored --nocapture title_copies_per_submission`.
+    #[test]
+    #[ignore = "benchmark"]
+    fn title_copies_per_submission() {
+        use crate::watch::PAGE;
+        const BIG: usize = 1024;
+        let Some((p, big)) = tracked_copy(BIG, 1) else { return };
+        let Some((q, small)) = tracked_copy(4, 2) else {
+            drop_copy(p, big);
+            return;
+        };
+        let submit = |precise: bool| {
+            let mut batch = Batch::default();
+            let started = std::time::Instant::now();
+            for list in 0..12 {
+                batch.add(&big, p, BIG * PAGE);
+                batch.add(&small, q, 4 * PAGE);
+                for k in 0..6 {
+                    // The title's threads write the big buffer meanwhile.
+                    for page in 0..8 {
+                        // SAFETY: our pool.
+                        unsafe { ((p + (page * 128 + list * 8 + k) * PAGE) as *mut u32).write_volatile(k as u32) };
+                    }
+                    let at = q + 64 * (list * 6 + k);
+                    if precise {
+                        batch.title_copied(at, 16);
+                    } else {
+                        batch.title_written();
+                    }
+                    // SAFETY: our pool.
+                    unsafe { (at as *mut u32).write_volatile(k as u32) };
+                }
+            }
+            batch.flush();
+            (started.elapsed(), batch.updates)
+        };
+        submit(false); // warm up: the copies taken whole
+        let (before, n_before) = submit(false);
+        let (after, n_after) = submit(true);
+        println!(
+            "12 lists, 72 title copies, a {} MiB copy written meanwhile: every copy redone {n_before} updates in {before:?}, \
+             only those touched {n_after} in {after:?} ({:.1}x)",
+            (BIG * PAGE) >> 20,
+            before.as_secs_f64() / after.as_secs_f64()
+        );
+        drop_copy(p, big);
+        drop_copy(q, small);
+    }
+
     #[test]
     fn vram_dirty_sync_survives_title_written_and_only_copies_changed_pages() {
         use crate::watch::PAGE;
