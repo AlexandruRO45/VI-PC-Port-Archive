@@ -113,6 +113,9 @@ fi
 if ! command -v umu-run >/dev/null 2>&1; then
     fail 'umu-run was not found on PATH. Install umu-launcher and try again.'
 fi
+if ! command -v script >/dev/null 2>&1; then
+    fail 'script was not found on PATH. Install util-linux to attach Proton to this terminal.'
+fi
 
 if ((game_arg_set)); then
     game_input=$game_arg
@@ -211,7 +214,13 @@ else
 fi
 
 cd -- "$install_dir" || fail "Could not enter the install directory: $install_dir"
-"${command[@]}" 2>&1 | tee -a "$log_file"
+# Give Proton a PTY so console-subsystem programs use this terminal instead
+# of asking Wine to open a separate console window. script(1) runs its command
+# through $SHELL, so quote argv for Bash explicitly; output remains streamed
+# here and is copied into the run log.
+printf -v command_line '%q ' "${command[@]}"
+SHELL="$BASH" script --quiet --return --flush --command "$command_line" /dev/null \
+    2>&1 | tee -a "$log_file"
 pipeline_status=("${PIPESTATUS[@]}")
 child_status=${pipeline_status[0]:-1}
 tee_status=${pipeline_status[1]:-0}

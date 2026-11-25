@@ -40,6 +40,7 @@ has_line() {
     local file=$1 expected=$2 line
     [[ -f $file ]] || return 1
     while IFS= read -r line; do
+        line=${line%$'\r'}
         [[ $line == "$expected" ]] && return 0
     done < "$file"
     return 1
@@ -79,6 +80,16 @@ printf '%s\n' "${VICTORY_ACTIVATE_RAYS-}" > "$UMU_CAPTURE_DIR/activate-rays"
 printf '%s\n' "${VICTORY_RT_RESOLVE-}" > "$UMU_CAPTURE_DIR/rt-resolve"
 printf '%s\n' "${VICTORY_D3D12_WARP-}" > "$UMU_CAPTURE_DIR/warp"
 printf '%s\n' "${VICTORY_DEBUG_HUD-}" > "$UMU_CAPTURE_DIR/debug-hud"
+if [[ -t 1 ]]; then
+    printf 'yes\n' > "$UMU_CAPTURE_DIR/stdout-tty"
+else
+    printf 'no\n' > "$UMU_CAPTURE_DIR/stdout-tty"
+fi
+if [[ -t 2 ]]; then
+    printf 'yes\n' > "$UMU_CAPTURE_DIR/stderr-tty"
+else
+    printf 'no\n' > "$UMU_CAPTURE_DIR/stderr-tty"
+fi
 : > "$UMU_CAPTURE_DIR/called"
 
 if [[ ${UMU_HOLD_OPEN:-0} == 1 ]]; then
@@ -113,7 +124,9 @@ clear_capture() {
         "$capture_dir/data-dir" "$capture_dir/cache-dir" \
         "$capture_dir/bvh-builder" "$capture_dir/bvh-quarantine" \
         "$capture_dir/activate-rays" "$capture_dir/rt-resolve" \
-        "$capture_dir/warp" "$capture_dir/debug-hud" "$capture_dir/called"
+        "$capture_dir/warp" "$capture_dir/debug-hud" \
+        "$capture_dir/stdout-tty" "$capture_dir/stderr-tty" \
+        "$capture_dir/called"
 }
 
 wine_path() {
@@ -149,6 +162,10 @@ assert_equal "$(wine_path "$install_one/state")" \
 assert_equal "$(wine_path "$install_one/cache")" \
     "$(cat "$capture_dir/cache-dir")" "Wine-formatted cache directory"
 assert_equal "1" "$(cat "$capture_dir/debug-hud")" "default debug HUD"
+assert_equal "yes" "$(cat "$capture_dir/stdout-tty")" \
+    "umu-run stdout is attached to a PTY"
+assert_equal "yes" "$(cat "$capture_dir/stderr-tty")" \
+    "umu-run stderr is attached to a PTY"
 assert_arg "$capture_dir/args" "$expected_runtime"
 assert_path_arg "$capture_dir/args" "$expected_game"
 has_line "$tmp/default-output" "mock-umu-stdout" ||

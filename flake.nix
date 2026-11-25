@@ -21,6 +21,7 @@
           coreutils
           curl
           umu-launcher
+          util-linux
           llvmPackages_21.clang
           llvmPackages_21.lld
           llvmPackages_21.llvm

@@ -49,7 +49,7 @@ install -Dm755 target/x86_64-pc-windows-msvc/release/victory.exe "$HOME/Games/VI
 install -Dm755 scripts/victory-linux.sh "$HOME/Games/VIctory-runtime/victory-linux"
 ```
 
-Put the Linux path to your game's executable on one line in `game-path.txt` (for example, `/mnt/games/title/game_scarlett_master.exe`; do not use a Windows drive path). A game executable supplied as an argument overrides that file; relative paths in the file are resolved from the runtime directory. The launcher selects [GE-Proton](https://github.com/GloriousEggroll/proton-ge-custom) with `PROTONPATH=GE-Proton`. The Nix development shell provides `umu-run`; outside the shell, install `umu-launcher` using your distribution's package instructions. The launcher runs the Windows console runtime through `umu-run`, keeping its output in the calling Linux terminal instead of starting a Wine GUI console. Run it from the runtime directory:
+Put the Linux path to your game's executable on one line in `game-path.txt` (for example, `/mnt/games/title/game_scarlett_master.exe`; do not use a Windows drive path). A game executable supplied as an argument overrides that file; relative paths in the file are resolved from the runtime directory. The launcher selects [GE-Proton](https://github.com/GloriousEggroll/proton-ge-custom) with `PROTONPATH=GE-Proton`. The Nix development shell provides `umu-run` and util-linux's `script`; outside the shell, install `umu-launcher` and `util-linux` using your distribution's package instructions. The launcher gives Proton a pseudo-terminal so the Windows console runtime uses the invoking Linux terminal, while still saving its output to the run log. Run it from the runtime directory:
 
 ```sh
 ./victory-linux
