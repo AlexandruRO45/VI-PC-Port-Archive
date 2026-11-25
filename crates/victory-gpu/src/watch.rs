@@ -354,10 +354,13 @@ impl Tracked {
     /// memory itself (what shaders wrote went back): taken and guarded.
     pub(crate) fn taken(&self, pages: &[usize]) {
         let mut g = guards();
+        // A page the title wrote during the copy is no longer guarded: do not
+        // mark it current, so the next refresh copies that write (#722).
+        let pages: Vec<usize> = pages.iter().copied().filter(|p| g.protected.contains(p)).collect();
         let mut changed = self.changed.0.lock().unwrap_or_else(|e| e.into_inner());
-        let others = aliases(&g, pages);
+        let others = aliases(&g, &pages);
         guard_aliases(&mut g, &others);
-        for page in protect(&mut g, pages) {
+        for page in protect(&mut g, &pages) {
             changed.remove(&page);
             self.changed.taken(page);
         }
