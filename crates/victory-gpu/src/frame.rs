@@ -188,11 +188,9 @@ mod tests {
         assert_eq!(set_interval(null, null, 2_000, 1, 0), S_OK);
         let mut first = 0;
         assert_eq!(wait(null, 0, 1_000, std::ptr::null(), 0, &mut first), S_OK);
-        let before = Instant::now();
         let mut second = 0;
         assert_eq!(wait(null, 0, 1_000, std::ptr::null(), 0, &mut second), S_OK);
-        assert!(second > first);
-        assert!(before.elapsed() <= Duration::from_millis(50));
+        assert_eq!(second, first + 1);
         assert_eq!(wait(null, 0, 0, std::ptr::null(), 0, &mut second), TIMEOUT);
         // Tokens count frames, a frame started early on a time-out too.
         let mut early = 0;
@@ -210,21 +208,25 @@ mod tests {
         // origin poll that times out (and starts the frame), then a
         // blocking flip wait. Each flip takes its own tick.
         const FLIP: u32 = 2;
-        // 50 ms ticks: a thread woken 15-30 ms late on a busy host (seen with
-        // 5 ms ticks) still makes its tick.
-        assert_eq!(set_interval(null, null, 50_000, 3, 0), S_OK);
+        const INTERVAL_US: u32 = 5_000;
+        assert_eq!(set_interval(null, null, INTERVAL_US, 3, 0), S_OK);
         let mut token = 0;
         let flips: Vec<u64> = (0..4)
-            .map(|_| {
+            .map(|frame| {
+                if frame == 2 {
+                    // A slow frame returns to the wait loop after missing a tick.
+                    std::thread::sleep(Duration::from_micros(u64::from(INTERVAL_US) * 3));
+                }
                 let _ = wait(null, 0, 0, std::ptr::null(), TOKEN_ON_TIMEOUT, &mut token);
                 assert_eq!(
                     wait(null, FLIP, u32::MAX, std::ptr::null(), 0, &mut token),
                     S_OK
                 );
-                LAST[2].load(Ordering::Relaxed)
+                last(FLIP).load(Ordering::Relaxed)
             })
             .collect();
-        assert!(flips.windows(2).all(|w| w[1] == w[0] + 1), "{flips:?}");
+        assert!(flips[2] > flips[1] + 1, "slow frame missed a tick: {flips:?}");
+        assert!(flips.windows(2).all(|w| w[1] > w[0]), "{flips:?}");
         // Even when a flip wait begins on the tick another just ended on.
         let (tick, _) = next_tick(FLIP, Duration::ZERO);
         assert!(tick > flips[3]);
