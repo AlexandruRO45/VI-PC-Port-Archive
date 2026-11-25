@@ -91,9 +91,32 @@ fn decode(sticks: [u8; 4], triggers: [u8; 2], b: &Buttons) -> PadState {
     }
 }
 
+/// Whether the report is a DualShock 4 USB wireless adapter saying that no pad
+/// is connected to it. The adapter stays enumerated and keeps sending the
+/// 64-byte `0x01` report, mostly zeros, with bit 2 of byte 31 (the id counted
+/// as byte 0) set; the bit is always clear for a pad on a cable.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn gone(kind: Kind, report: &[u8]) -> bool {
+    kind == Kind::DualShock4 && report.len() == 64 && report[0] == 0x01 && report[31] & 0x04 != 0
+}
+
+/// The reading to publish after `report`, given the one published before: the
+/// new state, none when the adapter says its pad left, and the old one for a
+/// report that says nothing about the pad.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn after(kind: Kind, report: &[u8], current: Option<PadState>) -> Option<PadState> {
+    if gone(kind, report) {
+        return None;
+    }
+    parse(kind, report).or(current)
+}
+
 /// A reading from one input report; `None` for a report that is no pad state
-/// (feedback, a short or unknown one).
+/// (feedback, a short or unknown one, an adapter with no pad).
 pub(super) fn parse(kind: Kind, report: &[u8]) -> Option<PadState> {
+    if gone(kind, report) {
+        return None;
+    }
     let (&id, rest) = report.split_first()?;
     match (kind, id) {
         // DualSense over USB: the data follows the id.
@@ -292,6 +315,8 @@ mod reader {
         tracing::info!(?kind, report_bytes = size, "PlayStation pad connected");
         let mut buf = vec![0u8; size];
         let mut first = true;
+        // What is published for this device: none while its adapter has no pad.
+        let mut state: Option<PadState> = None;
         loop {
             let mut read = 0u32;
             // SAFETY: a buffer of `size` bytes and our handle; blocks until a report.
@@ -316,9 +341,12 @@ mod reader {
                 );
                 first = false;
             }
-            if let Some(state) = parse(kind, report) {
-                set(Some((state, (SONY, product))));
+            let now = after(kind, report, state);
+            if state.is_some() && now.is_none() {
+                tracing::info!("PlayStation adapter: its pad left");
             }
+            state = now;
+            set(state.map(|pad| (pad, (SONY, product))));
         }
         tracing::info!("PlayStation pad disconnected");
         // SAFETY: our handle.
@@ -463,5 +491,52 @@ mod tests {
         );
         assert_eq!(kind_of(r"\\?\hid#vid_046d&pid_c52b#7&1"), None);
         assert_eq!(kind_of(r"\\?\hid#vid_054c&pid_0000#7&1"), None);
+    }
+
+    /// A DualShock 4 USB report: Cross held, sticks centred, `status` in byte 31.
+    fn ds4_usb(face: u8, status: u8) -> Vec<u8> {
+        let mut r = vec![0u8; 64];
+        r[0] = 0x01;
+        r[1..5].copy_from_slice(&[128; 4]);
+        r[5] = 0x08 | face;
+        r[31] = status;
+        r
+    }
+
+    #[test]
+    fn an_adapter_without_a_pad_is_not_a_pad() {
+        // The bit alone, on a report that otherwise holds Cross.
+        let gone = ds4_usb(0x20, 0x04);
+        assert_eq!(parse(Kind::DualShock4, &gone), None);
+        // A zero-filled report with only the id and the bit read as D-pad up
+        // and both sticks pushed to a corner.
+        let mut zero = vec![0u8; 64];
+        zero[0] = 0x01;
+        zero[31] = 0x04;
+        assert_eq!(parse(Kind::DualShock4, &zero), None);
+        // Other bits of the byte are the pad's own status.
+        assert!(parse(Kind::DualShock4, &ds4_usb(0x20, 0x1B)).is_some());
+        // Not a DualShock 4's layout: left to the other kind's parser.
+        assert!(parse(Kind::DualSense, &gone).is_some());
+        // Only the 64-byte USB report carries it.
+        assert!(parse(Kind::DualShock4, &gone[..10]).is_some());
+    }
+
+    #[test]
+    fn a_pad_that_leaves_and_returns_is_published_and_cleared_and_published_again() {
+        let kind = Kind::DualShock4;
+        let mut now = None;
+        now = after(kind, &ds4_usb(0x20, 0), now); // Cross held
+        assert_eq!(now.unwrap().buttons, A);
+        now = after(kind, &[0x02; 78], now); // a report that says nothing: unchanged
+        assert_eq!(now.unwrap().buttons, A);
+        now = after(kind, &ds4_usb(0x20, 0x04), now); // the adapter's pad left
+        assert_eq!(now, None);
+        now = after(kind, &ds4_usb(0x20, 0x04), now); // still gone
+        assert_eq!(now, None);
+        now = after(kind, &[0x02; 78], now); // nothing to say, nothing to publish
+        assert_eq!(now, None);
+        now = after(kind, &ds4_usb(0x40, 0), now); // back, Circle held
+        assert_eq!(now.unwrap().buttons, B);
     }
 }
