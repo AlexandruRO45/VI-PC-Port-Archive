@@ -845,16 +845,18 @@ fn write_address(data: usize, index: usize, view: Option<&View>) {
 
 /// The texture extent encoded in the console descriptor's third word.
 fn view_size_words(view: &View) -> Option<[u32; 3]> {
-    let (dimension, width, height, levels, words, unordered) = match view {
+    let (dimension, width, height, layers, samples, levels, words, unordered) = match view {
         View::Shader(resource, words) | View::Unordered(resource, _, words) => {
             // SAFETY: a mirrored resource has a live host copy.
             let desc = unsafe { crate::resource::host_resource(*resource as crate::object::This)?.GetDesc() };
-            (desc.Dimension.0 as u32, desc.Width, desc.Height, u32::from(desc.MipLevels), words.as_ref(), matches!(view, View::Unordered(..)))
+            (desc.Dimension.0 as u32, desc.Width, desc.Height, u32::from(desc.DepthOrArraySize), desc.SampleDesc.Count, u32::from(desc.MipLevels), words.as_ref(), matches!(view, View::Unordered(..)))
         }
         View::Placed(unordered, resource, desc) => (
             resource[0],
             u64::from(resource[4]) | (u64::from(resource[5]) << 32),
             resource[6],
+            resource[7] & 0xffff,
+            resource[9],
             resource[7] >> 16,
             Some(desc[..10].try_into().ok()?),
             *unordered,
@@ -863,6 +865,7 @@ fn view_size_words(view: &View) -> Option<[u32; 3]> {
     };
     if dimension == 1 {
         let words = words?;
+        if words[1] != 1 { return None; }
         // SAFETY: only read the buffer union member for a buffer view.
         return Some([0, unsafe {
             if unordered { uav_desc(words).Anonymous.Buffer.NumElements }
@@ -882,12 +885,26 @@ fn view_size_words(view: &View) -> Option<[u32; 3]> {
     });
     let width = width.checked_shr(mip).unwrap_or(0).max(1) - 1;
     let height = if dimension == 2 { 0 } else { height.checked_shr(mip).unwrap_or(0).max(1) - 1 };
-    let view_dimension = words.map_or(0, |words| words[1]);
-    let kind = match view_dimension {
-        2 => 8, 3 => 12, 4 => 9, 5 => 13, 6 => 14, 7 => 15,
-        8 => 10,
-        9 | 10 if !unordered => 11,
-        _ => match dimension { 2 => 8, 4 => 10, _ => 9 },
+    let kind = match words.map(|words| words[1]) {
+        Some(2) => 8,
+        Some(3) => 12,
+        Some(4) => 9,
+        Some(5) => 13,
+        Some(6) if !unordered => 14,
+        Some(7) if !unordered => 15,
+        Some(8) => 10,
+        Some(9 | 10) if !unordered => 11,
+        None => match (dimension, layers > 1, samples > 1) {
+            (2, false, _) => 8,
+            (2, true, _) => 12,
+            (3, false, false) => 9,
+            (3, true, false) => 13,
+            (3, false, true) => 14,
+            (3, true, true) => 15,
+            (4, _, _) => 10,
+            _ => return None,
+        },
+        _ => return None,
     };
     let available = levels.saturating_sub(mip).max(1);
     let view_levels = if unordered || matches!(kind, 14 | 15) {
@@ -1573,6 +1590,9 @@ mod tests {
             super::view_size_words(&super::View::Placed(false, resource, desc)),
             Some([3 << 30, 63 | (63 << 14), (13 << 28) | (2 << 16)])
         );
+        desc[1] = 11; // Unsupported explicit view dimension.
+        assert_eq!(super::view_size_words(&super::View::Placed(false, resource, desc)), None);
+
         desc[1] = 9; // TextureCube SRV.
         desc[5] = u32::MAX;
         assert_eq!(
