@@ -157,7 +157,8 @@ the translated shaders do not require it at runtime.
 
 The differential shader tests also need a console `dxc.exe`: set
 `VICTORY_CONSOLE_DXC` to its path. The PC compiler is `VICTORY_PC_DXC`, else
-the newest Windows SDK's `dxc.exe`; without either, those tests are skipped.
+the newest Windows SDK's `dxc.exe`. If either compiler is missing, those tests
+are skipped, because `tools()` returns `None` unless both compiler paths exist.
 `VICTORY_WARP=1` draws on WARP instead of the hardware adapter.
 
 ## Debugging
