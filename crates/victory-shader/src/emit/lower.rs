@@ -1134,12 +1134,13 @@ impl<'a> Lower<'a> {
             // other half of a wave64.
             let in_half = |i: &Inst| {
                 i.name().starts_with("ds_swizzle")
+                    || i.name() == "ds_bpermute_b32"
                     || implicit_derivatives(i.name())
                     || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
             };
             let whole = |i: &Inst| {
                 let n = i.name();
-                n.contains("permute")
+                (n.contains("permute") && n != "ds_bpermute_b32")
                     || n.starts_with("v_permlane")
                     || n.starts_with("v_mbcnt")
                     // Its derivatives are the quad's.
@@ -4690,19 +4691,24 @@ impl<'a> Lower<'a> {
             // Each lane reads the data of the lane it names (times 4): 0 if
             // that one does not run this.
             self.cross_lane(false)?;
-            if self.split {
-                return Err("a lane permutation in a wave64 program split in halves");
-            }
             let at = self.vgprs(inst, addr.as_ref().ok_or("a permutation address")?, 1)?[0];
             let x = self.vgprs(inst, data.first().ok_or("permutation data")?, 1)?[0];
             let (by, two, last) = (
                 self.s.m.i32(offset),
                 self.s.m.i32(2),
-                self.s.m.i32(self.wave() - 1),
+                self.s.m.i32(31),
             );
             let at = self.s.m.bin(c, Bin::Add, at, by);
             let at = self.s.m.bin(c, Bin::LShr, at, two);
             let src = self.s.m.bin(c, Bin::And, at, last);
+            let here = self.lane_index();
+            let src = if self.s.wave_size == Some(64) {
+                let not31 = self.s.m.i32(!31);
+                let half = self.s.m.bin(c, Bin::And, here, not31);
+                self.s.m.bin(c, Bin::Or, half, src)
+            } else {
+                src
+            };
             let z = self.s.m.i32(0);
             let active = guard.unwrap_or_else(|| self.s.m.bool(true));
             let i32t = self.s.t.i32;
@@ -4719,7 +4725,6 @@ impl<'a> Lower<'a> {
             let one = self.s.m.i32(1);
             let bit = self.s.m.bin(c, Bin::And, bit, one);
             let running = self.s.m.cmp(c, pred::NE, bit, z);
-            let here = self.lane_index();
             let source = self.s.m.select(c, running, src, here);
             let r = self.read_lane(x, source);
             let r = self.s.m.select(c, running, r, z);
