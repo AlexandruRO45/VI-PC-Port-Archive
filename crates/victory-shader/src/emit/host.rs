@@ -103,6 +103,23 @@ fn create_device(warp: bool) -> Result<ID3D12Device, String> {
                 sm.HighestShaderModel.0
             ));
         }
+        // A device that caps its view heaps below `HEAP_VIEWS` (NVIDIA:
+        // 1,000,000) lowers the limit translated shaders clamp to, as
+        // the runtime host does (`victory_gpu`'s `probe_view_limit`), so
+        // heaps made here and shaders translated after agree.
+        // shortcut: shaders translated before the first `Host::new`
+        // keep the limit they were made with.
+        let heap = |count: u32| {
+            device.CreateDescriptorHeap::<ID3D12DescriptorHeap>(&D3D12_DESCRIPTOR_HEAP_DESC {
+                Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                NumDescriptors: count,
+                Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                NodeMask: 0,
+            })
+        };
+        if heap(super::HEAP_VIEWS).is_err() && heap(PORTABLE_VIEWS).is_ok() {
+            super::set_view_heap_limit(PORTABLE_VIEWS);
+        }
         Ok(device)
     }
 }
@@ -157,6 +174,10 @@ fn hardware_adapter(factory: &IDXGIFactory4) -> windows::core::Result<IDXGIAdapt
 /// Serializes WARP (`d3d10warp.dll`) operations across threads: concurrent
 /// WARP pipeline compiles / dispatches crash with `0xC0000005` on Windows 11.
 static WARP_LOCK: Mutex<()> = Mutex::new(());
+
+/// The shader-visible view heap size every host takes (resource binding
+/// tiers 1 and 2), as `victory_gpu`'s host has it.
+const PORTABLE_VIEWS: u32 = 1_000_000;
 
 impl Host {
     fn lock_warp(&self) -> Option<MutexGuard<'static, ()>> {
