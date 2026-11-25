@@ -1092,16 +1092,26 @@ impl<'a> Lower<'a> {
     /// the section are made from what the simulation found them to be.
     fn section_inst(&mut self, b: usize, i: usize, start: usize) {
         const UNKNOWN: Why = "a whole-wave section step the simulation does not follow";
+        // A value with no shape gets the instruction that last wrote it,
+        // else the one that ended the simulation: either names the step that
+        // has to be taught next.
+        let ended = self.sections[&b][&start].ended.unwrap_or(UNKNOWN);
         let inst = &self.x.p.blocks[b].insts[i];
         for &(_, w) in &inst.writes {
             let val = if self.section_out.contains(&w) {
                 let shape = self.sections[&b][&start].shapes.get(&w).copied();
-                match shape.ok_or(UNKNOWN).and_then(|sh| self.shape(sh)) {
+                match shape.ok_or(ended).and_then(|sh| self.shape(sh)) {
                     Ok(x) => Val::I32(x),
                     Err(why) => Val::Missing(why),
                 }
             } else {
-                Val::Missing(UNKNOWN)
+                Val::Missing(
+                    self.sections[&b][&start]
+                        .reasons
+                        .get(&w)
+                        .copied()
+                        .unwrap_or(UNKNOWN),
+                )
             };
             self.vals.insert(w, val);
         }

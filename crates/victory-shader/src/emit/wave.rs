@@ -125,6 +125,14 @@ pub(crate) enum Shape {
 pub(crate) struct Section {
     pub end: usize,
     pub shapes: HashMap<Value, Shape>,
+    /// The instruction that ended the simulation before the section ended
+    /// (a lane mask it does not follow), for the error a value read after
+    /// it gets.
+    pub ended: Option<&'static str>,
+    /// The instruction that last wrote each value the simulation left
+    /// without a shape, for the error a read of it gets: the name says what
+    /// kind of step is not modelled (a compare, a lane value, a select).
+    pub reasons: HashMap<Value, &'static str>,
 }
 
 /// Every whole-wave section of `block`, by start index.
@@ -162,8 +170,18 @@ pub(crate) fn sections(p: &Program, block: usize) -> HashMap<usize, Section> {
         let Some(end) = end else {
             break;
         };
-        let shapes = simulate(&insts[i + 1..end], wave, saved);
-        out.insert(i, Section { end, shapes });
+        let (shapes, ended) = simulate(&insts[i + 1..end], wave, saved);
+        // What wrote each value the simulation could not shape: the last
+        // such instruction is the one a reader has to teach it.
+        let mut reasons = HashMap::new();
+        for inst in &insts[i + 1..end] {
+            for &(_, w) in &inst.writes {
+                if !shapes.contains_key(&w) {
+                    reasons.insert(w, inst.name());
+                }
+            }
+        }
+        out.insert(i, Section { end, shapes, ended, reasons });
         i = end + 1;
     }
     out
@@ -312,7 +330,11 @@ fn half(op: Op, a: Sym, b: Option<Sym>, old: Sym) -> Sym {
     }
 }
 
-fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
+fn simulate(
+    insts: &[Inst],
+    wave: u32,
+    saved: Value,
+) -> (HashMap<Value, Shape>, Option<&'static str>) {
     let all = if wave == 64 {
         u64::MAX
     } else {
@@ -333,7 +355,7 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
                 .then(|| constant(inst))
                 .flatten();
             let Some(k) = lo else {
-                return shapes(vec, uni, wave);
+                return (shapes(vec, uni, wave), Some(name));
             };
             exec = (if name == "s_mov_b64" {
                 k
@@ -348,7 +370,7 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
                 .then(|| constant(inst))
                 .flatten()
             else {
-                return shapes(vec, uni, wave);
+                return (shapes(vec, uni, wave), Some(name));
             };
             exec = ((exec & 0xFFFF_FFFF) | ((k & 0xFFFF_FFFF) << 32)) & all;
             continue;
@@ -575,7 +597,7 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
             .collect();
         vec.insert(dst, merged);
     }
-    shapes(vec, uni, wave)
+    (shapes(vec, uni, wave), None)
 }
 
 fn constant(inst: &Inst) -> Option<u64> {
