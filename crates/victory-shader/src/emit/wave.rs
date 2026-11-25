@@ -333,6 +333,8 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> Found {
     let mut uni: HashMap<Value, Sym> = HashMap::new();
     // Masks the section derives from the saved EXEC (`s_and` with it).
     let mut masked = vec![saved];
+    // Scalars the section set to a constant, which `EXEC` may be set from.
+    let mut sconst: HashMap<Value, u64> = HashMap::new();
     for inst in insts {
         let name = inst.name();
         if inst.write(Reg::S(EXEC)).is_some() {
@@ -340,7 +342,7 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> Found {
             // the simulation can follow.
             let lo = name
                 .starts_with("s_mov_b")
-                .then(|| constant(inst))
+                .then(|| constant(inst, &sconst))
                 .flatten();
             let Some(k) = lo else {
                 return (shapes(vec.clone(), uni, wave), vec);
@@ -355,7 +357,7 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> Found {
         if inst.write(Reg::S(EXEC + 1)).is_some() {
             let Some(k) = name
                 .starts_with("s_mov_b")
-                .then(|| constant(inst))
+                .then(|| constant(inst, &sconst))
                 .flatten()
             else {
                 return (shapes(vec.clone(), uni, wave), vec);
@@ -371,6 +373,24 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> Found {
                 && let Some(&(_, w)) = inst.writes.iter().find(|w| matches!(w.0, Reg::S(_)))
             {
                 masked.push(w);
+            }
+            // A 32-bit copy of a constant keeps it (an inline constant or
+            // a scalar the section itself set to one); anything else drops
+            // what the scalar held. A 64-bit move is not tracked here: both
+            // halves are in `inst.writes` with the same constant, but only
+            // the low half holds it (review on #90).
+            for &(_, w) in &inst.writes {
+                let known = seeds_scalar_constant(name)
+                    .then(|| constant(inst, &sconst))
+                    .flatten();
+                match known {
+                    Some(k) => {
+                        sconst.insert(w, k);
+                    }
+                    None => {
+                        sconst.remove(&w);
+                    }
+                }
             }
             // A uniform copied, or two combined (the halves of a Wave64
             // reduction read with `v_readlane`).
@@ -687,11 +707,22 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> Found {
     (shapes(vec.clone(), uni, wave), vec)
 }
 
-fn constant(inst: &Inst) -> Option<u64> {
+/// Only a plain 32-bit move seeds the tracked scalar constants: a 64-bit
+/// move has two writes in `inst.writes` but carries one constant value, and
+/// only the low half holds it.
+fn seeds_scalar_constant(name: &str) -> bool {
+    name == "s_mov_b32"
+}
+
+fn constant(inst: &Inst, sconst: &HashMap<Value, u64>) -> Option<u64> {
     let Fields::Sop { src, .. } = &inst.fields else {
         return None;
     };
     match *src.first()? {
+        // A scalar the section itself set to a constant carries it on.
+        Operand::Scalar { code, .. } if code != NULL => {
+            inst.read(Reg::S(code)).and_then(|v| sconst.get(&v).copied())
+        }
         Operand::Const(c) => {
             let x = crate::resource::inline(c)?;
             Some(if (x as i32) < 0 {
@@ -930,6 +961,37 @@ mod tests {
             found[&0].shapes.get(&total),
             Some(&Shape::Active(Op::AddU, x, saved, 0))
         );
+    }
+
+    /// `EXEC` set from a scalar the section itself set to a constant: the
+    /// simulation follows it instead of stopping there, which is what a
+    /// section that masks itself with a computed all-ones needs.
+    #[test]
+    fn a_section_follows_exec_set_from_a_scalar_constant() {
+        let p = build(
+            &[
+                0xBE80_3DC1, // s_or_saveexec_b32 s0, -1 (every lane)
+                0xBE85_03C1, // s_mov_b32 s5, -1
+                0xBEFE_0305, // s_mov_b32 exec_lo, s5
+                0x7E04_0287, // v_mov_b32 v2, 7
+                0xBEFE_0300, // s_mov_b32 exec_lo, s0 (the section ends)
+                0xBF81_0000, // s_endpgm
+            ],
+            false,
+        );
+        let insts = &p.blocks[0].insts;
+        let v2_val = insts[3].write(Reg::V(2)).unwrap();
+        let sec = &sections(&p, 0)[&0];
+        assert_eq!(sec.shapes.get(&v2_val), Some(&Shape::K(7)));
+    }
+
+    /// Only plain 32-bit moves seed a tracked constant; a 64-bit move's
+    /// two writes would both get the full value.
+    #[test]
+    fn a_wide_move_does_not_seed_a_scalar_constant() {
+        assert!(seeds_scalar_constant("s_mov_b32"));
+        assert!(!seeds_scalar_constant("s_mov_b64"));
+        assert!(!seeds_scalar_constant("s_mov_b32_e64"));
     }
 
     fn build(words: &[u32], wave64: bool) -> Program {
