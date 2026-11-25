@@ -3077,6 +3077,14 @@ impl Meter {
                 crate::texture::ALIAS_COPIES.swap(0, Ordering::Relaxed) as f64 / report_frames,
                 crate::twin::COPIES.swap(0, Ordering::Relaxed) as f64 / report_frames,
             );
+            #[cfg(windows)]
+            {
+                let reuses = crate::shadow::REUSES.load(Ordering::Relaxed);
+                tracing::info!(
+                    "loose windows: {} covered by a wider one since start",
+                    reuses
+                );
+            }
             #[cfg(feature = "diagnostics")]
             {
                 if let Some([(local, budget), (system, system_budget)]) = video_memory() {
