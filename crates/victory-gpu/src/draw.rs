@@ -2015,6 +2015,7 @@ pub(crate) mod hdr_trace {
     use super::{HostList, This, UsedResource, View};
     use crate::descriptor::host::{HdrViewInfo, hdr_current};
     use crate::host::{host, transition};
+    use std::sync::atomic::AtomicU32;
     use std::sync::{Mutex, OnceLock};
     use windows::Win32::Graphics::Direct3D12::*;
     use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
@@ -2029,6 +2030,19 @@ pub(crate) mod hdr_trace {
 
     pub(crate) fn frame_is_selected(frame: u64) -> bool {
         enabled() && crate::capture::listed(frame)
+    }
+
+    /// Frames with a TiledLighting draw so far and, from
+    /// `VICTORY_HDR_TRACE_AFTER` (default 1), the one to flush without a
+    /// listed frame. This is the first frame where the real lit path
+    /// executes, not an offset that a slow world may never reach.
+    static TILED: AtomicU32 = AtomicU32::new(0);
+    static WITH_TILED: AtomicU32 = AtomicU32::new(0);
+    static NOTES: AtomicU32 = AtomicU32::new(0);
+
+    fn auto_after() -> u32 {
+        static AFTER: OnceLock<u32> = OnceLock::new();
+        *AFTER.get_or_init(|| std::env::var("VICTORY_HDR_TRACE_AFTER").ok().and_then(|v| v.parse().ok()).unwrap_or(1))
     }
 
     /// Recording is armed for the whole run: the title records a frame's
@@ -2059,6 +2073,10 @@ pub(crate) mod hdr_trace {
 
         fn graphics(self) -> bool {
             matches!(self, Self::Tiled | Self::TiledNoDir | Self::Composite | Self::CompositeNoise)
+        }
+
+        fn tiled(self) -> bool {
+            matches!(self, Self::Tiled | Self::TiledNoDir)
         }
 
         pub(super) fn slot(self, slot: u8, dwords: u32) -> bool {
@@ -2177,6 +2195,7 @@ pub(crate) mod hdr_trace {
         bindings: &[Binding], targets: &[Target]) -> Option<Event>
     {
         active_frame()?;
+        if program.tiled() { TILED.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
         let mut q = QUOTA.lock().unwrap_or_else(|e| e.into_inner());
         let seen = &mut q.seen[program as usize];
         if *seen != 0 { return None; }
@@ -2265,16 +2284,22 @@ pub(crate) mod hdr_trace {
 
     /// Lines kept for the frame now presenting; emitted only if it is the
     /// selected frame, and dropped either way.
-    pub(crate) fn flush(frame: u64) {
-        let selected = frame_is_selected(frame);
+    pub(crate) fn flush(frame: u64) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        let tiled = TILED.swap(0, Relaxed) > 0;
+        let listed = frame_is_selected(frame);
+        let auto = tiled && WITH_TILED.fetch_add(1, Relaxed) + 1 == auto_after();
+        let selected = listed || auto;
         let mut pending = PENDING.lock().unwrap_or_else(|e| e.into_inner());
         if selected {
+            if auto && !listed { NOTES.fetch_add(1, Relaxed); }
             for line in pending.iter() {
-                tracing::info!(target: "victory_gpu::hdr_trace", frame, "{line}");
+                tracing::info!(target: "victory_gpu::hdr_trace", frame, auto, listed, "{line}");
             }
         }
         pending.clear();
         *QUOTA.lock().unwrap_or_else(|e| e.into_inner()) = Quota { seen: [0; 7] };
+        selected
     }
 
     pub(crate) fn complete(list: &HostList, _frame: u64, submission: u64, ordinal: usize) {

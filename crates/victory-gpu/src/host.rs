@@ -2527,7 +2527,8 @@ impl Host {
             list.ResourceBarrier(&[transition(&back, back_state, D3D12_RESOURCE_STATE_PRESENT)]);
             p.copy.close();
             #[cfg(feature = "diagnostics")]
-            let hdr_fence = if crate::draw::hdr_trace::frame_is_selected(frame) { *submitted + 1 } else { 0 };
+            #[cfg(feature = "diagnostics")]
+            let hdr_fence = *submitted + 1;
             self.execute_locked(
                 &[&p.copy], submitted,
                 #[cfg(feature = "diagnostics")]
@@ -2540,8 +2541,8 @@ impl Host {
             let result = p.swap_chain.Present(0, DXGI_PRESENT(0));
             #[cfg(feature = "diagnostics")]
             {
-                crate::draw::hdr_trace::flush(frame);
-                if hdr_fence != 0 {
+                let traced_now = crate::draw::hdr_trace::flush(frame);
+                if traced_now {
                     tracing::info!(target: "victory_gpu::hdr_trace", frame, fence = hdr_fence,
                         source_host_texture = ?texture.as_raw(),
                         source_traced = ?crate::draw::hdr_trace::label(texture.as_raw() as usize),

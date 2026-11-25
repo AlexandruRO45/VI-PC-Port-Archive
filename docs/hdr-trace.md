@@ -4,7 +4,10 @@
 `victory-gpu`. It is compiled only with the `diagnostics` feature, reads its
 switches once at first use, and records nothing unless all of the following
 hold: `VICTORY_HDR_TRACE=1`, `VICTORY_CAPTURE_WORLD` is set, and
-`VICTORY_CAPTURE_LISTED_ONLY=1`. Recording is armed for the run (the title
+`VICTORY_CAPTURE_LISTED_ONLY=1`. A TiledLighting draw also flushes the kept
+lines and the Present line on its own: the first frame where that draw
+executes, or the `VICTORY_HDR_TRACE_AFTER`-th one (default 1), so a frame
+offset a slow world never reaches is not needed. Recording is armed for the run (the title
 records a frame's commands before presenting it, so filtering by the
 presented number misses them); the kept lines are emitted only at the
 selected world frame's Present and are discarded at every other Present.
@@ -46,11 +49,13 @@ $env:VICTORY_HDR_TRACE        = '1'
 $env:VICTORY_DEPTH_EQUAL_RELAX = '1'
 $env:VICTORY_CAPTURE          = 'D:\GTA 6\wt\victory-data\captures\hdr-<stamp>'
 $env:VICTORY_CAPTURE_LISTED_ONLY = '1'
-$env:VICTORY_CAPTURE_WORLD    = '2,20,120'
-# comma-separated offsets from the first world frame: one session can
-# compare an early and a settled frame; each selected Present flushes once
+$env:VICTORY_CAPTURE_WORLD    = '2'
+# optional; the TiledLighting trigger below does not need an offset
 $env:VICTORY_LOG              = 'info,victory_gpu::hdr_trace=info'
 ```
+
+`$env:VICTORY_HDR_TRACE_AFTER = '8'` flushes the 8th frame with a
+TiledLighting draw instead of the first (more settled), and is optional.
 
 Do not set `VICTORY_DUMP_TARGETS`, `VICTORY_DUMP_WRITERS`, `VICTORY_SHOW_TARGET`,
 `VICTORY_GPU_TIMING`, `VICTORY_D3D12_DRED` or `VICTORY_D3D12_DEBUG` for this
