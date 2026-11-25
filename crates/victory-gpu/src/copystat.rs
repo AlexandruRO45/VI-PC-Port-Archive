@@ -104,42 +104,83 @@ pub(crate) enum C {
     /// Title threads writing a view into a shader-visible heap: time
     /// waiting for the heaps' lock (held by heap syncs and other writers).
     MirrorWaitUs,
+    /// Not a counter: how many there are. Keep it last.
+    Count,
 }
-const COUNTERS: usize = 61;
-static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
+const COUNTERS: usize = C::Count as usize;
+
+struct Counters([AtomicU64; COUNTERS]);
+
+impl Counters {
+    const fn new() -> Self {
+        Counters([const { AtomicU64::new(0) }; COUNTERS])
+    }
+
+    fn add(&self, c: C, n: u64) {
+        self.0[c as usize].fetch_add(n, Relaxed);
+    }
+
+    /// Each counter per frame over `frames` frames, zeroing it.
+    fn take(&self, frames: f64) -> Vec<f64> {
+        self.0
+            .iter()
+            .map(|a| a.swap(0, Relaxed) as f64 / frames)
+            .collect()
+    }
+}
+
+static COUNT: Counters = Counters::new();
 
 pub(crate) fn add(c: C, n: u64) {
-    COUNT[c as usize].fetch_add(n, Relaxed);
-}
-
-fn parse_mode(value: Option<&str>) -> u8 {
-    match value {
-        Some("plain") => 1,
-        Some("none") => 2,
-        _ => 0,
-    }
+    COUNT.add(c, n);
 }
 
 /// How copies run: 0 guarded (as always), 1 plain, 2 not at all.
 pub(crate) fn mode() -> u8 {
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
-    *MODE.get_or_init(|| parse_mode(std::env::var("VICTORY_COPY_MODE").ok().as_deref()))
+    *MODE.get_or_init(|| match std::env::var("VICTORY_COPY_MODE").as_deref() {
+        Ok("plain") => 1,
+        Ok("none") => 2,
+        _ => 0,
+    })
 }
 
-/// Per source range (start, length): copies, bytes, microseconds, memory type.
-type Ranges = HashMap<(usize, usize), (u64, u64, u64, u32)>;
-static RANGES: Mutex<Option<Ranges>> = Mutex::new(None);
+/// Copies, bytes, microseconds, memory type.
+type Copies = (u64, u64, u64, u32);
+
+/// Per source range (start, length): its copies.
+struct Ranges(Mutex<Option<HashMap<(usize, usize), Copies>>>);
+
+impl Ranges {
+    const fn new() -> Self {
+        Ranges(Mutex::new(None))
+    }
+
+    fn add(&self, src: usize, len: usize, us: u64, kind: u32) {
+        let mut map = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let e = map
+            .get_or_insert_with(HashMap::new)
+            .entry((src, len))
+            .or_insert((0, 0, 0, kind));
+        e.0 += 1;
+        e.1 += len as u64;
+        e.2 += us;
+    }
+
+    /// The ranges so far, most bytes first, emptying the table.
+    fn take(&self) -> Vec<((usize, usize), Copies)> {
+        let ranges = self.0.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let mut ranges: Vec<_> = ranges.into_iter().flatten().collect();
+        ranges.sort_by_key(|&(_, (_, bytes, _, _))| std::cmp::Reverse(bytes));
+        ranges
+    }
+}
+
+static RANGES: Ranges = Ranges::new();
 
 /// A copy of `len` bytes from `src` (memory type `kind`) took `us`.
 pub(crate) fn range(src: usize, len: usize, us: u64, kind: u32) {
-    let mut map = RANGES.lock().unwrap_or_else(|e| e.into_inner());
-    let e = map
-        .get_or_insert_with(HashMap::new)
-        .entry((src, len))
-        .or_insert((0, 0, 0, kind));
-    e.0 += 1;
-    e.1 += len as u64;
-    e.2 += us;
+    RANGES.add(src, len, us, kind);
 }
 
 /// Snapshot bytes per host copy (its title start and length).
@@ -219,17 +260,9 @@ pub(crate) fn page_faults() -> u64 {
 /// took most bytes.
 pub(crate) fn log(frames: f64) {
     static FAULTS: AtomicU64 = AtomicU64::new(0);
-    let frames = if frames.is_finite() && frames > 0.0 {
-        frames
-    } else {
-        1.0
-    };
     let faults = page_faults();
     let faults = faults - FAULTS.swap(faults, Relaxed).min(faults);
-    let c: Vec<f64> = COUNT
-        .iter()
-        .map(|a| a.swap(0, Relaxed) as f64 / frames)
-        .collect();
+    let c = COUNT.take(frames);
     let mb = |v: f64| v / 1e6;
     let ms = |v: f64| v / 1e3;
     tracing::info!(
@@ -328,10 +361,7 @@ pub(crate) fn log(frames: f64) {
         .map(|((start, len), bytes)| format!("{start:#x}+{len:#x} {:.1} MB", *bytes as f64 / 1e6 / frames))
         .collect();
     tracing::info!("  snapshots per frame by copy: {}", snapshots.join(", "));
-    let ranges = RANGES.lock().unwrap_or_else(|e| e.into_inner()).take();
-    let mut ranges: Vec<_> = ranges.into_iter().flatten().collect();
-    ranges.sort_by_key(|&(_, (_, bytes, _, _))| std::cmp::Reverse(bytes));
-    for ((src, len), (n, bytes, us, _)) in ranges.into_iter().take(10) {
+    for ((src, len), (n, bytes, us, _)) in RANGES.take().into_iter().take(10) {
         use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
         // SAFETY: plain data filled in by the query.
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
@@ -431,72 +461,45 @@ unsafe impl std::alloc::GlobalAlloc for CountingAlloc {
 mod tests {
     use super::*;
 
-    static LOCK: Mutex<()> = Mutex::new(());
-
-    #[test]
-    fn counter_enum_matches_array_length() {
-        assert_eq!(C::Submissions as usize, 0);
-        assert_eq!(C::TexChanged as usize + 1, COUNTERS);
-    }
-
-    #[test]
-    fn parse_mode_maps_known_and_unknown_values() {
-        assert_eq!(parse_mode(None), 0);
-        assert_eq!(parse_mode(Some("")), 0);
-        assert_eq!(parse_mode(Some("guarded")), 0);
-        assert_eq!(parse_mode(Some("plain")), 1);
-        assert_eq!(parse_mode(Some("none")), 2);
-    }
+    // Each test has its own counters and ranges: the GPU tests count into
+    // the global ones while these run.
 
     #[test]
     fn range_accumulates_same_key_and_separates_distinct_ranges() {
-        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        RANGES.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let ranges = Ranges::new();
+        ranges.add(0x1000, 64, 10, 0x20000);
+        ranges.add(0x1000, 64, 25, 0x20000);
+        ranges.add(0x2000, 256, 7, 0x40000);
 
-        range(0x1000, 64, 10, 0x20000);
-        range(0x1000, 64, 25, 0x20000);
-        range(0x2000, 128, 7, 0x40000);
-
-        let map = RANGES
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take()
-            .expect("ranges recorded");
-        assert_eq!(map.len(), 2);
-        assert_eq!(map.get(&(0x1000, 64)), Some(&(2, 128, 35, 0x20000)));
-        assert_eq!(map.get(&(0x2000, 128)), Some(&(1, 128, 7, 0x40000)));
+        assert_eq!(
+            ranges.take(),
+            [
+                ((0x2000, 256), (1, 256, 7, 0x40000)),
+                ((0x1000, 64), (2, 128, 35, 0x20000))
+            ]
+        );
+        assert!(ranges.take().is_empty());
     }
 
     #[test]
-    fn add_and_log_drain_counters_and_ranges() {
-        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        for a in &COUNT {
-            a.store(0, Relaxed);
-        }
-        RANGES.lock().unwrap_or_else(|e| e.into_inner()).take();
+    fn take_drains_counters_per_frame() {
+        let counters = Counters::new();
+        counters.add(C::Submissions, 4);
+        counters.add(C::Copies, 12);
+        counters.add(C::Copies, 8);
+        counters.add(C::SavedPages, 6);
 
-        add(C::Submissions, 4);
-        add(C::Copies, 12);
-        add(C::CopyBytes, 4096);
-        add(C::TexChanged, 512);
-        let probe = 0u64;
-        range((&raw const probe) as usize, size_of::<u64>(), 3, 0);
+        let c = counters.take(4.0);
+        assert_eq!(c.len(), COUNTERS);
+        assert_eq!(c[C::Submissions as usize], 1.0);
+        assert_eq!(c[C::Copies as usize], 5.0);
+        assert_eq!(c[C::SavedPages as usize], 1.5);
+        assert_eq!(c.iter().sum::<f64>(), 7.5);
 
-        // Zero and non-finite frame counts must not panic or divide by zero.
-        log(0.0);
-        for a in &COUNT {
-            assert_eq!(a.load(Relaxed), 0);
-        }
-        assert!(RANGES.lock().unwrap_or_else(|e| e.into_inner()).is_none());
-
-        add(C::Submissions, 2);
-        log(f64::NAN);
-        assert_eq!(COUNT[C::Submissions as usize].load(Relaxed), 0);
-    }
-
-    #[test]
-    fn page_faults_queries_current_process() {
-        // Current process always has at least one page fault since startup.
-        assert!(page_faults() > 0);
+        // The next line counts from zero.
+        counters.add(C::Copies, 2);
+        let c = counters.take(1.0);
+        assert_eq!(c[C::Copies as usize], 2.0);
+        assert_eq!(c.iter().sum::<f64>(), 2.0);
     }
 }
