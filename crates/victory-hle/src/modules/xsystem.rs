@@ -270,7 +270,13 @@ mod device_type {
     pub(crate) fn module() -> HleModule {
         HleModule {
             name: "device type",
-            dlls: &["advapi32.dll", "api-ms-win-core-registry-*"],
+            dlls: &[
+                "advapi32.dll",
+                // The registry API set loads as kernelbase.dll on Windows, and
+                // the title may import or GetProcAddress it by that name.
+                "kernelbase.dll",
+                "api-ms-win-core-registry-*",
+            ],
             exports: vec![
                 hle_export!(RegOpenKeyW),
                 hle_export!(RegOpenKeyExW),
@@ -396,5 +402,34 @@ mod tests {
         assert_eq!(size_of::<AnalyticsInfo>(), 0x90);
         assert_eq!(info.os.build, 22000);
         assert_eq!(&info.form[..14], b"Xbox Series X\0");
+    }
+}
+#[cfg(test)]
+mod registry_tests {
+    use victory_pe::ImportSymbol;
+
+    /// The registry API set loads as `kernelbase.dll` on Windows: a title that
+    /// imports or reaches the registry calls by that name still gets the
+    /// ConsoleMode overrides (not the host's registry, which has no value).
+    #[test]
+    fn the_console_mode_lookups_are_reached_through_kernelbase() {
+        let resolver = crate::HleResolver::new(crate::HostPolicy::none());
+        let name = |n: &str| ImportSymbol::Name {
+            hint: 0,
+            name: n.into(),
+        };
+        for dll in [
+            "kernelbase.dll",
+            "advapi32.dll",
+            "api-ms-win-core-registry-l1-1-0.dll",
+        ] {
+            for symbol in ["RegOpenKeyExW", "RegQueryValueExW", "RegCloseKey"] {
+                assert_eq!(
+                    resolver.classify(dll, &name(symbol)),
+                    Some(victory_loader::Provenance::Hle),
+                    "{dll}!{symbol}"
+                );
+            }
+        }
     }
 }
