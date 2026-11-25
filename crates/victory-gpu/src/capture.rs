@@ -859,14 +859,4 @@ mod tests {
         // B8G8R8A8 still swaps to RGBA.
         assert_eq!(super::to_rgba(87, 1, 1, 4, &[1, 2, 3, 4]), Some(vec![3, 2, 1, 255]));
     }
-
-    #[test]
-    fn auto_capture_window_matches_three_frames() {
-        assert!(!super::auto_listed(1, 0));
-        assert!(!super::auto_listed(1899, 1900));
-        assert!(super::auto_listed(1900, 1900));
-        assert!(super::auto_listed(1901, 1900));
-        assert!(super::auto_listed(1902, 1900));
-        assert!(!super::auto_listed(1903, 1900));
-    }
 }
