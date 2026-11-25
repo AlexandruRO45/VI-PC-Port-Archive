@@ -119,7 +119,7 @@ impl HostHeap {
         // Every slot a shader can index (title slots, also past a capped
         // heap, and dynamic ones): shaders read the table as a root view,
         // which has no bounds, at indices clamped below `heap_views()`.
-        let views = victory_shader::emit::heap_views();
+        let views = crate::host::heap_views();
         let strides = (!sampler)
             .then(|| host.upload_buffer(u64::from(count.max(views)) * 4))
             .flatten()
@@ -511,7 +511,7 @@ impl HostHeap {
 
     fn write_stride(&self, index: u32, stride: u32) {
         let Some((_, data)) = &self.strides else { return };
-        if index >= self.count.max(victory_shader::emit::heap_views()) {
+        if index >= self.count.max(crate::host::heap_views()) {
             return;
         }
         // SAFETY: a dword of the mapped table, which has one per slot below
@@ -529,7 +529,7 @@ impl HostHeap {
     /// none for anything else.
     pub(crate) fn set_mark(&self, index: u32, entry: Option<(u32, u32)>) {
         let Some((_, data)) = &self.marks else { return };
-        if index >= self.count.max(victory_shader::emit::heap_views()) {
+        if index >= self.count.max(crate::host::heap_views()) {
             return;
         }
         let entry = entry.unwrap_or((victory_shader::emit::VIEW_MARK_NONE, 0));
@@ -2229,7 +2229,7 @@ mod tests {
     /// null buffer views, which stay below the clamped index.
     #[test]
     fn a_capped_view_heap_keeps_the_null_buffer_views() {
-        let views = victory_shader::emit::heap_views();
+        let views = crate::host::heap_views();
         let Some(heap) = HostHeap::new(false, views) else {
             return; // no host GPU
         };
@@ -2253,7 +2253,7 @@ mod tests {
     /// leave them to the null buffer views and the clamped index.
     #[test]
     fn a_range_ending_at_the_heap_end_keeps_the_null_buffer_views() {
-        let views = victory_shader::emit::heap_views();
+        let views = crate::host::heap_views();
         let null = victory_shader::emit::null_buffer_view();
         for dynamic in [DYNAMIC, MIN_DYNAMIC] {
             for short in 0..=3 {
@@ -2286,7 +2286,7 @@ mod tests {
         // `heap_views()`, `HEAP_SAMPLERS`).
         // SAFETY: plain queries of live heaps.
         unsafe {
-            assert!(heap.heap.GetDesc().NumDescriptors >= victory_shader::emit::heap_views());
+            assert!(heap.heap.GetDesc().NumDescriptors >= crate::host::heap_views());
             let samplers = HostHeap::new(true, 128).unwrap();
             assert!(samplers.heap.GetDesc().NumDescriptors >= victory_shader::emit::HEAP_SAMPLERS);
         }

@@ -158,12 +158,14 @@ fn hardware_adapter(factory: &IDXGIFactory4) -> windows::core::Result<IDXGIAdapt
 /// WARP pipeline compiles / dispatches crash with `0xC0000005` on Windows 11.
 static WARP_LOCK: Mutex<()> = Mutex::new(());
 
-/// Whether the adapter the host draws on makes a shader-visible view heap
-/// of `count` slots (NVIDIA refuses more than 1,000,000), for
-/// [`super::heap_views`]: the default adapter, or WARP with `warp` (the
-/// host's software device, whatever the default adapter caps). Without a
-/// device, yes: nothing runs the translation on a host then.
-pub(crate) fn takes_view_heap(count: u32, warp: bool) -> bool {
+/// Whether the test host's adapter makes a shader-visible view heap of
+/// `count` slots (NVIDIA refuses more than 1,000,000), for
+/// [`super::heap_views`] in the translator's own tests: the default
+/// adapter, or WARP with `VICTORY_WARP=1` (as [`Host::new`]). Without a
+/// device, yes: no test runs on a host then.
+#[cfg(test)]
+pub(crate) fn takes_view_heap(count: u32) -> bool {
+    let warp = std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1");
     // SAFETY: plain DXGI/device and heap creation with valid out pointers.
     unsafe {
         let mut device: Option<ID3D12Device> = None;

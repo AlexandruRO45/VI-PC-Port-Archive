@@ -41,35 +41,30 @@ static HEAP_VIEWS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
 
 /// View heap indices are clamped below this (`emit`, "Heap indices"): the
 /// host's view heaps are at least this large, the slots past their own
-/// null. [`HEAP_VIEWS_MAX`], or [`HEAP_VIEWS_PORTABLE`] where the default
-/// adapter refuses a heap that large (NVIDIA: an index past its heap
-/// faults the device). Fixed for the process at first use, before any
-/// translation; the value is part of the translation, so the shader cache
-/// must key on it (`victory-gpu`'s does).
+/// null. The host that runs the translations says what its adapter takes
+/// ([`set_heap_views`]: `victory-gpu`, [`HEAP_VIEWS_PORTABLE`] on NVIDIA,
+/// where an index past the heap faults the device); without one,
+/// [`HEAP_VIEWS_MAX`]. The translator itself opens no device for it (its
+/// own tests excepted: their test host's adapter, WARP with
+/// `VICTORY_WARP=1`). Fixed for the process at first use; the value is part
+/// of the translation, so the shader cache must key on it (`victory-gpu`'s
+/// does).
 pub fn heap_views() -> u32 {
     *HEAP_VIEWS.get_or_init(|| {
-        #[cfg(all(windows, any(test, feature = "host")))]
-        if !super::host::takes_view_heap(
-            HEAP_VIEWS_MAX,
-            HEAP_VIEWS_ON_WARP.load(std::sync::atomic::Ordering::Relaxed),
-        ) {
+        #[cfg(all(windows, test))]
+        if !super::host::takes_view_heap(HEAP_VIEWS_MAX) {
             return HEAP_VIEWS_PORTABLE;
         }
         HEAP_VIEWS_MAX
     })
 }
 
-static HEAP_VIEWS_ON_WARP: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-/// The host draws on WARP, not the default adapter: [`heap_views`] asks
-/// WARP what it takes. A capped default adapter (NVIDIA) would otherwise
-/// clamp indices below slots WARP's heap holds, and put the null buffer
-/// views among the title's. Before the first [`heap_views`]; returns
-/// whether some call was (one after it changes nothing).
-pub fn heap_views_on_warp() -> bool {
-    let told = HEAP_VIEWS_ON_WARP.swap(true, std::sync::atomic::Ordering::Relaxed);
-    told || HEAP_VIEWS.get().is_none()
+/// The host's view heaps take `views` slots ([`HEAP_VIEWS_PORTABLE`] or
+/// [`HEAP_VIEWS_MAX`]): [`heap_views`] from now on, before the first
+/// translation. Returns the size in effect, another one if [`heap_views`]
+/// was already fixed (a translation before this call).
+pub fn set_heap_views(views: u32) -> u32 {
+    *HEAP_VIEWS.get_or_init(|| views)
 }
 
 /// The heap index of the host's null raw buffer view (the null raw

@@ -64,15 +64,7 @@ fn build() -> &'static [u8; 32] {
                 "VICTORY_SHADER_LOOP_LIMIT: translated loops stop sooner"
             );
         }
-        // Before the size is fixed: a WARP host's, not the default adapter's.
-        crate::host::on_warp();
-        let views = victory_shader::emit::heap_views();
-        if views != victory_shader::emit::HEAP_VIEWS_MAX {
-            tracing::info!(
-                views,
-                "the host caps view heaps: shader heap indices clamped below it"
-            );
-        }
+        let views = crate::host::heap_views();
         key(victory_shader::SOURCE_HASH, ENCODING, limit, views)
     })
 }
@@ -96,6 +88,8 @@ pub fn host_shader(container: &[u8]) -> (Result<HostShader, String>, bool) {
     // (`crate::shadow::copy_back_marks`).
     let options = victory_shader::emit::Options { view_marks: true };
     let translate = |c: &[u8]| victory_shader::emit::translate_with(c, options).map_err(|e| e.to_string());
+    // The translator clamps heap indices below the host's view heap size.
+    crate::host::heap_views();
     match CACHE.get() {
         Some(cache) => cached(cache, build(), container, translate),
         None => (translate(container), false),
@@ -502,7 +496,7 @@ mod tests {
                 victory_shader::SOURCE_HASH,
                 ENCODING,
                 victory_shader::emit::loop_limit(),
-                victory_shader::emit::heap_views()
+                crate::host::heap_views()
             )
         );
         // The encoding part is this file as built.
