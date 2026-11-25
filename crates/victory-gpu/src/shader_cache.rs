@@ -27,6 +27,7 @@ static CACHE: OnceLock<Cache> = OnceLock::new();
 static HITS: AtomicU64 = AtomicU64::new(0);
 static MISSES: AtomicU64 = AtomicU64::new(0);
 static WAVE64_MODE: AtomicU8 = AtomicU8::new(0);
+static WAVE64_CAPS: AtomicU8 = AtomicU8::new(0);
 
 fn mode_byte(mode: Wave64Mode) -> u8 {
     match mode {
@@ -36,10 +37,17 @@ fn mode_byte(mode: Wave64Mode) -> u8 {
     }
 }
 
-/// Records the host device's preferred Wave64 compute lowering strategy.
+/// Records the host device's preferred Wave64 compute lowering strategy and
+/// supported hardware wave sizes.
 #[cfg(windows)]
-pub(crate) fn set_wave64_mode(mode: Wave64Mode) {
+pub(crate) fn set_wave64_mode(
+    mode: Wave64Mode,
+    supports_wave32: bool,
+    supports_wave64: bool,
+) {
     WAVE64_MODE.store(mode_byte(mode), Ordering::Relaxed);
+    let caps = u8::from(supports_wave32) | (u8::from(supports_wave64) << 1);
+    WAVE64_CAPS.store(caps, Ordering::Relaxed);
 }
 
 fn effective_wave64_mode() -> Wave64Mode {
@@ -119,7 +127,7 @@ pub fn host_shader(container: &[u8]) -> (Result<HostShader, String>, bool) {
     let wave64 = effective_wave64_mode();
     let translate = |c: &[u8]| {
         let mut first = None;
-        for &wave64 in lowerings(wave64) {
+        for wave64 in lowerings(wave64) {
             let options = victory_shader::emit::Options {
                 view_marks: true,
                 wave64,
@@ -145,12 +153,35 @@ pub fn host_shader(container: &[u8]) -> (Result<HostShader, String>, bool) {
 /// `v_readfirstlane` there), so a program one refuses tries the other, then
 /// the native lowering, whose `WaveSize(64)` a 32-lane host may still refuse
 /// when it makes the pipeline. The refusal kept is the one of `mode`.
-fn lowerings(mode: Wave64Mode) -> &'static [Wave64Mode] {
+fn lowerings(mode: Wave64Mode) -> Vec<Wave64Mode> {
+    let caps = WAVE64_CAPS.load(Ordering::Relaxed);
+    lowerings_for(mode, caps & 1 != 0, caps & 2 != 0)
+}
+
+fn lowerings_for(
+    mode: Wave64Mode,
+    supports_wave32: bool,
+    supports_wave64: bool,
+) -> Vec<Wave64Mode> {
+    let mut out = vec![mode];
     match mode {
-        Wave64Mode::Native => &[Wave64Mode::Native],
-        Wave64Mode::Wave32 => &[Wave64Mode::Wave32, Wave64Mode::Emulate, Wave64Mode::Native],
-        Wave64Mode::Emulate => &[Wave64Mode::Emulate, Wave64Mode::Wave32, Wave64Mode::Native],
+        Wave64Mode::Native => {}
+        Wave64Mode::Wave32 => {
+            out.push(Wave64Mode::Emulate);
+            if supports_wave64 {
+                out.push(Wave64Mode::Native);
+            }
+        }
+        Wave64Mode::Emulate => {
+            if supports_wave32 {
+                out.push(Wave64Mode::Wave32);
+            }
+            if supports_wave64 {
+                out.push(Wave64Mode::Native);
+            }
+        }
     }
+    out
 }
 
 /// The cache entry's converter: the build, the lowering mode and the
@@ -599,10 +630,15 @@ mod tests {
     }
 
     #[test]
-    fn a_lowering_refused_tries_the_other_emulation_then_native() {
+    fn a_lowering_refused_tries_supported_fallbacks() {
         use Wave64Mode::{Emulate, Native, Wave32};
-        assert_eq!(lowerings(Native), [Native]);
-        assert_eq!(lowerings(Wave32), [Wave32, Emulate, Native]);
-        assert_eq!(lowerings(Emulate), [Emulate, Wave32, Native]);
+        // 64-lane host (with Wave32 also supported, e.g. RDNA)
+        assert_eq!(lowerings_for(Native, true, true), [Native]);
+        assert_eq!(lowerings_for(Emulate, true, true), [Emulate, Wave32, Native]);
+        // 32-lane host (NVIDIA RTX): never fall back to Native Wave64
+        assert_eq!(lowerings_for(Wave32, true, false), [Wave32, Emulate]);
+        assert_eq!(lowerings_for(Emulate, true, false), [Emulate, Wave32]);
+        // 16-lane or WARP host: never fall back to Wave32 or Native Wave64
+        assert_eq!(lowerings_for(Emulate, false, false), [Emulate]);
     }
 }

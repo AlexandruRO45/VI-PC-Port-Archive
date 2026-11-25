@@ -6790,27 +6790,7 @@ impl<'a> Lower<'a> {
                 }
                 self.s.flags |= flags::WAVE_OPS;
                 let r = if let Some(g) = guard {
-                    let i32t = self.s.t.i32;
-                    let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
-                    let ballot = self
-                        .s
-                        .op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[g]);
-                    let lo = self.s.m.extract(c, ballot, 0);
-                    let hi = self.s.m.extract(c, ballot, 1);
-                    let k0 = self.s.m.i32(0);
-                    let k32 = self.s.m.i32(32);
-                    let bit_lo = self
-                        .s
-                        .op(c, "unaryBits.i32", Attr::ReadNone, i32t, 32, &[lo]);
-                    let bit_hi = self
-                        .s
-                        .op(c, "unaryBits.i32", Attr::ReadNone, i32t, 32, &[hi]);
-                    let hi_idx = self.s.m.bin(c, Bin::Add, bit_hi, k32);
-                    let has_hi = self.s.m.cmp(c, pred::NE, hi, k0);
-                    let idx = self.s.m.select(c, has_hi, hi_idx, k0);
-                    let has_lo = self.s.m.cmp(c, pred::NE, lo, k0);
-                    let idx = self.s.m.select(c, has_lo, bit_lo, idx);
-                    self.read_lane(a, idx)
+                    self.host_wave_readfirstlane(a, g)
                 } else {
                     self.s.op(
                         c,
