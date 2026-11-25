@@ -835,3 +835,429 @@ fn intersections_on_nodes_in_title_memory_equal_the_reference() {
     run_cases(false, 4, true);
     run_cases(true, 4, true);
 }
+
+/// Like [`program`], with the BVH descriptor built from a separate root
+/// descriptor `s[4:5]` plus `base_offset` (`s_add_u32` / `s_addc_u32`, then
+/// `s_lshr_b64 ..., 8`); when `mask_odd` is set, only odd lanes run the
+/// intersection while even lanes keep pre-loaded sentinel dwords in `v[20:23]`.
+fn root_bvh_program(wide: bool, base_offset: u32, mask_odd: bool) -> Vec<u32> {
+    let global_load_x4 =
+        |vdst: u32, offset: u32| [0x37 << 26 | 0x0E << 18 | 2 << 14 | offset, 1 | vdst << 24];
+    let mut w = vec![
+        s_mov(3, 0x80),
+        // s_load_dwordx4 s[8:11], s[2:3], 0
+        0x3D << 26 | 0x02 << 18 | 8 << 6 | 2 >> 1,
+        125 << 25,
+        // v_lshlrev_b32 v1, 6, v0
+        0x1A << 25 | 1 << 17 | 256 << 9 | (128 + 6),
+    ];
+    for (k, v) in [2, 6, 10].into_iter().enumerate() {
+        w.extend(global_load_x4(v, 16 * k as u32));
+    }
+    w.extend([
+        sop2(0x00, 6, 4, LITERAL), // s_add_u32 s6, s4, base_offset
+        base_offset,
+        sop2(0x04, 7, 5, 128),       // s_addc_u32 s7, s5, 0
+        sop2(0x21, 12, 6, 128 + 8),  // s_lshr_b64 s[12:13], s[6:7], 8
+        sop2(0x10, 13, 13, LITERAL), // s_or_b32 s13, s13, 0x80000000
+        0x8000_0000,
+        s_mov(14, 193), // -1
+        s_mov(15, LITERAL),
+        8 << 28 | 1 << 24 | 1 << 27 | 0x3FF,
+    ]);
+    if mask_odd {
+        for k in 0..4u32 {
+            // v_mov_b32 v(20 + k), 0xDEAD_0000 + k
+            w.extend([
+                0x7E00_0000 | (20 + k) << 17 | 1 << 9 | u32::from(LITERAL),
+                0xDEAD_0000 + k,
+            ]);
+        }
+        w.extend([
+            0x1B << 25 | 14 << 17 | (128 + 1), // v_and_b32 v14, 1, v0
+            0x7C00_0000 | 0xC2 << 17 | 14 << 9 | (128 + 1), // v_cmp_eq_u32 vcc_lo, 1, v14
+            0xBE94_3C6A,                       // s_and_saveexec_b32 s20, vcc_lo
+        ]);
+    }
+    let rest = 20 << 8 | (12 >> 2) << 16;
+    if wide {
+        let regs = [2u32, 13, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+        w.extend([0xF19C_9F07, rest | regs[0]]);
+        for k in 0..3 {
+            let reg = |j: usize| regs.get(1 + 4 * k + j).map_or(0, |r| r << (8 * j));
+            w.push((0..4).map(reg).fold(0, |a, b| a | b));
+        }
+    } else {
+        w.extend([0xF198_9F01, rest | 2]);
+    }
+    if mask_odd {
+        w.push(0xBEFE_0314); // s_mov_b32 exec_lo, s20
+    }
+    w.extend([
+        0x1A << 25 | 1 << 17 | 256 << 9 | (128 + 4),
+        0x38 << 26 | 0x1E << 18 | 1 << 12,
+        0x80 << 24 | (8 >> 2) << 16 | 20 << 8 | 1,
+        0xBF81_0000,
+    ]);
+    w
+}
+
+fn build_root_bvh(
+    wide: bool,
+    base_offset: u32,
+    bvh_kind: ResourceType,
+    mask_odd: bool,
+) -> Result<HostShader, crate::ShaderError> {
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 32,
+        layout: vec![
+            RootParam {
+                root: RootType::Descriptor,
+                table_offset_dwords: 0,
+                sgprs: 2,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            },
+            RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 2,
+                slot: 1,
+            },
+            RootParam {
+                root: RootType::Descriptor,
+                table_offset_dwords: 0,
+                sgprs: 2,
+                base_register: 0,
+                user_data: 4,
+                slot: 2,
+            },
+        ],
+        used: vec![
+            UsedResource {
+                kind: ResourceType::Srv,
+                root: RootType::Descriptor,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 0,
+                slot: 0,
+            },
+            UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 2,
+                slot: 1,
+            },
+            UsedResource {
+                kind: bvh_kind,
+                root: RootType::Descriptor,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 4,
+                slot: 2,
+            },
+        ],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 6 << 1,
+            threads: [256, 1, 1],
+        }),
+        code: root_bvh_program(wide, base_offset, mask_odd)
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect(),
+    };
+    let p = ir::build(&native.code, native.wave64, native.vgprs)?;
+    let st = structure::structure(&p)?;
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
+    assert!(
+        res.descriptors.iter().any(|d| matches!(
+            d.source,
+            resource::Source::Built { address, .. }
+                if address.param == 2 && address.offset == base_offset
+        )),
+        "BVH descriptor was not traced to root parameter 2"
+    );
+    let io = io::raise(&p, &native)?;
+    let lowered = lower::lower(&lower::Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+        view_marks: false,
+    })?;
+    let shader = HostShader {
+        stage: HwStage::Cs,
+        dxil: lowered.dxil,
+        user_data: lowered.user_data,
+        samplers: lowered.samplers,
+        static_samplers: Vec::new(),
+        root_cbvs: lowered.root_cbvs,
+        root_srvs: lowered.root_srvs,
+        root_uavs: lowered.root_uavs,
+        memory: lowered.memory,
+        memory_writes: lowered.memory_writes,
+        view_addresses: lowered.view_addresses,
+        heap: lowered.heap,
+        heap_writes: lowered.heap_writes,
+        view_marks: lowered.view_marks,
+    };
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut shader.dxil.clone())
+            .expect("DXIL validation failed");
+    }
+    Ok(shader)
+}
+
+#[test]
+fn root_srv_bvh_handles_high_pointer_bits_and_unaligned_bases() {
+    // (wide, bvh_root, base_offset, expected 48-bit aligned descriptor base).
+    // 1. 32-bit pointer with bits 29..31 set (20 GiB node offset), plus a
+    //    root_lo + base_offset carry across 4 GiB and a non-zero low byte.
+    // 2. 64-bit pointer with non-zero node_hi (>68 GiB node offset), plus a
+    //    base carry past bit 48 and a non-zero low byte dropped by `>> 8`.
+    let configs = [
+        (
+            false,
+            0x0000_000C_644F_F0AB_u64,
+            0xD000_1000_u32,
+            0x0000_000D_3450_0000_u64,
+        ),
+        (
+            true,
+            0x0000_FFFF_FFFF_F0CD_u64,
+            0x0000_2000_u32,
+            0x0000_0000_0000_1000_u64,
+        ),
+    ];
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (wide, bvh_root, base_offset, aligned_base) in configs {
+        let shader = build_root_bvh(wide, base_offset, ResourceType::Srv, false).expect("lower");
+        let mut rng = Rng(if wide { 901 } else { 900 });
+        let cases: Vec<(Vec<u32>, u32, Ray)> = (0..LANES).map(|_| case(&mut rng)).collect();
+        let nodes = (LANES * 64) as u32;
+        let mut data = vec![0u32; LANES * 16 + LANES * 32];
+        for (n, (w, ty, ray)) in cases.iter().enumerate() {
+            let target = TITLE + u64::from(nodes + 128 * n as u32);
+            let ptr = (target - aligned_base) >> 3;
+            if !wide {
+                assert_eq!(ptr >> 32, 0);
+                assert_ne!(ptr as u32 & 0xE000_0000, 0);
+            } else {
+                assert_ne!(ptr >> 32, 0);
+            }
+            let r = &mut data[16 * n..16 * n + 12];
+            r[0] = (ptr as u32) | ty;
+            r[1] = ray.extent.to_bits();
+            for k in 0..3 {
+                r[2 + k] = ray.origin[k].to_bits();
+                r[5 + k] = ray.dir[k].to_bits();
+                r[8 + k] = ray.inv[k].to_bits();
+            }
+            r[11] = (ptr >> 32) as u32;
+            let at = LANES * 16 + 32 * n;
+            data[at..at + 28].copy_from_slice(w);
+        }
+        for (label, warp) in [("hardware", false), ("warp", true)] {
+            let Ok(host) = Host::new(warp) else {
+                continue;
+            };
+            let (root, pso) = host
+                .compute_pipeline(&shader)
+                .unwrap_or_else(|e| panic!("{label} (wide={wide}): compute_pipeline failed: {e}"));
+            let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+            for u in &shader.user_data {
+                ud[u.index as usize] = match (u.root, u.slot) {
+                    (RootType::Descriptor, 0) => (TITLE >> (32 * u.dword)) as u32,
+                    (RootType::Table, 1) => 0,
+                    (RootType::Descriptor, 2) => (bvh_root >> (32 * u.dword)) as u32,
+                    _ => panic!("{u:?}"),
+                };
+            }
+            let roots = vec![
+                (0, Root::Constants(ud)),
+                (
+                    1,
+                    Root::View {
+                        srv: true,
+                        data: page_table(1, 3),
+                    },
+                ),
+                (2, Root::Uav(2 * 4096 / 32)),
+            ];
+            let views = [
+                View::RawUav((LANES * 4) as u32),
+                View::Memory(&data),
+                View::Pair,
+                View::NullPair,
+                View::Pair,
+            ];
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots,
+                        views: &views,
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{label} (wide={wide}): dispatch failed: {e}"));
+            for (n, (w, ty, ray)) in cases.iter().enumerate() {
+                let want = intersect(w, *ty, ray);
+                let got = &out[0][4 * n..4 * n + 4];
+                assert_eq!(got, want, "{label} (wide={wide}): lane {n}, type {ty}");
+            }
+            ran += 1;
+        }
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
+
+#[test]
+fn masked_lanes_and_page_end_nodes_leave_no_stray_marks() {
+    let shader = build_root_bvh(false, 0, ResourceType::Srv, true).expect("lower");
+    let mut rng = Rng(902);
+    let mut cases: Vec<(Vec<u32>, u32, Ray)> = (0..LANES).map(|_| case(&mut rng)).collect();
+    // Place a 64-byte node in the last 64 bytes of the mapped 64 KiB page
+    // (0xFFC0..0x10000, followed by an unmapped page).
+    while cases[1].1 == 5 {
+        cases[1] = case(&mut rng);
+    }
+    let nodes = (LANES * 64) as u32;
+    let mut data = vec![0u32; 65536 / 4];
+    let tail_slot = 0xFFC0u32;
+    data[(tail_slot / 4) as usize..(tail_slot / 4) as usize + 16]
+        .copy_from_slice(&cases[1].0[..16]);
+    for (n, (w, ty, ray)) in cases.iter().enumerate() {
+        if n % 2 == 0 {
+            // Inactive even lanes (including lane 0 of every wave) hold an
+            // unmapped box32 pointer: they neither fault nor mark a page miss.
+            data[16 * n] = 0x7FFF_FFF5;
+            continue;
+        }
+        let byte_off = if n == 1 {
+            tail_slot
+        } else {
+            let off = nodes + 128 * n as u32;
+            let at = (off / 4) as usize;
+            data[at..at + 28].copy_from_slice(w);
+            off
+        };
+        let r = &mut data[16 * n..16 * n + 12];
+        r[0] = (byte_off >> 3) | ty;
+        r[1] = ray.extent.to_bits();
+        for k in 0..3 {
+            r[2 + k] = ray.origin[k].to_bits();
+            r[5 + k] = ray.dir[k].to_bits();
+            r[8 + k] = ray.inv[k].to_bits();
+        }
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            continue;
+        };
+        let (root, pso) = host
+            .compute_pipeline(&shader)
+            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        for u in &shader.user_data {
+            ud[u.index as usize] = match (u.root, u.slot) {
+                (RootType::Descriptor, 0 | 2) => (TITLE >> (32 * u.dword)) as u32,
+                (RootType::Table, 1) => 0,
+                _ => panic!("{u:?}"),
+            };
+        }
+        let roots = vec![
+            (0, Root::Constants(ud)),
+            (
+                1,
+                Root::View {
+                    srv: true,
+                    data: page_table(1, 3),
+                },
+            ),
+            (2, Root::Uav(2 * 4096 / 32)),
+        ];
+        let views = [
+            View::RawUav((LANES * 4) as u32),
+            View::Memory(&data),
+            View::Pair,
+            View::NullPair,
+            View::Pair,
+        ];
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots,
+                    views: &views,
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+        for (n, (w, ty, ray)) in cases.iter().enumerate() {
+            let got = &out[0][4 * n..4 * n + 4];
+            if n % 2 == 0 {
+                assert_eq!(
+                    got,
+                    [0xDEAD_0000, 0xDEAD_0001, 0xDEAD_0002, 0xDEAD_0003],
+                    "{label}: inactive lane {n}"
+                );
+            } else {
+                let want = intersect(w, *ty, ray);
+                assert_eq!(got, want, "{label}: active lane {n}, type {ty}");
+            }
+        }
+        assert!(
+            out[2].iter().all(|&w| w == 0),
+            "{label}: stray page-miss bits marked"
+        );
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
+
+#[test]
+fn sixty_four_bit_bvh_pointer_in_non_address_built_view_is_refused() {
+    let Err(err) = build_root_bvh(true, 0, ResourceType::Cbv, false) else {
+        panic!("64-bit BVH pointer against a non-address built view must fail");
+    };
+    assert!(
+        matches!(
+            err,
+            crate::ShaderError::Unsupported {
+                what: "a 64-bit BVH pointer in a buffer view",
+                ..
+            }
+        ),
+        "unexpected error: {err:?}"
+    );
+}
