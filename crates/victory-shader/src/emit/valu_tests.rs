@@ -1677,6 +1677,85 @@ fn packed_fmac_accumulates_each_half() {
     );
 }
 
+#[test]
+fn mul_hi_matches_rdna2_without_int64() {
+    const VALUES: [u32; 12] = [
+        0,
+        1,
+        2,
+        0xFFFF,
+        0x1_0000,
+        0x007F_FFFF,
+        0x0080_0000,
+        0x00FF_FFFF,
+        0x7FFF_FFFF,
+        0x8000_0000,
+        0xFFFF_0001,
+        0xFFFF_FFFF,
+    ];
+    let mut inputs = Vec::with_capacity(VALUES.len() * VALUES.len());
+    for a in VALUES {
+        for b in VALUES {
+            inputs.push([a, b, 0, 0]);
+        }
+    }
+    let check_sfi0 = |shader: &HostShader, label: &str| {
+        let container = crate::Container::parse(&shader.dxil).expect("DXBC container");
+        let features = container.part(crate::FourCC::SFI0).expect("SFI0 part");
+        let flags = u64::from_le_bytes(features.data.try_into().expect("u64 SFI0"));
+        assert_eq!(flags & 0x8000, 0, "{label} must not set SFI0 INT64");
+    };
+    type Eval = fn(u32, u32) -> u32;
+    let cases: [(&str, Vec<u32>, Eval); 6] = [
+        (
+            "v_mul_hi_u32",
+            vop3(0x16A, 0, vgpr(1), vgpr(2), 0).to_vec(),
+            |a, b| ((u64::from(a) * u64::from(b)) >> 32) as u32,
+        ),
+        (
+            "v_mul_hi_i32",
+            vop3(0x16C, 0, vgpr(1), vgpr(2), 0).to_vec(),
+            |a, b| ((i64::from(a as i32) * i64::from(b as i32)) >> 32) as u32,
+        ),
+        (
+            "s_mul_hi_u32",
+            vec![sop2(0x35, 16, 0, 1), vop1(0x001, 0, sgpr(16))],
+            |a, b| ((u64::from(a) * u64::from(b)) >> 32) as u32,
+        ),
+        (
+            "s_mul_hi_i32",
+            vec![sop2(0x36, 16, 0, 1), vop1(0x001, 0, sgpr(16))],
+            |a, b| ((i64::from(a as i32) * i64::from(b as i32)) >> 32) as u32,
+        ),
+        (
+            "v_mul_hi_u32_u24",
+            vec![0x0C << 25 | 2 << 9 | vgpr(1) as u32],
+            |a, b| ((u64::from(a & 0x00FF_FFFF) * u64::from(b & 0x00FF_FFFF)) >> 32) as u32,
+        ),
+        (
+            "v_mul_hi_i32_i24",
+            vec![0x0A << 25 | 2 << 9 | vgpr(1) as u32],
+            |a, b| {
+                let ia = i64::from(((a << 8) as i32) >> 8);
+                let ib = i64::from(((b << 8) as i32) >> 8);
+                ((ia * ib) >> 32) as u32
+            },
+        ),
+    ];
+    for (name, body, eval) in cases {
+        let shader = build_valu_cs(&body);
+        check_sfi0(&shader, name);
+        run_cases(&shader, &inputs, |backend, _, inp, got| {
+            let want = eval(inp[0], inp[1]);
+            assert_eq!(
+                got, want,
+                "{backend}: {name}({:#010x}, {:#010x}) = {got:#010x}, want {want:#010x}",
+                inp[0], inp[1]
+            );
+        });
+    }
+}
+
 /// `src_scc` reads SCC as 0 or 1, in scalar and vector instructions.
 #[test]
 fn src_scc_reads_as_zero_or_one() {
