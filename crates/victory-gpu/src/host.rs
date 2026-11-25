@@ -888,6 +888,7 @@ fn record_transitions(list: &ID3D12GraphicsCommandList, transitions: &[PreludeTr
 }
 
 struct PlannedPrelude {
+    gpu_detiles: Vec<std::sync::Arc<crate::texture::Staging>>,
     commands: Prelude,
     to_copy: Vec<PreludeTransition>,
     syncs: Vec<(std::sync::Arc<crate::resource::HostTexture>, std::sync::Arc<crate::resource::Twin>, bool)>,
@@ -907,6 +908,9 @@ impl PlannedPrelude {
                     record_twin_copy(&list, &depth.texture, twin, *colour);
                 }
                 record_transitions(&list, &self.barriers);
+                for staging in &self.gpu_detiles {
+                    staging.record_gpu_detile(&list);
+                }
                 list.Close()
             })
         };
@@ -1783,6 +1787,7 @@ enum Step {
 /// the upload buffers its GPU commands read, kept until the list is reset.
 #[derive(Default)]
 struct Deferred {
+    gpu_detiles: Vec<std::sync::Arc<crate::texture::Staging>>,
     /// Destination, source, bytes.
     copies: Vec<Step>,
     /// First of the contiguous fills at the end of `copies`.
@@ -5499,12 +5504,13 @@ impl HostList {
             (real != *first)
                 .then(|| PreludeTransition(copy.texture.clone(), real, *first))
         }));
-        if barriers.is_empty() && syncs.is_empty() {
+        let gpu_detiles = self.deferred().gpu_detiles.clone();
+        if barriers.is_empty() && syncs.is_empty() && gpu_detiles.is_empty() {
             return None;
         }
         let commands = self.prelude.get_or_init(|| host().and_then(|h| h.make_prelude()))
             .as_ref().unwrap_or_else(|| fail(format_args!("no host list for a state prelude")));
-        Some(PlannedPrelude { commands: commands.clone(), to_copy, syncs, barriers })
+        Some(PlannedPrelude { commands: commands.clone(), to_copy, syncs, barriers, gpu_detiles })
     }
 
     /// Notes what the command about to be recorded does, as a marker
@@ -5826,6 +5832,10 @@ impl HostList {
 
     /// Brings a texture's staging buffer up to date when the list is
     /// submitted, keeping it alive until the list is reset.
+    pub(crate) fn defer_gpu_detile(&self, staging: std::sync::Arc<crate::texture::Staging>) {
+        self.deferred().gpu_detiles.push(staging);
+    }
+
     pub(crate) fn defer_texture(&self, staging: std::sync::Arc<crate::texture::Staging>) {
         self.deferred().copies.push(Step::Texture(staging));
     }
