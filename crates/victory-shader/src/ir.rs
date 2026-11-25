@@ -1119,7 +1119,10 @@ mod tests {
 
     // The old reachability-intersection search is retained as a small-graph
     // oracle only. Production code never calls it.
-    fn reference_multi_entry_loop(blocks: &[Block], inside: &[bool]) -> Option<(Vec<bool>, Vec<usize>)> {
+    fn reference_multi_entry_loop(
+        blocks: &[Block],
+        inside: &[bool],
+    ) -> Option<(Vec<bool>, Vec<usize>)> {
         let reach = |from: usize, forward: bool| {
             let mut seen = vec![false; blocks.len()];
             let mut stack = vec![from];
