@@ -1790,13 +1790,20 @@ fn sparse_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
         let wine = on_wine_host();
-        let on = match std::env::var_os("VICTORY_SPARSE") {
-            None => !wine,
-            Some(v) => v != "0",
-        };
+        let on = sparse_policy(std::env::var_os("VICTORY_SPARSE").as_deref(), wine);
         tracing::info!(on, wine, "copies of title memory in sparse buffers");
         on
     })
+}
+
+/// [`sparse_on`]'s choice from `VICTORY_SPARSE` and whether we run under
+/// Wine: unset, sparse copies everywhere but under Wine; set, `0` is off and
+/// any other value on.
+fn sparse_policy(switch: Option<&std::ffi::OsStr>, wine: bool) -> bool {
+    match switch {
+        None => !wine,
+        Some(v) => v != "0",
+    }
 }
 
 /// Whether we run under Wine (its ntdll exports `wine_get_version`), as
@@ -2497,6 +2504,19 @@ pub(crate) fn near(va: u64) -> String {
 mod tests {
     use super::*;
     use std::ops::Range;
+
+    #[test]
+    fn sparse_copies_are_off_under_wine_unless_asked_for() {
+        use std::ffi::OsStr;
+        // Unset: on natively, off under Wine.
+        assert!(sparse_policy(None, false));
+        assert!(!sparse_policy(None, true));
+        // Set: the switch decides on both hosts.
+        for wine in [false, true] {
+            assert!(!sparse_policy(Some(OsStr::new("0")), wine));
+            assert!(sparse_policy(Some(OsStr::new("1")), wine));
+        }
+    }
 
     #[test]
     fn partial_match_leaves_unchecked_bytes_visible() {
