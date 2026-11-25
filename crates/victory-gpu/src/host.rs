@@ -1356,18 +1356,9 @@ impl Host {
                 }
             }
         }
-        // A range overlapping a withheld one of the same copy is withheld
-        // too: its copy-back would take the other's bytes along (pages a
-        // program using title memory and another both wrote).
-        let held: Vec<(usize, usize, usize)> = back
-            .iter()
-            .filter(|b| !b.3)
-            .map(|(s, a, n, _)| (std::sync::Arc::as_ptr(s) as usize, *a, *n))
-            .collect();
-        for b in back.iter_mut().filter(|b| b.3) {
-            let copy = std::sync::Arc::as_ptr(&b.0) as usize;
-            b.3 = !held.iter().any(|&(c, a, n)| c == copy && a < b.1 + b.2 && b.1 < a + n);
-        }
+        // A range overlapping a withheld one of the same copy still goes
+        // back: its copy-back excludes the withheld bytes
+        // (`Shadow::copy_back_or_not`), so the other's bytes stay out.
         // Pages shaders marked first: the copy-backs below end what the
         // copies keep for them.
         let withheld: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = back
@@ -3954,8 +3945,7 @@ mod withholding {
     /// copies at once; what an ordinary program wrote in the same list goes
     /// back and stays in its copy (run light13: the imposter transforms in
     /// the BVH builder's list); an ordinary range overlapping a withheld one
-    /// is withheld with it, since its copy-back would take the other's bytes
-    /// along.
+    /// goes back without the withheld bytes, which its copy-back excludes.
     #[test]
     fn only_programs_using_title_memory_are_withheld() {
         use crate::watch::PAGE;
@@ -3991,7 +3981,7 @@ mod withholding {
         };
         assert_eq!((title(0, 0), copy(0, 0)), (0x22, 0x22), "an ordinary program's write goes back and stays");
         assert_eq!((title(1, 16), copy(1, 16)), (0x11, 0x11), "withheld, then dropped from the copy");
-        assert_eq!((title(1, 0), copy(1, 0)), (0, 0), "overlapping a withheld range: withheld with it");
+        assert_eq!((title(1, 0), copy(1, 0)), (0x44, 0x44), "overlapping a withheld range: the rest goes back");
         for (&p, copy) in pools.iter().zip(copies) {
             crate::shadow::unregister(p, p as u64);
             drop(copy);
