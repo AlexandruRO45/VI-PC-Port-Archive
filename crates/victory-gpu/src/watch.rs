@@ -717,8 +717,10 @@ pub fn writing(at: usize, len: usize) -> Writing {
 pub fn title_memory_remapped(at: usize, len: usize) {
     let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
     let mut g = guards();
-    // What it showed is gone already: nothing to keep.
-    changed(&mut g, first, last, false);
+    // What it showed is gone already: nothing to keep. Only these pages: a
+    // mapping that still shows the same physical pages shows what it did, and
+    // its tracker (armed for a marked write, say) keeps it (#2414).
+    changed_here(&mut g, first, last, false);
     // What it showed is not what it shows now: its links go, both ways.
     let stale: Vec<usize> = g.alias_of.range(first..last).map(|(&p, _)| p).collect();
     for page in stale {
@@ -1221,5 +1223,32 @@ pub(crate) mod tests {
         let top = usize::MAX - 16;
         drop(writing(top, PAGE));
         title_memory_remapped(top, usize::MAX);
+    }
+
+    /// A page the runtime remaps stops being current where it was mapped, but
+    /// a mapping that still shows the same physical page does not (#2414): its
+    /// tracker keeps what it had, so a marked copy-back there is not dropped
+    /// with "changed, nothing saved".
+    #[test]
+    fn remapping_one_mapping_leaves_the_other_unchanged() {
+        let a = pool(1);
+        let b = pool(1);
+        let Some(tracked) = track(a, PAGE, true) else {
+            free(a);
+            free(b);
+            return;
+        };
+        // Taken by a refresh, then armed for a marked write.
+        tracked.taken(&[a / PAGE]);
+        tracked.arm(a, a + PAGE);
+        // `b` shows the same physical page; the runtime remaps it.
+        title_memory_aliased(a, &[b]);
+        title_memory_remapped(b, PAGE);
+        assert!(
+            !tracked.changed(a / PAGE),
+            "the other mapping still shows what it did"
+        );
+        free(a);
+        free(b);
     }
 }
