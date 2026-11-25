@@ -1590,7 +1590,7 @@ impl State {
             s.refresh(list, *at, 4);
         }
         // Bounded first: the clamp binds a compute pipeline of its own.
-        if !crate::indirect::bound(list, &args.buffer, args.gpu(arguments), (kind, stride, max)) {
+        if !crate::indirect::bound(list, args.gpu(arguments), (kind, stride, max)) {
             why("not bounded (no clamp, or arguments not 4-byte aligned)");
             return false;
         }
@@ -1611,7 +1611,6 @@ impl State {
             _ => false,
         };
         if !ran {
-            crate::indirect::done(list, &args.buffer);
             #[cfg(feature = "diagnostics")]
             match crate::pipeline::host_pipeline(self.pipeline as This) {
                 None => {
@@ -1650,7 +1649,6 @@ impl State {
             let name = crate::pipeline::shaders_of(pipeline);
             crate::capture::read_indirect(list, (&args.buffer, args.offset(arguments)), count, (kind, stride, max), name);
         }
-        crate::indirect::done(list, &args.buffer);
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {
