@@ -90,8 +90,9 @@ pub(crate) struct Resolved {
 }
 
 enum Slot {
-    /// Being opened on the arenas' thread.
-    Opening,
+    /// Being opened on the arenas' thread; its bytes are held in the
+    /// budget from the ask on ([`Arenas::reserve`]).
+    Opening(u64),
     Open(Arc<Arena>),
     /// The host refused it, it is not committed whole, or over the budget:
     /// copies, as before.
@@ -163,7 +164,8 @@ pub(crate) struct Arenas {
     parts: BTreeMap<(u64, u64), Slot>,
     /// Section heaps by the section's handle.
     sections: HashMap<usize, Slot>,
-    /// Bytes of open parts and sections.
+    /// Bytes of open parts and sections, and of those being opened on the
+    /// arenas' thread.
     locked: u64,
 }
 
@@ -225,7 +227,10 @@ impl Arenas {
     /// new, longer part beside the older one, which stays for what was
     /// placed in it).
     pub(crate) fn committed(&mut self, at: u64, len: u64) {
-        let (mut from, mut to) = (at & !(K64 as u64 - 1), (at + len).next_multiple_of(4096));
+        let Some(to) = at.checked_add(len).and_then(|end| end.checked_next_multiple_of(4096)) else {
+            return;
+        };
+        let (mut from, mut to) = (at & !(K64 as u64 - 1), to);
         let touching: Vec<u64> = self.regions.range(..=to).filter(|&(&b, &n)| b + n >= from).map(|(&b, _)| b).collect();
         for base in touching {
             if let Some(n) = self.regions.remove(&base) {
@@ -255,12 +260,35 @@ impl Arenas {
         }
         let parts: Vec<(u64, u64)> = self.parts.keys().filter(|&&(s, n)| s < end && s + n > at).copied().collect();
         for key in &parts {
-            if let Some(Slot::Open(arena)) = self.parts.remove(key) {
-                self.locked -= arena.bytes;
-                ARENA_STATS[2].fetch_add(1, Ordering::Relaxed);
+            match self.parts.remove(key) {
+                Some(Slot::Open(arena)) => {
+                    self.locked -= arena.bytes;
+                    ARENA_STATS[2].fetch_add(1, Ordering::Relaxed);
+                }
+                // What the thread opens now stays closed (`landed`).
+                Some(Slot::Opening(bytes)) => self.locked -= bytes,
+                _ => {}
             }
         }
         parts
+    }
+
+    /// Holds `bytes` of the budget for a part or section the arenas'
+    /// thread is asked to open. The thread opens outside the arenas' lock,
+    /// so the budget is taken here, under it: two asks made while the
+    /// first opens cannot both pass it. Given back if the opening fails
+    /// ([`Arenas::landed`]) or the part is retired meanwhile.
+    fn reserve(&mut self, bytes: u64, most: u64) -> Result<(), Why> {
+        match self.locked.checked_add(bytes) {
+            Some(locked) if locked <= most => {
+                self.locked = locked;
+                Ok(())
+            }
+            _ => {
+                note_refused(format_args!("{} MB: over the budget ({} MB locked of {} MB)", bytes >> 20, self.locked >> 20, most >> 20));
+                Err(Why::Budget)
+            }
+        }
     }
 
     /// The part a range `[at, end)` of private title memory lies in. The
@@ -337,19 +365,28 @@ impl Arenas {
             let bytes = crate::inplace::section_bytes(section).ok_or(Why::View)?;
             let arena = match self.sections.get(&section) {
                 Some(Slot::Open(arena)) => arena.clone(),
-                Some(Slot::Opening) => return Err(Why::Opening),
+                Some(Slot::Opening(_)) => return Err(Why::Opening),
                 Some(Slot::Refused(why)) => return Err(*why),
                 None if bytes > sync => {
-                    self.sections.insert(section, Slot::Opening);
-                    request(Request::Section(section, bytes));
-                    return Err(Why::Opening);
+                    match section_fits(bytes).and_then(|held| self.reserve(held, most).map(|()| held)) {
+                        Ok(held) => {
+                            self.sections.insert(section, Slot::Opening(held));
+                            request(Request::Section(section, bytes));
+                            return Err(Why::Opening);
+                        }
+                        Err(why) => {
+                            ARENA_STATS[1].fetch_add(1, Ordering::Relaxed);
+                            self.sections.insert(section, Slot::Refused(why));
+                            return Err(why);
+                        }
+                    }
                 }
                 None => {
                     let slot = self.open_section(device, section, bytes, most);
                     let arena = match &slot {
                         Slot::Open(arena) => Ok(arena.clone()),
                         Slot::Refused(why) => Err(*why),
-                        Slot::Opening => Err(Why::Opening),
+                        Slot::Opening(_) => Err(Why::Opening),
                     };
                     self.sections.insert(section, slot);
                     arena?
@@ -378,10 +415,15 @@ impl Arenas {
                 let key = self.part_for(at, end)?;
                 match self.parts.get(&key) {
                     Some(Slot::Open(arena)) => arena.clone(),
-                    Some(Slot::Opening) => return Err(Why::Opening),
+                    Some(Slot::Opening(_)) => return Err(Why::Opening),
                     Some(Slot::Refused(why)) => return Err(*why),
                     None if key.1 > sync => {
-                        self.parts.insert(key, Slot::Opening);
+                        if let Err(why) = self.reserve(key.1, most) {
+                            ARENA_STATS[1].fetch_add(1, Ordering::Relaxed);
+                            self.parts.insert(key, Slot::Refused(why));
+                            return Err(why);
+                        }
+                        self.parts.insert(key, Slot::Opening(key.1));
                         request(Request::Part(key.0, key.1));
                         return Err(Why::Opening);
                     }
@@ -390,7 +432,7 @@ impl Arenas {
                         let arena = match &slot {
                             Slot::Open(arena) => Ok(arena.clone()),
                             Slot::Refused(why) => Err(*why),
-                            Slot::Opening => Err(Why::Opening),
+                            Slot::Opening(_) => Err(Why::Opening),
                         };
                         self.keep(key, slot);
                         arena?
@@ -424,55 +466,68 @@ impl Arenas {
         self.parts.insert(key, slot);
     }
 
+    /// Opens a part on the asking thread, under the arenas' lock.
     fn open_part_now(&mut self, device: &ID3D12Device, (start, bytes): (u64, u64), most: u64) -> Slot {
-        let slot = open_part(device, start, bytes, self.locked, most);
-        self.opened(&slot);
+        let slot = match self.reserve(bytes, most) {
+            Ok(()) => self.held_or_given_back(bytes, open_part(device, start, bytes)),
+            Err(why) => Slot::Refused(why),
+        };
+        counted(&slot);
         slot
     }
 
+    /// Opens a section on the asking thread, under the arenas' lock.
     fn open_section(&mut self, device: &ID3D12Device, section: usize, bytes: u64, most: u64) -> Slot {
-        let slot = open_section(device, section, bytes, self.locked, most);
-        self.opened(&slot);
+        let slot = match section_fits(bytes).and_then(|held| self.reserve(held, most).map(|()| held)) {
+            Ok(held) => self.held_or_given_back(held, open_section(device, section, held)),
+            Err(why) => Slot::Refused(why),
+        };
+        counted(&slot);
         slot
     }
 
-    fn opened(&mut self, slot: &Slot) {
-        match slot {
-            Slot::Open(arena) => {
-                self.locked += arena.bytes;
-                ARENA_STATS[0].fetch_add(1, Ordering::Relaxed);
-                ARENA_STATS[3].fetch_add(arena.bytes, Ordering::Relaxed);
-            }
-            _ => {
-                ARENA_STATS[1].fetch_add(1, Ordering::Relaxed);
-            }
+    /// The budget held for an opening stays with what opened, and is
+    /// given back if nothing did.
+    fn held_or_given_back(&mut self, held: u64, slot: Slot) -> Slot {
+        if !matches!(slot, Slot::Open(_)) {
+            self.locked -= held;
         }
+        slot
     }
 
-    /// What the arenas' thread opened.
+    /// What the arenas' thread opened. Its bytes were held from the ask
+    /// on: kept if it opened, given back if not. A part or section retired
+    /// while it was being opened gave them back then, and stays closed.
     fn landed(&mut self, request: Request, slot: Slot) {
-        // A part retired while it was being opened stays closed.
+        let held = match request {
+            Request::Part(start, bytes) => match self.parts.get(&(start, bytes)) {
+                Some(&Slot::Opening(held)) => held,
+                _ => return,
+            },
+            Request::Section(section, _) => match self.sections.get(&section) {
+                Some(&Slot::Opening(held)) => held,
+                _ => return,
+            },
+        };
+        let slot = self.held_or_given_back(held, slot);
+        counted(&slot);
         match request {
-            Request::Part(start, bytes) => {
-                if matches!(self.parts.get(&(start, bytes)), Some(Slot::Opening)) {
-                    self.opened(&slot);
-                    self.keep((start, bytes), slot);
-                }
-            }
+            Request::Part(start, bytes) => self.keep((start, bytes), slot),
             Request::Section(section, _) => {
-                if matches!(self.sections.get(&section), Some(Slot::Opening)) {
-                    self.opened(&slot);
-                    self.sections.insert(section, slot);
-                }
+                self.sections.insert(section, slot);
             }
         }
     }
 
     /// The section is gone: its heap goes when what is in place in it does.
     pub(crate) fn section_gone(&mut self, section: usize) {
-        if let Some(Slot::Open(arena)) = self.sections.remove(&section) {
-            self.locked -= arena.bytes;
-            ARENA_STATS[2].fetch_add(1, Ordering::Relaxed);
+        match self.sections.remove(&section) {
+            Some(Slot::Open(arena)) => {
+                self.locked -= arena.bytes;
+                ARENA_STATS[2].fetch_add(1, Ordering::Relaxed);
+            }
+            Some(Slot::Opening(held)) => self.locked -= held,
+            _ => {}
         }
     }
 
@@ -501,11 +556,32 @@ pub(crate) enum Request {
     Section(usize, u64),
 }
 
-fn open_part(device: &ID3D12Device, start: u64, bytes: u64, locked: u64, most: u64) -> Slot {
-    if locked + bytes > most {
-        note_refused(format_args!("part {start:#x}+{bytes:#x}: over the budget ({} MB locked of {} MB)", locked >> 20, most >> 20));
-        return Slot::Refused(Why::Budget);
+/// Since the start: openings refused (counted once a slot is had, on
+/// whichever thread opened it), or opened and their bytes.
+fn counted(slot: &Slot) {
+    match slot {
+        Slot::Open(arena) => {
+            ARENA_STATS[0].fetch_add(1, Ordering::Relaxed);
+            ARENA_STATS[3].fetch_add(arena.bytes, Ordering::Relaxed);
+        }
+        _ => {
+            ARENA_STATS[1].fetch_add(1, Ordering::Relaxed);
+        }
     }
+}
+
+/// The bytes of a section's heap (cut on 64 KiB), if it can be opened.
+fn section_fits(bytes: u64) -> Result<u64, Why> {
+    let bytes = bytes & !(K64 as u64 - 1);
+    if bytes > PART {
+        note_refused(format_args!("section of {} MB: 4 GiB or more cannot be opened (VICTORY_POOL_SECTION_MB)", bytes >> 20));
+        return Err(Why::Size);
+    }
+    Ok(bytes)
+}
+
+/// Opens a part; the budget is the caller's ([`Arenas::reserve`]).
+fn open_part(device: &ID3D12Device, start: u64, bytes: u64) -> Slot {
     // The runs were asked when the part was cut; the title may have
     // changed its pages since.
     if !private_whole(start as usize, bytes as usize) {
@@ -534,16 +610,9 @@ fn open_part(device: &ID3D12Device, start: u64, bytes: u64, locked: u64, most: u
     }
 }
 
-fn open_section(device: &ID3D12Device, section: usize, bytes: u64, locked: u64, most: u64) -> Slot {
-    let bytes = bytes & !(K64 as u64 - 1);
-    if bytes > PART {
-        note_refused(format_args!("section of {} MB: 4 GiB or more cannot be opened (VICTORY_POOL_SECTION_MB)", bytes >> 20));
-        return Slot::Refused(Why::Size);
-    }
-    if locked + bytes > most {
-        note_refused(format_args!("section of {} MB: over the budget ({} MB locked of {} MB)", bytes >> 20, locked >> 20, most >> 20));
-        return Slot::Refused(Why::Budget);
-    }
+/// Opens a section's heap of `bytes` ([`section_fits`]); the budget is the
+/// caller's.
+fn open_section(device: &ID3D12Device, section: usize, bytes: u64) -> Slot {
     let started = std::time::Instant::now();
     let made = open(device, From::Section(section)).and_then(|heap| place(device, &heap, 0, bytes).map(|b| (heap, b)));
     match made {
@@ -607,13 +676,14 @@ fn worker() -> &'static std::sync::mpsc::Sender<Request> {
         let (sender, receiver) = std::sync::mpsc::channel::<Request>();
         let _ = std::thread::Builder::new().name("victory-arenas".into()).spawn(move || {
             for request in receiver {
-                let Some(host) = crate::host::host() else {
-                    continue;
-                };
-                let locked = with(|a| a.locked);
-                let slot = match request {
-                    Request::Part(start, bytes) => open_part(&host.device, start, bytes, locked, most()),
-                    Request::Section(section, bytes) => open_section(&host.device, section, bytes, locked, most()),
+                // The budget was taken with the ask (`Arenas::reserve`).
+                let slot = match (crate::host::host(), request) {
+                    (None, _) => Slot::Refused(Why::Host),
+                    (Some(host), Request::Part(start, bytes)) => open_part(&host.device, start, bytes),
+                    (Some(host), Request::Section(section, bytes)) => match section_fits(bytes) {
+                        Ok(bytes) => open_section(&host.device, section, bytes),
+                        Err(why) => Slot::Refused(why),
+                    },
                 };
                 with(|a| a.landed(request, slot));
             }
@@ -784,6 +854,66 @@ mod tests {
             drop((one, two, joined, again));
             drop(a);
             mem::VirtualFree(base.cast(), 0, mem::MEM_RELEASE);
+        }
+    }
+
+    /// A part opened on the arenas' thread holds its bytes of the budget
+    /// from the ask on, under the arenas' lock: a second ask while it opens
+    /// cannot pass the budget as well (before, the thread read the bytes
+    /// locked, opened outside the lock, and added them only once open).
+    /// Opened, the bytes stay; refused, or retired while it opens, they are
+    /// given back.
+    #[test]
+    fn warp_a_part_asked_of_the_thread_holds_its_budget() {
+        let Some(device) = crate::inplace::tests::warp() else { return };
+        // SAFETY: allocations of the test's own.
+        unsafe {
+            let bytes = 4 * K64;
+            let region = || {
+                let at = mem::VirtualAlloc(std::ptr::null(), bytes, mem::MEM_RESERVE | mem::MEM_COMMIT, mem::PAGE_READWRITE);
+                assert!(!at.is_null());
+                at as u64
+            };
+            let (one, two, three) = (region(), region(), region());
+            let n = bytes as u64;
+            let mut a = Arenas::default();
+            for at in [one, two, three] {
+                a.committed(at, n);
+            }
+            let most = n + n / 2;
+            let asked = std::cell::Cell::new(0);
+            let ask = |a: &mut Arenas, at: u64| a.resolve_why(&device, at + 16, 16, 0, most, &mut |_| asked.set(asked.get() + 1)).err();
+            assert_eq!(ask(&mut a, one), Some(Why::Opening));
+            assert_eq!(a.locked, n, "held from the ask on");
+            assert_eq!(ask(&mut a, two), Some(Why::Budget), "the first one's bytes count while it opens");
+            assert_eq!(ask(&mut a, one), Some(Why::Opening), "asked once");
+            assert_eq!(a.locked, n);
+            // The thread's refusal gives the bytes back.
+            a.landed(Request::Part(one, n), Slot::Refused(Why::Host));
+            assert_eq!(a.locked, 0);
+            assert_eq!(ask(&mut a, one), Some(Why::Host), "a refusal is kept");
+            // Retired while it opens: given back then, and what the thread
+            // opens later stays closed.
+            assert_eq!(ask(&mut a, three), Some(Why::Opening));
+            assert_eq!(a.locked, n);
+            assert_eq!(a.released(three, K64 as u64), [(three, n)]);
+            assert_eq!(a.locked, 0);
+            a.landed(Request::Part(three, n), Slot::Refused(Why::Host));
+            assert_eq!(a.locked, 0);
+            assert_eq!(asked.get(), 2, "each opening asked of the thread once");
+            // Opened by the thread: the bytes stay with the open part.
+            if device.cast::<windows::Win32::Graphics::Direct3D12::ID3D12Device13>().is_ok() {
+                a.committed(three, n);
+                assert_eq!(ask(&mut a, three), Some(Why::Opening));
+                a.landed(Request::Part(three, n), open_part(&device, three, n));
+                assert_eq!(a.census(), (1, 0, n));
+                assert!(a.resolve_why(&device, three + 16, 16, 0, most, &mut |_| ()).is_ok());
+                assert_eq!(a.released(three, n), [(three, n)]);
+            }
+            assert_eq!(a.locked, 0);
+            // The regions stay reserved to the end of the run: released
+            // here, their addresses went to tests running beside this one,
+            // and about one run in ten ended in an access violation.
         }
     }
 
