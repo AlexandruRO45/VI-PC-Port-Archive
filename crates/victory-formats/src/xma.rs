@@ -4,7 +4,8 @@
 //! A packet starts with a 32-bit header (MSB first): the number of frames
 //! that begin in it (6 bits), the number of bits that finish the previous
 //! frame before the first new one (15), metadata (3) and how many packets of
-//! other streams follow before this stream's next packet (8). Every frame
+//! other streams follow before this stream's next packet (8, with `0xff`
+//! marking the stream's last packet). Every frame
 //! starts with its length in bits (15) and ends with a "more frames" bit.
 //!
 //! The frame decoder follows FFmpeg's `wmaprodec.c` (LGPL-2.1-or-later, used
@@ -20,6 +21,8 @@ use tables::*;
 pub const PACKET_BYTES: usize = 2048;
 const PACKET_BITS: usize = PACKET_BYTES * 8;
 const HEADER_BITS: usize = 32;
+/// `PacketSkipCount` value meaning no further packets belong to this stream.
+const END_OF_STREAM: u32 = 0xff;
 /// Samples per channel in one frame.
 pub const FRAME_SAMPLES: usize = 512;
 /// Samples per channel in one subframe, the unit of skips and loop ends.
@@ -63,6 +66,14 @@ pub fn packet(data: &[u8], index: usize) -> Option<Packet> {
     })
 }
 
+/// Index of this stream's next packet after `index`, or `None` if `skip` is the
+/// end-of-stream sentinel (`0xff`) or the index overflows.
+fn next_packet(index: usize, skip: u32) -> Option<usize> {
+    (skip != END_OF_STREAM)
+        .then(|| index.checked_add(1 + skip as usize))
+        .flatten()
+}
+
 /// One frame's bits gathered out of its packets.
 #[derive(Debug, Clone)]
 pub struct Frame {
@@ -88,8 +99,8 @@ impl Cursor<'_> {
             // Leaving a packet: jump over the other streams' packets.
             let previous = self.pos / PACKET_BITS;
             if previous > 0 {
-                let skip = packet(self.data, previous - 1)?.skip as usize;
-                self.pos = (previous + skip) * PACKET_BITS;
+                let next = next_packet(previous - 1, packet(self.data, previous - 1)?.skip)?;
+                self.pos = next.checked_mul(PACKET_BITS)?;
             }
             self.pos += HEADER_BITS;
         }
@@ -151,9 +162,11 @@ fn next_frame(data: &[u8], start: usize, end: usize) -> Option<usize> {
     let mut end = end;
     if end.is_multiple_of(PACKET_BITS) || (last && end / PACKET_BITS == index) {
         // The next frame begins in the next packet of this stream.
-        let next = (end - 1) / PACKET_BITS + 1 + packet(data, (end - 1) / PACKET_BITS)?.skip as usize;
+        let end_packet = (end - 1) / PACKET_BITS;
+        let next = next_packet(end_packet, packet(data, end_packet)?.skip)?;
         let header = packet(data, next)?;
-        end = next * PACKET_BITS + HEADER_BITS + header.first_frame_bit as usize;
+        let base = next.checked_mul(PACKET_BITS)?;
+        end = base.checked_add(HEADER_BITS + header.first_frame_bit as usize)?;
     }
     (end / 8 < data.len()).then_some(end)
 }
@@ -1045,6 +1058,79 @@ mod tests {
         let frame = read_frame(&data, start).expect("the frame at `start` is well formed");
         assert_eq!(frame.bits, 200);
         assert_eq!(frame.next, None);
+    }
+
+    /// `PacketSkipCount == 0xff` marks the last packet of a stream: finding
+    /// the next frame must stop even when 256 or more packets follow in the
+    /// buffer.
+    #[test]
+    fn skip_count_ff_ends_the_stream_instead_of_jumping_255_packets() {
+        let header = |frames: u32, first: u32, skip: u32| (frames << 26) | (first << 11) | skip;
+        let mut data = vec![0u8; 257 * PACKET_BYTES];
+        put_bits(&mut data, 0, 32, header(1, 0, END_OF_STREAM));
+        put_bits(&mut data, HEADER_BITS, LENGTH_BITS, 100);
+        // Another stream's valid packet sitting 256 packets ahead.
+        put_bits(&mut data, 256 * PACKET_BITS, 32, header(1, 0, 0));
+        put_bits(&mut data, 256 * PACKET_BITS + HEADER_BITS, LENGTH_BITS, 100);
+        let frame = read_frame(&data, HEADER_BITS).unwrap();
+        assert_eq!(frame.bits, 100);
+        assert_eq!(frame.next, None);
+    }
+
+    /// A frame whose length runs past a packet with `PacketSkipCount == 0xff`
+    /// must fail to read rather than splicing bits from 256 packets ahead.
+    #[test]
+    fn skip_count_ff_stops_cross_packet_frame_reads() {
+        let header = |frames: u32, first: u32, skip: u32| (frames << 26) | (first << 11) | skip;
+        let mut data = vec![0u8; 257 * PACKET_BYTES];
+        let start = PACKET_BITS - 64;
+        put_bits(&mut data, 0, 32, header(1, (start - HEADER_BITS) as u32, END_OF_STREAM));
+        put_bits(&mut data, start, LENGTH_BITS, 128);
+        put_bits(&mut data, 256 * PACKET_BITS, 32, header(1, 0, 0));
+        assert!(read_frame(&data, start).is_none());
+    }
+
+    /// `PacketSkipCount == 0xfe` (254) is the largest non-sentinel skip and
+    /// still jumps 254 packets for both `next_frame` and cross-packet reads.
+    #[test]
+    fn skip_count_fe_still_skips_254_packets() {
+        let header = |frames: u32, first: u32, skip: u32| (frames << 26) | (first << 11) | skip;
+        let mut data = vec![0u8; 511 * PACKET_BYTES];
+
+        // Packet 0 -> (skip 254) -> packet 255 -> (skip 254) -> packet 510 (end).
+        put_bits(&mut data, 0, 32, header(1, 0, 0xfe));
+        put_bits(&mut data, HEADER_BITS, LENGTH_BITS, 100);
+
+        let p255_start = 255 * PACKET_BITS + PACKET_BITS - 64;
+        put_bits(
+            &mut data,
+            255 * PACKET_BITS,
+            32,
+            header(1, (PACKET_BITS - 64 - HEADER_BITS) as u32, 0xfe),
+        );
+        put_bits(&mut data, p255_start, LENGTH_BITS, 112); // 64 bits in p255 + 48 bits in p510
+
+        // Sentinel pattern in packet 510's first 6 payload bytes (48 bits).
+        put_bits(&mut data, 510 * PACKET_BITS, 32, header(1, 48, END_OF_STREAM));
+        let tail_bytes = [0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc];
+        data[510 * PACKET_BYTES + 4..510 * PACKET_BYTES + 10].copy_from_slice(&tail_bytes);
+        let p510_frame = 510 * PACKET_BITS + HEADER_BITS + 48;
+        put_bits(&mut data, p510_frame, LENGTH_BITS, 80);
+
+        // `next_frame` jumps 254 packets from packet 0 to packet 255.
+        let first = read_frame(&data, HEADER_BITS).unwrap();
+        assert_eq!(first.next, Some(p255_start));
+
+        // Cross-packet frame read jumps 254 packets from packet 255 to packet 510.
+        let spanning = read_frame(&data, p255_start).unwrap();
+        assert_eq!(spanning.bits, 112);
+        assert_eq!(&spanning.data[8..14], &tail_bytes);
+        assert_eq!(spanning.next, Some(p510_frame));
+
+        // Final frame stops at packet 510's `0xff` sentinel.
+        let last = read_frame(&data, p510_frame).unwrap();
+        assert_eq!(last.bits, 80);
+        assert_eq!(last.next, None);
     }
 
     /// The direct sum `imdct_half` stands for (FFmpeg's naive inverse MDCT:
