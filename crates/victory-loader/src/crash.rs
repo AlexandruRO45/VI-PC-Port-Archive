@@ -393,6 +393,8 @@ unsafe fn clzero(context: &mut CONTEXT) -> bool {
         if let [0x48, 0x83, 0xc0, 0x40, cmp @ .., 0x72, 0xf4] = after
             && let Some((0, limit)) = compare_registers(cmp)
             && limit != 0
+            && *gpr(context, limit) <= u64::MAX - 0x3f
+            && context.Rax <= u64::MAX - 0x3f
         {
             let limit = *gpr(context, limit);
             loop {
@@ -420,6 +422,8 @@ unsafe fn clzero(context: &mut CONTEXT) -> bool {
             && a == add & 7 | (add_rex & 1) << 3
             && a != 0
             && b != 0
+            && *gpr(context, b) <= u64::MAX - 0x3f
+            && *gpr(context, a) <= u64::MAX - 0x3f
         {
             let limit = *gpr(context, b);
             loop {
@@ -1401,6 +1405,39 @@ mod tests {
         );
         let zeroed: Vec<bool> = (0..4).map(|i| mem.0[i * 64] == 0).collect();
         assert_eq!(zeroed, [true, true, false, false]);
+    }
+
+    #[test]
+    fn emulated_clzero_loop_falls_back_when_limit_would_wrap() {
+        #[repr(align(64))]
+        struct Lines([u8; 128]);
+        // Loop 1 with `limit = u64::MAX`: must fall back to single-instruction `clzero`.
+        let mut mem = Lines([0xff; 128]);
+        let start = mem.0.as_mut_ptr() as u64;
+        // SAFETY: an all-zero context is valid.
+        let mut context: CONTEXT = unsafe { std::mem::zeroed() };
+        context.Rax = start;
+        context.R10 = u64::MAX;
+        let code = [0x0f, 0x01, 0xfc, 0x48, 0x83, 0xc0, 0x40, 0x4c, 0x39, 0xd0, 0x72, 0xf4];
+        assert!(emulate_in(&code, 0, &mut context));
+        assert_eq!((context.Rip, context.Rax), (3, start));
+        assert_eq!((mem.0[0] == 0, mem.0[64] == 0), (true, false));
+
+        // Loop 2 with `limit = u64::MAX`: same single-instruction fallback.
+        let mut mem = Lines([0xff; 128]);
+        let start = mem.0.as_mut_ptr() as u64;
+        // SAFETY: an all-zero context is valid.
+        let mut context: CONTEXT = unsafe { std::mem::zeroed() };
+        context.Rax = start;
+        context.Rdx = start + 64;
+        context.R8 = u64::MAX;
+        let code = [
+            0x48, 0x89, 0xd0, 0x48, 0x83, 0xc2, 0x40, 0x0f, 0x01, 0xfc, 0x4c, 0x39, 0xc2, 0x72,
+            0xf1,
+        ];
+        assert!(emulate_in(&code, 7, &mut context));
+        assert_eq!((context.Rip, context.Rax, context.Rdx), (10, start, start + 64));
+        assert_eq!((mem.0[0] == 0, mem.0[64] == 0), (true, false));
     }
 
     #[test]
