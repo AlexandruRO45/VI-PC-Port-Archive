@@ -2462,7 +2462,15 @@ mod tests {
             row_pitch: 24,
             ..full_rows
         };
-        let partials = [(full_rows, 0, 0, Some(crop_box)), (larger, 1, 1, None)].map(
+        // A 2x2 box written at the origin, the same box at x = 1, and a whole
+        // 4x4 copy at (1, 1) of a larger footprint: bytes outside each box
+        // keep the 0xa5 sentinel.
+        let partials = [
+            (full_rows, 0, 0, Some(crop_box)),
+            (full_rows, 1, 0, Some(crop_box)),
+            (larger, 1, 1, None),
+        ]
+        .map(
             |(footprint, x, y, region)| {
                 let size = u64::from(footprint.row_pitch) * u64::from(footprint.height);
                 let mut output = null;
