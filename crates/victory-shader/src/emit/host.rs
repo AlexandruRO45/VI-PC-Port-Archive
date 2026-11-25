@@ -17,6 +17,20 @@ pub struct Host {
     pub device: ID3D12Device,
 }
 
+/// Root signatures with the view-stride table (`super::VIEW_STRIDES`), by their
+/// pointer, and its root parameter.
+static STRIDE_TABLES: std::sync::Mutex<Vec<(usize, u32)>> = std::sync::Mutex::new(Vec::new());
+
+/// The root parameter of `root`'s view-stride table, if `binds` (the
+/// parameters a test binds) leaves it out: such a test gets a table of
+/// zeros, as the host's holds for views on 16 bytes (no bytes skipped).
+fn stride_table(root: &ID3D12RootSignature, binds: impl Iterator<Item = u32>) -> Option<u32> {
+    let known = STRIDE_TABLES.lock().unwrap_or_else(|e| e.into_inner());
+    let &(_, param) = known.iter().find(|&&(r, _)| r == root.as_raw() as usize)?;
+    let mut binds = binds;
+    (!binds.any(|p| p == param)).then_some(param)
+}
+
 /// What the stage declares that a pipeline must match.
 fn sig(dxil: &[u8], fourcc: FourCC) -> Result<Vec<SigElement>, String> {
     let c = Container::parse(dxil).map_err(|e| e.to_string())?;
@@ -193,6 +207,12 @@ impl Host {
             views.push((super::VIEW_MARKS, super::MEMORY_SPACE, 1));
             views.push((super::VIEW_WRITES, super::MEMORY_SPACE, 2));
         }
+        // The view-stride table's parameter: a dispatch or draw that does
+        // not bind it gets a table of zeros (`stride_table`).
+        let strides = views
+            .iter()
+            .position(|&(r, space, kind)| r == u32::from(super::VIEW_STRIDES) && space == super::ROOT_CBV_SPACE && kind == 1)
+            .map(|i| (params.len() + i) as u32);
         for (register, space, kind) in views {
             params.push(D3D12_ROOT_PARAMETER1 {
                 ParameterType: match kind {
@@ -268,7 +288,13 @@ impl Host {
                 blob.GetBufferPointer().cast::<u8>(),
                 blob.GetBufferSize(),
             );
-            self.device.CreateRootSignature(0, bytes).map_err(err)
+            let root: ID3D12RootSignature = self.device.CreateRootSignature(0, bytes).map_err(err)?;
+            let mut known = STRIDE_TABLES.lock().unwrap_or_else(|e| e.into_inner());
+            known.retain(|&(r, _)| r != root.as_raw() as usize);
+            if let Some(param) = strides {
+                known.push((root.as_raw() as usize, param));
+            }
+            Ok(root)
         }
     }
 
@@ -1094,6 +1120,11 @@ impl Host {
                     Root::View { .. } | Root::Uav(_) => return Err("root views in a draw".into()),
                 }
             }
+            if let Some(param) = stride_table(root, d.roots.iter().map(|r| r.0)) {
+                let b = make(D3D12_HEAP_TYPE_UPLOAD, &buf_desc(1 << 16), D3D12_RESOURCE_STATE_GENERIC_READ, None)?;
+                list.SetGraphicsRootShaderResourceView(param, b.GetGPUVirtualAddress());
+                keep.push(b);
+            }
             list.OMSetRenderTargets(1, Some(&rtv), false, None);
             list.RSSetViewports(&[D3D12_VIEWPORT {
                 Width: w as f32,
@@ -1850,6 +1881,11 @@ impl Host {
                         uavs.push((b, None, n, rb));
                     }
                 }
+            }
+            if let Some(param) = stride_table(root, d.roots.iter().map(|r| r.0)) {
+                let b = upload(&vec![0; 1 << 14])?;
+                list.SetComputeRootShaderResourceView(param, b.GetGPUVirtualAddress());
+                keep.push(b);
             }
             let [x, y, z] = d.groups;
             list.Dispatch(x, y, z);
