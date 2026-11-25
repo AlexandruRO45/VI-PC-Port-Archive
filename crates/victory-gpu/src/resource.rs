@@ -1137,10 +1137,31 @@ fn video_memory_percent() -> u64 {
     last.1
 }
 
+/// How full memory is, in percent: video memory or the machine's, whichever
+/// is fuller.
+#[cfg(windows)]
+fn video_pressure_of(video: u64, system: u64) -> u64 {
+    video.max(system)
+}
+
+/// The largest side a streamed texture keeps, by how full memory is in
+/// percent: 1024, 512 and then 256.
+#[cfg(windows)]
+fn texture_cap(percent: u64) -> u64 {
+    match percent {
+        0..70 => 1024,
+        70..85 => 512,
+        _ => 256,
+    }
+}
+
 /// How many of a streamed texture's largest mips to do without, for none of
 /// its sides to pass `VICTORY_TEXTURE_MAX`: by default 1024, 512 and then 256 as
-/// video memory fills up. All textures together did not fit, and paging them
-/// cost seconds a frame, or the driver failed.
+/// video memory fills up, or the machine's memory (physical, or the commit
+/// limit) does: on a 32 GB machine the title with all its textures reached
+/// the commit limit, and the runs ended in a device loss with 1 to 3 GiB of
+/// commit left (the cause of the loss is not proven). All textures together
+/// did not fit, and paging them cost seconds a frame, or the driver failed.
 #[cfg(windows)]
 fn over_cap(d: &ResourceDesc) -> u32 {
     static SET: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
@@ -1152,10 +1173,14 @@ fn over_cap(d: &ResourceDesc) -> u32 {
     if !STREAMED.get() || textures() != Textures::Stream {
         return 0;
     }
-    let max = set.unwrap_or_else(|| match video_memory_percent() {
-        0..70 => 1024,
-        70..85 => 512,
-        _ => 256,
+    let max = set.unwrap_or_else(|| {
+        let (video, system) = (video_memory_percent(), crate::memstat::system_memory_percent());
+        let cap = texture_cap(video_pressure_of(video, system));
+        static LOGGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1024);
+        if LOGGED.swap(cap, std::sync::atomic::Ordering::Relaxed) != cap {
+            tracing::info!(cap, video, system, "streamed texture size cap changed (percent of video memory and of the machine's memory in use)");
+        }
+        cap
     });
     const TEXTURE2D: u32 = 3;
     let block = (70..=84).contains(&d.format) || (94..=99).contains(&d.format);
@@ -2209,6 +2234,31 @@ pub(crate) fn test_buffer(width: u64) -> This {
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    /// The size cap of streamed textures follows how full memory is: video
+    /// memory, or the machine's (the higher of the two counts).
+    #[cfg(windows)]
+    #[test]
+    fn texture_cap_falls_as_memory_fills() {
+        assert_eq!(texture_cap(0), 1024);
+        assert_eq!(texture_cap(69), 1024);
+        assert_eq!(texture_cap(70), 512);
+        assert_eq!(texture_cap(84), 512);
+        assert_eq!(texture_cap(85), 256);
+        assert_eq!(texture_cap(100), 256);
+        assert_eq!(texture_cap(video_pressure_of(40, 88)), 256, "the machine's memory is the fuller");
+        assert_eq!(texture_cap(video_pressure_of(75, 30)), 512, "video memory is the fuller");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_machine_reports_its_memory() {
+        let [(ram, ram_total), (commit, commit_total)] = crate::memstat::system_memory().expect("Windows answers");
+        assert!(ram_total > 0 && ram <= ram_total);
+        assert!(commit_total >= ram_total, "the commit limit is physical memory plus paging files");
+        assert!(commit <= commit_total);
+        assert!(crate::memstat::system_memory_percent() <= 100);
+    }
 
     type Release = extern "system" fn(This) -> u32;
     type Map = extern "system" fn(This, u32, *const c_void, *mut *mut u8) -> HRESULT;

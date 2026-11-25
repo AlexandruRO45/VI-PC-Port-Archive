@@ -260,6 +260,28 @@ pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
 /// behaves as before: nothing executes).
 static HOST: OnceLock<Option<Host>> = OnceLock::new();
 
+/// Logs how finely the system can take the card from a submission. With
+/// DMA-buffer preemption a submission runs to its end once it has started,
+/// and one that runs past the system's timeout (2 s) resets the driver.
+fn log_preemption(device: &ID3D12Device) {
+    // SAFETY: plain DXGI queries on a live device.
+    unsafe {
+        let Ok(factory) = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0)) else {
+            return;
+        };
+        let Ok(adapter) = factory.EnumAdapterByLuid::<IDXGIAdapter3>(device.GetAdapterLuid()) else {
+            return;
+        };
+        if let Ok(desc) = adapter.GetDesc2() {
+            tracing::info!(
+                graphics = desc.GraphicsPreemptionGranularity.0,
+                compute = desc.ComputePreemptionGranularity.0,
+                "host adapter preemption (graphics 0 = DMA buffer, 1 primitive, 2 triangle, 3 pixel, 4 instruction; compute 0 = DMA buffer, 1 dispatch, 2 thread group, 3 thread, 4 instruction)"
+            );
+        }
+    }
+}
+
 /// The host GPU's memory use as its driver reports it, `[(used, budget)]`
 /// in video memory and in system memory; `None` before the device is
 /// made (asking does not make it).
@@ -372,6 +394,7 @@ fn create() -> windows::core::Result<Host> {
             }
         }
         let device = device.ok_or_else(windows::core::Error::empty)?;
+        log_preemption(&device);
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
             .flatten();

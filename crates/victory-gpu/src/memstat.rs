@@ -102,6 +102,41 @@ pub(crate) fn track(
     }
 }
 
+/// What Windows says of the whole machine, as `[(in use, total); 2]` in
+/// bytes: physical memory (what standby caches hold counts as free) and the
+/// commit limit (physical memory plus the paging files).
+#[cfg(windows)]
+pub(crate) fn system_memory() -> Option<[(u64, u64); 2]> {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    let mut status = MEMORYSTATUSEX {
+        dwLength: size_of::<MEMORYSTATUSEX>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: a sized structure of our own.
+    if unsafe { GlobalMemoryStatusEx(&mut status) } == 0 {
+        return None;
+    }
+    Some([
+        (status.ullTotalPhys.saturating_sub(status.ullAvailPhys), status.ullTotalPhys),
+        (status.ullTotalPageFile.saturating_sub(status.ullAvailPageFile), status.ullTotalPageFile),
+    ])
+}
+
+/// How full the machine's memory is, in percent: its physical memory or its
+/// commit limit, whichever is higher. Asked at most once a second.
+#[cfg(windows)]
+pub(crate) fn system_memory_percent() -> u64 {
+    static LAST: std::sync::Mutex<(Option<std::time::Instant>, u64)> = std::sync::Mutex::new((None, 0));
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    if last.0.is_none_or(|at| at.elapsed() > std::time::Duration::from_secs(1)) {
+        last.0 = Some(std::time::Instant::now());
+        if let Some([(ram, ram_total), (commit, commit_total)]) = system_memory() {
+            last.1 = (ram * 100 / ram_total.max(1)).max(commit * 100 / commit_total.max(1));
+        }
+    }
+    last.1
+}
+
 /// One line of MiB figures: what this crate holds, and what the host GPU
 /// driver says it uses in video and system memory.
 pub fn report() -> String {
@@ -139,6 +174,16 @@ pub fn report() -> String {
                 mib(local.0),
                 mib(local.1),
                 mib(system.0)
+            );
+        }
+        if let Some([(ram, ram_total), (commit, commit_total)]) = system_memory() {
+            let _ = write!(
+                line,
+                ", machine: memory {} of {} MiB in use, commit {} of {} MiB in use",
+                mib(ram),
+                mib(ram_total),
+                mib(commit),
+                mib(commit_total)
             );
         }
     }
