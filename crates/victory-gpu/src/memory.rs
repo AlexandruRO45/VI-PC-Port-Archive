@@ -75,6 +75,8 @@ pub(crate) struct Map {
     /// Ranges that go back byte for byte instead (root UAVs, see
     /// [`Map::precise`]): the copy, the first address and the bytes.
     precise: Arc<Mutex<Vec<(usize, u64, u64)>>>,
+    /// The heap's key.
+    key: usize,
 }
 
 impl Map {
@@ -86,6 +88,11 @@ impl Map {
     /// physical pages no watch sees) wrote there since. The range is taken
     /// out to whole pages (cut to the copy): shaders mark pages, and what
     /// they wrote beside it in its first and last one goes back too.
+    ///
+    /// A page of it that shaders read from another copy (`copy` holds it in
+    /// part) goes back byte for byte from that one as well: whole, it would
+    /// put back what that copy held over what went back from `copy`, or not
+    /// go back at all (that write-back marks the page changed).
     pub(crate) fn precise(&self, list: &HostList, copy: &Arc<Shadow>, address: u64, len: u64) {
         let (start, size) = copy.range();
         let from = (address & !(PAGE - 1)).max(start);
@@ -96,6 +103,18 @@ impl Map {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .push((Arc::as_ptr(copy) as usize, from, len));
+        let (key, this, precise) = (self.key, Arc::as_ptr(copy) as usize, self.precise.clone());
+        list.defer_gpu_writes(move || {
+            let others = layout(key).others(this, from, len);
+            let mut precise = precise.lock().unwrap_or_else(|e| e.into_inner());
+            for (c, a, n) in &others {
+                let range = (Arc::as_ptr(c) as usize, *a as u64, *n as u64);
+                if !precise.contains(&range) {
+                    precise.push(range);
+                }
+            }
+            others
+        });
     }
 }
 
@@ -202,6 +221,31 @@ impl Drop for PooledBitmap {
             }
         };
         drop(overflow);
+    }
+}
+
+impl Layout {
+    /// The pages of `[from, from + len)` read from another copy than `copy`
+    /// (its address), each cut to that one.
+    fn others(&self, copy: usize, from: u64, len: u64) -> Vec<crate::host::Range> {
+        (from >> 16..(from + len).div_ceil(PAGE))
+            .filter_map(|page| {
+                // Block 0 is the null one (its level-1 index names no block).
+                let block = self.blocks.iter().position(|&l1| l1 as u64 == page >> 12)?;
+                let entry = *self.owner.get(block * BLOCK + (page as usize & 0xFFF))?;
+                if entry == NO_OWNER {
+                    return None;
+                }
+                let owner = &self.copies[entry as usize];
+                if Arc::as_ptr(owner) as usize == copy {
+                    return None;
+                }
+                let (start, size) = owner.range();
+                let at = (page << 16).max(start);
+                let end = ((page + 1) << 16).min(start + size);
+                Some((owner.clone(), at as usize, (end - at) as usize))
+            })
+            .collect()
     }
 }
 
@@ -716,6 +760,7 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
         table,
         dirty,
         precise,
+        key,
     })
 }
 
@@ -972,11 +1017,16 @@ void main(uint3 id : SV_DispatchThreadID) {
     /// Title memory of `pages` pages, below 2^40 and write-watched, as the
     /// runtime places its pools.
     fn pool(pages: usize) -> usize {
+        memory(pages, crate::watch::tests::MEM_WRITE_WATCH)
+    }
+
+    /// Title memory below 2^40, allocated with `flags` too.
+    fn memory(pages: usize, flags: u32) -> usize {
         use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
         (0..256u64)
             .map(|k| 0x40_0000_0000 + (k << 28))
             // SAFETY: a fresh allocation where nothing is mapped, or none.
-            .map(|hint| unsafe { VirtualAlloc(hint as *const _, pages * crate::watch::PAGE, MEM_RESERVE | MEM_COMMIT | crate::watch::tests::MEM_WRITE_WATCH, PAGE_READWRITE) } as usize)
+            .map(|hint| unsafe { VirtualAlloc(hint as *const _, pages * crate::watch::PAGE, MEM_RESERVE | MEM_COMMIT | flags, PAGE_READWRITE) } as usize)
             .find(|&p| p != 0)
             .expect("memory below 2^40")
     }
@@ -1241,5 +1291,101 @@ void main() {
         }
         crate::shadow::unregister(inner, inner as u64);
         crate::shadow::unregister(p, p as u64);
+    }
+
+    /// [`WRITE`], and 1 at byte 0x10 of a root UAV of the title's.
+    const WRITE_BOTH: &str = r#"
+#define RS "DescriptorTable(UAV(u0, numDescriptors=unbounded)), SRV(t0, space=2), UAV(u0, space=2), RootConstants(num32BitConstants=3, b0), UAV(u0, space=3)"
+RWByteAddressBuffer views[] : register(u0);
+ByteAddressBuffer table : register(t0, space2);
+RWByteAddressBuffer dirty : register(u0, space2);
+RWByteAddressBuffer own : register(u0, space3);
+cbuffer c : register(b0) { uint lo; uint hi; uint value; }
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void main() {
+    own.Store(0x10, 1);
+    uint block = table.Load((hi << 4 | lo >> 28) * 4);
+    uint entry = block << 12 | (lo >> 16 & 0xFFF);
+    uint2 e = table.Load2((4096 + 2 * entry) * 4);
+    views[e.x + 1].Store(lo - e.y, value);
+    uint old;
+    dirty.InterlockedOr(entry / 32 * 4, 1u << (entry % 32), old);
+}
+"#;
+
+    /// A root UAV on a buffer that holds its page only in part, inside a
+    /// bigger one whose copy the page is read from: a shader writing through
+    /// both, in that page, has both writes go back.
+    #[test]
+    fn writes_through_a_root_uav_and_the_page_table_in_one_page_both_go_back() {
+        if let Some(title) = run_both(pool(3)) {
+            assert_eq!(title, [1, 2], "through the root UAV, and through the page table in its page");
+        }
+    }
+
+    /// The same in memory whose writes are not tracked.
+    #[test]
+    fn writes_through_a_root_uav_and_the_page_table_in_one_untracked_page_both_go_back() {
+        if let Some(title) = run_both(memory(3, 0)) {
+            assert_eq!(title, [1, 2], "through the root UAV, and through the page table in its page");
+        }
+    }
+
+    /// Runs [`WRITE_BOTH`] on the 3 pages at `p`: title memory where it wrote
+    /// 1 (through the root UAV) and 2 (through the page table) after it.
+    fn run_both(p: usize) -> Option<[u32; 2]> {
+        use crate::watch::PAGE;
+        let _none_missed = none_missed();
+        let (host, views) = (crate::host::host()?, heap()?);
+        let inner = p + PAGE + 0x100;
+        let beside = p + PAGE + 0x1000;
+        crate::shadow::register(p, p as u64, 3 * PAGE as u64);
+        crate::shadow::register(inner, inner as u64, 0x200);
+        // Both have a copy before the list runs; the page is the bigger one's.
+        let outer_copy = crate::shadow::find(p as u64, 1).unwrap();
+        let inner_copy = crate::shadow::find(inner as u64, 0x200).unwrap();
+        assert!(!Arc::ptr_eq(&outer_copy, &inner_copy), "two copies");
+        let (root, pso) = pipeline(WRITE_BOTH);
+        let list = host.new_list().unwrap();
+        let map = bind(&list, OURS).expect("a page table");
+        map.precise(&list, &inner_copy, inner as u64, 0x200);
+        let constants = [beside as u32, (beside >> 32) as u32, 2];
+        // SAFETY: an open list, live objects of ours.
+        unsafe {
+            list.list.SetDescriptorHeaps(&[Some(views.heap.clone())]);
+            list.list.SetComputeRootSignature(&root);
+            list.list.SetComputeRootDescriptorTable(0, views.gpu(0));
+            list.list.SetComputeRootShaderResourceView(1, map.table);
+            list.list.SetComputeRootUnorderedAccessView(2, map.dirty);
+            list.list.SetComputeRoot32BitConstants(3, 3, constants.as_ptr().cast(), 0);
+            list.list.SetComputeRootUnorderedAccessView(4, inner_copy.gpu(inner as u64));
+            list.list.SetPipelineState(&pso);
+            list.list.Dispatch(1, 1, 1);
+        }
+        list.close();
+        host.execute(&[&list]);
+        // The GPU wrote each copy, whatever goes back.
+        assert_eq!(inner_copy.read_host(inner as u64 + 0x10, 1), [1], "the root UAV's copy");
+        assert_eq!(outer_copy.read_host(beside as u64, 1), [2], "the page's copy");
+        // SAFETY: the test's pool, the GPU done with it.
+        let read = || [inner + 0x10, beside].map(|a| unsafe { (a as *const u32).read_volatile() });
+        let title = read();
+        // Again, twice in one submission, after the title wrote the page:
+        // nothing of the first run is left declared, and the title's other
+        // bytes reach the copy and stay.
+        let others = beside + 0x1000;
+        for (a, v) in [(inner + 0x10, 0), (beside, 0), (others, 7u32)] {
+            // SAFETY: our pool (a guarded page faults into the handler).
+            unsafe { (a as *mut u32).write_volatile(v) };
+        }
+        host.execute(&[&list, &list]);
+        assert_eq!(read(), title, "submitted again");
+        assert_eq!(outer_copy.read_host(others as u64, 1), [7], "the title's write, in the copy");
+        // SAFETY: as above.
+        assert_eq!(unsafe { (others as *const u32).read_volatile() }, 7, "the title's write, kept");
+        crate::shadow::unregister(inner, inner as u64);
+        crate::shadow::unregister(p, p as u64);
+        Some(title)
     }
 }
