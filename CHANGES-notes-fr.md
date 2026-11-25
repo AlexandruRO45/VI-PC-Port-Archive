@@ -131,7 +131,39 @@ qu'elles n'aidaient pas :
   10 400 ms par image. La bonne façon est celle de DexNom (reprendre les
   textures éparses à l'envoi), pas de découper la lecture ici.
 
-## 9. Ce qui reste à changer, du plus utile au moins utile
+## 9. Niveaux de texture lus un par un, bornages hissés (ce passage)
+
+**Les niveaux d'une texture sont lus un par un** (`texture.rs`, nouveau
+`Layout::span` dans `victory-formats`). Avant, une texture n'était envoyée
+à la carte que si *toute* sa mémoire était arrivée. Or le titre fait
+arriver les pages du milieu d'abord : une texture restait donc hors de la
+carte pendant des frames entières, et s'affichait en noir. Maintenant
+chaque niveau dont la mémoire est là est détilé, et un niveau qui n'est
+pas encore arrivé est mis à zéro (noir) jusqu'à ce qu'il le soit : la
+texture s'affiche tout de suite, en basse résolution d'abord.
+`VICTORY_SPARSE_LEVELS=0` revient à l'ancien comportement.
+
+Deux corrections de la même famille :
+- une texture dont la **première page** n'est pas encore mappée mais dont
+  les pages du milieu le sont n'est plus prise pour une texture absente
+  (`any_mapped`, repris de DexNom) ;
+- `Layout::span` traite le mode linéaire à part (ses motifs de ligne et de
+  colonne sont vides : c'est ce qui a fait planter le premier essai).
+
+**Les bornages d'une suite de draws indirects sont hissés** (`indirect.rs`,
+`host.rs`, `draw.rs`) : au lieu d'un bornage (un dispatch de compute) entre
+chaque paire de draws, ils vont dans une liste de commandes à part qui
+s'exécute juste avant celle qui dessine. Une suite de draws ne fait plus
+qu'un aller-retour dessin → compute au lieu d'un par draw. C'est la
+modification de Belobug (fork AMD), où 225 ms de temps carte par frame
+sont passées à environ 80 ms dans une scène de 9 000 draws.
+`VICTORY_HOIST_CLAMPS=0` revient à un bornage devant chaque draw.
+
+Mesures sur cette machine : 176 tests passent ; le lancement va jusqu'au
+monde, 30 fps constants dans les menus (le plafond), 0 refus de detile,
+0 plantage sur 4 minutes.
+
+## 10. Ce qui reste à changer, du plus utile au moins utile
 
 1. **Les zones à l'ombre sont noires** : le lancer de rayons (l'éclairage
    indirect, les ombres) ne tourne pas. C'est ce que le fork de DexNom a en
@@ -139,10 +171,9 @@ qu'elles n'aidaient pas :
    donc ça marchera aussi sur NVIDIA. Son propre chiffre, en ville avec le RT
    allumé, est **969 ms par image** : c'est de l'image avant d'être de la
    vitesse. Gros chantier.
-2. **Les textures éparses** : une texture dont seules les pages du milieu sont
-   en mémoire n'est pas envoyée. DexNom le fait ; ici, non. C'est ce qui donne
-   des textures noires ou en basse résolution au chargement, et probablement
-   une partie des micro-freezes aux changements brusques d'image.
+2. ~~**Les textures éparses**~~ : **fait au passage 9**. Les niveaux sont lus
+   un par un ; ce qui reste possible est d'aller plus fin, bloc par bloc à
+   l'intérieur d'un niveau, pour les très grandes textures.
 3. **Le bornage par enregistrement** dans les listes du jeu reste l'essentiel
    du temps de la carte (102 ms sur 130). Les fenêtres en enlèvent une part ;
    le reste demande une autre façon d'émuler la lecture d'arguments de la
@@ -161,6 +192,11 @@ qu'elles n'aidaient pas :
    création que le titre appelle et que la couche refuse) et les textures qui
    arrivent en retard. Le point 2 règle une partie des secondes ; les
    pipelines demandent d'écrire les deux méthodes manquantes.
-7. **La base est en retard sur l'amont** : `fxceless/victory-fork` a un commit
-   de plus (`3973179`, 16 fichiers) que cette branche n'a pas encore. À
-   fusionner avant tout le reste, sinon les deux divergent.
+7. ~~**La base est en retard sur l'amont**~~ : fusionné au passage 6.
+
+8. **Ce que le fork de Belobug a et que nous n'avons pas encore** : son
+   `VICTORY_STRETCH` (la mémoire du titre vue un bloc de 64 Kio à la fois est
+   utilisée là où elle est : copies de retour de 36 à 12 ms) et son
+   `VICTORY_AMBIENT` (la lumière indirecte remplacée par une constante, sinon
+   les zones que le soleil n'atteint pas sont noires). Le second est un
+   pansement d'image, mais il rend le monde regardable tout de suite.
