@@ -1,6 +1,6 @@
 # Ray tracing
 
-The local RTX 4090 prologue test on revision `fd505a5` ran with the ray-tracing
+The local RTX 4090 prologue test on revision `05a78e3` ran with the ray-tracing
 structure builder disabled. The captures showed stepped shadow edges and
 missing or uneven lighting. See the [local test results](../README.md#local-test-results)
 for the machine, configuration, and frame timing.

@@ -22,7 +22,7 @@ publisher.
 
 ## Local test results
 
-The November 24, 2026 test of revision `fd505a5` used the Xbox Series X profile.
+The November 24, 2026 test of revision `05a78e3` used the Xbox Series X profile.
 It rendered at 2560 × 1440 internally and presented at 3840 × 2160. The command
 relay was enabled at level 2. The ray-tracing structure builder and texture
 prefetching were disabled.
