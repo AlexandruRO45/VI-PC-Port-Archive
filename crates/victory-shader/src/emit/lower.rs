@@ -72,6 +72,9 @@ pub(crate) struct Lowered {
     /// Whether the module contains the 32-lane half mask (`!31`).
     #[cfg(test)]
     pub has_half_wave_mask: bool,
+    /// Live clamps of an index to `HEAP_VIEWS - 1`.
+    #[cfg(test)]
+    pub view_clamps: u32,
 }
 
 pub(crate) struct Parts<'a> {
@@ -1412,6 +1415,11 @@ impl<'a> Lower<'a> {
             uses_lane_index: self.s.m.has_function("dx.op.waveGetLaneIndex"),
             #[cfg(test)]
             has_half_wave_mask: self.s.m.has_i32_const(!31),
+            #[cfg(test)]
+            view_clamps: self
+                .s
+                .m
+                .live_cmps_with_const(pred::IUGT, i64::from(super::HEAP_VIEWS - 1)),
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -4604,6 +4612,17 @@ impl<'a> Lower<'a> {
         self.end_guarded(outer, &[]);
     }
 
+    /// `index` clamped to the last heap slot, [`super::HEAP_VIEWS`] - 1,
+    /// as [`super::shader::Shader::heap_handle`] clamps it: for the root
+    /// views indexed by heap slot (`t`[`VIEW_STRIDES`], the view addresses),
+    /// which have no bounds of their own.
+    fn clamp_view_index(&mut self, index: V) -> V {
+        let c = self.cur;
+        let last = self.s.m.i32(super::HEAP_VIEWS - 1);
+        let over = self.s.m.cmp(c, pred::IUGT, index, last);
+        self.s.m.select(c, over, last, index)
+    }
+
     /// The byte stride of the buffer view at heap index `index`, from the
     /// view-stride table (`t`[`VIEW_STRIDES`]).
     fn stride_at(&mut self, index: V) -> V {
@@ -4830,6 +4849,7 @@ impl<'a> Lower<'a> {
             let word = (a.offset / 4 + k) % 8;
             let val = if word < known {
                 let index = self.heap_index(site, k as u8, false)?;
+                let index = self.clamp_view_index(index);
                 let c = self.cur;
                 let four = self.s.m.i32(4);
                 let at = self.s.m.bin(c, Bin::Shl, index, four);
@@ -5266,6 +5286,7 @@ impl<'a> Lower<'a> {
             Source::Phi { .. } => return Err(WHY),
             _ => self.lane_heap_index(src, false)?,
         };
+        let index = self.clamp_view_index(index);
         let c = self.cur;
         let four = self.s.m.i32(4);
         let at = self.s.m.bin(c, Bin::Mul, index, four);
@@ -5548,10 +5569,8 @@ impl<'a> Lower<'a> {
         if sampler || !(10..=12).contains(&(props.0 & 0xFF)) || !self.is_heap_direct(src) {
             return index;
         }
+        let index = self.clamp_view_index(index);
         let c = self.cur;
-        let last = self.s.m.i32(super::HEAP_VIEWS - 1);
-        let over = self.s.m.cmp(c, pred::IUGT, index, last);
-        let index = self.s.m.select(c, over, last, index);
         let four = self.s.m.i32(4);
         let at = self.s.m.bin(c, Bin::Mul, index, four);
         let table = self.s.root_srv_handle(VIEW_STRIDES);
@@ -12204,4 +12223,8 @@ mod tests {
         #[cfg(not(windows))]
         let _ = l;
     }
+
+    /// Descriptor tests, in a file of their own (`lower.rs` is close to the
+    /// repository's limit on a file's size).
+    mod descriptors;
 }
