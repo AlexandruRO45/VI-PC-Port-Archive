@@ -818,10 +818,14 @@ extern "system" fn unregister_callback(this: This, token: u64, timeout: u64) -> 
             return true;
         }
         state = match deadline {
+<<<<<<< HEAD
             None => hub
                 .returned
                 .wait(state)
                 .unwrap_or_else(PoisonError::into_inner),
+=======
+            None => hub.returned.wait(state).unwrap_or_else(PoisonError::into_inner),
+>>>>>>> upstream/main
             Some(deadline) => {
                 let Some(left) = deadline.checked_duration_since(Instant::now()) else {
                     return false;
@@ -1156,9 +1160,13 @@ mod host {
             #[cfg(feature = "diagnostics")]
             if slot == 0 {
                 for vk in scripted() {
+<<<<<<< HEAD
                     if let Some(&(_, button)) =
                         super::FALLBACK_BUTTONS.iter().find(|(key, _)| *key == vk)
                     {
+=======
+                    if let Some(&(_, button)) = super::FALLBACK_BUTTONS.iter().find(|(key, _)| *key == vk) {
+>>>>>>> upstream/main
                         pad.buttons |= button;
                     }
                 }
@@ -1583,6 +1591,7 @@ mod tests {
         let mut token = 0;
         let context = (&raw const hub.object).cast_mut().cast();
         assert_eq!(
+<<<<<<< HEAD
             register(
                 &hub.object,
                 std::ptr::null(),
@@ -1593,6 +1602,9 @@ mod tests {
                 Some(slow),
                 &mut token
             ),
+=======
+            register(&hub.object, std::ptr::null(), GAMEPAD_KIND, 1, 0, context, Some(slow), &mut token),
+>>>>>>> upstream/main
             S_OK
         );
         host.lock().unwrap().pads[1] = Some(PadState::default());
@@ -1601,10 +1613,14 @@ mod tests {
             std::thread::sleep(Duration::from_millis(1));
         }
         let unregister = slot::<extern "system" fn(This, u64, u64) -> bool, _>(&hub.object, 0x68);
+<<<<<<< HEAD
         assert!(
             !unregister(&hub.object, token, 5000),
             "times out while it runs"
         );
+=======
+        assert!(!unregister(&hub.object, token, 5000), "times out while it runs");
+>>>>>>> upstream/main
         let leave = std::thread::spawn(|| {
             std::thread::sleep(Duration::from_millis(50));
             LEAVE.store(true, Ordering::SeqCst);

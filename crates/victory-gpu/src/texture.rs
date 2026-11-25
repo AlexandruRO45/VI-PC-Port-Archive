@@ -59,11 +59,14 @@ pub(crate) struct Staging {
     /// Levels on demand (`crate::tiles`): the texture's host copy was made
     /// without memory of its own when the staging buffer was made.
     on_demand: bool,
+<<<<<<< HEAD
     /// For such a texture: whether [`Staging::detile`] has produced a held
     /// level mask in [`Staging::detiled`] (false before the first detiling,
     /// e.g. when a partly-mapped read was all zero or `refresh_unlocked`
     /// failed).
     has_detiled: std::sync::atomic::AtomicBool,
+=======
+>>>>>>> upstream/main
     /// For such a texture: the levels that were the title's at the last
     /// detiling (a bit a level; the staging buffer holds zeros for the
     /// others), and what that was judged by ([`Staging::judgement`]).
@@ -708,10 +711,14 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     };
     list.defer_texture(staging.clone());
     list.defer_host(move || {
+<<<<<<< HEAD
         let Some(held) = staging.detiled_levels() else {
             return;
         };
         let waiting = on_demand.uploaded(held, staging.memory as u64);
+=======
+        let waiting = on_demand.uploaded(staging.detiled.load(Relaxed), staging.memory as u64);
+>>>>>>> upstream/main
         staging.waiting.store(if waiting { crate::host::moment().max(1) } else { 0 }, Relaxed);
         // A texture picked by index has no staging buffer after this
         // upload: its slots are made due again by the texture pass.
@@ -858,6 +865,7 @@ impl Staging {
         [self.judged[0].load(Relaxed), self.judged[1].load(Relaxed)]
     }
 
+<<<<<<< HEAD
     fn record_judged(&self, judged: [u64; 2]) {
         use std::sync::atomic::Ordering::Relaxed;
         self.judged[0].store(judged[0], Relaxed);
@@ -873,6 +881,8 @@ impl Staging {
             .then(|| self.detiled.load(Relaxed))
     }
 
+=======
+>>>>>>> upstream/main
     /// Levels on demand: the levels that are the title's now, a bit a
     /// level. A level is held if no view starts above it, its bytes end
     /// before the next texture starts, and all of them are mapped. The
@@ -1019,9 +1029,12 @@ impl Staging {
                 }
                 last.hash = Some(hash);
                 if read.iter().all(|&b| b == 0) {
+<<<<<<< HEAD
                     if self.on_demand {
                         self.record_judged(self.judgement());
                     }
+=======
+>>>>>>> upstream/main
                     return false;
                 }
                 self.detile(read);
@@ -1090,7 +1103,10 @@ impl Staging {
         } else {
             UNLOCKED[1].fetch_add(1, Relaxed);
             last.asked = 0;
+<<<<<<< HEAD
             self.dirty.store(true, Relaxed);
+=======
+>>>>>>> upstream/main
             0
         }
     }
@@ -1102,12 +1118,21 @@ impl Staging {
         // once, for what the staging buffer holds from now on. The step
         // that gives levels their memory goes by this answer.
         let held = if self.on_demand {
+<<<<<<< HEAD
             use std::sync::atomic::Ordering::{Relaxed, Release};
             let judged = self.judgement();
             self.record_judged(judged);
             let held = self.held_levels(judged);
             self.detiled.store(held, Relaxed);
             self.has_detiled.store(true, Release);
+=======
+            use std::sync::atomic::Ordering::Relaxed;
+            let judged = self.judgement();
+            self.judged[0].store(judged[0], Relaxed);
+            self.judged[1].store(judged[1], Relaxed);
+            let held = self.held_levels(judged);
+            self.detiled.store(held, Relaxed);
+>>>>>>> upstream/main
             held
         } else {
             u32::MAX
@@ -1448,7 +1473,10 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         uploaded: std::sync::atomic::AtomicBool::new(false),
         used: std::sync::atomic::AtomicU64::new(crate::host::moment()),
         on_demand,
+<<<<<<< HEAD
         has_detiled: std::sync::atomic::AtomicBool::new(false),
+=======
+>>>>>>> upstream/main
         detiled: std::sync::atomic::AtomicU32::new(0),
         judged: [const { std::sync::atomic::AtomicU64::new(0) }; 2],
         waiting: std::sync::atomic::AtomicU64::new(0),
@@ -1566,6 +1594,7 @@ mod title_memory_tests {
             }
         }
     }
+<<<<<<< HEAD
 
     #[test]
     fn on_demand_skipped_detile_preserves_none_and_updates_judged() {
@@ -1663,4 +1692,6 @@ mod title_memory_tests {
         // SAFETY: freeing our private reservation.
         unsafe { VirtualFree(base.cast(), 0, MEM_RELEASE) };
     }
+=======
+>>>>>>> upstream/main
 }

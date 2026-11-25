@@ -74,9 +74,13 @@ fn build(mut outputs: Vec<SigElement>, ps_inputs: &[SigElement]) -> Result<Vec<u
         .iter()
         .position(|e| e.kind == 3 && e.comp == 9 && e.cols == 4)
     else {
+<<<<<<< HEAD
         return Err(unsupported(
             "a rectangle list without a four-component position",
         ));
+=======
+        return Err(unsupported("a rectangle list without a four-component position"));
+>>>>>>> upstream/main
     };
     for e in &mut outputs {
         // Interpolation as `emit_program` declares a vertex shader's
@@ -250,7 +254,16 @@ fn load(s: &mut Shader, id: usize, col: u8, vertex: u32) -> V {
     } else {
         ("loadInput.i32", s.t.i32)
     };
+<<<<<<< HEAD
     let args = [s.m.i32(id as u32), s.m.i32(0), s.m.i8(col), s.m.i32(vertex)];
+=======
+    let args = [
+        s.m.i32(id as u32),
+        s.m.i32(0),
+        s.m.i8(col),
+        s.m.i32(vertex),
+    ];
+>>>>>>> upstream/main
     let entry = s.entry;
     s.op(entry, name, Attr::ReadNone, ty, 4, &args)
 }
@@ -475,10 +488,14 @@ mod tests {
             }
             let half = draw(None);
             let missing = half.iter().zip(&whole).filter(|(a, b)| a != b).count();
+<<<<<<< HEAD
             assert!(
                 missing >= 24,
                 "{name}: only {missing} texels need the stage"
             );
+=======
+            assert!(missing >= 24, "{name}: only {missing} texels need the stage");
+>>>>>>> upstream/main
         }
     }
 }

@@ -343,12 +343,21 @@ pub fn track(
     for (block, (accesses, mut reads)) in first_lane_at {
         reads.sort_unstable();
         reads.dedup();
+<<<<<<< HEAD
         let proof =
             t.waterfall(block, &accesses, &reads)
                 .map_err(|what| ShaderError::Unsupported {
                     offset: t.inst((block, accesses[0])).machine.offset,
                     what,
                 })?;
+=======
+        let proof = t
+            .waterfall(block, &accesses, &reads)
+            .map_err(|what| ShaderError::Unsupported {
+                offset: t.inst((block, accesses[0])).machine.offset,
+                what,
+            })?;
+>>>>>>> upstream/main
         out.waterfall.compares.extend(proof.compares);
         out.waterfall.reads.extend(proof.reads);
     }
@@ -747,10 +756,16 @@ impl<'a> Tracer<'a> {
     /// [`Self::code_high`], at most `depth` additions deep.
     fn code_high_in(&self, t: Term, depth: u32) -> bool {
         let Term::Value(x) = t else { return false };
+<<<<<<< HEAD
         if self
             .def(x)
             .is_some_and(|i| i.name() == "s_getpc_b64" && i.writes.get(1).is_some_and(|w| w.1 == x))
         {
+=======
+        if self.def(x).is_some_and(|i| {
+            i.name() == "s_getpc_b64" && i.writes.get(1).is_some_and(|w| w.1 == x)
+        }) {
+>>>>>>> upstream/main
             return true;
         }
         depth > 0
@@ -959,11 +974,15 @@ impl<'a> Tracer<'a> {
             // A join of paths into tables in the code is the byte in the code
             // already: each path's `s_getpc_b64` counts as its own offset.
             let joined = s.dynamic.is_some_and(|d| self.code_join(d).is_some());
+<<<<<<< HEAD
             let first = if joined {
                 0
             } else {
                 pc.machine.offset as u32 + 4
             };
+=======
+            let first = if joined { 0 } else { pc.machine.offset as u32 + 4 };
+>>>>>>> upstream/main
             return Ok(Address {
                 param: CODE,
                 offset: first.wrapping_add(s.offset).wrapping_add(extra.offset),
@@ -2035,8 +2054,12 @@ impl<'a> Tracer<'a> {
                 } else {
                     continue;
                 };
+<<<<<<< HEAD
                 let Some(matched) = mask(inst.write(Reg::S(code)), inst.write(Reg::S(code + 1)))
                 else {
+=======
+                let Some(matched) = mask(inst.write(Reg::S(code)), inst.write(Reg::S(code + 1))) else {
+>>>>>>> upstream/main
                     continue;
                 };
                 if meet(&[reach, (selected, true), (matched, false)]) {
@@ -2630,10 +2653,14 @@ pub(crate) mod tests {
         assert_eq!(r.scalar.len(), 1);
         let a = r.scalar[0].1;
         assert_eq!((a.param, a.offset), (CODE, 0));
+<<<<<<< HEAD
         assert!(
             a.dynamic.is_some(),
             "the join is the computed term, the byte in the code"
         );
+=======
+        assert!(a.dynamic.is_some(), "the join is the computed term, the byte in the code");
+>>>>>>> upstream/main
     }
 
     /// An address into a table in the code computed per lane and taken from

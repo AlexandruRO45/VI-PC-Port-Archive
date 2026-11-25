@@ -84,10 +84,17 @@ mod bitcode;
 mod container;
 #[cfg(all(test, windows))]
 mod diff_tests;
+<<<<<<< HEAD
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
 #[cfg(all(test, windows))]
 mod intersect_tests;
+=======
+#[cfg(all(test, windows))]
+mod intersect_tests;
+#[cfg(all(windows, any(test, feature = "host")))]
+pub mod host;
+>>>>>>> upstream/main
 mod lower;
 mod own_bits;
 mod rect;
@@ -100,15 +107,22 @@ pub mod validator;
 mod valu_tests;
 #[cfg(all(test, windows))]
 mod waterfall_tests;
+<<<<<<< HEAD
 mod wave;
 #[cfg(all(test, windows))]
 mod wave64_tests;
+=======
+#[cfg(all(test, windows))]
+mod wave64_tests;
+mod wave;
+>>>>>>> upstream/main
 
 use crate::dxbc::{Container, FourCC};
 use crate::native::{HwStage, NativeProgram, RootType};
 use crate::{ShaderError, io, ir, resource, structure};
 
 pub use bitcode::census;
+<<<<<<< HEAD
 pub use lower::set_host_max_wave;
 pub use rect::rect_list_gs;
 pub use sampler::StaticSampler;
@@ -116,6 +130,15 @@ pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY,
     SLOT_STRIDES, SLOT_STRIDES_COUNT, USER_DATA_SPACE, USER_MEMORY_BASE, USER_VIEW_ADDRESS,
     USER_VIEW_BIAS, set_view_heap_limit, view_heap_limit,
+=======
+pub use sampler::StaticSampler;
+pub use lower::set_host_max_wave;
+pub use rect::rect_list_gs;
+pub use shader::{
+    MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
+    SLOT_STRIDES_COUNT, USER_DATA_SPACE, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
+    set_view_heap_limit, view_heap_limit,
+>>>>>>> upstream/main
 };
 
 /// The loop limit without an override: 2^20.
@@ -161,6 +184,7 @@ pub fn loop_limit() -> u32 {
 /// does).
 pub fn group_sync() -> u8 {
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+<<<<<<< HEAD
     *MODE.get_or_init(|| {
         match std::env::var("VICTORY_GROUP_SYNC")
             .ok()
@@ -171,6 +195,12 @@ pub fn group_sync() -> u8 {
             Some("1") => 1,
             _ => 2,
         }
+=======
+    *MODE.get_or_init(|| match std::env::var("VICTORY_GROUP_SYNC").ok().as_deref().map(str::trim) {
+        Some("0") => 0,
+        Some("1") => 1,
+        _ => 2,
+>>>>>>> upstream/main
     })
 }
 
@@ -205,10 +235,14 @@ pub fn translation_fingerprint() -> Vec<u8> {
     out.extend_from_slice(env!("VICTORY_SHADER_SOURCE_HASH").as_bytes());
     out.push(u8::from(cfg!(feature = "diagnostics")));
     out.push(u8::from(cfg!(debug_assertions)));
+<<<<<<< HEAD
     for name in env!("VICTORY_SHADER_SWITCHES")
         .split(',')
         .filter(|n| !n.is_empty())
     {
+=======
+    for name in env!("VICTORY_SHADER_SWITCHES").split(',').filter(|n| !n.is_empty()) {
+>>>>>>> upstream/main
         out.extend_from_slice(name.as_bytes());
         out.push(b'=');
         if let Some(value) = std::env::var_os(name) {
@@ -306,7 +340,27 @@ pub struct UserData {
 
 /// Translates the vertex, pixel, compute or mesh program of a console
 /// shader container.
+<<<<<<< HEAD
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
+=======
+///
+/// A program refused because the first half of an interpolation is read as
+/// data is translated once more with first halves evaluated as the pair
+/// they start (`lower::with_first_half_pairs`), and only such a program:
+/// with that on for every program, 8,551 pixel programs of the title that
+/// already translated came out changed (an extra evaluation in each), for
+/// the sake of 9 that did not translate.
+pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
+    match translate_plain(container) {
+        Err(ShaderError::Unsupported { what, .. }) if what == lower::FIRST_HALF => {
+            lower::with_first_half_pairs(|| translate_plain(container))
+        }
+        other => other,
+    }
+}
+
+fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
+>>>>>>> upstream/main
     let c = Container::parse(container)?;
     let dxil = c
         .part(FourCC::DXIL)
@@ -382,9 +436,13 @@ pub fn emit(
             Ok(()) => true,
             Err((offset, what)) => {
                 if why {
+<<<<<<< HEAD
                     eprintln!(
                         "WAVE64-RETRY local waves: not the allocation idiom at {offset:#x}: {what}"
                     );
+=======
+                    eprintln!("WAVE64-RETRY local waves: not the allocation idiom at {offset:#x}: {what}");
+>>>>>>> upstream/main
                 }
                 false
             }
@@ -428,11 +486,15 @@ pub fn emit(
                 // lane runs, where the two host waves can exchange.
                 // (`VICTORY_WAVE_DEEP_SKIPS=0` and `VICTORY_WAVE_WIDE=0` turn the two off.)
                 let deep_on = std::env::var_os("VICTORY_WAVE_DEEP_SKIPS").is_none_or(|v| v != "0");
+<<<<<<< HEAD
                 let deep = if deep_on {
                     form(ir::without_skips(p, true))
                 } else {
                     None
                 };
+=======
+                let deep = if deep_on { form(ir::without_skips(p, true)) } else { None };
+>>>>>>> upstream/main
                 if let Some((p, st, io, res)) = &deep {
                     let again = emit_program(c, native, p, st, io, res);
                     report("without skips, scalars followed", &again);
@@ -470,6 +532,7 @@ pub fn emit(
                     && idiom(p, st) == exact
                 {
                     let local = lower::with_local_waves(|| emit_program(c, native, p, st, io, res));
+<<<<<<< HEAD
                     report(
                         &format!(
                             "local waves ({}), {name}",
@@ -477,6 +540,9 @@ pub fn emit(
                         ),
                         &local,
                     );
+=======
+                    report(&format!("local waves ({}), {name}", if exact { "idiom" } else { "APPROXIMATE" }), &local);
+>>>>>>> upstream/main
                     if done(&local) {
                         return local.map(|(shader, _)| shader);
                     }
@@ -484,6 +550,7 @@ pub fn emit(
             }
             if idiom(p, st) == exact {
                 let local = lower::with_local_waves(|| emit_program(c, native, p, st, io, res));
+<<<<<<< HEAD
                 report(
                     if exact {
                         "local waves (idiom)"
@@ -492,6 +559,9 @@ pub fn emit(
                     },
                     &local,
                 );
+=======
+                report(if exact { "local waves (idiom)" } else { "local waves (APPROXIMATE)" }, &local);
+>>>>>>> upstream/main
                 if done(&local) {
                     return local.map(|(shader, _)| shader);
                 }
@@ -502,12 +572,17 @@ pub fn emit(
             if !strict {
                 for (name, f) in &forms {
                     if let Some((p, st, io, res)) = f {
+<<<<<<< HEAD
                         let local =
                             lower::with_local_waves_any(|| emit_program(c, native, p, st, io, res));
                         report(
                             &format!("local waves (APPROXIMATE, any mask), {name}"),
                             &local,
                         );
+=======
+                        let local = lower::with_local_waves_any(|| emit_program(c, native, p, st, io, res));
+                        report(&format!("local waves (APPROXIMATE, any mask), {name}"), &local);
+>>>>>>> upstream/main
                         if done(&local) {
                             return local.map(|(shader, _)| shader);
                         }
@@ -610,10 +685,14 @@ fn widen(
             .collect();
         if more.is_empty() {
             if why {
+<<<<<<< HEAD
                 eprintln!(
                     "WAVE64-WIDE stopped with {} branches wave-wide: a branch around it cannot be",
                     wide.len()
                 );
+=======
+                eprintln!("WAVE64-WIDE stopped with {} branches wave-wide: a branch around it cannot be", wide.len());
+>>>>>>> upstream/main
             }
             return r;
         }
@@ -1203,7 +1282,12 @@ mod tests {
             let c = super::Container::parse(&bytes).unwrap();
             let p = crate::ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
             let st = crate::structure::structure(&p).unwrap();
+<<<<<<< HEAD
             let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+=======
+            let res =
+                crate::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+>>>>>>> upstream/main
             let io = crate::io::raise(&p, &native).unwrap();
             let out = super::emit(&c, &native, &p, &st, &io, &res).unwrap();
             // dxil.dll, where there is one, checks PSV0 against the module.

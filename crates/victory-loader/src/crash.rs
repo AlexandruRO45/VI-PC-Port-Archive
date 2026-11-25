@@ -64,11 +64,16 @@ pub fn log_crashes_to(file: std::path::PathBuf) {
 /// Appends a failure that is not an exception (the host GPU's) to the crash
 /// log, with the title's last debug output, and prints it.
 pub fn log_crash(text: &str) {
+<<<<<<< HEAD
     let text = format!(
         "{text}
 {}",
         title_output()
     );
+=======
+    let text = format!("{text}
+{}", title_output());
+>>>>>>> upstream/main
     eprint!("{text}");
     append_to_log(&text);
 }
@@ -79,6 +84,7 @@ fn append_to_log(text: &str) {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
+<<<<<<< HEAD
     let opened = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -89,6 +95,11 @@ fn append_to_log(text: &str) {
             "unix time {now}, process {}\n{text}\n",
             std::process::id()
         );
+=======
+    let opened = std::fs::OpenOptions::new().create(true).append(true).open(file);
+    if let Ok(mut f) = opened {
+        let _ = write!(f, "unix time {now}, process {}\n{text}\n", std::process::id());
+>>>>>>> upstream/main
     }
 }
 
@@ -115,9 +126,13 @@ fn title_output() -> String {
     let Ok(said) = SAID.try_lock() else {
         return String::new();
     };
+<<<<<<< HEAD
     said.iter()
         .map(|l| format!("  title said: {l}\n"))
         .collect()
+=======
+    said.iter().map(|l| format!("  title said: {l}\n")).collect()
+>>>>>>> upstream/main
 }
 
 /// Installs the handlers; call once before running title code.
@@ -348,20 +363,28 @@ unsafe fn sse4a(code: *const u8, xmm: &mut [M128A; 16]) -> Option<usize> {
         ((b(at + 3), b(at + 4)), at + 5)
     } else {
         // extrq reads its fields from src's low half, insertq from its high.
+<<<<<<< HEAD
         let f = if prefix == 0x66 {
             xmm[src].Low
         } else {
             xmm[src].High as u64
         };
+=======
+        let f = if prefix == 0x66 { xmm[src].Low } else { xmm[src].High as u64 };
+>>>>>>> upstream/main
         ((f as u8, (f >> 8) as u8), at + 3)
     };
     let (n, at_bit) = (u32::from(fields.0 & 63), u32::from(fields.1 & 63));
     let bits = if n == 0 { 64 } else { n };
+<<<<<<< HEAD
     let mask = if bits == 64 {
         u64::MAX
     } else {
         (1u64 << bits) - 1
     };
+=======
+    let mask = if bits == 64 { u64::MAX } else { (1u64 << bits) - 1 };
+>>>>>>> upstream/main
     if prefix == 0x66 {
         // extrq: register form takes its fields from src, works on dst.
         if immediate && (modrm >> 3) & 7 != 0 {
@@ -443,7 +466,12 @@ unsafe fn thrown(p: &[usize]) -> String {
         let types = p[3] + rva(p[2] + 12);
         let name = |i: usize| {
             let descriptor = p[3] + rva(p[3] + rva(types + 4 + 4 * i) + 4);
+<<<<<<< HEAD
             std::ffi::CStr::from_ptr((descriptor + 16) as *const std::ffi::c_char).to_string_lossy()
+=======
+            std::ffi::CStr::from_ptr((descriptor + 16) as *const std::ffi::c_char)
+                .to_string_lossy()
+>>>>>>> upstream/main
         };
         let first = name(0);
         let value = match &*first {
