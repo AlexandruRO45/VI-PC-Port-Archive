@@ -19,6 +19,65 @@ use crate::{
 /// What D3D returns when none of the requested feature levels is supported.
 const UNSUPPORTED: HRESULT = 0x887A_0004_u32 as i32;
 
+/// The vtable slot (method index, not byte offset) each `ID3D12DeviceN`
+/// interface's own methods *end* at, PC order, computed from the exact
+/// `windows` crate version this workspace pins
+/// (`windows-0.62.2/src/Windows/Win32/Graphics/Direct3D12/mod.rs`, counting
+/// `ID3D12Device{,1..=14}_Vtbl` fields with this crate's enabled features -
+/// `Win32_Graphics_Dxgi_Common` and `Win32_Security` - since feature-gated
+/// fields keep their slot either way, just with a dummy type when off).
+/// Reliable only through `ID3D12Device4` (slot 56): this module's own doc
+/// comment says the table matches PC order only up to where "console
+/// additions follow", and that boundary is demonstrably at or before
+/// `ID3D12Device5` - this table's hand-written note at [`unknown_pipeline`]
+/// claims `ID3D12Device5` and `ID3D12Device8` each add 9 methods, but the
+/// pinned `windows` crate has 8 and 5. Past slot 56, a slot is reported as
+/// "ID3D12Device5-or-later, PC order uncertain here" rather than guessing
+/// which one - a wrong confident name would be worse than none for actually
+/// debugging this.
+const DEVICE_INTERFACE_BOUNDS: &[(usize, &str)] = &[
+    (2, "IUnknown"),
+    (6, "ID3D12Object"),
+    (43, "ID3D12Device"),
+    (46, "ID3D12Device1"),
+    (47, "ID3D12Device2"),
+    (50, "ID3D12Device3"),
+    (56, "ID3D12Device4"),
+];
+
+/// Names the `ID3D12DeviceN` interface vtable slot `slot` belongs to, in PC
+/// order - exact through `ID3D12Device4`, hedged past it (see
+/// [`DEVICE_INTERFACE_BOUNDS`]).
+fn device_interface_for_slot(slot: usize) -> &'static str {
+    DEVICE_INTERFACE_BOUNDS
+        .iter()
+        .find(|&&(end, _)| slot <= end)
+        .map_or("ID3D12Device5-or-later (console layout may diverge from PC here)", |&(_, name)| name)
+}
+
+/// Calls to each vtable slot [`unknown_pipeline`] covers, for a summary at
+/// process end ([`report_unimplemented_calls`]).
+static UNIMPLEMENTED_CALLS: std::sync::Mutex<std::collections::BTreeMap<usize, u32>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// Logs every unimplemented device method slot hit this run and its total
+/// call count, with the PC interface it falls under where that's reliable.
+/// Called once at process end, next to `pipeline::save_pipeline_cache` -
+/// `victory_hle::modules::lifecycle::end` ends the process with
+/// `TerminateProcess`, which runs no normal shutdown/`atexit` code, so this
+/// must be called explicitly before that, not registered as a handler.
+pub fn report_unimplemented_calls() {
+    let calls = UNIMPLEMENTED_CALLS.lock().unwrap_or_else(|e| e.into_inner());
+    for (&slot, &calls) in calls.iter() {
+        tracing::info!(
+            slot = format_args!("{slot:#x}"),
+            calls,
+            interface = device_interface_for_slot(slot),
+            "unimplemented device method: total calls this run"
+        );
+    }
+}
+
 /// The device interface id (the same as on PC). Titles also import it as
 /// data.
 pub static IID: Iid = guid(
@@ -362,18 +421,22 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
     _iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
-    use std::sync::atomic::{AtomicU32, Ordering};
-    static CALLS: [AtomicU32; 2] = [const { AtomicU32::new(0) }; 2];
-    let calls = CALLS[usize::from(SLOT == 0x218)].fetch_add(1, Ordering::Relaxed) + 1;
+    let calls = {
+        let mut calls = UNIMPLEMENTED_CALLS.lock().unwrap_or_else(|e| e.into_inner());
+        let c = calls.entry(SLOT).or_insert(0);
+        *c += 1;
+        *c
+    };
     if !out.is_null() {
         // SAFETY: the title's out pointer (a local of its own).
         unsafe { *out = std::ptr::null() };
     }
+    let interface = device_interface_for_slot(SLOT);
     #[cfg(all(windows, feature = "diagnostics"))]
     crate::shader_diag::record(
         "device-method-unimplemented",
         "(no shader - a whole creation method, not a shader)",
-        format_args!("slot={SLOT:#x} calls={calls}"),
+        format_args!("slot={SLOT:#x} interface={interface} calls={calls}"),
     );
     if calls <= 4 || calls.is_power_of_two() {
         // Sixteen 64-bit words at `at`, read through the kernel: neither
@@ -396,6 +459,7 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
             .and_then(|w| words(w[0] as usize));
         tracing::warn!(
             slot = format_args!("{:#x}", SLOT),
+            interface,
             calls,
             description = format_args!("{description:x?}"),
             first_points_at = format_args!("{first:x?}"),

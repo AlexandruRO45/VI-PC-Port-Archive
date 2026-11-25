@@ -289,6 +289,11 @@ fn end() {
     // Compiled host pipelines kept for the next run.
     #[cfg(windows)]
     victory_gpu::pipeline::save_pipeline_cache();
+    // Unimplemented device methods hit this run, with their call counts:
+    // this is as far as the title drove us, so it is the only place a
+    // final summary can run (see the function's own doc comment).
+    #[cfg(windows)]
+    victory_gpu::device::report_unimplemented_calls();
     // SAFETY: ends this process, as the console ends a suspended title.
     unsafe { TerminateProcess(GetCurrentProcess(), 0) };
 }
