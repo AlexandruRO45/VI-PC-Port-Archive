@@ -1084,7 +1084,8 @@ impl State {
         let mut fresh: Vec<u8> = Vec::new();
         // Tables reaching past a host heap smaller than the title's (the
         // host's limit, 1,000,000 views on NVIDIA) are made afresh too: the
-        // title's slots there have no host slot of their own.
+        // title's slots there have no host slot of their own. A table with
+        // a changed placed-buffer backing also needs its own slots.
         for u in used.iter().filter(tables) {
             if fresh.contains(&u.slot) {
                 continue;
@@ -1099,7 +1100,7 @@ impl State {
             let (Some(host), Some(index)) = (heap.host(), heap.index(end)) else {
                 continue;
             };
-            if index >= host.count() {
+            if index >= host.count() || host.placed_buffer_binding_changed(index, end) {
                 fresh.push(u.slot);
             }
         }
@@ -1131,7 +1132,7 @@ impl State {
                 .map(|u| u.table_offset_dwords / 8 + 1)
                 .max()
                 .unwrap_or(1);
-            // The table and what its entries hold (record words).
+            // A placed view can change backing while its record stays the same.
             let key = {
                 use std::hash::{Hash, Hasher};
                 let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -1139,6 +1140,12 @@ impl State {
                     let at = table + u64::from(k) * 32;
                     // SAFETY: a descriptor slot in title memory.
                     unsafe { (at as *const [u32; 3]).read_unaligned() }.hash(&mut h);
+                    if let Some(copy) = crate::descriptor::view(at)
+                        .as_ref()
+                        .and_then(crate::descriptor::host::placed_buffer_copy)
+                    {
+                        copy.buffer.as_raw().hash(&mut h);
+                    }
                 }
                 (table, h.finish())
             };
