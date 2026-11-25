@@ -175,6 +175,7 @@ python3 -m venv out/pe-env
 ./out/pe-env/bin/python -B tests/startup_compute_request_offline_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_scalar_m0_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_readfirstlane_uniform_check.py
+./out/pe-env/bin/python -B tests/startup_gfx2hlsl_loop_constants_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_readfirstlane_recompute_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_sop2_complement_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_sdwa_cvt_check.py
@@ -199,6 +200,7 @@ python3 -m venv out/pe-env
 ./out/pe-env/bin/python -B tests/compute_heap_store_check.py
 ./out/pe-env/bin/python -B tests/compute_desc_numeric_check.py controls
 ./out/pe-env/bin/python -B tests/startup_ngg_slice_check.py
+./out/pe-env/bin/python -B tests/mesh_clip_cull_check.py
 ./out/pe-env/bin/python -B tests/mesh_dynamic_aot_check.py
 ./out/pe-env/bin/python -B tests/mesh_heap_sampler_check.py
 ./out/pe-env/bin/python -B tests/mesh_lane_spill_check.py
