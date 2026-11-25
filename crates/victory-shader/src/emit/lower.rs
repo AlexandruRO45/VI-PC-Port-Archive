@@ -769,8 +769,8 @@ impl<'a> Lower<'a> {
             }
         };
         let c = self.cur;
-        let dword = |l: &mut Self, byte: V| -> Result<V, Why> {
-            match h {
+        let dword = |l: &mut Self, handle: Option<V>, byte: V| -> Result<V, Why> {
+            match handle {
                 None => l.code_dword(byte),
                 Some(h) => {
                     let c = l.cur;
@@ -793,20 +793,20 @@ impl<'a> Lower<'a> {
                 None => {
                     let four = self.s.m.i32(4 * k);
                     let at = self.s.m.bin(c, Bin::Add, off, four);
-                    dword(self, at)?
+                    dword(self, h, at)?
                 }
                 Some((width, signed)) => {
                     let (not3, three) = (self.s.m.i32(!3), self.s.m.i32(3));
                     let at = self.s.m.bin(c, Bin::And, off, not3);
-                    let w = dword(self, at)?;
+                    let w = dword(self, h, at)?;
                     let byte = self.s.m.bin(c, Bin::And, off, three);
                     let sh = self.s.m.bin(c, Bin::Shl, byte, three);
                     let mut x = self.s.m.bin(c, Bin::LShr, w, sh);
-                    if width == 16 && (a.dynamic.is_some() || a.offset & 3 == 3) {
+                    if width == 16 && (a.param == MEMORY || a.dynamic.is_some() || a.offset & 3 == 3) {
                         // A 16-bit load at byte offset 3 mod 4 takes its high
                         // byte from the next dword; guard dynamic offsets so
                         // non-straddling loads never read past a buffer's end.
-                        let br = if a.dynamic.is_some() {
+                        let br = if a.dynamic.is_some() || a.param == MEMORY {
                             let mut crosses = self.s.m.cmp(c, pred::EQ, byte, three);
                             if let Some(g) = guard {
                                 crosses = self.s.m.bin(c, Bin::And, crosses, g);
@@ -815,10 +815,25 @@ impl<'a> Lower<'a> {
                         } else {
                             None
                         };
+                        let (next_handle, next) = if a.param == MEMORY {
+                            // A dword load through the current page's view cannot
+                            // safely reach the next page: it may be a separate
+                            // host allocation. Look up the high byte's page.
+                            let (lo, hi) = self.global_address(inst)?;
+                            let one = self.s.m.i32(1);
+                            let (next_lo, next_hi) = self.add64(lo, hi, one, false);
+                            let (handle, offset) = self.memory(next_lo, next_hi, 1, false, guard);
+                            let cur = self.cur;
+                            let mask = self.s.m.i32(!3);
+                            let offset = self.s.m.bin(cur, Bin::And, offset, mask);
+                            (Some(handle), offset)
+                        } else {
+                            let cur = self.cur;
+                            let four = self.s.m.i32(4);
+                            (h, self.s.m.bin(cur, Bin::Add, at, four))
+                        };
+                        let hi = dword(self, next_handle, next)?;
                         let cur = self.cur;
-                        let four = self.s.m.i32(4);
-                        let next = self.s.m.bin(cur, Bin::Add, at, four);
-                        let hi = dword(self, next)?;
                         let eight = self.s.m.i32(8);
                         let hi = self.s.m.bin(cur, Bin::Shl, hi, eight);
                         let combined = self.s.m.bin(cur, Bin::Or, x, hi);

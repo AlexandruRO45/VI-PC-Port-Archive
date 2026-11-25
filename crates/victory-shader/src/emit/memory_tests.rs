@@ -62,7 +62,7 @@ fn program() -> HostShader {
     let mut w = vec![s_mov_b32(5, 0x80)]; // s[4:5]: the table at s4
     w.extend(s_load(2, 8, 4, 0)); // s[8:11]: the result UAV
     w.push(v_mov_b32(1, ZERO));
-    w.extend(global(12, 2, 1, 0, 0, 0)); // global_load_dword v2, v1, s[0:1]
+    w.extend(global(10, 2, 1, 0, 0, 3)); // global_load_ushort across dwords
     w.extend(s_load(1, 12, 0, 8)); // s[12:13] = the pointer at +8
     w.push(S_WAITCNT_ALL);
     w.extend(s_load(0, 14, 12, 0)); // s14 = what it points at
@@ -228,6 +228,7 @@ fn title_memory_is_read_and_written_at_computed_addresses() {
         .unwrap_or_else(|e| e.into_inner());
     let mut memory = vec![0u32; 256];
     memory[0] = 0x1111_1111;
+    memory[1] = 0x0000_CDAB;
     let pointer = TITLE + 0x100;
     memory[2] = pointer as u32;
     memory[3] = (pointer >> 32) as u32;
@@ -288,7 +289,14 @@ fn title_memory_is_read_and_written_at_computed_addresses() {
                 .unwrap_or_else(|e| panic!("{label}: {e}"));
             assert_eq!(
                 out[0],
-                [0x1111_1111, 0x2222_2222, 0x2222_2222, 0, 0, 0x3333_3333],
+                [
+                    0xAB11,
+                    0x2222_2222,
+                    0x2222_2222,
+                    0,
+                    0,
+                    0x3333_3333,
+                ],
                 "{label}: reads"
             );
             assert_eq!(out[1][0x40 / 4], value, "{label}: the store");

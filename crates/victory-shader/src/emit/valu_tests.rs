@@ -1854,6 +1854,7 @@ fn build_global_load_cs(body: &[u32], tail: &[u32]) -> HostShader {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        view_marks: false,
     })
     .expect("lower");
 
@@ -1868,6 +1869,7 @@ fn build_global_load_cs(body: &[u32], tail: &[u32]) -> HostShader {
         root_uavs: lowered.root_uavs,
         memory: lowered.memory,
         memory_writes: lowered.memory_writes,
+        view_marks: lowered.view_marks,
         view_addresses: lowered.view_addresses,
         heap: lowered.heap,
         heap_writes: lowered.heap_writes,
