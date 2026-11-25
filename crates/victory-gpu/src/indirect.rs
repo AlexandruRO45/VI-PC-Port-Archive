@@ -219,16 +219,19 @@ pub(crate) fn bound(
     true
 }
 
-/// After the execution: the buffer back to common so later passes promote it
-/// as needed and submissions finish in common.
+/// After the execution: the buffer back to unordered access, where the
+/// title's passes keep using it; with `VICTORY_VRAM_COPIES=1`, to common
+/// instead, so later passes promote it as needed and submissions finish in
+/// common.
 pub(crate) fn done(list: &HostList, buffer: &ID3D12Resource) {
+    let after = if crate::shadow::vram_copies() {
+        D3D12_RESOURCE_STATE_COMMON
+    } else {
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS
+    };
     // SAFETY: an open list and a live buffer.
     unsafe {
-        list.list.ResourceBarrier(&[transition(
-            buffer,
-            D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
-            D3D12_RESOURCE_STATE_COMMON,
-        )])
+        list.list.ResourceBarrier(&[transition(buffer, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, after)])
     };
 }
 
