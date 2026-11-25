@@ -89,6 +89,14 @@ pub(crate) struct State {
     /// slot, end): taken [`ROOT_VIEW_RUN`] at a time, so that single slots
     /// do not break up the runs fresh tables need.
     root_run: (usize, u32, u32),
+    /// Slots made for unordered access clears in this list
+    /// ([`State::clear_view`]): (view heap, view, host resource) → dynamic
+    /// slot, so that clears of one view (a stand-in's, at each dispatch of
+    /// its program) share one. The slots are among [`Self::dynamic`], held
+    /// until the list is reset (which drops this with them) or released;
+    /// the list keeps the host resource, so its address names no other.
+    /// Made again in each segment of the list, as root views are.
+    clear_slots: std::collections::BTreeMap<(usize, View, usize), u32>,
     /// What was set straight onto the host list, for the next segment of
     /// the list ([`State::cut`]).
     fixed: Fixed,
@@ -314,6 +322,7 @@ impl State {
         self.host_state_lost();
         self.fresh_tables.clear();
         self.root_slots.clear();
+        self.clear_slots.clear();
         self.memory = None;
         let fixed = std::mem::take(&mut self.fixed);
         if fixed.topology {
@@ -1027,22 +1036,44 @@ impl State {
             once!("an unordered access clear of a slot without a view");
             return;
         };
+        self.clear_view(list, &view, values, float, rects);
+    }
+
+    /// The clear of [`Self::clear_unordered`] of `view`. Whether it was
+    /// recorded. Its shader-visible slot is a dynamic one the list holds
+    /// until reset, one per view however often the list clears it
+    /// (`clear_slots`).
+    fn clear_view(
+        &mut self,
+        list: &HostList,
+        view: &View,
+        values: [u32; 4],
+        float: bool,
+        rects: &[RECT],
+    ) -> bool {
         let heap = (self.heaps[0] != 0).then(|| crate::descriptor::heap(self.heaps[0] as This));
         let (Some(heap), Some(host)) = (heap, crate::host::host()) else {
             once!("an unordered access clear without a bound view heap");
-            return;
+            return false;
         };
-        let Some(visible) = heap.host() else { return };
-        let Some(slot) = visible.dynamic(1) else {
-            return;
-        };
-        self.dynamic
-            .push((std::ptr::from_ref(heap) as usize, slot, 1));
-        visible.make_at(slot, &view);
+        let Some(visible) = heap.host() else { return false };
         let at = host.cpu_view();
-        let Some(resource) = crate::descriptor::host::make_view(&view, at) else {
+        let Some(resource) = crate::descriptor::host::make_view(view, at) else {
             once!("an unordered access clear of a view the host cannot make");
-            return;
+            return false;
+        };
+        let key = (std::ptr::from_ref(heap) as usize, view.clone(), resource.as_raw() as usize);
+        let slot = match self.clear_slots.get(&key) {
+            Some(&slot) => slot,
+            None => {
+                let Some(slot) = visible.dynamic(1) else {
+                    return false;
+                };
+                self.dynamic.push((key.0, slot, 1));
+                visible.make_at(slot, view);
+                self.clear_slots.insert(key, slot);
+                slot
+            }
         };
         let written = UsedResource {
             kind: ResourceType::Uav,
@@ -1054,7 +1085,7 @@ impl State {
             user_data: 0,
             slot: 0,
         };
-        readable(list, &written, &view, false);
+        readable(list, &written, view, false);
         self.bind_heaps(list, false);
         list.keep(&resource);
         let gpu = visible.gpu(slot);
@@ -1069,6 +1100,7 @@ impl State {
                     .ClearUnorderedAccessViewUint(gpu, at, &resource, &values, rects);
             }
         }
+        true
     }
 
     /// Runs a dispatch on the host.
@@ -3122,6 +3154,86 @@ void main(uint3 id : SV_DispatchThreadID) {
         let (n, x) = submit();
         assert_eq!(n, 1, "mip 1 alone");
         assert!((x - 64.0 / 255.0).abs() < 1e-6, "mip 0 kept: {x}");
+    }
+
+    /// Clears of one view in one list share one dynamic slot (a title
+    /// that clears one view in many passes): eight clears of a
+    /// view take one, a clear of another view one more, and the views hold
+    /// their last clears; the slots come back when the list is reset.
+    #[test]
+    fn clears_of_one_view_in_a_list_share_a_dynamic_slot() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        const N: u32 = 16;
+        let null = std::ptr::null();
+        let heap_desc: [u32; 8] = [0, 8, 1, 0, 0, 0, 0, 0];
+        let mut heap = null;
+        let iid = crate::object::guid(0x8efb471d, 0x616c, 0x4f49, [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51]);
+        assert_eq!(crate::descriptor::create_heap(null, heap_desc.as_ptr().cast(), &iid, &mut heap), S_OK);
+        let heap_host = crate::descriptor::heap(heap).host().expect("a host view heap");
+        // R32_UINT.
+        let textures: Vec<This> = (0..2)
+            .map(|_| texture_at_address(title_memory(1 << 20), &texture_words(N, N, 42, 0x105, 4)))
+            .collect();
+        let uavs: Vec<View> = textures
+            .iter()
+            .map(|&t| View::Unordered(t as usize, 0, Some([42, 4, 0, 0, 0, 0, 0, 0, 0, 0])))
+            .collect();
+        let slots = Slots::new(2);
+        for (i, &t) in textures.iter().enumerate() {
+            slots.make(i as u32, &View::Shader(t as usize, Some([42, 4, 0x1688, 0, 0, 1, 0, 0, 0, 0])));
+        }
+        let read = compile_cs(
+            r#"
+#define RS "DescriptorTable(SRV(t0, numDescriptors=2)), UAV(u1)"
+Texture2D<uint> a : register(t0);
+Texture2D<uint> b : register(t1);
+RWByteAddressBuffer o : register(u1);
+[RootSignature(RS)]
+[numthreads(8, 8, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    int3 at = int3(id.xy, 0);
+    o.Store2((id.y * 16 + id.x) * 8, uint2(a.Load(at), b.Load(at)));
+}
+"#,
+        );
+        let (out, data) = host.shared_buffer(u64::from(N * N) * 8).unwrap();
+        let free = heap_host.dynamic_free();
+        let list = host.new_list().unwrap();
+        let mut state = State::default();
+        state.set_heaps(&[heap]);
+        for k in 1..=8 {
+            assert!(state.clear_view(&list, &uavs[0], [k, 0, 0, 0], false, &[]), "clear {k}");
+        }
+        assert_eq!(heap_host.dynamic_free(), free - 1, "eight clears of one view, one slot");
+        assert!(state.clear_view(&list, &uavs[1], [0x77, 0, 0, 0], false, &[]));
+        assert_eq!(heap_host.dynamic_free(), free - 2, "another view, another slot");
+        assert!(state.clear_view(&list, &uavs[0], [0x55, 0, 0, 0], false, &[]));
+        assert_eq!(heap_host.dynamic_free(), free - 2, "the first view's slot again");
+        for t in &textures {
+            let srv = View::Shader(*t as usize, Some([42, 4, 0x1688, 0, 0, 1, 0, 0, 0, 0]));
+            readable(&list, &used(ResourceType::Srv), &srv, false);
+        }
+        run(&list, &slots, &read, 0, Some(&out), (N / 8, N / 8));
+        list.close();
+        host.execute(&[&list]);
+        for i in [0usize, 5, 7 * 16 + 9, 255] {
+            // SAFETY: inside the mapped output, after the list ran.
+            let words = unsafe { (data.add(i * 8) as *const [u32; 2]).read() };
+            assert_eq!(words, [0x55, 0x77], "texel {i}: each view's last clear");
+        }
+        list.reset();
+        state.reset(null);
+        assert_eq!(heap_host.dynamic_free(), free, "the slots come back at reset");
+        // A new recording takes a slot afresh.
+        state.set_heaps(&[heap]);
+        assert!(state.clear_view(&list, &uavs[0], [1, 0, 0, 0], false, &[]));
+        assert_eq!(heap_host.dynamic_free(), free - 1);
+        list.close();
+        host.execute(&[&list]);
+        list.reset();
+        state.reset(null);
     }
 
     /// A depth texture with stencil (the console's 16-bit depth, the
