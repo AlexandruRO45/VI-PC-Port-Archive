@@ -514,6 +514,55 @@ mod tests {
     }
 
     #[test]
+    fn last_bc4_mip_ends_after_the_active_block() {
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_BC4_UNORM, DXGI_SAMPLE_DESC};
+
+        let Some(host) = host() else {
+            return;
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 8,
+            Height: 4,
+            DepthOrArraySize: 1,
+            MipLevels: 2,
+            Format: DXGI_FORMAT_BC4_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            ..Default::default()
+        };
+        let mut footprints = [D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); 2];
+        let mut rows = [0; 2];
+        let mut row_bytes = [0; 2];
+        let mut total = 0;
+        // SAFETY: each output array has room for both subresources.
+        unsafe {
+            host.device.GetCopyableFootprints(
+                &desc,
+                0,
+                2,
+                0,
+                Some(footprints.as_mut_ptr()),
+                Some(rows.as_mut_ptr()),
+                Some(row_bytes.as_mut_ptr()),
+                Some(&mut total),
+            );
+        }
+        let last = footprints[1];
+        assert_eq!(row_bytes[1], 8);
+        assert!(u64::from(last.Footprint.RowPitch) > row_bytes[1]);
+        assert_eq!(
+            subresource_len(
+                last.Offset,
+                last.Footprint.RowPitch as usize,
+                rows[1],
+                last.Footprint.Depth,
+                total
+            ),
+            row_bytes[1] as usize
+        );
+    }
+
+    #[test]
     fn committed_rejects_overflow_and_noaccess_pages() {
         use windows_sys::Win32::System::Memory::{
             MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE, VirtualAlloc,
