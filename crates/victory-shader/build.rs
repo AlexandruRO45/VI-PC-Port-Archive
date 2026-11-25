@@ -45,6 +45,9 @@ fn main() {
 /// `apps/victory` has: without it Windows 10 reports shader model 6.5 and every
 /// SM 6.6 test is skipped. A no-op unless the runtime is already staged.
 fn app_local_agility_runtime() {
+    // Declared on every build, including the ones that take an early return below: a `cfg`
+    // name has to be known to rustc even when nothing sets it.
+    println!("cargo:rustc-check-cfg=cfg(agility_runtime)");
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
         return;
     }
@@ -59,12 +62,14 @@ fn app_local_agility_runtime() {
         .expect("a profile directory above OUT_DIR")
         .to_path_buf();
     let runtime = profile.join("D3D12").join("D3D12Core.dll");
-    println!("cargo:rerun-if-changed={}", runtime.display());
     if !runtime.is_file() {
         // No app-local runtime: leave the in-box one alone, exactly as a build without
-        // the opt-in would.
+        // the opt-in would. Do not watch the missing file: `rerun-if-changed` on a path
+        // that does not exist reruns this script on every build.
         return;
     }
+    // The runtime is staged: rerun if it is replaced or removed.
+    println!("cargo:rerun-if-changed={}", runtime.display());
 
     // The loader resolves `D3D12SDKPath` next to the running module, and test binaries run
     // from `deps`, so mirror the runtime there before the tests need it.
@@ -72,11 +77,32 @@ fn app_local_agility_runtime() {
     let _ = std::fs::create_dir_all(&deps);
     let _ = std::fs::copy(&runtime, deps.join("D3D12Core.dll"));
 
-    // Export the two symbols the Agility SDK loader looks for in the host module, so
-    // d3d12.dll loads that runtime instead of the in-box copy. Without them Windows 10
-    // reports shader model 6.5 and every SM 6.6 test is skipped.
-    println!("cargo:rustc-link-arg=/EXPORT:D3D12SDKVersion,DATA");
-    println!("cargo:rustc-link-arg=/EXPORT:D3D12SDKPath,DATA");
+    // `src/agility.rs` defines the two symbols the Agility SDK loader looks for in the host
+    // module. They are `DATA` symbols and the loader needs both: exporting the version alone
+    // leaves it on the in-box runtime.
+    //
+    // The MSVC linker takes `/EXPORT:` options straight from here. GNU hosts do not: `ld`
+    // reads `.drectve` sections from MSVC objects only, and treats `/EXPORT:...` as a file
+    // name, so the exports go through a `.def` file instead. `cargo:rustc-link-arg` applies
+    // to this package's test and bench binaries, which is exactly the set that needs it.
+    match std::env::var("CARGO_CFG_TARGET_ENV").as_deref() {
+        Ok("msvc") => {
+            println!("cargo:rustc-link-arg=/EXPORT:D3D12SDKVersion,DATA");
+            println!("cargo:rustc-link-arg=/EXPORT:D3D12SDKPath,DATA");
+        }
+        _ => {
+            let def = out.join("agility-exports.def");
+            let _ = std::fs::write(
+                &def,
+                "EXPORTS
+    D3D12SDKVersion DATA
+    D3D12SDKPath DATA
+",
+            );
+            println!("cargo:rustc-link-arg=-Wl,{}", def.display());
+        }
+    }
+    println!("cargo:rustc-cfg=agility_runtime");
 }
 
 fn sources(dir: &Path, out: &mut Vec<PathBuf>) {
