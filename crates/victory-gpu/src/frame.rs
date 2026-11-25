@@ -16,6 +16,80 @@ use std::time::{Duration, Instant};
 
 use crate::object::{HRESULT, S_FALSE, S_OK, This};
 
+/// Sleeps out `wait` as precisely as the host allows.
+///
+/// `std::thread::sleep` on Windows rounds up to the system timer's tick
+/// (about 15.6 ms unless something has raised the resolution), which makes
+/// every sub-tick frame wait late: the title's menu screens drift. A
+/// high-resolution waitable timer (Windows 10 1803+) fires on the tick the
+/// due time asks for; where the host has none, plain sleep stands in and
+/// behaves as before.
+fn sleep_precise(wait: Duration) {
+    #[cfg(windows)]
+    if let Some(timer) = high_res_timer() {
+        // A negative due time is relative, in 100 ns units.
+        let due = -(wait.as_nanos().div_ceil(100) as i64);
+        // SAFETY: `timer.0` is a valid handle or the function returns before
+        // using it; the other arguments are constants and null pointers.
+        if unsafe {
+            windows_sys::Win32::System::Threading::SetWaitableTimer(
+                timer.0,
+                &due,
+                0,
+                None,
+                std::ptr::null_mut(),
+                0,
+            ) != 0
+        } {
+            // SAFETY: a valid handle with no other waiter.
+            unsafe {
+                if windows_sys::Win32::System::Threading::WaitForSingleObject(timer.0, u32::MAX)
+                    == windows_sys::Win32::Foundation::WAIT_OBJECT_0
+                {
+                    return;
+                }
+            }
+        }
+        std::thread::sleep(wait);
+        return;
+    }
+    std::thread::sleep(wait);
+}
+
+/// A waitable timer handle: a plain kernel token.
+#[cfg(windows)]
+#[derive(Clone, Copy)]
+struct Timer(windows_sys::Win32::Foundation::HANDLE);
+
+/// The calling thread's high-resolution waitable timer, made on first use,
+/// or `None` where the host cannot make one.
+///
+/// One per thread: a timer is a synchronization object, and two frame
+/// threads waiting on one handle would wake on each other's due times.
+#[cfg(windows)]
+fn high_res_timer() -> Option<Timer> {
+    thread_local! {
+        static TIMER: std::cell::OnceCell<Option<Timer>> = const { std::cell::OnceCell::new() };
+    }
+    TIMER.with(|timer| {
+        *timer.get_or_init(|| {
+            // SAFETY: a plain creation call with a name no other code uses.
+            // `SYNCHRONIZE` is required to wait on the handle; the timer is
+            // only ever used by this thread.
+            let timer = unsafe {
+                windows_sys::Win32::System::Threading::CreateWaitableTimerExW(
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    windows_sys::Win32::System::Threading::CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                    windows_sys::Win32::System::Threading::TIMER_ALL_ACCESS,
+                )
+            };
+            // A failed creation returns NULL (not INVALID_HANDLE_VALUE).
+            (!timer.is_null()).then_some(Timer(timer))
+        })
+    })
+}
+
 /// What a wait returns when its time is up first.
 const TIMEOUT: HRESULT = S_FALSE;
 /// The frame-origin event: the one that starts frames and makes tokens.
@@ -134,10 +208,10 @@ pub(crate) extern "system" fn wait(
     #[cfg_attr(not(feature = "diagnostics"), allow(unused_variables))]
     let (tick, wait) = next_tick(kind, limit);
     let hr = if wait > limit {
-        std::thread::sleep(limit);
+        sleep_precise(limit);
         TIMEOUT
     } else {
-        std::thread::sleep(wait);
+        sleep_precise(wait);
         S_OK
     };
     // A frame begun on a time-out takes no tick: its flip still does.
