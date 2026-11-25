@@ -99,7 +99,8 @@ impl Drop for Changed {
 /// Pages (page numbers) whose bytes a tracker keeps when they are first
 /// written after it took them, and those bytes: while shaders may be
 /// writing its copy of them, what it held before (`crate::shadow`'s
-/// copy-back of marked pages).
+/// copy-back of marked pages), with what the copy took of the page since
+/// laid over them ([`Tracked::refreshed`]).
 #[derive(Default)]
 struct Saved {
     armed: BTreeSet<usize>,
@@ -548,7 +549,8 @@ impl Tracked {
     }
 
     /// The bytes page `page` (a page number) held when it was first written
-    /// since it was taken, if it was armed then (and so changed).
+    /// since it was taken, if it was armed then (and so changed), with what
+    /// the copy took of it since: the copy's bytes before the submission.
     pub(crate) fn saved(&self, page: usize) -> Option<Box<[u8]>> {
         self.changed.1.lock().unwrap_or_else(|e| e.into_inner()).bytes.remove(&page)
     }
