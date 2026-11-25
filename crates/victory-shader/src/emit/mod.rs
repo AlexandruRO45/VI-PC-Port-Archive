@@ -183,6 +183,8 @@
 //!   console never exports them).
 
 mod bitcode;
+#[cfg(test)]
+mod translate_bench;
 #[cfg(all(test, windows))]
 mod bvh_tests;
 mod container;
