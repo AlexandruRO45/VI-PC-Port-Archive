@@ -7,7 +7,7 @@
 
 use std::sync::Mutex;
 
-use victory_shader::emit::{HEAP_SAMPLERS, HEAP_VIEWS, PORTABLE_VIEWS};
+use victory_shader::emit::{HEAP_SAMPLERS, HEAP_VIEWS, PORTABLE_TITLE_VIEWS, PORTABLE_VIEWS};
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
@@ -126,6 +126,9 @@ const DYNAMIC: u32 = 1 << 18;
 /// The dynamic slots a heap of [`HEAP_VIEWS`] keeps at least, when the title's
 /// slots would take nearly all of it.
 const MIN_DYNAMIC: u32 = 1 << 16;
+
+// Shaders send title indices past these slots to a null view.
+const _: () = assert!(PORTABLE_TITLE_VIEWS == PORTABLE_VIEWS - 3 - DYNAMIC);
 
 /// The mirrored slots, dynamic slots and total slots of a view heap.
 /// The shader's last three slots stay reserved for the null UAV, SRV and general view.
@@ -2251,6 +2254,9 @@ mod tests {
             let fits = available - DYNAMIC;
             assert_eq!(view_layout(fits, portable), (fits, DYNAMIC, total));
             assert_eq!(view_layout(u32::MAX, portable), (available - kept, kept, total));
+            if portable {
+                assert_eq!(available - kept, PORTABLE_TITLE_VIEWS, "the title slots shaders assume");
+            }
         }
     }
 

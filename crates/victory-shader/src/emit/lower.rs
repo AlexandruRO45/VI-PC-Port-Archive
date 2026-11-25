@@ -5272,11 +5272,7 @@ impl<'a> Lower<'a> {
             Source::Phi { .. } => return Err(WHY),
             _ => self.lane_heap_index(src, false)?,
         };
-        let index = if self.s.view_limit == super::PORTABLE_VIEWS {
-            self.s.clamp_heap_index(self.cur, index, false)
-        } else {
-            index
-        };
+        let index = self.s.clamp_title_heap_index(self.cur, index);
         Ok(self.stride_at(index))
     }
 
@@ -5538,6 +5534,12 @@ impl<'a> Lower<'a> {
     /// buffer one (a wild address: the texture's address shifted 8 bits
     /// down) and faulted the device.
     fn buffer_guard(&mut self, src: &Source, index: V, sampler: bool, props: (u32, u32)) -> V {
+        // Indices the title made itself (every path from the heap): not past its slots.
+        let index = if !sampler && self.is_heap_only(src) {
+            self.s.clamp_title_heap_index(self.cur, index)
+        } else {
+            index
+        };
         // Typed, raw and structured buffers (DXIL resource kinds 10-12).
         if sampler || !(10..=12).contains(&(props.0 & 0xFF)) || !self.is_heap_direct(src) {
             return index;
@@ -5551,6 +5553,13 @@ impl<'a> Lower<'a> {
         let null = self.s.view_limit - 2 - u32::from(props.0 & 0x1000 != 0);
         let null = self.s.m.i32(null);
         self.s.m.select(c, none, null, index)
+    }
+
+    /// Whether a descriptor comes from the resource heap itself (root type
+    /// 5, not a table) on every path.
+    fn is_heap_only(&self, src: &Source) -> bool {
+        let leaves = src.leaves();
+        !leaves.is_empty() && leaves.iter().all(|l| self.is_heap_direct(l))
     }
 
     /// Whether a descriptor comes from the resource heap itself (root type

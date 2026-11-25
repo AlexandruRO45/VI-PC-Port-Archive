@@ -1241,6 +1241,23 @@ mod tests {
     }
 
     #[test]
+    fn title_indices_past_the_portable_title_slots_read_the_null_view() {
+        use super::super::shader::{HEAP_VIEWS, Shader};
+        use super::super::{PORTABLE_TITLE_VIEWS, PORTABLE_VIEWS};
+
+        let mut s = Shader::new(false);
+        let index = s.m.undef(s.t.i32);
+        s.view_limit = HEAP_VIEWS;
+        assert_eq!(s.clamp_title_heap_index(s.entry, index), index);
+        s.view_limit = PORTABLE_VIEWS;
+        let V::Inst(selected) = s.clamp_title_heap_index(s.entry, index) else { panic!("expected a select") };
+        let (last, null) = (s.m.i32(PORTABLE_TITLE_VIEWS - 1), s.m.i32(PORTABLE_VIEWS - 1));
+        let Op::Select(V::Inst(over), t, f) = s.m.insts[selected as usize].op else { panic!("expected a select") };
+        assert_eq!((t, f), (null, index));
+        assert!(matches!(s.m.insts[over as usize].op, Op::Cmp(pred::IUGT, a, b) if (a, b) == (index, last)));
+    }
+
+    #[test]
     fn vbr_and_blocks() {
         let mut w = Writer::default();
         w.vbr(5, 6);

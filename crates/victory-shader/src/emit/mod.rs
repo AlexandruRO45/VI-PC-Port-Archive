@@ -368,6 +368,10 @@ pub struct UserData {
 /// The portable shader-visible view heap size.
 pub const PORTABLE_VIEWS: u32 = 1_000_000;
 
+/// The title's slots in the portable view heap. The host's dynamic slots
+/// (2^18) and the three null views follow them.
+pub const PORTABLE_TITLE_VIEWS: u32 = PORTABLE_VIEWS - 3 - (1 << 18);
+
 /// How a translation is made.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Options {

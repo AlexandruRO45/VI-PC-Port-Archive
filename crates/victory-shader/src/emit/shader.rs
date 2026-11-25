@@ -531,6 +531,19 @@ impl Shader {
         self.m.select(block, over, last, index)
     }
 
+    /// On the portable heap, redirects an index the title made past its own
+    /// slots ([`super::PORTABLE_TITLE_VIEWS`]) to the null view: the host's
+    /// dynamic slots follow them.
+    pub fn clamp_title_heap_index(&mut self, block: usize, index: V) -> V {
+        if self.view_limit != super::PORTABLE_VIEWS {
+            return index;
+        }
+        let last = self.m.i32(super::PORTABLE_TITLE_VIEWS - 1);
+        let over = self.m.cmp(block, pred::IUGT, index, last);
+        let null = self.m.i32(self.view_limit - 1);
+        self.m.select(block, over, null, index)
+    }
+
     /// A descriptor heap handle, annotated with `props`; `nonuniform` when
     /// the index may differ between lanes (`NonUniformResourceIndex`).
     pub fn heap_handle(
