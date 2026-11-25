@@ -205,7 +205,7 @@ pub struct Object {
 
 #[repr(C)]
 pub struct Device {
-    vtable: &'static Table<21>,
+    vtable: &'static Table<22>,
     hub: *const Hub,
     index: usize,
     info: DeviceInfo,
@@ -1031,6 +1031,20 @@ extern "system" fn set_rumble(this: *const Device, params: *const [f32; 4]) {
     let speed = |level: f32| (level.clamp(0.0, 1.0) * f32::from(u16::MAX)) as u16;
     lock(&device.hub().source).rumble(device.index, speed(low), speed(high));
 }
+/// `IsForceFeedbackMotorPoweredOn`: the host pads we expose have no motor
+/// this can report (XInput's vibration is not a powered motor).
+extern "system" fn force_feedback_motor_powered_on(_: *const Device, _motor: u32) -> bool {
+    false
+}
+
+/// `AcquireExclusiveRawDeviceAccess`: the host pad stays shared.
+extern "system" fn acquire_raw_device_access(_: *const Device, _timeout: u64) -> bool {
+    false
+}
+
+/// `ReleaseExclusiveRawDeviceAccess`: nothing was acquired.
+extern "system" fn release_raw_device_access(_: *const Device) {}
+
 extern "system" fn unsupported<const SLOT: usize>(_: *const c_void) -> HRESULT {
     tracing::warn!(
         slot = format_args!("{SLOT:#x}"),
@@ -1039,7 +1053,7 @@ extern "system" fn unsupported<const SLOT: usize>(_: *const c_void) -> HRESULT {
     E_NOTIMPL
 }
 
-static DEVICE: Table<21> = Table([
+static DEVICE: Table<22> = Table([
     device_interface as *const (),    // 0x00
     add_ref as *const (),             // 0x08 AddRef
     add_ref as *const (),             // 0x10 Release
@@ -1047,20 +1061,21 @@ static DEVICE: Table<21> = Table([
     device_status as *const (),       // 0x20
     unsupported::<0x28> as *const (), // battery
     unsupported::<0x30> as *const (), // force feedback
-    unsupported::<0x38> as *const (), //
-    unsupported::<0x40> as *const (), //
+    force_feedback_motor_powered_on as *const (), // 0x38
+    unsupported::<0x40> as *const (), // 0x40
     unsupported::<0x48> as *const (), // haptics
     set_rumble as *const (),          // 0x50
     unsupported::<0x58> as *const (), // input synchronization
-    unsupported::<0x60> as *const (), //
+    unsupported::<0x60> as *const (), // 0x60
     unsupported::<0x68> as *const (), // power off
     unsupported::<0x70> as *const (), // raw device access
-    unsupported::<0x78> as *const (), //
-    unsupported::<0x80> as *const (), //
-    unsupported::<0x88> as *const (), //
-    unsupported::<0x90> as *const (), //
-    unsupported::<0x98> as *const (), //
-    unsupported::<0xa0> as *const (), //
+    unsupported::<0x78> as *const (), // 0x78
+    unsupported::<0x80> as *const (), // 0x80
+    unsupported::<0x88> as *const (), // 0x88
+    unsupported::<0x90> as *const (), // 0x90
+    unsupported::<0x98> as *const (), // 0x98
+    acquire_raw_device_access as *const (), // 0xa0
+    release_raw_device_access as *const (), // 0xa8
 ]);
 
 fn reading<'a>(this: *const Reading) -> &'a Reading {
@@ -1575,6 +1590,15 @@ mod tests {
             E_NOINTERFACE
         );
         assert!(out.is_null());
+
+        // The SDK's 22-slot device table: the typed stubs at 0x38, 0xa0 and
+        // 0xa8 answer (false / nothing) rather than E_NOTIMPL.
+        let powered = slot::<extern "system" fn(*const Device, u32) -> bool, _>(device, 0x38);
+        assert!(!powered(device, 0));
+        let acquire = slot::<extern "system" fn(*const Device, u64) -> bool, _>(device, 0xa0);
+        assert!(!acquire(device, 0));
+        let release_raw = slot::<extern "system" fn(*const Device), _>(device, 0xa8);
+        release_raw(device);
 
         // IGameInputReading is counted: QueryInterface's AddRef is released.
         let reading = current(hub, GAMEPAD_KIND, 0).unwrap();
