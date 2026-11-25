@@ -3,7 +3,7 @@ name: CI
 on:
   pull_request:
   push:
-    branches: [main]
+    branches: [main, 'local/fxceless-render']
 
 permissions:
   contents: read
