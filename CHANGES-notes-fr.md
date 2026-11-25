@@ -74,7 +74,29 @@ Le flux de pipeline du titre nomme deux choses que la couche ne savait pas
 lire (le nombre d'échantillons forcé du rasteriseur, et les formats de cible
 un par un). Elles sont lues ; un flux qui les nomme n'est plus refusé.
 
-## 6. Repris de DexNom (25 nov.)
+## 6. Fusion de l'amont et méthode 0x218 (25 nov.)
+
+- **L'amont `fxceless/victory-fork` est fusionné** (`3973179`, 16 fichiers :
+  ce qui fait une image, les parties jointes, les copies de retour par notre
+  propre vue, un compteur d'images dans le coin, les enregistrements indirects
+  ramassés une fois par liste). Un seul conflit, sur `watch.rs` : notre
+  `VICTORY_VIEW_KNOWN` allumé par défaut est gardé, et le mode `=alt` de
+  l'amont (vingt secondes avec, vingt sans) est ajouté à côté. 176 tests
+  passent. Mesure après fusion au dossier de test : **1,1 à 1,5 s par image**
+  (contre 4 à 5 s avant), soit environ 0,6 à 0,9 images/s au chargement.
+- **La méthode de création de pipeline au slot 0x218 est écrite.** C'est
+  `CreatePipelineState` sur un flux de sous-objets, la même forme que la
+  méthode 0x1a8 que la couche savait déjà lire : elle est maintenant lue par
+  le même code. Le titre fait 13 appels au lancement et les 13 réussissent
+  (`VICTORY_PIPELINE_STREAM=0` revient à l'ancien refus).
+  **Ce que ça ne fait pas** : ces 13 flux commencent tous par un sous-objet
+  de type console `0x1c`, dont on ne connaît pas la forme ; les shaders d'un
+  état d'objet (lancer de rayons) n'y sont pas. Ce qui est rendu est donc un
+  pipeline sans étage : le titre ne reçoit plus un échec, mais ce n'est pas
+  un pipeline de lancer de rayons. Les 969 ms par image de DexNom viennent
+  d'un travail qui reste à faire.
+
+## 7. Repris de DexNom (25 nov.)
 
 Trois correctifs de [DexNom/VIctory](https://github.com/DexNom/VIctory), portés
 et adaptés à notre branche :
@@ -95,7 +117,7 @@ et adaptés à notre branche :
   passe : 54 passes par image pour 3 460 envois. Le plafond est passé à 256
   (réglable de 4 à 4096 par `VICTORY_INDIRECT_WINDOW_MOST`).
 
-## 7. Essayé et abandonné (mesuré, pas supposé)
+## 8. Essayé et abandonné (mesuré, pas supposé)
 
 Deux pistes ont été écrites, compilées, mesurées, puis retirées parce
 qu'elles n'aidaient pas :
@@ -109,7 +131,7 @@ qu'elles n'aidaient pas :
   10 400 ms par image. La bonne façon est celle de DexNom (reprendre les
   textures éparses à l'envoi), pas de découper la lecture ici.
 
-## 8. Ce qui reste à changer, du plus utile au moins utile
+## 9. Ce qui reste à changer, du plus utile au moins utile
 
 1. **Les zones à l'ombre sont noires** : le lancer de rayons (l'éclairage
    indirect, les ombres) ne tourne pas. C'est ce que le fork de DexNom a en
