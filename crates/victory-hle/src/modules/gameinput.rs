@@ -366,9 +366,14 @@ struct Slot {
     latch: Latch,
 }
 
-/// Whether presses are latched: on unless `VICTORY_INPUT_LATCH=0`.
+/// Whether presses are latched: only with `VICTORY_INPUT_LATCH=1`. Off by
+/// default, since it departs from what the real `GetCurrentReading` returns.
 fn latch_enabled() -> bool {
-    std::env::var_os("VICTORY_INPUT_LATCH").is_none_or(|v| v != "0")
+    latch_asked(std::env::var_os("VICTORY_INPUT_LATCH").as_deref())
+}
+
+fn latch_asked(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_some_and(|v| v == "1")
 }
 
 /// A title that reads only the current state once per frame misses a tap
@@ -1564,8 +1569,18 @@ mod tests {
     fn fake() -> (&'static Hub, Arc<Mutex<FakeHost>>) {
         let host = Arc::new(Mutex::new(FakeHost::default()));
         let hub = Hub::new(Box::new(Fake(Arc::clone(&host))));
+        // The latch is opt-in; these tests are about it (one turns it off).
+        hub.state().latch = true;
         hub.poll();
         (hub, host)
+    }
+
+    #[test]
+    fn the_latch_is_off_unless_asked_for() {
+        assert!(!latch_asked(None));
+        assert!(!latch_asked(Some("0".as_ref())));
+        assert!(!latch_asked(Some("".as_ref())));
+        assert!(latch_asked(Some("1".as_ref())));
     }
 
     fn key(virtual_key: u8) -> KeyState {
