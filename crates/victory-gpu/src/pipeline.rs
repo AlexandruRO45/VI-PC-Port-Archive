@@ -163,7 +163,8 @@ fn thread_cpu() -> (u64, u64) {
 #[cfg(windows)]
 fn thread_cpu_since(then: (u64, u64)) -> (u64, u64) {
     let now = thread_cpu();
-    ((now.0 - then.0) / 10_000, (now.1 - then.1) / 10_000)
+    // Saturating: a failed `thread_cpu` reads zeros, below any `then`.
+    (now.0.saturating_sub(then.0) / 10_000, now.1.saturating_sub(then.1) / 10_000)
 }
 
 /// The translation, and whether it came from the cache.
@@ -696,6 +697,14 @@ mod tests {
 
     use super::*;
     use crate::object::{S_OK, slot};
+
+    /// A processor time that reads below an earlier one (a failed query
+    /// reads zeros) is no time, not a panic or a huge one.
+    #[cfg(windows)]
+    #[test]
+    fn thread_time_never_runs_backwards() {
+        assert_eq!(thread_cpu_since((u64::MAX, u64::MAX)), (0, 0));
+    }
 
     fn shaders(p: This) -> Vec<(&'static str, Vec<u8>)> {
         pipeline(p)
