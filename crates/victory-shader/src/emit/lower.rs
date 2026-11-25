@@ -66,6 +66,8 @@ pub(crate) struct Lowered {
     /// Whether it declares rasterizer-ordered views.
     #[cfg(test)]
     pub rovs: bool,
+    #[cfg(test)]
+    pub legacy_half_conversion: bool,
     /// Whether the module declares `dx.op.waveGetLaneIndex`.
     #[cfg(test)]
     pub uses_lane_index: bool,
@@ -1392,6 +1394,8 @@ impl<'a> Lower<'a> {
             #[cfg(test)]
             rovs: self.s.flags & flags::ROVS != 0,
             #[cfg(test)]
+            legacy_half_conversion: self.s.m.has_function("dx.op.legacyF32ToF16"),
+            #[cfg(test)]
             uses_lane_index: self.s.m.has_function("dx.op.waveGetLaneIndex"),
             #[cfg(test)]
             has_half_wave_mask: self.s.m.has_i32_const(!31),
@@ -2198,7 +2202,11 @@ impl<'a> Lower<'a> {
     // shortcut: rounding toward +-infinity, or a mode not known at this
     // point (paths that set it differently join), rounds to nearest even.
     fn narrow16(&mut self, f: V) -> V {
-        let rtz = self.mode16 == Some(3);
+        self.narrow16_bits(f, self.mode16 == Some(3))
+    }
+
+    /// Converts with a fixed rounding direction, independent of the host.
+    fn narrow16_bits(&mut self, f: V, rtz: bool) -> V {
         let c = self.cur;
         let x = self.as_int(f);
         let k = |l: &mut Self, v: u32| l.s.m.i32(v);
@@ -4992,13 +5000,20 @@ impl<'a> Lower<'a> {
         let c = self.cur;
         let mut halves = Vec::new();
         for x in channels {
-            halves.push(if matches!(numeric, Numeric::Uint | Numeric::Sint) {
-                let m = self.s.m.i32(0xFFFF);
-                self.s.m.bin(c, Bin::And, x, m)
-            } else {
-                let (f, i32t) = (self.as_float(x), self.s.t.i32);
-                self.s
-                    .op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f])
+            halves.push(match numeric {
+                Numeric::Uint | Numeric::Sint => {
+                    let m = self.s.m.i32(0xFFFF);
+                    self.s.m.bin(c, Bin::And, x, m)
+                }
+                Numeric::Uscaled | Numeric::Sscaled | Numeric::Unorm | Numeric::Snorm => {
+                    // D16 rounds these formats to nearest even, independently of VALU MODE.
+                    let f = self.as_float(x);
+                    self.narrow16_bits(f, false)
+                }
+                Numeric::Float => {
+                    let f = self.as_float(x);
+                    self.s.op(c, "legacyF32ToF16", Attr::ReadNone, self.s.t.i32, 130, &[f])
+                }
             });
         }
         let mut out = Vec::new();
@@ -10696,7 +10711,7 @@ mod tests {
     /// Lowers a one-thread compute program that copies four root constants
     /// (s0..s3) into v1..v4, runs `body`, and stores v0 to a raw buffer from a
     /// descriptor table, so the vector instructions in `body` have an effect.
-    fn lowers_valu(body: &[u32]) -> Result<(), crate::ShaderError> {
+    fn lowers_valu(body: &[u32]) -> Result<Lowered, crate::ShaderError> {
         let mut words = vec![
             0xBE85_0380, // s_mov_b32 s5, 0
             0xF408_0202, // s_load_dwordx4 s[8:11], s[4:5], 0
@@ -10729,7 +10744,16 @@ mod tests {
             vec![constants, root(RootType::Table, 4, 1)],
             vec![buffer],
         )
-        .map(|_| ())
+    }
+
+    #[test]
+    fn d16_scaled_buffer_load_uses_portable_rounding() {
+        // tbuffer_load_format_d16_x v0, off, s[8:11], 0 format:16_USCALED
+        let shader = lowers_valu(&[0xE848_0000, 0x8022_0000]).unwrap();
+        assert!(
+            !shader.legacy_half_conversion,
+            "D16 load uses host-dependent f32tof16"
+        );
     }
 
     #[test]
@@ -11192,6 +11216,7 @@ mod tests {
         let layout = vec![root(RootType::Table, 0, 0)];
         let l = lower_with(&words, layout, used).unwrap();
         assert_eq!(l.nonuniform_handles, 0);
+        #[cfg(windows)]
         if let Ok(mut v) = super::super::validator::Validator::load(
             super::super::validator::Validator::default_path().as_deref(),
         ) {
@@ -11245,6 +11270,7 @@ mod tests {
         let l = lower_with(&words, layout, used).unwrap();
         // One image handle from the joins' heap index, the same in all lanes.
         assert_eq!(l.nonuniform_handles, 0);
+        #[cfg(windows)]
         if let Ok(mut v) = super::super::validator::Validator::load(
             super::super::validator::Validator::default_path().as_deref(),
         ) {
@@ -11295,6 +11321,7 @@ mod tests {
         // One image handle made in the entry block for both loads, and the
         // UAV's.
         assert_eq!(l.heap_handles, 2);
+        #[cfg(windows)]
         if let Ok(mut v) = super::super::validator::Validator::load(
             super::super::validator::Validator::default_path().as_deref(),
         ) {
