@@ -274,12 +274,13 @@ fn queue(p: Arc<Pending>, now: bool) {
 }
 
 /// `VICTORY_PIPELINE_THREADS` when it holds a count, else `None`: how many
-/// threads may compile pipelines at once. On some host/driver pairs the
-/// driver's compiler is not safe to call from several threads at once (AMD
-/// RDNA4 crashes in amdxc64 while pipelines compile in parallel; one worker
-/// avoids it). Callers that make pipelines on threads of their own
-/// (`victory translate` sizes its `--jobs` default by it) read the same
-/// value so one setting covers both.
+/// threads may compile pipelines at once, a knob for hosts whose driver
+/// compiler misbehaves under parallel calls (AMD RDNA4 crashes in amdxc64
+/// while pipelines compile in parallel; serialising the calls delays the
+/// crash rather than removing it — #2124 tracks the real fix). Callers
+/// that make pipelines on threads of their own (`victory translate` sizes
+/// its `--jobs` default by it) read the same value so one setting covers
+/// both.
 pub fn env_workers() -> Option<usize> {
     let v = std::env::var("VICTORY_PIPELINE_THREADS").ok()?;
     match v.parse() {
