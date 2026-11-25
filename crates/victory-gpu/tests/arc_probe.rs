@@ -1,3 +1,4 @@
+#![cfg(windows)]
 #![allow(dead_code, clippy::all)]
 
 use std::ffi::c_void;
