@@ -2,9 +2,11 @@
 //! title's own compute passes write most of them; a pass we drop or
 //! translate wrongly leaves whatever the memory held, and a draw of four
 //! billion vertices or a dispatch past the host's limits runs until the
-//! host resets the display driver. So every record is clamped on the GPU,
-//! just before its execution, by a compute shader of ours (HLSL compiled by
-//! the system's compiler; a 5.1 shader with its root signature inside).
+//! host resets the display driver. So every record is validated and bounded
+//! on the GPU, just before its execution, by a compute shader of ours (HLSL
+//! compiled by the system's compiler; a 5.1 shader with its root signature
+//! inside): a record past the limits runs empty rather than being clamped up
+//! to them.
 //!
 //! Each list also has a budget (2^27 vertex instances or threads, groups
 //! counted as 64 threads, mesh groups as 128): records past it run empty,
@@ -41,30 +43,43 @@ void main(uint3 id : SV_DispatchThreadID) {
     uint cost;
     if (kind <= 1) {
         // Draws: vertex or index count, then instances.
-        uint count = min(args.Load(at), 1u << 24);
-        uint instances = min(args.Load(at + 4), (1u << 26) / max(count, 1u));
+        uint count = args.Load(at);
+        uint instances = args.Load(at + 4);
+        if (count > (1u << 24) || instances > (1u << 26) / max(count, 1u)) {
+            args.Store2(at, uint2(0, 0));
+            return;
+        }
         cost = count * instances;
         args.Store2(at, uint2(count, instances));
     } else if (kind == 2) {
-        uint3 g = min(args.Load3(at), uint3(65535, 65535, 65535));
+        uint3 g = args.Load3(at);
         // x * y fits 32 bits; the whole count may not.
-        if (g.z != 0 && g.x * g.y > GROUPS / g.z) {
-            g = uint3(0, 0, 0);
+        if (any(g > uint3(65535, 65535, 65535)) ||
+            (g.z != 0 && g.x * g.y > GROUPS / g.z)) {
+            args.Store3(at, uint3(0, 0, 0));
+            return;
         }
         cost = g.x * g.y * g.z * 64;
         args.Store3(at, g);
     } else {
-        // Mesh dispatches: the console's are one-dimensional.
+        // Mesh dispatches (kind 10): the console's are one-dimensional.
         uint3 g = args.Load3(at);
-        g = uint3(min(g.x, 65535u), min(g.y, 1u), min(g.z, 1u));
+        if (any(g > uint3(65535, 1, 1))) {
+            args.Store3(at, uint3(0, 0, 0));
+            return;
+        }
         cost = g.x * g.y * g.z * 128;
         args.Store3(at, g);
     }
     uint before;
     budget.InterlockedAdd(0, cost, before);
-    if (before >= BUDGET || before + cost > BUDGET) {
+    if (before >= BUDGET || cost > BUDGET - before) {
         // Draws keep their layout with no vertices; groups become zero.
-        args.Store(at, 0);
+        if (kind <= 1) {
+            args.Store2(at, uint2(0, 0));
+        } else {
+            args.Store3(at, uint3(0, 0, 0));
+        }
     }
 }
 "#;

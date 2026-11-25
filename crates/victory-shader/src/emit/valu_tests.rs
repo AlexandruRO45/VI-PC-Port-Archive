@@ -10,7 +10,7 @@ use super::{HostShader, lower, validator};
 use crate::native::{
     ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
 };
-use crate::{io, ir, resource, structure};
+use crate::{io, ir, range, resource, structure};
 
 const S_ENDPGM: u32 = 0xBF81_0000;
 
@@ -69,6 +69,10 @@ const fn vgpr(n: u8) -> u16 {
 /// 4 dwords of root constants in `s0..s3`, runs `body` (leaving its result in
 /// `v0`), and stores `v0` to dword 0 of the raw UAV at heap index 0.
 fn build_valu_cs(body: &[u32]) -> HostShader {
+    try_build_valu_cs(body).expect("build")
+}
+
+fn try_build_valu_cs(body: &[u32]) -> Result<HostShader, crate::ShaderError> {
     let mut words = Vec::new();
     // s[4:5] = descriptor table address (heap index 0 -> byte offset 0).
     words.push(s_mov_b32(5, 0x80)); // inline constant 0
@@ -86,7 +90,7 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
     let native = NativeProgram {
         stage: HwStage::Cs,
         wave64: false,
-        vgprs: 8,
+        vgprs: 16,
         layout: vec![
             RootParam {
                 root: RootType::Constants,
@@ -122,11 +126,10 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
         code,
     };
 
-    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
-    let st = structure::structure(&p).expect("structure");
-    let res =
-        resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
-    let io = io::raise(&p, &native).expect("io::raise");
+    let (p, st) = range::build(&native.code, native.wave64, native.vgprs)?;
+    let st = st?;
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
+    let io = io::raise(&p, &native)?;
     let lowered = lower::lower(&lower::Parts {
         native: &native,
         p: &p,
@@ -137,9 +140,7 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
-        max_wave: 64,
-    })
-    .expect("lower");
+    })?;
 
     let shader = HostShader {
         stage: HwStage::Cs,
@@ -149,6 +150,12 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
         static_samplers: Vec::new(),
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
+        root_uavs: lowered.root_uavs,
+        memory: lowered.memory,
+        memory_writes: lowered.memory_writes,
+        view_addresses: lowered.view_addresses,
+        heap: lowered.heap,
+        heap_writes: lowered.heap_writes,
     };
 
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
@@ -158,7 +165,7 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
         assert_eq!(copy[4..20], ours[..], "container hash mismatch");
     }
 
-    shader
+    Ok(shader)
 }
 
 /// One GPU test at a time. With these tests on the hardware adapter and WARP
@@ -869,6 +876,339 @@ fn bfe_signed_and_unsigned_match_rdna2() {
     });
 }
 
+/// Lowers a wave32 compute program of 32 threads (with `validate`,
+/// validated when `dxil.dll` is there): a root constant in s0 (slot 0), view and sampler
+/// tables at s4 and s6 (slots 1 and 2); `used` lists (table user SGPR,
+/// kind, table offset in dwords, descriptor dwords).
+fn lower_cs32(words: &[u32], used: &[(u8, ResourceType, u32, u8)], validate: bool) -> HostShader {
+    let param = |root, user_data, slot| RootParam {
+        root,
+        table_offset_dwords: 0,
+        sgprs: 1,
+        base_register: 0,
+        user_data,
+        slot,
+    };
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 32,
+        layout: vec![
+            param(RootType::Constants, 0, 0),
+            param(RootType::Table, 4, 1),
+            param(RootType::Table, 6, 2),
+        ],
+        used: used
+            .iter()
+            .map(
+                |&(user_data, kind, table_offset_dwords, dwords)| UsedResource {
+                    kind,
+                    root: RootType::Table,
+                    table_offset_dwords,
+                    lower_bound: 0,
+                    stride: 0,
+                    dwords,
+                    user_data,
+                    slot: user_data / 2 - 1,
+                },
+            )
+            .collect(),
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 7 << 1,
+            threads: [32, 1, 1],
+        }),
+        code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let lowered = lower::lower(&lower::Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+    })
+    .expect("lower");
+    let shader = HostShader {
+        stage: HwStage::Cs,
+        dxil: lowered.dxil,
+        user_data: lowered.user_data,
+        samplers: lowered.samplers,
+        static_samplers: Vec::new(),
+        root_cbvs: lowered.root_cbvs,
+        root_srvs: lowered.root_srvs,
+        root_uavs: lowered.root_uavs,
+        memory: lowered.memory,
+        memory_writes: lowered.memory_writes,
+        view_addresses: lowered.view_addresses,
+        heap: lowered.heap,
+        heap_writes: lowered.heap_writes,
+    };
+    if let (true, Ok(mut v)) = (
+        validate,
+        validator::Validator::load(validator::Validator::default_path().as_deref()),
+    ) {
+        v.validate(&mut shader.dxil.clone())
+            .expect("DXIL validation failed");
+    }
+    shader
+}
+
+/// User data for [`lower_cs32`]'s programs: the root constant `k`, both
+/// tables from heap index 0.
+fn user_data_cs32(shader: &HostShader, k: u32) -> Vec<u32> {
+    let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+    for u in &shader.user_data {
+        ud[u.index as usize] = match (u.root, u.slot) {
+            (RootType::Constants, 0) => k,
+            (RootType::Table, 1 | 2) => 0,
+            other => panic!("unexpected user data {other:?}"),
+        };
+    }
+    ud
+}
+
+/// Image addresses with `a16` after a whole-VGPR operand (the offset or
+/// bias keeps a VGPR; the coordinates share the next) and the clamp of
+/// `image_sample_d_cl` (after the coordinates). Program 1: a biased sample
+/// of 16-bit coordinates whose f16 bias is the root constant's low half.
+/// Program 2: a gather with an offset of 16-bit and of 32-bit coordinates
+/// (equal results), and a sample with gradients and the root constant as
+/// clamp. The samples read a 32x32 texture whose level `n` holds `n`, at
+/// level 1 by the derivatives, with a point sampler.
+#[test]
+fn image_addresses_of_16_bits_and_clamps() {
+    use windows::Win32::Graphics::Direct3D12::*;
+    let (v0, v3, v4) = (vgpr(0), vgpr(3), vgpr(4));
+    // Descriptors: s[8:15] the levels texture (heap index 0), s[20:23] the
+    // raw UAV (1), s[24:31] the 4x4 texture (2), s[16:19] the sampler.
+    let mut prefix = vec![s_mov_b32(5, 0x80), s_mov_b32(7, 0x80)];
+    for (op, dst, base, offset) in [
+        (3u32, 8u32, 4u32, 0u32),
+        (2, 20, 4, 0x20),
+        (3, 24, 4, 0x40),
+        (2, 16, 6, 0),
+    ] {
+        prefix.extend([
+            0x3D << 26 | op << 18 | dst << 6 | base >> 1,
+            125 << 25 | offset,
+        ]);
+    }
+    let used = [
+        (4, ResourceType::Srv, 0, 8),
+        (4, ResourceType::Uav, 8, 4),
+        (4, ResourceType::Srv, 16, 8),
+        (6, ResourceType::Sampler, 0, 4),
+    ];
+
+    // A 2x2 quad per four lanes: u = (4 + (l & 1)) / 16, v = (4 + (l >> 1 & 1)) / 16.
+    let mut biased = prefix.clone();
+    biased.push(0x1B << 25 | 3 << 17 | (v0 as u32 & 0xFF) << 9 | 129); // v_and_b32 v3, 1, v0
+    biased.extend(vop3(0x148, 4, v0, 129, 129)); // v_bfe_u32 v4, v0, 1, 1
+    biased.push(0x25 << 25 | 3 << 17 | (v3 as u32 & 0xFF) << 9 | 132); // v_add_nc_u32 v3, 4, v3
+    biased.push(0x25 << 25 | 4 << 17 | (v4 as u32 & 0xFF) << 9 | 132); // v_add_nc_u32 v4, 4, v4
+    biased.extend([vop1(0x006, 3, v3), vop1(0x006, 4, v4)]); // v_cvt_f32_u32
+    // v_mul_f32 v3, 1/16, v3; v_mul_f32 v4, 1/16, v4
+    biased.extend([
+        0x08 << 25 | 3 << 17 | (v3 as u32 & 0xFF) << 9 | 255,
+        0x3D80_0000,
+    ]);
+    biased.extend([
+        0x08 << 25 | 4 << 17 | (v4 as u32 & 0xFF) << 9 | 255,
+        0x3D80_0000,
+    ]);
+    biased.push(0x2F << 25 | 2 << 17 | (v4 as u32 & 0xFF) << 9 | v3 as u32); // v_cvt_pkrtz_f16_f32 v2, v3, v4
+    biased.push(vop1(0x001, 1, sgpr(0)));
+    // image_sample_b v[5:8], v[1:2], s[8:15], s[16:19] dmask:0xf dim:2D a16
+    biased.extend([0xF094_0F08, 1 | 5 << 8 | 2 << 16 | 4 << 21 | 1 << 30]);
+    biased.extend(buffer_store_dword(5, 20, 0));
+    biased.push(S_ENDPGM);
+    // The 1.6 validator refuses implicit derivatives in compute (1.8 takes
+    // them); the host runs them.
+    let biased = lower_cs32(&biased, &used, false);
+
+    let mut gathers = prefix;
+    // Offset (1, 0); coordinates (0.375, 0.625) as f16 in v2 and as f32 in
+    // v[11:12]: image_gather4_lz_o v[13:16], v[1:2], s[24:31], s[16:19]
+    // dmask:0x1 dim:2D a16, and v[17:20], v[10:12] without a16.
+    gathers.extend([vop1(0x001, 1, 129), vop1(0x001, 2, 255), 0x3900_3600]);
+    gathers.extend([vop1(0x001, 10, 129), vop1(0x001, 11, 255), 0x3EC0_0000]);
+    gathers.extend([vop1(0x001, 12, 255), 0x3F20_0000]);
+    gathers.extend([0xF15C_0108, 1 | 13 << 8 | 6 << 16 | 4 << 21 | 1 << 30]);
+    gathers.extend([0xF15C_0108, 10 | 17 << 8 | 6 << 16 | 4 << 21]);
+    for k in 0..8u8 {
+        gathers.extend(buffer_store_dword(13 + k, 20, 4 * u16::from(k)));
+    }
+    // Gradients (1/16, 0) and (0, 1/16), coordinates (1/4, 1/4), clamp s0:
+    // image_sample_d_cl v[27:30], v[20:26], s[8:15], s[16:19] dmask:0xf dim:2D
+    gathers.extend([vop1(0x001, 20, 255), 0x3D80_0000]);
+    gathers.extend([vop1(0x001, 21, 128), vop1(0x001, 22, 128)]);
+    gathers.extend([vop1(0x001, 23, 255), 0x3D80_0000]);
+    gathers.extend([vop1(0x001, 24, 255), 0x3E80_0000]);
+    gathers.extend([vop1(0x001, 25, 255), 0x3E80_0000]);
+    gathers.push(vop1(0x001, 26, sgpr(0)));
+    gathers.extend([0xF08C_0F08, 20 | 27 << 8 | 2 << 16 | 4 << 21]);
+    gathers.extend(buffer_store_dword(27, 20, 32));
+    gathers.push(S_ENDPGM);
+    let gathers = lower_cs32(&gathers, &used, true);
+
+    let samplers = [D3D12_SAMPLER_DESC {
+        Filter: D3D12_FILTER_MIN_MAG_MIP_POINT,
+        AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+        AddressV: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+        AddressW: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+        MaxAnisotropy: 1,
+        MaxLOD: f32::MAX,
+        ..Default::default()
+    }];
+    let texels: Vec<[f32; 4]> = (0..16).map(|i| [i as f32, 0.0, 0.0, 1.0]).collect();
+    let views = [
+        View::Levels(32, 6),
+        View::RawUav(9),
+        View::Texture(4, 4, &texels),
+    ];
+    let f = |x: f32| x.to_bits();
+    // Texels (2, 3), (3, 3), (3, 2), (2, 2) twice, then the level.
+    let gathered = |level| [14.0, 15.0, 11.0, 10.0, 14.0, 15.0, 11.0, 10.0, level];
+    let cases: [(&HostShader, u32, &[f32]); 9] = [
+        (&biased, 0x3C00, &[2.0]),      // bias 1
+        (&biased, 0xABCD_BC00, &[0.0]), // bias -1, high half ignored
+        (&biased, 0x4000, &[3.0]),      // bias 2
+        (&biased, 0, &[1.0]),           // bias 0
+        (&biased, f(2.0), &[1.0]),      // low half 0
+        (&gathers, 0, &gathered(1.0)),  // clamp 0
+        (&gathers, f(2.0), &gathered(2.0)),
+        (&gathers, f(3.0), &gathered(3.0)),
+        (&gathers, f(-1.0), &gathered(1.0)),
+    ];
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        for (shader, k, want) in cases {
+            let (root, pso) = host
+                .compute_pipeline(shader)
+                .unwrap_or_else(|e| panic!("{label}: {e}"));
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(user_data_cs32(shader, k)))],
+                        views: &views,
+                        samplers: &samplers,
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{label}: {e}"));
+            let got: Vec<f32> = out[0][..want.len()]
+                .iter()
+                .map(|&x| f32::from_bits(x))
+                .collect();
+            assert_eq!(got, want, "{label}: {k:#x}");
+        }
+    }
+}
+
+/// MIMG `image_atomic_<op> vdata, v[vaddr:vaddr+1], s[srsrc:srsrc+7]
+/// dmask dim:2D unorm` (glc returns the old value).
+const fn image_atomic(op: u32, vdata: u8, vaddr: u8, srsrc: u8, dmask: u32, glc: bool) -> [u32; 2] {
+    [
+        0xF000_0000 | op << 18 | (glc as u32) << 13 | 1 << 12 | dmask << 8 | 1 << 3,
+        vaddr as u32 | (vdata as u32) << 8 | (srsrc as u32 >> 2) << 16,
+    ]
+}
+
+/// 64-bit image atomics (two dwords per value, an R32G32_UINT view, the
+/// low dword in R) as the alpha prepasses use them: an unsigned maximum of
+/// keys whose high dword decides, returning the old value with glc, and an
+/// exchange and a compare-exchange. 32 lanes; lane `l` writes texels
+/// (l, 1..=3), all lanes texel (0, 0).
+#[test]
+fn image_atomics_of_64_bits() {
+    let (v0, v5) = (vgpr(0), vgpr(5));
+    let mut words = vec![s_mov_b32(5, 0x80)];
+    // s_load_dwordx8 s[8:15], s[4:5], 0: the texture's descriptor.
+    words.extend([0x3D << 26 | 0x03 << 18 | 8 << 6 | 4 >> 1, 125 << 25]);
+    words.extend([
+        0x1B << 25 | 5 << 17 | (v0 as u32 & 0xFF) << 9 | 131, // v_and_b32 v5, 3, v0
+        0x26 << 25 | 1 << 17 | (v0 as u32 & 0xFF) << 9 | 159, // v_sub_nc_u32 v1, 31, v0
+        0x1A << 25 | 2 << 17 | (v5 as u32 & 0xFF) << 9 | 158, // v_lshlrev_b32 v2, 30, v5
+        vop1(0x001, 14, 128),
+        vop1(0x001, 15, 128),
+        vop1(0x001, 3, v0),
+        vop1(0x001, 4, 129),
+        vop1(0x001, 8, v0),
+        vop1(0x001, 9, 129),
+    ]);
+    // a = (31 - l) | (l & 3) << 62 into texel (0, 0) and (l, 1).
+    words.extend(image_atomic(0x17, 1, 14, 8, 3, false));
+    words.extend(image_atomic(0x17, 1, 3, 8, 3, false));
+    // b = l | 1 << 32 into (l, 1), returning a in v[8:9].
+    words.extend(image_atomic(0x17, 8, 3, 8, 3, true));
+    // a swapped into (l, 2); b into (l, 3) where it compares equal to 0.
+    words.push(vop1(0x001, 4, 130));
+    words.extend(image_atomic(0x0F, 8, 3, 8, 3, false));
+    words.extend([
+        vop1(0x001, 4, 131),
+        vop1(0x001, 10, v0),
+        vop1(0x001, 11, 129),
+        vop1(0x001, 12, 128),
+        vop1(0x001, 13, 128),
+    ]);
+    words.extend(image_atomic(0x10, 10, 3, 8, 0xF, false));
+    words.push(S_ENDPGM);
+    let shader = lower_cs32(&words, &[(4, ResourceType::Uav, 0, 8)], true);
+
+    let key = |lo: u32, hi: u32| u64::from(lo) | u64::from(hi) << 32;
+    let a = |l: u32| key(31 - l, (l & 3) << 30);
+    let b = |l: u32| key(l, 1);
+    let mut want = vec![0u64; 32 * 4];
+    want[0] = (0..32).map(a).max().unwrap();
+    for l in 0..32 {
+        want[32 + l as usize] = a(l).max(b(l));
+        want[64 + l as usize] = a(l);
+        want[96 + l as usize] = b(l);
+    }
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host
+            .compute_pipeline(&shader)
+            .unwrap_or_else(|e| panic!("{label}: {e}"));
+        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        for u in &shader.user_data {
+            assert_eq!((u.root, u.slot), (RootType::Table, 1), "user data {u:?}");
+            ud[u.index as usize] = 0;
+        }
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &[View::Uint2TextureUav(32, 4)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label}: {e}"));
+        let got: Vec<u64> = out[0].chunks(2).map(|t| key(t[0], t[1])).collect();
+        assert_eq!(got, want, "{label}");
+    }
+}
+
 #[test]
 fn v_cmp_class_f16_matches_rdna2() {
     // v_cmp_class_f16_e64 s6, v1, v2 (VOP3 opcode 0x08f); v_cndmask_b32_e64 v0, 0, 1, s6
@@ -939,806 +1279,179 @@ fn v_cmp_class_f16_matches_rdna2() {
     });
 }
 
-#[test]
-fn wave64_single_wave_lds_lowers_for_wave32_hosts() {
-    const fn vop2(op: u32, vdst: u8, vsrc1: u8, src0: u16) -> u32 {
-        (op << 25) | ((vdst as u32) << 17) | ((vsrc1 as u32) << 9) | (src0 as u32 & 0x1FF)
-    }
-    let words = [
-        s_mov_b32(1, 0x80),
-        s_load_dwordx4(8, 0)[0],
-        s_load_dwordx4(8, 0)[1],
-        // v2 = v0 << 2 (byte offset for this thread)
-        vop2(0x01a, 2, 0, 0x82),
-        // v1 = 63 + v0
-        vop2(0x025, 1, 0, 0xBF),
-        // ds_write_b32 v2, v1 (no explicit s_barrier)
-        0xD834_0000,
-        (1 << 8) | 2,
-        // v3 = (63 ^ v0) << 2 (cross-subwave read on wave32)
-        vop2(0x01d, 3, 0, 0xBF),
-        vop2(0x01a, 3, 3, 0x82),
-        // ds_read_b32 v4, v3
-        0xD8D8_0000,
-        (4 << 24) | 3,
-        // buffer_store_dword v4, v2, s[8:11], 0 offen
-        0x38 << 26 | 0x1C << 18 | (1 << 12),
-        0x80 << 24 | ((8 >> 2) << 16) | (4 << 8) | 2,
-        S_ENDPGM,
-    ];
+/// A compute program in an `ACCC` part, as the AMD upscaler's are: `body`
+/// leaves its result in v0, stored to the raw UAV of the table at user data
+/// 4 (root parameter 1). Translated from the container's bytes.
+fn fspx_cs(body: &[u32]) -> HostShader {
+    use crate::native::tests::{fspx, fspx_resource};
+    let mut words = vec![s_mov_b32(5, 0x80)];
+    words.extend_from_slice(&s_load_dwordx4(8, 4));
+    words.extend_from_slice(body);
+    words.extend_from_slice(&buffer_store_dword(0, 8, 0));
+    words.push(S_ENDPGM);
     let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
-    let native = NativeProgram {
-        stage: HwStage::Cs,
-        wave64: true,
-        vgprs: 8,
-        layout: vec![RootParam {
-            root: RootType::Table,
-            table_offset_dwords: 0,
-            sgprs: 1,
-            base_register: 0,
-            user_data: 0,
-            slot: 0,
-        }],
-        used: vec![UsedResource {
-            kind: ResourceType::Uav,
-            root: RootType::Table,
-            table_offset_dwords: 0,
-            lower_bound: 0,
-            stride: 0,
-            dwords: 4,
-            user_data: 0,
-            slot: 0,
-        }],
-        io: StageIo::Cs(ComputeIo {
-            rsrc2: (1 << 1) | (1 << 15), // 1 user SGPR (s0) + 512 bytes LDS
-            threads: [64, 1, 1],
-        }),
-        code,
-    };
-    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
-    let st = structure::structure(&p).expect("structure");
-    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
-    let io = io::raise(&p, &native).expect("io::raise");
-    let lowered = lower::lower(&lower::Parts {
-        native: &native,
-        p: &p,
-        st: &st,
-        io: &io,
-        res: &res,
-        inputs: Vec::new(),
-        outputs: Vec::new(),
-        prims: Vec::new(),
-        mesh_stride: 0,
-        max_wave: 64,
-    })
-    .expect("lower");
-    let mut shader = HostShader {
-        stage: HwStage::Cs,
-        dxil: lowered.dxil,
-        user_data: lowered.user_data,
-        samplers: lowered.samplers,
-        static_samplers: Vec::new(),
-        root_cbvs: lowered.root_cbvs,
-        root_srvs: lowered.root_srvs,
-    };
-    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
-        v.validate(&mut shader.dxil).expect("DXIL validation failed");
-    }
-    let mut ran = 0;
-    for (label, warp) in [("hardware", false), ("warp", true)] {
-        let Ok(host) = Host::new(warp) else {
-            continue;
-        };
-        let (root, pso) = host
-            .compute_pipeline(&shader)
-            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
-        let out = host
-            .dispatch(
-                &root,
-                &pso,
-                &Dispatch {
-                    roots: vec![(0, Root::Constants(vec![0]))],
-                    views: &[View::RawUav(64)],
-                    samplers: &[],
-                    groups: [1, 1, 1],
-                },
-            )
-            .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
-        assert_eq!(out[0][0], 126, "{label}: thread 0 should read thread 63's LDS write");
-        assert_eq!(out[0][63], 63, "{label}: thread 63 should read thread 0's LDS write");
-        ran += 1;
-    }
-    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+    let part = fspx(
+        &code,
+        5 << 1,
+        [1, 1, 1],
+        true,
+        &[fspx_resource(3, 3, 0, 0, 4, 1)],
+    );
+    let container = crate::dxbc::build(&[(crate::FourCC::ACCC, &part)]);
+    super::translate(&container).expect("translate")
 }
 
-/// Assembles, lowers with `max_wave: 32`, validates, and runs a wave64
-/// compute shader on hardware / WARP adapters that support `WaveSize(32)`.
-fn run_wave64_on_wave32(
-    threads: [u32; 3],
-    lds_dwords: u32,
-    words: &[u32],
-    out_vreg: u8,
-) -> Option<Vec<u32>> {
-    const fn vop2(op: u32, vdst: u8, vsrc1: u8, src0: u16) -> u32 {
-        (op << 25) | ((vdst as u32) << 17) | ((vsrc1 as u32) << 9) | (src0 as u32 & 0x1FF)
+/// VOP3P `v_dot4_i32_i8 vdst, src0, src1, src2`, `opsel` and `opsel_hi`
+/// one bit per source.
+const fn dot4(vdst: u8, src0: u16, src1: u16, src2: u16, opsel: u32, opsel_hi: u32) -> [u32; 2] {
+    [
+        0xCC16_0000 | (opsel_hi >> 2 & 1) << 14 | (opsel & 7) << 11 | vdst as u32,
+        (opsel_hi & 3) << 27
+            | (src2 as u32 & 0x1FF) << 18
+            | (src1 as u32 & 0x1FF) << 9
+            | (src0 as u32 & 0x1FF),
+    ]
+}
+
+/// The signed byte dot product plus `acc`, wrapping (RDNA2 ISA).
+fn dot4_ref(a: u32, b: u32, acc: u32) -> u32 {
+    (0..4).fold(acc, |s, k| {
+        let (x, y) = ((a >> (8 * k)) as i8 as i32, (b >> (8 * k)) as i8 as i32);
+        s.wrapping_add((x * y) as u32)
+    })
+}
+
+/// The upscaler's integer dot products, from an `ACCC` container to the
+/// host GPU: op_sel picks each multiplicand's low half, op_sel_hi its high
+/// half (a constant folded in as `sel_hi_lo(2.0)` is 0x4000), and
+/// `v_dot4c` accumulates into its destination.
+#[test]
+fn fspx_programs_run_with_the_hardwares_dot_products() {
+    let (a, b, acc) = (0x0302_FB02u32, 0x80FF_7F01u32, 0x7FFF_FFF0u32);
+    let mut load = Vec::new();
+    for (v, x) in [(1, a), (2, b), (3, acc)] {
+        load.extend([vop1(0x001, v, 0xFF), x]); // v_mov_b32 vN, literal
     }
-    let total = threads.iter().product::<u32>();
-    let mut full = vec![
-        s_mov_b32(1, 0x80),
-        s_load_dwordx4(8, 0)[0],
-        s_load_dwordx4(8, 0)[1],
-        // v15 = v0 << 2 (dword output byte offset)
-        vop2(0x01a, 15, 0, 0x82),
+    let cases: [(Vec<u32>, u32); 4] = [
+        (
+            dot4(0, vgpr(1), vgpr(2), vgpr(3), 0, 7).to_vec(),
+            dot4_ref(a, b, acc),
+        ),
+        // sel_hi_lo on an inline 2.0 (0x40000000): the halves swapped.
+        (
+            dot4(0, vgpr(1), 244, vgpr(3), 0b010, 0b101).to_vec(),
+            dot4_ref(a, 0x4000, acc),
+        ),
+        (
+            dot4(0, vgpr(1), vgpr(2), vgpr(3), 0b001, 0b110).to_vec(),
+            dot4_ref(a.rotate_left(16), b, acc),
+        ),
+        // v_mov_b32 v0, v3; v_dot4c_i32_i8 v0, v1, v2
+        (
+            vec![
+                vop1(0x001, 0, vgpr(3)),
+                0x0d << 25 | 2 << 9 | vgpr(1) as u32,
+            ],
+            dot4_ref(a, b, acc),
+        ),
     ];
-    full.extend_from_slice(words);
-    full.extend_from_slice(&[
-        // buffer_store_dword v[out_vreg], v15, s[8:11], 0 offen
-        0x38 << 26 | 0x1C << 18 | (1 << 12),
-        0x80 << 24 | ((8 >> 2) << 16) | ((out_vreg as u32) << 8) | 15,
-        S_ENDPGM,
+    for (body, want) in cases {
+        let mut words = load.clone();
+        words.extend(&body);
+        let shader = fspx_cs(&words);
+        run_cases(&shader, &[[0; 4]], |backend, _, _, got| {
+            assert_eq!(got, want, "{backend}: {body:08x?}");
+        });
+    }
+}
+
+/// `v_pk_fmac_f16` (VOP2): each half of the destination plus the product
+/// of the sources' halves.
+#[test]
+fn packed_fmac_accumulates_each_half() {
+    let shader = build_valu_cs(&[
+        vop1(0x001, 0, vgpr(3)),              // v_mov_b32 v0, v3
+        0x3C << 25 | 2 << 9 | vgpr(1) as u32, // v_pk_fmac_f16 v0, v1, v2
     ]);
-    let code: Vec<u8> = full.iter().flat_map(|w| w.to_le_bytes()).collect();
-    let rsrc2 = (1 << 1) | ((lds_dwords.div_ceil(128)) << 15);
-    let native = NativeProgram {
-        stage: HwStage::Cs,
-        wave64: true,
-        vgprs: 16,
-        layout: vec![RootParam {
-            root: RootType::Table,
-            table_offset_dwords: 0,
-            sgprs: 1,
-            base_register: 0,
-            user_data: 0,
-            slot: 0,
-        }],
-        used: vec![UsedResource {
-            kind: ResourceType::Uav,
-            root: RootType::Table,
-            table_offset_dwords: 0,
-            lower_bound: 0,
-            stride: 0,
-            dwords: 4,
-            user_data: 0,
-            slot: 0,
-        }],
-        io: StageIo::Cs(ComputeIo { rsrc2, threads }),
-        code,
-    };
-    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
-    let st = structure::structure(&p).expect("structure");
-    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
-    let io = io::raise(&p, &native).expect("io::raise");
-    let lowered = lower::lower(&lower::Parts {
-        native: &native,
-        p: &p,
-        st: &st,
-        io: &io,
-        res: &res,
-        inputs: Vec::new(),
-        outputs: Vec::new(),
-        prims: Vec::new(),
-        mesh_stride: 0,
-        max_wave: 32,
-    })
-    .expect("lower with max_wave=32");
-    assert!(lowered.wave_ops, "expected WAVE_OPS feature flag");
-    let mut shader = HostShader {
-        stage: HwStage::Cs,
-        dxil: lowered.dxil,
-        user_data: lowered.user_data,
-        samplers: lowered.samplers,
-        static_samplers: Vec::new(),
-        root_cbvs: lowered.root_cbvs,
-        root_srvs: lowered.root_srvs,
-    };
-    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
-        v.validate(&mut shader.dxil).expect("DXIL validation failed");
+    // (2.0, 1.0) * (3.0, 4.0) + (1.0, 0.5) = (7.0, 4.5)
+    run_cases(
+        &shader,
+        &[[0x4000_3C00, 0x4200_4400, 0x3C00_3800, 0]],
+        |backend, _, _, got| {
+            assert_eq!(got, 0x4700_4480, "{backend}");
+        },
+    );
+}
+
+/// `src_scc` reads SCC as 0 or 1, in scalar and vector instructions.
+#[test]
+fn src_scc_reads_as_zero_or_one() {
+    for (compare, want) in [(0xBF06_8181u32, 1), (0xBF06_8281, 0)] {
+        // s_cmp_eq_u32 1, 1 (or 2); s_mov_b32 s12, src_scc; v_mov_b32 v0, s12;
+        // v_add_nc_u32 v0, src_scc, v0 (VOP2 0x25)
+        let shader = build_valu_cs(&[
+            compare,
+            s_mov_b32(12, 253),
+            vop1(0x001, 0, sgpr(12)),
+            0x25 << 25 | u32::from(vgpr(0) as u8) << 9 | 253,
+        ]);
+        run_cases(&shader, &[[0; 4]], |backend, _, _, got| {
+            assert_eq!(got, 2 * want, "{backend}");
+        });
     }
-    let mut first_out = None;
-    let mut ran = 0;
-    for (label, warp) in [("hardware", false), ("warp", true)] {
-        let Ok(host) = Host::new(warp) else {
-            continue;
-        };
-        let Ok((min_w, max_w)) = host.wave_range() else {
-            continue;
-        };
-        if min_w > 32 || max_w < 32 {
-            eprintln!(
-                "{label}: adapter {:?} wave_range=({min_w}, {max_w}) skips WaveSize(32)",
-                host.adapter_name()
-            );
-            continue;
+}
+
+/// A register array indexed through M0 whose upper registers hold
+/// descriptor words, which have no host value: the indices are clamped
+/// (`v_med3_u32`, `v_and_b32`), so the moves reach only v8-v11, and the
+/// program runs. Unclamped, the read could reach the descriptor words and
+/// the program is refused.
+#[test]
+fn relative_moves_reach_only_what_their_clamped_index_can() {
+    let body = |second_index: u32| {
+        let mut w = Vec::new();
+        for k in 0..4u8 {
+            w.push(vop1(0x001, 8 + k, 138 + u16::from(k))); // v_mov_b32 v8+k, 10+k
+            w.push(vop1(0x001, 12 + k, sgpr(8 + k))); // v_mov_b32 v12+k, s8+k
         }
-        let (root, pso) = host
-            .compute_pipeline(&shader)
-            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
-        let out = host
-            .dispatch(
-                &root,
-                &pso,
-                &Dispatch {
-                    roots: vec![(0, Root::Constants(vec![0]))],
-                    views: &[View::RawUav(total)],
-                    samplers: &[],
-                    groups: [1, 1, 1],
-                },
-            )
-            .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
-        if let Some(prev) = &first_out {
-            assert_eq!(prev, &out[0], "{label} disagreed with hardware output");
-        } else {
-            first_out = Some(out[0].clone());
-        }
-        ran += 1;
-    }
-    if ran == 0 {
-        eprintln!("no wave-32 SM 6.6 D3D12 device available; skipped execution");
-    }
-    first_out
-}
-
-#[test]
-fn wave64_emulated_ballot_on_wave32() {
-    // v_cmp_gt_u32_e32 vcc, 40, v0 -> lo = 0xFFFF_FFFF, hi = 0x0000_00FF
-    // Even lanes store vcc_lo, odd lanes store vcc_hi.
-    let v_cmp_gt_40 = 0x7C00_0000 | (0x0C4 << 17) | 0xA8; // src0 = 128 + 40 = 0xA8, vsrc1 = v0
-    let v_cmp_lt_32 = 0x7C00_0000 | (0x0C1 << 17) | (0xA0 << 9); // wait: use v1 = v0 < 32 via v_cmp_gt_u32 32, v0
-    let _ = v_cmp_lt_32;
-    let body = [
-        // vcc = (40 > v0)
-        v_cmp_gt_40,
-        // v1 = vcc_lo (s106), v2 = vcc_hi (s107)
-        vop1(0x001, 1, sgpr(106)),
-        vop1(0x001, 2, sgpr(107)),
-        // vcc = (32 > v0): true for subwave 0, false for subwave 1
-        0x7C00_0000 | (0x0C4 << 17) | 0xA0,
-        // v3 = vcc ? v1 : v2 (VOP2 v_cndmask_b32 vdst, src0(false), vsrc1(true))
-        (0x001 << 25) | (3 << 17) | (1 << 9) | vgpr(2) as u32,
-    ];
-    let Some(out) = run_wave64_on_wave32([64, 1, 1], 0, &body, 3) else {
-        return;
+        w.extend(vop3(0x159, 5, vgpr(1), 128, 131)); // v_med3_u32 v5, v1, 0, 3
+        w.push(vop1(0x002, 12, vgpr(5))); // v_readfirstlane_b32 s12, v5
+        w.push(s_mov_b32(124, 12)); // s_mov_b32 m0, s12
+        w.push(vop1(0x042, 8, vgpr(3))); // v_movreld_b32 v8, v3: v[8 + m0] = v3
+        w.push(second_index); // v6 = the second index
+        w.push(vop1(0x002, 12, vgpr(6))); // v_readfirstlane_b32 s12, v6
+        w.push(s_mov_b32(124, 12));
+        w.push(vop1(0x043, 0, vgpr(8))); // v_movrels_b32 v0, v8: v0 = v[8 + m0]
+        w
     };
-    for (i, &val) in out.iter().enumerate() {
-        let want = if i < 32 { 0xFFFF_FFFF } else { 0x0000_00FF };
-        assert_eq!(val, want, "lane {i}");
-    }
-}
-
-#[test]
-fn wave64_emulated_readlane_cross_subwave_on_wave32() {
-    const fn vop2(op: u32, vdst: u8, vsrc1: u8, src0: u16) -> u32 {
-        (op << 25) | ((vdst as u32) << 17) | ((vsrc1 as u32) << 9) | (src0 as u32 & 0x1FF)
-    }
-    let rl_45 = vop3(0x360, 2, vgpr(1), 128 + 45, 0);
-    let rl_7 = vop3(0x360, 3, vgpr(1), 128 + 7, 0);
-    let body = [
-        // v1 = v0 + 100
-        vop2(0x025, 1, 0, 0xFF),
-        100,
-        // s2 = readlane(v1, 45), s3 = readlane(v1, 7)
-        rl_45[0],
-        rl_45[1],
-        rl_7[0],
-        rl_7[1],
-        // v2 = s3 << 16 | s2
-        vop1(0x001, 2, sgpr(3)),
-        vop2(0x01a, 2, 2, 128 + 16),
-        vop2(0x01c, 2, 2, sgpr(2)),
+    // v_and_b32 v6, 3, v2
+    let shader = build_valu_cs(&body(0x1B << 25 | 6 << 17 | 2 << 9 | 131));
+    let cases = [
+        [0, 0, 77, 0],
+        [5, 3, 77, 0],
+        [1, 2, 77, 0],
+        [u32::MAX, 7, 77, 0],
+        [2, 1, 77, 0],
+        [3, 0, 77, 0],
     ];
-    let Some(out) = run_wave64_on_wave32([128, 1, 1], 0, &body, 2) else {
-        return;
-    };
-    for (i, &val) in out.iter().enumerate() {
-        let base = ((i / 64) * 64 + 100) as u32;
-        let want = (base + 45) | ((base + 7) << 16);
-        assert_eq!(val, want, "thread {i}");
-    }
-}
-
-#[test]
-fn wave64_emulated_mbcnt_on_wave32() {
-    let lo = vop3(0x365, 1, 0xC1, 0x80, 0);
-    let hi = vop3(0x366, 1, 0xC1, vgpr(1), 0);
-    let body = [lo[0], lo[1], hi[0], hi[1]];
-    let Some(out) = run_wave64_on_wave32([64, 1, 1], 0, &body, 1) else {
-        return;
-    };
-    for (i, &val) in out.iter().enumerate() {
-        assert_eq!(val, i as u32, "lane {i}");
-    }
-}
-
-#[test]
-fn wave64_emulated_ds_swizzle_and_dpp_row_mask_on_wave32() {
-    const fn vop2(op: u32, vdst: u8, vsrc1: u8, src0: u16) -> u32 {
-        (op << 25) | ((vdst as u32) << 17) | ((vsrc1 as u32) << 9) | (src0 as u32 & 0x1FF)
-    }
-    // ds_swizzle_b32 v2, v1 offset:0x041F (xor 1 across 32 lanes)
-    let swizzle = [0xD8D4_041F, (2 << 24) | 1];
-    // v_mov_b32_dpp v2, v2 row_shr:1 row_mask:0xA bank_mask:0xF bound_ctrl:1
-    let dpp_shr1_rows13 = [
-        vop1(0x001, 2, 0xFA),
-        2 | (0x111 << 8) | (1 << 19) | (0xF << 24) | (0xA << 28),
-    ];
-    let body = [
-        // v1 = v0 + 10
-        vop2(0x025, 1, 0, 128 + 10),
-        swizzle[0],
-        swizzle[1],
-        dpp_shr1_rows13[0],
-        dpp_shr1_rows13[1],
-    ];
-    let Some(out) = run_wave64_on_wave32([64, 1, 1], 0, &body, 2) else {
-        return;
-    };
-    for (i, &val) in out.iter().enumerate() {
-        let row = i >> 4;
-        let want = if row == 1 || row == 3 {
-            if i & 15 == 0 {
-                0
-            } else {
-                (((i - 1) ^ 1) + 10) as u32
-            }
-        } else {
-            ((i ^ 1) + 10) as u32
-        };
-        assert_eq!(val, want, "lane {i}");
-    }
-}
-
-#[test]
-fn wave64_emulated_reduction_and_prefix_sum_on_wave32() {
-    const fn vop2(op: u32, vdst: u8, vsrc1: u8, src0: u16) -> u32 {
-        (op << 25) | ((vdst as u32) << 17) | ((vsrc1 as u32) << 9) | (src0 as u32 & 0x1FF)
-    }
-    const fn dpp_add_shr(vdst: u8, k: u32) -> [u32; 2] {
-        [
-            vop2(0x025, vdst, vdst, 0xFA),
-            (vdst as u32) | ((0x110 + k) << 8) | (1 << 19) | (0xF << 24) | (0xF << 28),
-        ]
-    }
-    let cnd = vop3(0x101, 9, 0x80, vgpr(1), sgpr(2));
-    let rl15 = vop3(0x360, 4, vgpr(2), 128 + 15, 0);
-    let rl31 = vop3(0x360, 5, vgpr(2), 128 + 31, 0);
-    let rl47 = vop3(0x360, 6, vgpr(2), 128 + 47, 0);
-    let rl63 = vop3(0x360, 7, vgpr(2), 128 + 63, 0);
-    let mut body = vec![
-        // v1 = v0 + 1
-        vop2(0x025, 1, 0, 0x81),
-        // s_or_saveexec_b64 s[2:3], -1
-        0xBE82_25C1,
-        // v9 = v_cndmask_b32(0, v1, s[2:3]); v2 = v9
-        cnd[0],
-        cnd[1],
-        vop1(0x001, 2, vgpr(9)),
-    ];
-    for shift in [1, 2, 4, 8] {
-        body.extend_from_slice(&dpp_add_shr(2, shift));
-    }
-    body.extend_from_slice(&[
-        rl15[0], rl15[1],
-        rl31[0], rl31[1],
-        rl47[0], rl47[1],
-        rl63[0], rl63[1],
-        // v3 = s4 + s5, v4 = s6 + s7, v6 = v3 + v4 (wave sum), v7 = v3 + s6
-        vop1(0x001, 3, sgpr(5)),
-        vop2(0x025, 3, 3, sgpr(4)),
-        vop1(0x001, 4, sgpr(7)),
-        vop2(0x025, 4, 4, sgpr(6)),
-        vop2(0x025, 6, 4, vgpr(3)),
-        vop2(0x025, 7, 3, sgpr(6)),
-        // Row 1 (lanes 16..31): exec = 0x0000_0000_FFFF_0000; v2 += s4
-        s_mov_b32(126, 0xFF),
-        0xFFFF_0000,
-        s_mov_b32(127, 0x80),
-        vop2(0x025, 2, 2, sgpr(4)),
-        // Row 2 (lanes 32..47): exec = 0x0000_FFFF_0000_0000; v2 += v3
-        s_mov_b32(126, 0x80),
-        s_mov_b32(127, 0xFF),
-        0x0000_FFFF,
-        vop2(0x025, 2, 2, vgpr(3)),
-        // Row 3 (lanes 48..63): exec = 0xFFFF_0000_0000_0000; v2 += v7
-        s_mov_b32(127, 0xFF),
-        0xFFFF_0000,
-        vop2(0x025, 2, 2, vgpr(7)),
-        // exec = -1
-        0xBEFE_04C1,
-        // v5 = v2 - v9 (exclusive prefix sum)
-        vop2(0x026, 5, 9, vgpr(2)),
-        // Restore exec = s[2:3]
-        0xBEFE_0402,
-        // v8 = v6 | (v5 << 16)
-        vop2(0x01a, 5, 5, 128 + 16),
-        vop2(0x01c, 8, 5, vgpr(6)),
-    ]);
-    let Some(out) = run_wave64_on_wave32([64, 1, 1], 0, &body, 8) else {
-        return;
-    };
-    let total_sum: u32 = (1..=64).sum();
-    for (i, &val) in out.iter().enumerate() {
-        let prefix: u32 = (1..=i as u32).sum();
-        let want = total_sum | (prefix << 16);
-        assert_eq!(val, want, "lane {i}");
-    }
-}
-
-#[test]
-fn s_buffer_load_descriptor_reads_num_records_as_data() {
-    const fn vop2(op: u32, vdst: u8, vsrc1: u8, src0: u16) -> u32 {
-        (op << 25) | ((vdst as u32) << 17) | ((vsrc1 as u32) << 9) | (src0 as u32 & 0x1FF)
-    }
-    let load_srv = [
-        0x3D << 26 | 0x02 << 18 | (12 << 6),
-        (125 << 25) | 32, // table byte offset 32 (view index 1, 8 dwords per heap slot)
-    ];
-    let buf_load = [
-        0x3D << 26 | 0x08 << 18 | (16 << 6) | (12 >> 1),
-        125 << 25,
-    ];
-    let words = [
-        s_mov_b32(1, 0x80),
-        s_load_dwordx4(8, 0)[0],
-        s_load_dwordx4(8, 0)[1],
-        load_srv[0],
-        load_srv[1],
-        buf_load[0],
-        buf_load[1],
-        vop1(0x001, 0, sgpr(16)),     // v0 = s16 (loaded dword)
-        vop2(0x025, 0, 0, sgpr(14)),  // v0 += s14 (SRV NUM_RECORDS)
-        buffer_store_dword(0, 8, 0)[0],
-        buffer_store_dword(0, 8, 0)[1],
-        S_ENDPGM,
-    ];
-    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
-    let native = NativeProgram {
-        stage: HwStage::Cs,
-        wave64: false,
-        vgprs: 4,
-        layout: vec![RootParam {
-            root: RootType::Table,
-            table_offset_dwords: 0,
-            sgprs: 1,
-            base_register: 0,
-            user_data: 0,
-            slot: 0,
-        }],
-        used: vec![
-            UsedResource {
-                kind: ResourceType::Uav,
-                root: RootType::Table,
-                table_offset_dwords: 0,
-                lower_bound: 0,
-                stride: 0,
-                dwords: 4,
-                user_data: 0,
-                slot: 0,
-            },
-            UsedResource {
-                kind: ResourceType::Srv,
-                root: RootType::Table,
-                table_offset_dwords: 8,
-                lower_bound: 0,
-                stride: 0,
-                dwords: 4,
-                user_data: 0,
-                slot: 0,
-            },
-        ],
-        io: StageIo::Cs(ComputeIo {
-            rsrc2: 1 << 1,
-            threads: [1, 1, 1],
-        }),
-        code,
-    };
-    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
-    let st = structure::structure(&p).expect("structure");
-    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
-    let io = io::raise(&p, &native).expect("io::raise");
-    let lowered = lower::lower(&lower::Parts {
-        native: &native,
-        p: &p,
-        st: &st,
-        io: &io,
-        res: &res,
-        inputs: Vec::new(),
-        outputs: Vec::new(),
-        prims: Vec::new(),
-        mesh_stride: 0,
-        max_wave: 32,
-    })
-    .expect("lower");
-    let mut shader = HostShader {
-        stage: HwStage::Cs,
-        dxil: lowered.dxil,
-        user_data: lowered.user_data,
-        samplers: lowered.samplers,
-        static_samplers: Vec::new(),
-        root_cbvs: lowered.root_cbvs,
-        root_srvs: lowered.root_srvs,
-    };
-    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
-        v.validate(&mut shader.dxil).expect("DXIL validation failed");
-    }
-    let mut ran = 0;
-    for (label, warp) in [("hardware", false), ("warp", true)] {
-        let Ok(host) = Host::new(warp) else {
-            continue;
-        };
-        let (root, pso) = host
-            .compute_pipeline(&shader)
-            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
-        let src_data = [111u32, 222, 333, 444];
-        let out = host
-            .dispatch(
-                &root,
-                &pso,
-                &Dispatch {
-                    roots: Vec::new(),
-                    views: &[
-                        View::RawUav(1),
-                        View::Buffer {
-                            data: &src_data,
-                            stride: Stride::Raw,
-                        },
-                    ],
-                    samplers: &[],
-                    groups: [1, 1, 1],
-                },
-            )
-            .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
-        assert_eq!(out[0][0], 111 + 16, "{label}: loaded dword + raw byte size");
-        ran += 1;
-    }
-    assert!(ran > 0, "neither hardware nor WARP device available");
-}
-
-#[test]
-fn indexed_load_uses_stride_from_built_root_descriptor() {
-    const fn vop2(op: u32, vdst: u8, vsrc1: u8, src0: u16) -> u32 {
-        (op << 25) | ((vdst as u32) << 17) | ((vsrc1 as u32) << 9) | (src0 as u32 & 0x1FF)
-    }
-    let words = [
-        // Table in s[0:1] -> UAV at s[8:11]
-        s_mov_b32(1, 0x80),
-        s_load_dwordx4(8, 0)[0],
-        s_load_dwordx4(8, 0)[1],
-        // Build root SRV descriptor in s[12:15] from s[2:3] with STRIDE = 12 (0xC << 16).
-        0xBE8C_0302, // s_mov_b32 s12, s2
-        0x880D_FF03, // s_or_b32 s13, s3, 0x000C_0000
-        0x000C_0000,
-        0xBE8E_03C1, // s_mov_b32 s14, -1
-        0xBE8F_03FF, // s_mov_b32 s15, 0x11014fac
-        0x1101_4FAC,
-        // buffer_load_dword v1, v0, s[12:15], 0 idxen offset:4
-        0x38 << 26 | 0x0C << 18 | (1 << 13) | 4,
-        0x80 << 24 | ((12 >> 2) << 16) | (1 << 8),
-        // Store v1 to UAV[v0 * 4]
-        vop2(0x01a, 2, 0, 0x82), // v2 = v0 << 2
-        0x38 << 26 | 0x1C << 18 | (1 << 12),
-        0x80 << 24 | ((8 >> 2) << 16) | (1 << 8) | 2,
-        S_ENDPGM,
-    ];
-    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
-    let native = NativeProgram {
-        stage: HwStage::Cs,
-        wave64: false,
-        vgprs: 4,
-        layout: vec![
-            RootParam {
-                root: RootType::Table,
-                table_offset_dwords: 0,
-                sgprs: 1,
-                base_register: 0,
-                user_data: 0,
-                slot: 0,
-            },
-            RootParam {
-                root: RootType::Descriptor,
-                table_offset_dwords: 0,
-                sgprs: 2,
-                base_register: 0,
-                user_data: 2,
-                slot: 1,
-            },
-        ],
-        used: vec![
-            UsedResource {
-                kind: ResourceType::Uav,
-                root: RootType::Table,
-                table_offset_dwords: 0,
-                lower_bound: 0,
-                stride: 0,
-                dwords: 4,
-                user_data: 0,
-                slot: 0,
-            },
-            UsedResource {
-                kind: ResourceType::Srv,
-                root: RootType::Descriptor,
-                table_offset_dwords: 0,
-                lower_bound: 0,
-                stride: 0,
-                dwords: 4,
-                user_data: 2,
-                slot: 1,
-            },
-        ],
-        io: StageIo::Cs(ComputeIo {
-            rsrc2: 4 << 1,
-            threads: [3, 1, 1],
-        }),
-        code,
-    };
-    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
-    let st = structure::structure(&p).expect("structure");
-    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
-    let io = io::raise(&p, &native).expect("io::raise");
-    let lowered = lower::lower(&lower::Parts {
-        native: &native,
-        p: &p,
-        st: &st,
-        io: &io,
-        res: &res,
-        inputs: Vec::new(),
-        outputs: Vec::new(),
-        prims: Vec::new(),
-        mesh_stride: 0,
-        max_wave: 32,
-    })
-    .expect("lower");
-    let mut shader = HostShader {
-        stage: HwStage::Cs,
-        dxil: lowered.dxil,
-        user_data: lowered.user_data,
-        samplers: lowered.samplers,
-        static_samplers: Vec::new(),
-        root_cbvs: lowered.root_cbvs,
-        root_srvs: lowered.root_srvs,
-    };
-    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
-        v.validate(&mut shader.dxil).expect("DXIL validation failed");
-    }
-    let mut ran = 0;
-    for (label, warp) in [("hardware", false), ("warp", true)] {
-        let Ok(host) = Host::new(warp) else {
-            continue;
-        };
-        let (root, pso) = host
-            .compute_pipeline(&shader)
-            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
-        let src_data = vec![10, 100, 20, 30, 200, 40, 50, 300, 60];
-        let out = host
-            .dispatch(
-                &root,
-                &pso,
-                &Dispatch {
-                    roots: vec![(
-                        1,
-                        Root::View {
-                            srv: true,
-                            data: src_data,
-                        },
-                    )],
-                    views: &[View::RawUav(3)],
-                    samplers: &[],
-                    groups: [1, 1, 1],
-                },
-            )
-            .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
-        assert_eq!(out[0], [100, 200, 300], "{label}: stride=12 + offset=4");
-        ran += 1;
-    }
-    assert!(ran > 0, "neither hardware nor WARP device available");
-}
-
-#[test]
-fn wave64_uniform_ballot_read_inside_divergent_branch_emulates_on_wave32() {
-    // Compare (v0 & 1) == 1 in uniform entry block, then read the uniform
-    // ballot mask inside a divergent `if (v0 < 32)` branch (lanes >= 32 keep 0).
-    let body = [
-        // v1 = v0 & 1
-        (0x1B << 25) | (1 << 17) | 0x81,
-        // v_cmp_eq_u32 s[4:5], v1, 1
-        vop3(0x0c2, 4, vgpr(1), 0x81, 0)[0],
-        vop3(0x0c2, 4, vgpr(1), 0x81, 0)[1],
-        // Divergent branch: v_cmp_lt_u32 s[6:7], v0, 32
-        vop3(0x0c1, 6, vgpr(0), 128 + 32, 0)[0],
-        vop3(0x0c1, 6, vgpr(0), 128 + 32, 0)[1],
-        // v2 = 0
-        vop1(0x001, 2, 0x80),
-        // s_and_saveexec_b64 s[6:7], s[6:7]
-        0xBE86_2406,
-        // s_cbranch_execz +1 (skip the 1-dword v2 = s4 when exec == 0)
-        0xBF88_0001,
-        // v2 = s4 (low 32 bits of uniform odd-lanes ballot = 0xAAAA_AAAA), read inside divergent block!
-        vop1(0x001, 2, sgpr(4)),
-        // s_or_b64 exec, exec, s[6:7]
-        0x88FE_067E,
-    ];
-    let Some(out) = run_wave64_on_wave32([64, 1, 1], 0, &body, 2) else {
-        return;
-    };
-    for (i, &val) in out.iter().enumerate() {
-        let want = if i < 32 { 0xAAAA_AAAA } else { 0 };
-        assert_eq!(val, want, "lane {i}");
-    }
-}
-
-#[test]
-fn wave64_readfirstlane_only_with_large_title_lds_fits_on_wave32() {
-    // 8064 dwords of title LDS (63 * 128) with 256 threads leaves 128 dwords before
-    // 8192: old per-thread LDS (8064 + 256 = 8320) overflowed, whereas waves64 * 2
-    // = 8 dwords (8072 <= 8192) fits cleanly.
-    let body = [
-        // v_cmp_ge_u32 s[4:5], v0, 35 (only wave 0 lanes 0..34 are masked off in wave 0).
-        vop3(0x0c6, 4, vgpr(0), 0xFF, 0)[0],
-        vop3(0x0c6, 4, vgpr(0), 0xFF, 0)[1],
-        35,
-        // Read s4 as data so console_lanes = true activates wave64 emulation.
-        vop1(0x001, 3, sgpr(4)),
-        // v1 = v0 + 100
-        (0x25 << 25) | (1 << 17) | 0xFF,
-        100,
-        // s_and_saveexec_b64 s[4:5], s[4:5]
-        0xBE84_2404,
-        // v_readfirstlane_b32 s6, v1
-        0x7E0C_0400 | 257,
-        // s_or_b64 exec, exec, s[4:5]
-        0x88FE_047E,
-        // v2 = s6
-        vop1(0x001, 2, sgpr(6)),
-    ];
-    let Some(out) = run_wave64_on_wave32([256, 1, 1], 8064, &body, 2) else {
-        return;
-    };
-    for (i, &val) in out.iter().enumerate() {
-        let want = if i < 64 {
-            35 + 100
-        } else {
-            ((i & !63) + 100) as u32
-        };
-        assert_eq!(val, want, "lane {i}");
-    }
-}
-
-#[test]
-fn non_active_bitwise_mask_combining_branch_masks_lowers_and_runs() {
-    // Compare even threads in first arm (v0 < 16) and thread == 21 in else arm (v0 >= 16),
-    // then OR those two disjoint-EXEC masks and read the combined mask as data.
-    // Expected 32-bit mask: even bits in 0..15 (0x5555) | bit 21 (0x0020_0000) = 0x0020_5555.
-    const fn vop2(op: u32, vdst: u8, vsrc1: u8, src0: u16) -> u32 {
-        (op << 25) | ((vdst as u32) << 17) | ((vsrc1 as u32) << 9) | (src0 as u32 & 0x1FF)
-    }
-    let body = [
-        // v1 = v0 & 1
-        vop2(0x01B, 1, 0, 0x81),
-        // Split mask: s[6:7] = (v0 < 16)
-        vop3(0x0c1, 6, vgpr(0), 128 + 16, 0)[0],
-        vop3(0x0c1, 6, vgpr(0), 128 + 16, 0)[1],
-        // s_and_saveexec_b64 s[6:7], s[6:7] (old exec = !0 saved in s[6:7])
-        0xBE86_2406,
-        // Arm A (v0 < 16): s[2:3] = (v1 == 0)
-        vop3(0x0c2, 2, vgpr(1), 0x80, 0)[0],
-        vop3(0x0c2, 2, vgpr(1), 0x80, 0)[1],
-        // Switch to Arm B (v0 >= 16): s_andn2_b64 exec, s[6:7], exec
-        0x8AFE_7E06,
-        // Arm B: s[4:5] = (v0 == 21)
-        vop3(0x0c2, 4, vgpr(0), 128 + 21, 0)[0],
-        vop3(0x0c2, 4, vgpr(0), 128 + 21, 0)[1],
-        // Restore exec: s_mov_b64 exec, s[6:7]
-        0xBEFE_0406,
-        // Combine disjoint masks (result holds lanes active elsewhere): s[16:17] = s[2:3] | s[4:5]
-        0x8890_0402,
-        // Read s16 as data!
-        vop1(0x001, 2, sgpr(16)),
-    ];
-    let Some(out) = run_wave64_on_wave32([32, 1, 1], 0, &body, 2) else {
-        return;
-    };
-    for (i, &val) in out.iter().enumerate() {
-        assert_eq!(val, 0x0020_5555, "lane {i}");
-    }
+    run_cases(&shader, &cases, |backend, _, [a, b, c, _], got| {
+        let (i, j) = (a.min(3), b & 3);
+        let want = if i == j { c } else { 10 + j };
+        assert_eq!(got, want, "{backend}: a {a:#x} b {b:#x}");
+    });
+    // v_mov_b32 v6, v2
+    let refused = try_build_valu_cs(&body(vop1(0x001, 6, vgpr(2))));
+    assert!(
+        matches!(
+            refused,
+            Err(crate::ShaderError::Unsupported {
+                what: "a descriptor's address or format read as data",
+                ..
+            })
+        ),
+        "{:?}",
+        refused.err()
+    );
 }
 
 #[test]
@@ -1826,7 +1539,6 @@ fn lower_synthetic_cs(
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
-        max_wave: 64,
     })
     .expect("lower");
     let shader = HostShader {
@@ -1837,6 +1549,12 @@ fn lower_synthetic_cs(
         static_samplers: Vec::new(),
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
+        root_uavs: lowered.root_uavs,
+        memory: lowered.memory,
+        memory_writes: lowered.memory_writes,
+        view_addresses: lowered.view_addresses,
+        heap: lowered.heap,
+        heap_writes: lowered.heap_writes,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         let mut copy = shader.dxil.clone();
@@ -1928,17 +1646,29 @@ fn root_descriptor_s_load_dword_reads_cbv_and_srv() {
         let (root, pso) = host
             .compute_pipeline(&shader)
             .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        for u in &shader.user_data {
+            if u.root == RootType::Descriptor && u.slot == 2 {
+                ud[u.index as usize] = u32::from(u.dword == super::ROOT_SRV_VIEW);
+            }
+        }
+        let srv_data = [1u32, 2, 0x3333_4444, 4];
         let out = host
             .dispatch(
                 &root,
                 &pso,
                 &Dispatch {
                     roots: vec![
-                        (0, Root::Constants(vec![0; shader.user_data_dwords().max(1) as usize])),
+                        (0, Root::Constants(ud)),
                         (1, Root::View { srv: false, data: vec![0xAAAA_0000, 0x1111_2222, 0, 0] }),
-                        (2, Root::View { srv: true, data: vec![1, 2, 0x3333_4444, 4] }),
                     ],
-                    views: &[View::RawUav(1)],
+                    views: &[
+                        View::RawUav(1),
+                        View::Buffer {
+                            data: &srv_data,
+                            stride: super::host::Stride::Raw,
+                        },
+                    ],
                     samplers: &[],
                     groups: [1, 1, 1],
                 },
@@ -2160,7 +1890,7 @@ fn image_sample_d_cl_lowers_and_runs_with_clamp() {
 fn v_cndmask_b32_with_untracked_mask_selects_per_lane() {
     // Runs both native wave32 (32 threads) and emulated wave64 on wave32 (64 threads).
     // s0 = mask_lo (root constant), s1 = mask_hi (root constant), s[2:3] = view table (s2=0).
-    for (wave64, total_threads, max_wave) in [(false, 32u32, 64u32), (true, 64u32, 32u32)] {
+    for (wave64, total_threads, _max_wave) in [(false, 32u32, 64u32), (true, 64u32, 32u32)] {
         let mut words = Vec::new();
         words.push(s_mov_b32(3, 0x80)); // s3 = 0
         words.extend_from_slice(&s_load_dwordx4(8, 2)); // UAV @ byte 0 -> s[8:11]
@@ -2231,7 +1961,6 @@ fn v_cndmask_b32_with_untracked_mask_selects_per_lane() {
             outputs: Vec::new(),
             prims: Vec::new(),
             mesh_stride: 0,
-            max_wave,
         })
         .expect("lower");
         let shader = HostShader {
@@ -2242,6 +1971,12 @@ fn v_cndmask_b32_with_untracked_mask_selects_per_lane() {
             static_samplers: Vec::new(),
             root_cbvs: lowered.root_cbvs,
             root_srvs: lowered.root_srvs,
+            root_uavs: lowered.root_uavs,
+            memory: lowered.memory,
+            memory_writes: lowered.memory_writes,
+            view_addresses: lowered.view_addresses,
+            heap: lowered.heap,
+            heap_writes: lowered.heap_writes,
         };
         if let Ok(mut v) =
             validator::Validator::load(validator::Validator::default_path().as_deref())
@@ -2384,19 +2119,25 @@ fn compute_spilled_user_data_table_resolves_constants_table_and_root_srv() {
                 (RootType::Constants, 0, 0) => 0x0000_0100,
                 (RootType::Constants, 0, 1) => 0x0000_0020,
                 (RootType::Table, 1, _) => 0,
+                (RootType::Descriptor, 2, d) if d == super::ROOT_SRV_VIEW => 1,
+                (RootType::Descriptor, 2, d) if d == super::ROOT_VIEW_OFFSET => 0,
                 other => panic!("unexpected user data {other:?}"),
             };
         }
+        let srv_data = [0u32, 0x2000_0003, 0, 0];
         let out = host
             .dispatch(
                 &root,
                 &pso,
                 &Dispatch {
-                    roots: vec![
-                        (0, Root::Constants(ud)),
-                        (1, Root::View { srv: true, data: vec![0, 0x2000_0003, 0, 0] }),
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &[
+                        View::RawUav(1),
+                        View::Buffer {
+                            data: &srv_data,
+                            stride: super::host::Stride::Raw,
+                        },
                     ],
-                    views: &[View::RawUav(1)],
                     samplers: &[],
                     groups: [1, 1, 1],
                 },
@@ -2409,7 +2150,7 @@ fn compute_spilled_user_data_table_resolves_constants_table_and_root_srv() {
 /// Runs a synthetic `[64, 1, 1]` compute shader with 512 B LDS that writes one
 /// `u32` per lane (`v1` -> `uav[v0]`), validating with `dxil.dll` and running
 /// on both RTX 4060 hardware and WARP.
-fn run_64_thread_lds_cs(wave64: bool, max_wave: u32, body: &[u32], taken: u32, skipped: u32) -> Vec<u32> {
+fn run_64_thread_lds_cs(wave64: bool, _max_wave: u32, body: &[u32], taken: u32, skipped: u32) -> Vec<u32> {
     let mut words = vec![
         s_mov_b32(1, 0x80), // view table s[0:1] high = 0
     ];
@@ -2465,7 +2206,6 @@ fn run_64_thread_lds_cs(wave64: bool, max_wave: u32, body: &[u32], taken: u32, s
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
-        max_wave,
     })
     .expect("lower");
     let mut shader = HostShader {
@@ -2476,6 +2216,12 @@ fn run_64_thread_lds_cs(wave64: bool, max_wave: u32, body: &[u32], taken: u32, s
         static_samplers: Vec::new(),
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
+        root_uavs: lowered.root_uavs,
+        memory: lowered.memory,
+        memory_writes: lowered.memory_writes,
+        view_addresses: lowered.view_addresses,
+        heap: lowered.heap,
+        heap_writes: lowered.heap_writes,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         v.validate(&mut shader.dxil).expect("DXIL validation failed");
@@ -2658,7 +2404,6 @@ fn mesh_per_wave_s_barrier_runs_on_hardware_and_clamps_out_of_bounds_prim() {
         }],
         prims: Vec::new(),
         mesh_stride: 128,
-        max_wave: 32,
     })
     .expect("lower");
     let ms = HostShader {
@@ -2669,6 +2414,12 @@ fn mesh_per_wave_s_barrier_runs_on_hardware_and_clamps_out_of_bounds_prim() {
         static_samplers: Vec::new(),
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
+        root_uavs: lowered.root_uavs,
+        memory: lowered.memory,
+        memory_writes: lowered.memory_writes,
+        view_addresses: lowered.view_addresses,
+        heap: lowered.heap,
+        heap_writes: lowered.heap_writes,
     };
     let ps = HostShader {
         stage: HwStage::Ps,
@@ -2678,6 +2429,12 @@ fn mesh_per_wave_s_barrier_runs_on_hardware_and_clamps_out_of_bounds_prim() {
         static_samplers: Vec::new(),
         root_cbvs: Vec::new(),
         root_srvs: Vec::new(),
+        root_uavs: Vec::new(),
+        memory: false,
+        memory_writes: false,
+        view_addresses: false,
+        heap: false,
+        heap_writes: false,
     };
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let Ok(host) = Host::new(false) else {
