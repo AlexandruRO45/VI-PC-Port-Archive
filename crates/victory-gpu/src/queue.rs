@@ -232,6 +232,12 @@ pub(crate) fn presented() -> u64 {
     FRAMES.load(Ordering::Relaxed)
 }
 
+#[cfg(any(windows, test))]
+fn since_last_count(last: &AtomicU64, now: u64) -> u64 {
+    // Another present can report a newer sample before this one.
+    now.saturating_sub(last.fetch_max(now, Ordering::Relaxed))
+}
+
 /// Shows the first plane's first resource in our window.
 ///
 /// shortcut: one plane, no scaling or placement, the source expected in
@@ -249,10 +255,9 @@ extern "system" fn present(
         let (drawn, dispatched) = {
             static DRAWN: AtomicU64 = AtomicU64::new(0);
             static DISPATCHED: AtomicU64 = AtomicU64::new(0);
-            let since = |last: &AtomicU64, now: u64| now - last.swap(now, Ordering::Relaxed);
             (
-                since(&DRAWN, crate::draw::drawn()),
-                since(&DISPATCHED, crate::draw::dispatched()),
+                since_last_count(&DRAWN, crate::draw::drawn()),
+                since_last_count(&DISPATCHED, crate::draw::dispatched()),
             )
         };
         #[cfg(not(windows))]
@@ -534,6 +539,15 @@ mod tests {
         assert_eq!(old[14], new[16]); // signal 0x70 → 0x80
         assert_eq!(old[30], new[32]); // present 0xf0 → 0x100
         assert_eq!(new[35], execute_x as *const ()); // 0x118
+    }
+
+    #[test]
+    fn an_older_present_sample_cannot_roll_back_the_reported_count() {
+        let last = AtomicU64::new(0);
+        // The older present samples 10, then a newer present reports 12 first.
+        assert_eq!(since_last_count(&last, 12), 12);
+        assert_eq!(since_last_count(&last, 10), 0);
+        assert_eq!(since_last_count(&last, 15), 3);
     }
 
     #[test]
