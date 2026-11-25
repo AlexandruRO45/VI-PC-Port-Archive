@@ -985,7 +985,11 @@ impl State {
                 let gpu = (self.heaps[0] != 0)
                     .then(|| crate::descriptor::heap(self.heaps[0] as This).host())
                     .flatten()
-                    .and_then(|h| h.stride_table_gpu());
+                    .and_then(|h| h.stride_table_gpu())
+                    .or_else(|| {
+                        let g = crate::descriptor::host::last_stride_gpu();
+                        (g != 0).then_some(g)
+                    });
                 if let Some(gpu) = gpu {
                     // SAFETY: an open list; the stride table buffer lives with the host heap.
                     unsafe {
@@ -1029,6 +1033,16 @@ impl State {
         if !p.compute {
             once!("a dispatch with a graphics pipeline");
             return;
+        }
+        #[cfg(feature = "diagnostics")]
+        if std::env::var_os("VICTORY_COMPUTE_TRACE").is_some() {
+            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 200 {
+                tracing::info!(
+                    "{}",
+                    self.op_text(format!("compute {x}x{y}x{z}"), true, true)
+                );
+            }
         }
         let limit = p.stages.first().and_then(|s| {
             let data = &s.translated().host.user_data;
@@ -1211,6 +1225,13 @@ impl State {
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
+        #[cfg(feature = "diagnostics")]
+        if std::env::var_os("VICTORY_MESH_TRACE").is_some() {
+            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 400 {
+                tracing::info!("{}", self.op_text(format!("mesh {x}"), false, true));
+            }
+        }
         if x > MAX_GROUPS {
             once!(x, "a mesh dispatch past the host's group limit dropped");
             DROPPED.fetch_add(1, Ordering::Relaxed);
