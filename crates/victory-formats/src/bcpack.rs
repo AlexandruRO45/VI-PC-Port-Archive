@@ -273,19 +273,19 @@ pub fn decode(bc: u8, src: &[u8], dst: &mut [u8], tables: &Tables) -> Result<(),
         6 => (&[3, 3, 7, 7, 7, 4, 4, 4, 5, 5, 5, 7, 7, 7, 7, 4], 2),
         _ => (&[3, 3, 7, 7, 7, 7, 7, 6, 6, 4, 5, 7, 7, 7, 7, 4], 2),
     };
-    let stride = widths.len() * per;
-    thread_local! {
-        static SCRATCH: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
-    }
-    SCRATCH.with(|cell| {
-        let mut records = cell.borrow_mut();
-        records.resize(blocks * stride, 0);
-        let mut next = src.iter().copied();
-        lanes(tables, widths, per, blocks, |_| next.next(), &mut records)?;
-        let records = records.chunks_exact(stride);
-        let out = dst.chunks_exact_mut(block);
-        let t = tables;
-        match bc {
+     let stride = widths.len() * per;
+ thread_local! {
+     static SCRATCH: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+ }
+ SCRATCH.with(|cell| {
+     let mut records = cell.borrow_mut();
+     records.resize(blocks * stride, 0);
+     let mut next = src.iter().copied();
+     lanes(tables, widths, per, blocks, |_| next.next(), &mut records)?;
+     let records = records.chunks_exact(stride);
+     let out = dst.chunks_exact_mut(block);
+     let t = tables;
+             match bc {
             1 => plain(records, out, &t.bc1, &BC1, |s| bc1_residual(t, s), bc1_pack),
             3 => plain(records, out, &t.bc3, &BC3, |s| bc3_residual(t, s), bc3_pack),
             4 => plain(records, out, &t.bc4, &BC4, |s| bc4_residual(t, s), bc4_pack),
@@ -295,6 +295,8 @@ pub fn decode(bc: u8, src: &[u8], dst: &mut [u8], tables: &Tables) -> Result<(),
         }
     })
 }
+
+
 
 // Lanes.
 
