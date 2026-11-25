@@ -256,10 +256,21 @@ std::string remap(const wchar_t* requested, bool) {
     D3D12_RANGE range{0,3*words*4},empty{};void* ptr{};
     check(readback->Map(0,&range,&ptr),"remap readback");
     const auto actual=static_cast<const UINT*>(ptr);
-    bool equal=true;
-    for(UINT i=0;i<words;++i)equal &= actual[i]==source[i]&&actual[words+i]==source[i]&&actual[2*words+i]==source[page/4+i];
+    // Old view, identical alias, then the import made after the replacement.
+    const UINT* expected[3]{source,source,source+page/4};
+    std::string differs;
+    for(UINT part=0;part<3;++part){
+        UINT wrong=0,first=0;
+        for(UINT i=0;i<words;++i)
+            if(actual[part*words+i]!=expected[part][i]&&!wrong++)first=i;
+        if(!wrong)continue;
+        char line[128];
+        std::snprintf(line,sizeof(line),"%s copy %u: %u/%u wrong, [%u]=%#x expected %#x",differs.empty()?"":";",
+                      part,wrong,words,first,actual[part*words+first],expected[part][first]);
+        differs+=line;
+    }
     readback->Unmap(0,&empty);
-    if(!equal)throw std::runtime_error("remap readback differs");
+    if(!differs.empty())throw std::runtime_error("remap readback differs:"+differs);
     for(auto& list:lists)list.Reset();
     for(auto& allocator:allocators)allocator.Reset();
     old.Reset();alias.Reset();current.Reset();
