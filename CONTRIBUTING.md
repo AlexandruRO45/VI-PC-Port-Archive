@@ -18,7 +18,7 @@ Same goes for screenshots of game content: describe what you see
 We use AI tools on this project ourselves, so this isn't about banning them. It's about knowing what we're reviewing.
 
 - **Say which model you used.** Add a trailer to your commits, e.g. `Assisted-by: Claude Code (claude-opus-5-5)`, and mention it in the PR. Use the real model name, not just "an LLM".
-- **Say so if it did most of the work.** If a model wrote most of the diff or came up with the core idea, add the `ai-heavy` label. That's fine, but it gets a closer look, and you need to be able to explain every line and show you ran it yourself. This matters most for shader translation, memory and sync code, where a plausible mistake can hang a GPU driver.
+- **Say so if it did most of the work.** If a model wrote most of the diff or came up with the core idea, mention it. That's fine, but it gets a closer look, and you need to be able to explain every line and show you ran it yourself. This matters most for shader translation, memory and sync code, where a plausible mistake can hang a GPU driver.
 - **No guardrail-free or easily broken models.** Abliterated, "uncensored" or no-refusal models, and services that sell jailbreaking as a feature, are not allowed. Not sure about one? Ask first. Maintainers may name specific models here later.
 - **Mind the licences.** Don't submit anything copied from incompatible code.
 - **Hiding AI use** can get a PR closed, however good the code is, and whether or not it was only used to draft or peer review.
