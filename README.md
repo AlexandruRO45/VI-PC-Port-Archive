@@ -54,7 +54,8 @@ time on the test machines. Set them in PowerShell before running the script.
 | `VICTORY_CAPTURE=<dir>` + `VICTORY_CAPTURE_FRAMES=<list>` | save those frames as PNG (diagnostics build) |
 | `VICTORY_KEYS=30:Enter,35:X` | press keys at those seconds (diagnostics build) |
 | `VICTORY_D3D12_DRED=1` | on a GPU failure, report the commands in flight |
-| `VICTORY_PIPELINE_WAIT_MS=24` | shorter per-frame wait for pipelines still being built |
+| `VICTORY_PIPELINE_WAIT_MS=<ms>` | how long a frame waits, over all threads, for pipelines still being built (default 500). A draw whose pipeline is not ready by then is dropped for that frame, so a lower value makes models vanish; on a slow GPU or a cold shader cache a higher one (e.g. 2000) can draw more and run faster |
+| `VICTORY_TEXTURE_BUDGET_MB=<mb>` | limit on the host copies of textures picked by index. Unset: 2 GB, then more while the process uses under 90% of the card's memory budget (4 GB if the budget cannot be read). On a 4 GB card, 3000 cut the time spent preparing each frame several times over (#73) |
 
 Diagnostics build: `cargo build --profile diag -p victory --features diagnostics`
 
