@@ -243,12 +243,11 @@ fn wait(p: &Pending, frame: u64) {
 static QUEUES: (Mutex<[VecDeque<Arc<Pending>>; 2]>, Condvar) =
     (Mutex::new([VecDeque::new(), VecDeque::new()]), Condvar::new());
 
-/// Hands `p` to the workers (half the logical processors, 2 to 8), started
-/// on first use.
+/// Hands `p` to the workers (`workers()` of them), started on first use.
 fn queue(p: Arc<Pending>, now: bool) {
     static WORKERS: OnceLock<usize> = OnceLock::new();
     let workers = *WORKERS.get_or_init(|| {
-        let n = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
+        let n = workers();
         (0..n)
             .filter(|i| {
                 let spawned = std::thread::Builder::new()
@@ -272,6 +271,30 @@ fn queue(p: Arc<Pending>, now: bool) {
     let (lock, work) = &QUEUES;
     lock.lock().unwrap_or_else(|e| e.into_inner())[usize::from(!now)].push_back(p);
     work.notify_one();
+}
+
+/// How many workers make pipelines: `VICTORY_PIPELINE_THREADS` when set
+/// (0 makes them on the calling thread, as when no worker starts), else
+/// half the logical processors, 2 to 8. On some host/driver pairs the
+/// driver's compiler is not safe to call from several threads at once
+/// (AMD RDNA4 crashes in amdxc64 while pipelines compile in parallel;
+/// one worker avoids it), so the count is configurable.
+fn workers() -> usize {
+    let Ok(v) = std::env::var("VICTORY_PIPELINE_THREADS") else {
+        return default_workers();
+    };
+    match v.parse() {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::warn!(value = %v, error = %e, "VICTORY_PIPELINE_THREADS not a number");
+            default_workers()
+        }
+    }
+}
+
+/// Half the logical processors, 2 to 8.
+fn default_workers() -> usize {
+    std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8))
 }
 
 /// A worker: makes queued pipelines, those draws wait for first, and saves
