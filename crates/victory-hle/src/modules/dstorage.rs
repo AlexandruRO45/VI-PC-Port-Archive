@@ -216,9 +216,23 @@ extern "system" fn create_queue(
     )
 }
 
+/// The staging sizes the current release documents, in bytes: zero, for a
+/// title whose queues are all from memory, and 16, 20, 24, 28 and 32 MiB.
+/// The scheduler's own default is the largest.
+const STAGING_SIZES: [u32; 6] = [0, 16 << 20, 20 << 20, 24 << 20, 28 << 20, 32 << 20];
+
 /// Grand Theft Auto VI asks for 32 MiB and stops if this fails.
+///
+/// The console supports the sizes above and nothing else, so a size it has
+/// none of leaves the scheduler as it stands. Microsoft documents no
+/// HRESULT for that, only "standard"; `E_INVALIDARG` is what this module
+/// already answers an out-of-range value with, not a console-verified code.
 extern "system" fn set_staging_buffer_size(_: Factory, size: u32) -> HRESULT {
     tracing::info!(size, "dstorage: staging buffer size");
+    if !STAGING_SIZES.contains(&size) {
+        tracing::warn!(size, "dstorage: staging buffer size the title has none of");
+        return E_INVALIDARG;
+    }
     if let Some(scheduler) = scheduler() {
         scheduler.lock().staging = u64::from(size);
     }
@@ -1364,6 +1378,168 @@ mod tests {
         assert!(l.start().is_none());
         l.finish(&second, Ok(()));
         assert!(l.start().is_some());
+    }
+
+    /// The staging capacities the current release documents, in bytes.
+    const DOCUMENTED_STAGING: [u32; 6] = [0, 16 << 20, 20 << 20, 24 << 20, 28 << 20, 32 << 20];
+
+    /// Sizes with no place in that list: inside it, between its entries,
+    /// beside them, and past the largest.
+    const REJECTED_STAGING: [u32; 16] = [
+        1,
+        8 << 20,
+        (16 << 20) - 1,
+        (16 << 20) + 1,
+        18 << 20,
+        (20 << 20) - 1,
+        (20 << 20) + 1,
+        (24 << 20) - 1,
+        (24 << 20) + 1,
+        (28 << 20) - 1,
+        30 << 20,
+        (28 << 20) + 1,
+        (32 << 20) - 1,
+        (32 << 20) + 1,
+        64 << 20,
+        u32::MAX,
+    ];
+
+    /// An environment variable the parent sets in the child process alone,
+    /// to this value and no other. An inherited marker — of any value, an
+    /// empty one included — runs none of the checks below.
+    const STAGING_CHILD: &str = "VICTORY_DSTORAGE_STAGING_CHILD";
+    const STAGING_CHILD_RUN: &str = "run";
+    /// The line the child writes once its last check has passed. A child's
+    /// exit code says nothing about how much of it ran, so the parent
+    /// requires the code and this line.
+    const STAGING_CHILD_DONE: &str = "VICTORY_DSTORAGE_STAGING_CHILD_DONE";
+
+    /// The scheduler's staging capacity, with no live queue to change it.
+    fn capacity() -> u64 {
+        let scheduler = scheduler().expect("no scheduler");
+        let lanes = scheduler.lock();
+        assert!(lanes.lanes.is_empty(), "a queue is live");
+        lanes.staging
+    }
+
+    /// Reads a pipe to its end on a thread of its own, so a child never
+    /// blocks on a full pipe while the parent keeps its deadline, and so
+    /// what it printed is there to report whatever it exits with.
+    fn drained<R: std::io::Read + Send + 'static>(pipe: R) -> std::thread::JoinHandle<String> {
+        std::thread::spawn(move || {
+            let mut pipe = pipe;
+            let mut text = String::new();
+            std::io::Read::read_to_string(&mut pipe, &mut text).unwrap();
+            text
+        })
+    }
+
+    /// The factory takes the staging sizes the release documents and, as
+    /// Microsoft publishes no HRESULT for the rest, answers our
+    /// `E_INVALIDARG`: the code this module already answers an out-of-range
+    /// value with. The staging capacity is the scheduler's, and the
+    /// scheduler is process state the tests above run on, so the calls run
+    /// in a child process of their own, as `xgamesave`'s crash test does.
+    /// That child is ignored, named by hand and run as an ignored test, and
+    /// it answers with `STAGING_CHILD_DONE` only past its last check: a
+    /// filter naming no test, a child that returns early and one that is
+    /// skipped all exit 0, and none of them is this regression.
+    #[test]
+    fn only_the_documented_staging_sizes_are_accepted() {
+        // A process whose own environment already says `run` is one of
+        // these children: it starts no child of its own, so none nests.
+        assert_ne!(
+            std::env::var(STAGING_CHILD).as_deref(),
+            Ok(STAGING_CHILD_RUN),
+            "the staging-size child is running inside its own child"
+        );
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "modules::dstorage::tests::staging_size_child",
+                "--ignored",
+                "--test-threads=1",
+                "--nocapture",
+            ])
+            // Set for the child, not inherited: its marker is this value
+            // whatever the environment here says.
+            .env(STAGING_CHILD, STAGING_CHILD_RUN)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let out = drained(child.stdout.take().unwrap());
+        let err = drained(child.stderr.take().unwrap());
+        let start = Instant::now();
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if start.elapsed() > Duration::from_secs(60) {
+                child.kill().unwrap();
+                let _ = child.wait();
+                panic!("the staging-size child never finished");
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        let (out, err) = (out.join().unwrap(), err.join().unwrap());
+        assert!(
+            status.success(),
+            "the staging sizes were not as documented: {status}\n{out}\n{err}"
+        );
+        assert!(
+            out.contains(STAGING_CHILD_DONE),
+            "the staging-size child answered with no completion: {status}\n{out}\n{err}"
+        );
+    }
+
+    /// The checks above, run by that test in a process of its own. Ignored,
+    /// so an ordinary run reports it ignored and never reaches these lines,
+    /// and this module's scheduler stays the default 32 MiB for every test
+    /// running beside it; the parent names the test, asks the harness for
+    /// ignored tests, and marks the process.
+    #[test]
+    #[ignore = "run by only_the_documented_staging_sizes_are_accepted, in a process of its own"]
+    fn staging_size_child() {
+        // The parent's value, exactly. Run any other way — from a shell, on
+        // an inherited marker, at any value — these checks say so loudly
+        // instead of standing in for a run that did not happen.
+        assert_eq!(
+            std::env::var(STAGING_CHILD).as_deref(),
+            Ok(STAGING_CHILD_RUN),
+            "the staging-size child was run outside its parent"
+        );
+        // The factory method as the title reaches it.
+        let set: extern "system" fn(*mut c_void, u32) -> HRESULT = call(factory(), 0x40);
+        // The capacities settled, so the line the parent reads says how far
+        // this child got.
+        let mut settled = 0;
+        // Every documented capacity, zero included, takes effect.
+        for &size in &DOCUMENTED_STAGING {
+            assert_eq!(set(factory(), size), S_OK, "{size} is documented");
+            assert_eq!(capacity(), u64::from(size), "{size} not set");
+            settled += 1;
+        }
+        // A size the console has none of fails, and leaves the capacity the
+        // title last set where it stands.
+        for &size in &REJECTED_STAGING {
+            assert_eq!(set(factory(), 24 << 20), S_OK, "24 MiB is documented");
+            assert_eq!(
+                set(factory(), size),
+                E_INVALIDARG,
+                "{size} is not a documented size"
+            );
+            assert_eq!(capacity(), 24 << 20, "{size} changed the capacity");
+            settled += 1;
+        }
+        // And the factory works on afterwards, at every capacity again.
+        for size in [28 << 20, 32 << 20, 0] {
+            assert_eq!(set(factory(), size), S_OK, "{size} after a rejection");
+            assert_eq!(capacity(), u64::from(size), "{size} set after a rejection");
+            settled += 1;
+        }
+        // Past the last check: the parent's evidence that every one of them ran.
+        println!("{STAGING_CHILD_DONE} {settled} capacities");
     }
 
     #[test]
