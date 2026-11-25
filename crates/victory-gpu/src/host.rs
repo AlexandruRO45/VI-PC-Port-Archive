@@ -3972,7 +3972,7 @@ impl Host {
             for list in runs {
                 for step in &list.deferred().copies {
                     if let Step::Refresh(shadow, address, len) = step
-                        && !shadow.unwatched()
+                        && shadow.kernel_watched()
                     {
                         let span = spans
                             .entry(std::sync::Arc::as_ptr(shadow) as usize)
@@ -5309,23 +5309,29 @@ impl Batch {
             let ranges: Vec<(usize, usize)> = self
                 .refreshes
                 .iter()
-                .filter(|r| !r.0.unwatched())
+                .filter(|r| r.0.kernel_watched())
                 .map(|r| (r.1, r.2))
                 .collect();
             crate::watch::ask_ahead(&ranges);
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
         }
         if wide_refresh() && self.refreshes.len() >= 4 {
-            // Each copy on its own, several at a time: a copy's refresh
+            // Each batch chunk on its own, several at a time: a copy's refresh
             // writes that copy and reads title memory, nothing of another's.
             // The time counted is the time it took, not the threads' sum.
             let started = std::time::Instant::now();
             let before = PREPARING[0].load(Ordering::Relaxed);
-            let jobs: Vec<Box<dyn FnOnce() + Send>> = self
-                .refreshes
-                .drain(..)
-                .map(|(shadow, from, to)| Box::new(move || Self::update(&shadow, from, to)) as Box<dyn FnOnce() + Send>)
-                .collect();
+            let each = self.refreshes.len().div_ceil(16);
+            let mut jobs: Vec<Box<dyn FnOnce() + Send>> = Vec::with_capacity(16);
+            while !self.refreshes.is_empty() {
+                let at = self.refreshes.len().saturating_sub(each);
+                let chunk: Vec<_> = self.refreshes.drain(at..).collect();
+                jobs.push(Box::new(move || {
+                    for (shadow, from, to) in chunk {
+                        Self::update(&shadow, from, to);
+                    }
+                }));
+            }
             crate::shadow::wide_run(jobs);
             let summed = PREPARING[0].load(Ordering::Relaxed).saturating_sub(before);
             PREPARING[0].fetch_sub(summed.saturating_sub(started.elapsed().as_micros() as u64), Ordering::Relaxed);
