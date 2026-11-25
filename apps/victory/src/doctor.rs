@@ -275,7 +275,15 @@ pub fn failures<'a>(lines: impl IntoIterator<Item = &'a str>) -> Vec<Failure> {
         if let Some(at) = lower.find("0x887a000")
             && (lower.contains("removed") || lower.contains("hung") || lower.contains("device"))
         {
-            let code = lower[at..at + 10].to_owned();
+            // A line cut right after the prefix, or a wide character there,
+            // is not a code.
+            let Some(code) = lower
+                .get(at..at + 10)
+                .filter(|c| c.as_bytes()[9].is_ascii_hexdigit())
+            else {
+                continue;
+            };
+            let code = code.to_owned();
             let f = Failure {
                 severity: 1,
                 key: format!("device {code}"),
@@ -546,7 +554,10 @@ pub fn run(
     html: Option<PathBuf>,
 ) -> Result<()> {
     let text =
-        std::fs::read_to_string(log).with_context(|| format!("reading {}", log.display()))?;
+        // Bytes, not UTF-8: a crash can cut a log mid-character.
+        std::fs::read(log)
+            .map(|b| String::from_utf8_lossy(&b).into_owned())
+            .with_context(|| format!("reading {}", log.display()))?;
     let stamps: Vec<i64> = text
         .lines()
         .filter_map(|l| unix(plain(l).get(..19)?))
@@ -555,7 +566,7 @@ pub fn run(
     let paths = crashes.map(|c| vec![c]).unwrap_or_else(crash_logs);
     if let (Some(&from), Some(&to)) = (stamps.first(), stamps.last()) {
         for p in paths {
-            if let Ok(c) = std::fs::read_to_string(&p) {
+            if let Ok(c) = std::fs::read(&p).map(|b| String::from_utf8_lossy(&b).into_owned()) {
                 lines.extend(
                     crash_entries(&c, from, to + 60)
                         .into_iter()
@@ -873,6 +884,24 @@ VIctory: unhandled exception 0xc0000005 at victory-image-b99f876b74d4a77f.dll+0x
         assert!(page.contains("&lt;script&gt;"));
         assert!(page.contains("https://github.com/Marvisak/VIctory/issues/new?title="));
         assert_eq!(page.matches(r#"class="card "#).count(), found.len());
+    }
+
+    #[test]
+    fn cut_device_codes_and_invalid_bytes_do_not_panic() {
+        let lines = [
+            "2026-11-25T10:24:00.000000Z  WARN victory_gpu::host: the device was removed 0x887a000",
+            "2026-11-25T10:24:00.000000Z  WARN victory_gpu::host: the device was removed 0x887a000é",
+        ];
+        let found = failures(lines.iter().copied());
+        assert!(found.iter().all(|f| !f.key.starts_with("device ")));
+        let dir = std::env::temp_dir().join("victory-doctor-bytes");
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("cut.log");
+        let mut bytes = b"2026-11-25T10:24:00.000000Z  WARN victory_gpu::host: refused ".to_vec();
+        bytes.extend_from_slice(&[0xff, 0xfe, b'\n']);
+        std::fs::write(&log, bytes).unwrap();
+        let none = dir.join("none.log");
+        assert!(run(&log, Some(none), None, "Marvisak/VIctory", true, None).is_ok());
     }
 
     #[test]
