@@ -865,6 +865,15 @@ impl HostHeap {
         true
     }
 
+    /// Whether host slot `index` currently holds a made view.
+    pub(crate) fn texture_slot_made(&self, index: u32) -> bool {
+        self.made
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(index as usize)
+            .is_some_and(|&key| key != 0)
+    }
+
     /// Makes host slot `index` null again, as it is before its view is
     /// made: a null view of the kind it held.
     fn unmake(&self, made: &mut [u64], index: u32) {

@@ -1505,6 +1505,16 @@ impl State {
             if SPENT.load(Ordering::Relaxed) >= PER_FRAME || began.elapsed() > SPAN {
                 break;
             }
+            // When the card texture budget is full, skip slots that have not
+            // yet been made so we avoid per-slot working-set probing; already
+            // made slots still check `mapped_bytes` so unmapped textures evict.
+            if !room && !host.texture_slot_made(index) {
+                refused += 1;
+                if refused > 256 {
+                    break;
+                }
+                continue;
+            }
             // A placed texture whose memory is not mapped (not streamed in
             // yet, or streamed out again: the heap keeps tens of thousands
             // of such views) gets no host texture; looked at again soon (a
