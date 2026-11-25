@@ -388,8 +388,8 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     use windows_sys::Win32::System::Memory::GetWriteWatch;
     const WRITE_WATCH_FLAG_RESET: u32 = 1;
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
-    let j = &mut *j;
+    let mut held = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let j = &mut *held;
     // Asked ahead with the submission's other ranges: the journal has it.
     if j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
         return Some((
@@ -409,6 +409,38 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     // kernel asking would only fail. Copies of it are flushed many times a
     // frame, each time paying that failed call before the guards answer.
     let known_view = guarded && known_view(first * PAGE);
+    // Their walk (`VirtualProtect` on what was written, page-table queries)
+    // is done without the journal's lock (`VICTORY_WATCH_SPLIT=0`: under it,
+    // as before): its askings waited for each other there, 18 ms a frame of
+    // the submitting thread in a gameplay profile, the wide refreshes too.
+    // The asking's number is taken first; what the walk finds is noted in
+    // the guards (`Guards::recent`) until the journal has it, so that a walk
+    // meanwhile, which finds those pages clean, reports them as well.
+    if known_view && split() {
+        j.asked += 1;
+        let now = j.asked;
+        drop(held);
+        #[cfg(feature = "diagnostics")]
+        let guarding = std::time::Instant::now();
+        let written = guard_noted(first * PAGE, last * PAGE, Some(now))?;
+        #[cfg(feature = "diagnostics")]
+        {
+            use crate::copystat::{C, add};
+            add(C::GuardUs, guarding.elapsed().as_micros() as u64);
+            add(C::WatchKnownView, 1);
+            add(C::Watches, 1);
+        }
+        let out = {
+            let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+            for &page in &written {
+                let w = j.written.entry(page).or_insert(0);
+                *w = (*w).max(now);
+            }
+            (now, j.written.range(first..last).map(|(&p, &w)| (p, w)).collect())
+        };
+        guard_noted_done(&written, now);
+        return Some(out);
+    }
     // SAFETY: the answer buffer holds `count` entries.
     let failed = known_view
         || unsafe {
@@ -578,6 +610,11 @@ struct Guards {
     /// runtime last mapped or unmapped them. They are view memory whether
     /// their guard stands now or a write has opened it.
     viewed: BTreeSet<usize>,
+    /// Pages a guard walk found written ([`guard_noted`]) whose asking has
+    /// not put them into the journal yet, with that asking's number. A walk
+    /// over them meanwhile finds them clean, and reports them from here:
+    /// the journal's lock is not held during walks ([`writes`]).
+    recent: BTreeMap<usize, u64>,
 }
 
 /// Whether a block once guarded stays known as view memory while its
@@ -627,6 +664,7 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     absent: BTreeSet::new(),
     aliased: BTreeSet::new(),
     viewed: BTreeSet::new(),
+    recent: BTreeMap::new(),
 });
 
 fn guards() -> std::sync::MutexGuard<'static, Guards> {
@@ -643,6 +681,13 @@ pub(crate) fn clean(page: usize) -> bool {
 /// they were last guarded (all of a block's pages), guarding them again
 /// before the caller copies them. `None` if the memory is not a view.
 fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
+    guard_noted(start, end, None)
+}
+
+/// [`guard`], and with `stamp` (the number of the asking it is for) what it
+/// found written is noted in [`Guards::recent`] until [`guard_noted_done`],
+/// and the range's pages noted there by other askings are reported too.
+fn guard_noted(start: usize, end: usize, stamp: Option<u64>) -> Option<Vec<usize>> {
     // A range whose first block the guards hold already (read-only by our
     // hand, or noted absent) is a view: no question to Windows. The
     // question walks the page tables to the end of the pages that share the
@@ -672,6 +717,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     let clean: Vec<usize> = g.clean.range(first..last).copied().collect();
     if clean.len() == last - first {
         // Nothing written, mapped or new since the range was last taken.
+        noted(&mut g, &mut written, first, last, stamp);
         return Some(written);
     }
     let mut next_clean = 0;
@@ -707,7 +753,38 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
             protect(&mut g, from, block);
         }
     }
+    noted(&mut g, &mut written, first, last, stamp);
     Some(written)
+}
+
+/// With an asking's `stamp`: `written` (page numbers, in order) goes into
+/// [`Guards::recent`], and the pages of `[first, last)` other askings noted
+/// there are added to it.
+fn noted(g: &mut Guards, written: &mut Vec<usize>, first: usize, last: usize, stamp: Option<u64>) {
+    let Some(stamp) = stamp else { return };
+    let others: Vec<usize> = g.recent.range(first..last).map(|(&p, _)| p).collect();
+    for &page in written.iter() {
+        g.recent.insert(page, stamp);
+    }
+    if !others.is_empty() {
+        written.extend(others);
+        written.sort_unstable();
+        written.dedup();
+    }
+}
+
+/// The asking numbered `stamp` has put what its guard walk found into the
+/// journal: those pages leave [`Guards::recent`].
+fn guard_noted_done(written: &[usize], stamp: u64) {
+    if written.is_empty() {
+        return;
+    }
+    let mut g = guards();
+    for page in written {
+        if g.recent.get(page) == Some(&stamp) {
+            g.recent.remove(page);
+        }
+    }
 }
 
 /// Whether `[start, end)` is view memory. The title's views lie in
@@ -819,6 +896,13 @@ pub(crate) fn release(at: usize) -> bool {
     g.viewed.remove(&block);
     g.aliased.remove(&block);
     was
+}
+
+/// Whether [`writes`] walks the guards without the journal's lock
+/// (`VICTORY_WATCH_SPLIT`; on by default, `=0`: under it, as before).
+fn split() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WATCH_SPLIT").is_none_or(|v| v != "0"))
 }
 
 /// Views of one page past which its views are not guarded together.
@@ -1248,6 +1332,45 @@ fn writable(at: usize) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// A guard walk's finds stay reported to the walks after it, which find
+    /// those pages clean, until its asking has put them in the journal.
+    #[test]
+    fn a_walks_finds_reach_the_walks_after_it_until_the_journal_has_them() {
+        let mut g = Guards {
+            protected: BTreeSet::new(),
+            clean: BTreeSet::new(),
+            absent: BTreeSet::new(),
+            aliased: BTreeSet::new(),
+            viewed: BTreeSet::new(),
+            recent: BTreeMap::new(),
+        };
+        // Asking 5 found pages 10 and 11 written.
+        let mut first = vec![10, 11];
+        noted(&mut g, &mut first, 8, 16, Some(5));
+        assert_eq!(first, vec![10, 11]);
+        // Asking 6 over pages 9..12 finds nothing itself, and is told of both.
+        let mut second = Vec::new();
+        noted(&mut g, &mut second, 9, 12, Some(6));
+        assert_eq!(second, vec![10, 11]);
+        // Outside the range: not told.
+        let mut elsewhere = Vec::new();
+        noted(&mut g, &mut elsewhere, 12, 20, Some(7));
+        assert!(elsewhere.is_empty());
+        // Without a stamp (the tests' and the old way's walks): nothing noted.
+        let mut plain = vec![30];
+        noted(&mut g, &mut plain, 30, 31, None);
+        assert!(!g.recent.contains_key(&30));
+        // Done for asking 5: gone; a page another asking noted since stays.
+        g.recent.insert(11, 9);
+        for page in [10usize, 11] {
+            if g.recent.get(&page) == Some(&5) {
+                g.recent.remove(&page);
+            }
+        }
+        assert!(!g.recent.contains_key(&10));
+        assert_eq!(g.recent.get(&11), Some(&9));
+    }
+
     use super::*;
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
