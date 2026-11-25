@@ -60,11 +60,12 @@ fn local(url: &[u16]) -> Result<Vec<u16>, (String, String)> {
         text.clone()
     } else if let Some(rest) = text.strip_prefix(r"\??\") {
         // The same prefix as the object manager spells it; the host's file
-        // calls take it too.
+        // calls take it too, after translating any virtual drive.
         if !drive(rest) {
             return Err(("unc".into(), host_of(rest.trim_start_matches("UNC\\"))));
         }
-        return Ok(with_nul(url));
+        let verbatim: Vec<u16> = format!(r"\\?\{rest}").encode_utf16().collect();
+        return Ok(files::translate(&verbatim).unwrap_or_else(|| with_nul(url)));
     } else if share(&text) {
         return Err(("unc".into(), host_of(&text[2..])));
     } else if drive(&text) {
@@ -637,5 +638,18 @@ mod tests {
     fn interface_ids_are_the_resolvers() {
         assert_eq!(&IID_IUNKNOWN[8..], &[0xC0, 0, 0, 0, 0, 0, 0, 0x46]);
         assert_eq!(&IID_RESOLVER[..4], &[0x2D, 0xA3, 0xE5, 0xFB]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn object_prefix_translates_virtual_drives() {
+        let dir = tempfile::tempdir().unwrap();
+        let letter = files::mount(dir.path()).unwrap();
+        let obj_path = format!(r"\??\{letter}:\movies\intro.mp4");
+        let wide: Vec<u16> = obj_path.encode_utf16().collect();
+        let resolved = local(&wide).unwrap();
+        let resolved = String::from_utf16_lossy(&resolved[..resolved.len() - 1]);
+        assert!(resolved.starts_with(r"\\?\"));
+        assert!(resolved.ends_with(r"\movies\intro.mp4"));
     }
 }
