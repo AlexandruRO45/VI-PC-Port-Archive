@@ -19,6 +19,8 @@ use std::sync::{Condvar, LazyLock, Mutex, MutexGuard, PoisonError};
 use std::thread::ThreadId;
 use std::time::{Duration, Instant};
 
+#[cfg(windows)]
+mod hid;
 mod playstation;
 
 use super::xasync::{E_INVALIDARG, E_NOTIMPL};
@@ -1193,7 +1195,7 @@ mod host {
                     self.identities[slot] = None;
                     return None;
                 }
-                let (pad, identity) = super::playstation::connected_pad()?;
+                let (pad, identity) = super::hid::connected_pad()?;
                 self.identities[slot] = Some(identity);
                 return Some(pad);
             };
@@ -1249,6 +1251,11 @@ mod host {
         }
 
         fn rumble(&mut self, slot: usize, low: u16, high: u16) {
+            // A slot filled by a HID pad has no XInput device behind it.
+            if self.identities[slot].is_some_and(|id| id != XBOX_IDENTITY) {
+                super::hid::set_rumble(low, high);
+                return;
+            }
             let speeds = XINPUT_VIBRATION {
                 wLeftMotorSpeed: low,
                 wRightMotorSpeed: high,

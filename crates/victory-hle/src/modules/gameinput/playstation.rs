@@ -24,7 +24,6 @@ use super::{
 
 /// The pads we read, by product id: DualSense, DualSense Edge; DualShock 4
 /// (two revisions and the USB adapter).
-#[cfg_attr(not(windows), allow(dead_code))]
 const PRODUCTS: [(&str, Kind); 5] = [
     ("0ce6", Kind::DualSense),
     ("0df2", Kind::DualSense),
@@ -104,7 +103,7 @@ fn gone(kind: Kind, report: &[u8]) -> bool {
 /// new state, none when the adapter says its pad left, and the old one for a
 /// report that says nothing about the pad.
 #[cfg_attr(not(windows), allow(dead_code))]
-fn after(kind: Kind, report: &[u8], current: Option<PadState>) -> Option<PadState> {
+pub(super) fn after(kind: Kind, report: &[u8], current: Option<PadState>) -> Option<PadState> {
     if gone(kind, report) {
         return None;
     }
@@ -157,202 +156,118 @@ fn full(data: &[u8]) -> Option<PadState> {
     ))
 }
 
-#[cfg(windows)]
-pub(super) use reader::connected_pad;
-
-#[cfg(windows)]
-mod reader {
-    use std::sync::{Mutex, OnceLock, PoisonError};
-    use std::time::Duration;
-
-    use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
-        CM_GET_DEVICE_INTERFACE_LIST_PRESENT, CM_Get_Device_Interface_List_SizeW,
-        CM_Get_Device_Interface_ListW, CR_SUCCESS,
-    };
-    use windows_sys::Win32::Devices::HumanInterfaceDevice::{
-        HIDP_CAPS, HidD_FreePreparsedData, HidD_GetHidGuid, HidD_GetPreparsedData, HidP_GetCaps,
-    };
-    use windows_sys::Win32::Foundation::{
-        CloseHandle, GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE,
-    };
-    use windows_sys::Win32::Storage::FileSystem::{
-        CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, ReadFile,
-    };
-
-    use super::*;
-
-    /// How often to look for a pad while none is open.
-    const RESCAN: Duration = Duration::from_secs(1);
-
-    /// Sony's USB vendor id.
-    const SONY: u16 = 0x054C;
-
-    /// A reading and the pad's vendor and product ids.
-    type Reading = (PadState, (u16, u16));
-
-    static LATEST: Mutex<Option<Reading>> = Mutex::new(None);
-
-    fn set(state: Option<Reading>) {
-        *LATEST.lock().unwrap_or_else(PoisonError::into_inner) = state;
+/// The kind of pad a HID device's vendor and product id name, if it is one we
+/// read.
+pub(super) fn kind_of(vendor: u16, product: u16) -> Option<Kind> {
+    if vendor != SONY {
+        return None;
     }
+    PRODUCTS
+        .iter()
+        .find(|(id, _)| u16::from_str_radix(id, 16) == Ok(product))
+        .map(|&(_, kind)| kind)
+}
 
-    /// The pad's newest reading while one is open; starts the reader thread
-    /// the first time it is asked.
-    pub(in super::super) fn connected_pad() -> Option<Reading> {
-        static STARTED: OnceLock<()> = OnceLock::new();
-        STARTED.get_or_init(|| {
-            let spawned = std::thread::Builder::new()
-                .name("dualsense".into())
-                .spawn(run);
-            if let Err(e) = spawned {
-                tracing::warn!(error = %e, "no PlayStation pad reader thread");
-            }
-        });
-        *LATEST.lock().unwrap_or_else(PoisonError::into_inner)
-    }
+/// Sony's USB vendor id.
+pub(super) const SONY: u16 = 0x054C;
 
-    /// The kind of pad a HID device path names, if it is one we read.
-    pub(super) fn kind_of(path: &str) -> Option<(Kind, u16)> {
-        let path = path.to_ascii_lowercase();
-        // `vid_054c&pid_0ce6` over USB, `vid&0002054c_pid&0ce6` over Bluetooth.
-        if !path.contains("054c") {
-            return None;
-        }
-        PRODUCTS
-            .iter()
-            .find(|(id, _)| {
-                path.contains(&format!("pid_{id}")) || path.contains(&format!("pid&{id}"))
-            })
-            .and_then(|&(id, kind)| Some((kind, u16::from_str_radix(id, 16).ok()?)))
-    }
-
-    /// Device paths of the present HID devices that look like a supported pad.
-    fn paths() -> Vec<(Vec<u16>, Kind, u16)> {
-        // SAFETY: plain queries into buffers we size from the answer.
-        unsafe {
-            let mut guid = std::mem::zeroed();
-            HidD_GetHidGuid(&mut guid);
-            let mut len = 0u32;
-            let flags = CM_GET_DEVICE_INTERFACE_LIST_PRESENT;
-            if CM_Get_Device_Interface_List_SizeW(&mut len, &guid, std::ptr::null(), flags)
-                != CR_SUCCESS
-                || len < 2
-            {
-                return Vec::new();
-            }
-            let mut buf = vec![0u16; len as usize];
-            if CM_Get_Device_Interface_ListW(&guid, std::ptr::null(), buf.as_mut_ptr(), len, flags)
-                != CR_SUCCESS
-            {
-                return Vec::new();
-            }
-            buf.split(|&c| c == 0)
-                .filter(|p| !p.is_empty())
-                .filter_map(|p| {
-                    let (kind, product) = kind_of(&String::from_utf16_lossy(p))?;
-                    Some((p.iter().copied().chain(Some(0)).collect(), kind, product))
-                })
-                .collect()
+/// CRC-32 (the zlib one) of `data`, continuing from `crc` (0 to start).
+fn crc32_update(crc: u32, data: &[u8]) -> u32 {
+    let mut crc = !crc;
+    for &byte in data {
+        crc ^= u32::from(byte);
+        for _ in 0..8 {
+            crc = (crc >> 1) ^ (0xEDB8_8320 & 0u32.wrapping_sub(crc & 1));
         }
     }
+    !crc
+}
 
-    fn run() {
-        loop {
-            for (path, kind, product) in paths() {
-                if read_from(&path, kind, product) {
-                    break;
-                }
-            }
-            set(None);
-            std::thread::sleep(RESCAN);
+/// The signature of a Bluetooth output report: the CRC-32 of the seed byte
+/// 0xA2 and every byte before the last four.
+fn output_crc(report: &[u8]) -> u32 {
+    crc32_update(crc32_update(0, &[0xA2]), &report[..report.len() - 4])
+}
+
+/// Motor speeds as the pad takes them: 8 bits, from the title's 16.
+fn motor(speed: u16) -> u8 {
+    (speed >> 8) as u8
+}
+
+/// An output report that sets the pad's rumble motors (`low`: the strong
+/// one on the left, `high`: the weak one on the right) and nothing else.
+/// Layouts after the Linux `hid-playstation` driver.
+///
+/// - `bluetooth`: the Bluetooth framing (report id and header, CRC-32 at
+///   the end) instead of the USB one.
+/// - `sequence`: the DualSense's Bluetooth sequence number, 0 to 15, one
+///   more each report.
+/// - `new_vibration`: a DualSense of firmware update 2.21 or later (and the
+///   Edge) takes the improved rumble emulation; older ones the classic bit.
+pub(super) fn rumble_report(
+    kind: Kind,
+    bluetooth: bool,
+    low: u16,
+    high: u16,
+    sequence: u8,
+    new_vibration: bool,
+) -> Vec<u8> {
+    let (left, right) = (motor(low), motor(high));
+    match (kind, bluetooth) {
+        (Kind::DualSense, false) => {
+            let mut r = vec![0u8; 63];
+            r[0] = 0x02;
+            dualsense_common(&mut r[1..48], left, right, new_vibration);
+            r
+        }
+        (Kind::DualSense, true) => {
+            let mut r = vec![0u8; 78];
+            r[0] = 0x31;
+            r[1] = (sequence & 0x0F) << 4;
+            r[2] = 0x10;
+            dualsense_common(&mut r[3..50], left, right, new_vibration);
+            let crc = output_crc(&r);
+            r[74..].copy_from_slice(&crc.to_le_bytes());
+            r
+        }
+        (Kind::DualShock4, false) => {
+            let mut r = vec![0u8; 32];
+            r[0] = 0x05;
+            dualshock4_common(&mut r[1..11], left, right);
+            r
+        }
+        (Kind::DualShock4, true) => {
+            let mut r = vec![0u8; 78];
+            r[0] = 0x11;
+            // The report carries HID data and a CRC.
+            r[1] = 0x80 | 0x40;
+            dualshock4_common(&mut r[3..13], left, right);
+            let crc = output_crc(&r);
+            r[74..].copy_from_slice(&crc.to_le_bytes());
+            r
         }
     }
+}
 
-    /// Reads one pad until it fails (unplugged, switched off); whether it
-    /// could be opened and read at all.
-    fn read_from(path: &[u16], kind: Kind, product: u16) -> bool {
-        // SAFETY: a NUL-terminated path; the handle is closed below.
-        let handle = unsafe {
-            let open = |access| {
-                CreateFileW(
-                    path.as_ptr(),
-                    access,
-                    FILE_SHARE_READ | FILE_SHARE_WRITE,
-                    std::ptr::null(),
-                    OPEN_EXISTING,
-                    0,
-                    std::ptr::null_mut(),
-                )
-            };
-            let h = open(GENERIC_READ | GENERIC_WRITE);
-            if h == INVALID_HANDLE_VALUE {
-                open(GENERIC_READ)
-            } else {
-                h
-            }
-        };
-        if handle == INVALID_HANDLE_VALUE {
-            return false;
-        }
-        // The size every read must have: the longest input report.
-        let mut size = 0usize;
-        // SAFETY: preparsed data from this handle, freed after the query.
-        unsafe {
-            let mut pp = 0isize;
-            if HidD_GetPreparsedData(handle, &mut pp) {
-                let mut caps: HIDP_CAPS = std::mem::zeroed();
-                if HidP_GetCaps(pp, &mut caps) >= 0 {
-                    size = usize::from(caps.InputReportByteLength);
-                }
-                HidD_FreePreparsedData(pp);
-            }
-        }
-        if size == 0 {
-            // SAFETY: our handle.
-            unsafe { CloseHandle(handle) };
-            return false;
-        }
-        tracing::info!(?kind, report_bytes = size, "PlayStation pad connected");
-        let mut buf = vec![0u8; size];
-        let mut first = true;
-        // What is published for this device: none while its adapter has no pad.
-        let mut state: Option<PadState> = None;
-        loop {
-            let mut read = 0u32;
-            // SAFETY: a buffer of `size` bytes and our handle; blocks until a report.
-            let ok = unsafe {
-                ReadFile(
-                    handle,
-                    buf.as_mut_ptr().cast(),
-                    size as u32,
-                    &mut read,
-                    std::ptr::null_mut(),
-                )
-            };
-            if ok == 0 {
-                break;
-            }
-            let report = &buf[..read as usize];
-            if first {
-                tracing::info!(
-                    id = report.first().copied().unwrap_or(0),
-                    bytes = read,
-                    "PlayStation pad first report"
-                );
-                first = false;
-            }
-            let now = after(kind, report, state);
-            if state.is_some() && now.is_none() {
-                tracing::info!("PlayStation adapter: its pad left");
-            }
-            state = now;
-            set(state.map(|pad| (pad, (SONY, product))));
-        }
-        tracing::info!("PlayStation pad disconnected");
-        // SAFETY: our handle.
-        unsafe { CloseHandle(handle) };
-        true
+/// The 47 bytes both DualSense output reports share. Only rumble is set.
+fn dualsense_common(c: &mut [u8], left: u8, right: u8, new_vibration: bool) {
+    // Select classic rumble style haptics and enable it.
+    c[0] = 0x02;
+    if new_vibration {
+        c[38] = 0x04;
+    } else {
+        c[0] |= 0x01;
     }
+    c[2] = right;
+    c[3] = left;
+}
+
+/// The 10 bytes both DualShock 4 output reports share. Only rumble is set;
+/// some third-party pads want the lightbar in the same report.
+fn dualshock4_common(c: &mut [u8], left: u8, right: u8) {
+    c[0] = 0x01;
+    c[3] = right;
+    c[4] = left;
 }
 
 #[cfg(test)]
@@ -477,66 +392,69 @@ mod tests {
         assert_ne!(parse(Kind::DualSense, &r).unwrap(), usb);
     }
 
-    #[cfg(windows)]
     #[test]
-    fn device_paths_name_the_pad() {
-        use super::reader::kind_of;
-        assert_eq!(
-            kind_of(r"\\?\hid#vid_054c&pid_0ce6#7&1#{4d1e55b2}"),
-            Some((Kind::DualSense, 0x0CE6))
-        );
-        assert_eq!(
-            kind_of(r"\\?\hid#{00001124-0000-1000-8000-00805f9b34fb}_vid&0002054c_pid&05c4#a"),
-            Some((Kind::DualShock4, 0x05C4))
-        );
-        assert_eq!(kind_of(r"\\?\hid#vid_046d&pid_c52b#7&1"), None);
-        assert_eq!(kind_of(r"\\?\hid#vid_054c&pid_0000#7&1"), None);
-    }
-
-    /// A DualShock 4 USB report: Cross held, sticks centred, `status` in byte 31.
-    fn ds4_usb(face: u8, status: u8) -> Vec<u8> {
-        let mut r = vec![0u8; 64];
-        r[0] = 0x01;
-        r[1..5].copy_from_slice(&[128; 4]);
-        r[5] = 0x08 | face;
-        r[31] = status;
-        r
+    fn ids_name_the_pad() {
+        assert_eq!(kind_of(0x054C, 0x0CE6), Some(Kind::DualSense));
+        assert_eq!(kind_of(0x054C, 0x0DF2), Some(Kind::DualSense));
+        assert_eq!(kind_of(0x054C, 0x05C4), Some(Kind::DualShock4));
+        assert_eq!(kind_of(0x054C, 0x09CC), Some(Kind::DualShock4));
+        assert_eq!(kind_of(0x054C, 0x0BA0), Some(Kind::DualShock4));
+        assert_eq!(kind_of(0x054C, 0x0000), None);
+        assert_eq!(kind_of(0x046D, 0x0CE6), None);
     }
 
     #[test]
-    fn an_adapter_without_a_pad_is_not_a_pad() {
-        // The bit alone, on a report that otherwise holds Cross.
-        let gone = ds4_usb(0x20, 0x04);
-        assert_eq!(parse(Kind::DualShock4, &gone), None);
-        // A zero-filled report with only the id and the bit read as D-pad up
-        // and both sticks pushed to a corner.
-        let mut zero = vec![0u8; 64];
-        zero[0] = 0x01;
-        zero[31] = 0x04;
-        assert_eq!(parse(Kind::DualShock4, &zero), None);
-        // Other bits of the byte are the pad's own status.
-        assert!(parse(Kind::DualShock4, &ds4_usb(0x20, 0x1B)).is_some());
-        // Not a DualShock 4's layout: left to the other kind's parser.
-        assert!(parse(Kind::DualSense, &gone).is_some());
-        // Only the 64-byte USB report carries it.
-        assert!(parse(Kind::DualShock4, &gone[..10]).is_some());
+    fn crc32_matches_the_standard_check_value() {
+        assert_eq!(crc32_update(0, b"123456789"), 0xCBF4_3926);
+        // Chunks continue each other.
+        assert_eq!(crc32_update(crc32_update(0, b"1234"), b"56789"), 0xCBF4_3926);
     }
 
     #[test]
-    fn a_pad_that_leaves_and_returns_is_published_and_cleared_and_published_again() {
-        let kind = Kind::DualShock4;
-        let mut now = None;
-        now = after(kind, &ds4_usb(0x20, 0), now); // Cross held
-        assert_eq!(now.unwrap().buttons, A);
-        now = after(kind, &[0x02; 78], now); // a report that says nothing: unchanged
-        assert_eq!(now.unwrap().buttons, A);
-        now = after(kind, &ds4_usb(0x20, 0x04), now); // the adapter's pad left
-        assert_eq!(now, None);
-        now = after(kind, &ds4_usb(0x20, 0x04), now); // still gone
-        assert_eq!(now, None);
-        now = after(kind, &[0x02; 78], now); // nothing to say, nothing to publish
-        assert_eq!(now, None);
-        now = after(kind, &ds4_usb(0x40, 0), now); // back, Circle held
-        assert_eq!(now.unwrap().buttons, B);
+    fn motors_scale_to_eight_bits() {
+        assert_eq!((motor(0), motor(0x00FF), motor(0x0100), motor(0xFFFF)), (0, 0, 1, 255));
+    }
+
+    /// The signature a Bluetooth report carries is the one its other bytes give.
+    fn signed(r: &[u8]) -> bool {
+        r[r.len() - 4..] == output_crc(r).to_le_bytes()
+    }
+
+    #[test]
+    fn dualsense_usb_rumble_report() {
+        let r = rumble_report(Kind::DualSense, false, 0xFF00, 0x8000, 0, true);
+        assert_eq!(r.len(), 63);
+        assert_eq!(r[0], 0x02);
+        // Haptics select in flag 0, improved vibration in flag 2; right motor
+        // before left in the common block.
+        assert_eq!((r[1], r[2], r[3], r[4]), (0x02, 0, 0x80, 0xFF));
+        assert_eq!(r[1 + 38], 0x04);
+        // Nothing else is touched: no lightbar, LED, or audio flag.
+        assert!(r[5..39].iter().chain(&r[40..]).all(|&b| b == 0));
+        let old = rumble_report(Kind::DualSense, false, 0, 0, 0, false);
+        assert_eq!((old[1], old[1 + 38]), (0x03, 0));
+    }
+
+    #[test]
+    fn dualsense_bluetooth_rumble_report() {
+        let r = rumble_report(Kind::DualSense, true, 0x4000, 0xC000, 5, true);
+        assert_eq!(r.len(), 78);
+        assert_eq!((r[0], r[1], r[2]), (0x31, 0x50, 0x10));
+        assert_eq!((r[3], r[5], r[6]), (0x02, 0xC0, 0x40));
+        assert_eq!(r[3 + 38], 0x04);
+        assert!(signed(&r));
+        // The sequence number is the high nibble and wraps.
+        assert_eq!(rumble_report(Kind::DualSense, true, 0, 0, 17, true)[1], 0x10);
+    }
+
+    #[test]
+    fn dualshock_4_rumble_reports() {
+        let usb = rumble_report(Kind::DualShock4, false, 0xFF00, 0x2000, 0, false);
+        assert_eq!(usb.len(), 32);
+        assert_eq!((usb[0], usb[1], usb[4], usb[5]), (0x05, 0x01, 0x20, 0xFF));
+        let bt = rumble_report(Kind::DualShock4, true, 0xFF00, 0x2000, 0, false);
+        assert_eq!(bt.len(), 78);
+        assert_eq!((bt[0], bt[1], bt[3], bt[6], bt[7]), (0x11, 0xC0, 0x01, 0x20, 0xFF));
+        assert!(signed(&bt));
     }
 }
