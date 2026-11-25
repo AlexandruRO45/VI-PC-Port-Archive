@@ -1442,11 +1442,13 @@ unsafe impl Send for CardWork {}
 static CARD_WORK: Mutex<Option<CardWork>> = Mutex::new(None);
 
 /// The compare of a declared range of a copy in the card's memory with
-/// its bytes from before, one thread per 64 KiB piece (cut at multiples of
-/// 64 KiB of title memory, as `Shadow::card_piece` cuts them): `differs`
-/// gets a dword per piece, 1 where a byte differs. The offsets are widened
-/// to 16 bytes; buffers are multiples of 64 KiB, and a piece flagged for a
-/// byte just outside the range costs a fetch that finds nothing.
+/// its bytes from before, one 256-thread group per 64 KiB piece (cut at
+/// multiples of 64 KiB of title memory, as `Shadow::card_piece` cuts them):
+/// `differs` gets a dword per piece, 1 where a byte differs. Each thread reads
+/// coalesced 16-byte chunks at 4 KiB stride and reduces through groupshared
+/// memory. The offsets are widened to 16 bytes; buffers are multiples of
+/// 64 KiB, and a piece flagged for a byte just outside the range costs a
+/// fetch that finds nothing.
 pub(crate) const CARD_COMPARE: &str = r#"
 #define RS "RootConstants(num32BitConstants=6, b0), SRV(t0), UAV(u0), UAV(u1)"
 cbuffer Span : register(b0) {
@@ -1462,32 +1464,79 @@ ByteAddressBuffer now : register(t0);
 // last sent up (or hashed whole, the first time).
 RWByteAddressBuffer hashes : register(u0);
 RWByteAddressBuffer differs : register(u1);
+groupshared uint4 acc[256];
 [RootSignature(RS)]
-[numthreads(64, 1, 1)]
-void main(uint3 id : SV_DispatchThreadID) {
-    if (id.x >= pieces) return;
-    uint piece = first + id.x;
+[numthreads(256, 1, 1)]
+void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
+    if (gid.x >= pieces) return;
+    uint piece = first + gid.x;
+    uint tid = gtid.x;
     uint lo = piece * 65536u;
     lo = lo > skew ? lo - skew : 0u;
     uint hi = min((piece + 1u) * 65536u - skew, size);
     lo = lo & ~15u;
     hi = (hi + 15u) & ~15u;
-    uint4 h = uint4(0x9E3779B9u, 0x85EBCA6Bu, 0xC2B2AE35u, 0x27D4EB2Fu);
+    uint4 h = uint4(0x9E3779B9u, 0x85EBCA6Bu, 0xC2B2AE35u, 0x27D4EB2Fu)
+        ^ uint4(tid * 0x01000193u, tid * 0x9E3779B1u, tid * 0x85EBCA77u, tid * 0xC2B2AE3Du);
     [loop]
-    for (uint at = lo; at < hi; at += 16u) {
+    for (uint at = lo + tid * 16u; at < hi; at += 256u * 16u) {
         h = (h ^ now.Load4(at)) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
         h = h.yzwx ^ (h >> 15);
     }
-    if (compare != 0u) {
-        differs.Store(out_at + id.x * 4u, any(h != hashes.Load4(piece * 16u)) ? 1u : 0u);
-        // With the copy-back on its own thread: the next compare of the
-        // piece finds what is written from here on.
-        if (compare == 2u) hashes.Store4(piece * 16u, h);
-    } else {
-        hashes.Store4(piece * 16u, h);
+    acc[tid] = h;
+    GroupMemoryBarrierWithGroupSync();
+    [unroll]
+    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            uint4 other = acc[tid + stride];
+            h = (h ^ (other.wxyz + uint4(0x9E3779B9u, 0x85EBCA6Bu, 0xC2B2AE35u, 0x27D4EB2Fu)))
+                * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
+            h = h.yzwx ^ (h >> 15);
+            acc[tid] = h;
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+    if (tid == 0u) {
+        if (compare != 0u) {
+            differs.Store(out_at + gid.x * 4u, any(h != hashes.Load4(piece * 16u)) ? 1u : 0u);
+            // With the copy-back on its own thread: the next compare of the
+            // piece finds what is written from here on.
+            if (compare == 2u) hashes.Store4(piece * 16u, h);
+        } else {
+            hashes.Store4(piece * 16u, h);
+        }
     }
 }
 "#;
+
+/// Dispatches [`CARD_COMPARE`] in chunks within D3D12's per-dimension
+/// group limit (`65_535`).
+///
+/// # Safety
+/// The list is open for compute with `CARD_COMPARE`'s root signature and
+/// resources bound for `[first, first + pieces)`.
+unsafe fn dispatch_card_compare(
+    list: &ID3D12GraphicsCommandList,
+    first: u32,
+    skew: u32,
+    size: u32,
+    pieces: u32,
+    out_at: u32,
+    compare: u32,
+) {
+    const MAX_GROUPS: u32 = 65_535;
+    let mut done = 0u32;
+    while done < pieces {
+        let n = (pieces - done).min(MAX_GROUPS);
+        let constants = [first + done, skew, size, n, out_at + done * 4, compare];
+        // SAFETY: caller ensures `list` has `CARD_COMPARE` and its resources bound.
+        unsafe {
+            list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+            list.Dispatch(n, 1, 1);
+        }
+        done += n;
+    }
+}
 
 /// Whether the pieces hashed again after ranges were sent up to a copy in
 /// the card's memory are hashed in runs of pieces that touch, each piece
@@ -3075,9 +3124,7 @@ impl Host {
                         CARD_PASSES[0].fetch_add(runs.len() as u64, Ordering::Relaxed);
                         CARD_PASSES[1].fetch_add(runs.iter().map(|r| u64::from(r.pieces)).sum::<u64>(), Ordering::Relaxed);
                         for run in runs {
-                            let constants = [run.first, run.skew, size as u32, run.pieces, 0, 0];
-                            list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
-                            list.Dispatch(run.pieces.div_ceil(64), 1, 1);
+                            dispatch_card_compare(list, run.first, run.skew, size as u32, run.pieces, 0, 0);
                         }
                     }
                     list.Close()?;
@@ -3158,11 +3205,17 @@ impl Host {
                         let Some((_, Some(before), size)) = r.shadow.card_sides() else {
                             continue;
                         };
-                        let constants = [r.span.first, r.span.skew, size as u32, r.span.pieces, r.at * 4, if flown { 2 } else { 1 }];
-                        list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
                         list.SetComputeRootShaderResourceView(1, r.shadow.buffer.GetGPUVirtualAddress());
                         list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
-                        list.Dispatch(r.span.pieces.div_ceil(64), 1, 1);
+                        dispatch_card_compare(
+                            list,
+                            r.span.first,
+                            r.span.skew,
+                            size as u32,
+                            r.span.pieces,
+                            r.at * 4,
+                            if flown { 2 } else { 1 },
+                        );
                         CARD_PASSES[2].fetch_add(1, Ordering::Relaxed);
                     }
                     list.Close()?;
