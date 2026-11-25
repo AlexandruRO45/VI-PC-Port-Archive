@@ -7359,18 +7359,57 @@ const BUFFERS: u32 = 2;
 
 #[derive(Default)]
 struct PresentTimes {
-    path: std::ffi::OsString,
+    path: Option<std::ffi::OsString>,
     last: Option<std::time::Instant>,
     intervals: Vec<u64>,
+    stall: Option<f64>,
+    counts: [u64; 3],
 }
 
 impl PresentTimes {
+    fn new() -> Option<Self> {
+        static STALL: OnceLock<Option<f64>> = OnceLock::new();
+        let stall = *STALL.get_or_init(|| {
+            std::env::var_os("VICTORY_STALL_LOG").map(|value| {
+                value.to_str().and_then(|v| v.parse::<f64>().ok())
+                    .filter(|v| v.is_finite() && *v >= 0.0).unwrap_or_else(|| {
+                        tracing::warn!("invalid VICTORY_STALL_LOG; using 100ms");
+                        100.0
+                    })
+            })
+        });
+        let path = std::env::var_os("VICTORY_PRESENT_TIMES");
+        (path.is_some() || stall.is_some()).then_some(Self { path, stall, ..Default::default() })
+    }
+
     fn frame(&mut self) -> std::io::Result<()> {
         let now = std::time::Instant::now();
+        // Sample every enabled Present, even short ones: deltas belong to this interval.
+        let counts = self.stall.map(|_| [
+            crate::pipeline::frame_log_counts().0,
+            crate::pipeline::kept()[2], // Successful translations; never reset.
+            crate::framelog::total(crate::framelog::T::Uploads),
+        ]);
         if let Some(last) = self.last.replace(now) {
-            self.intervals.push(now.duration_since(last).as_micros() as u64);
+            let interval_ms = now.duration_since(last).as_secs_f64() * 1000.0;
+            if let (Some(threshold), Some(counts)) = (self.stall, counts) {
+                if interval_ms > threshold {
+                    let [pipelines_created, shaders_translated, texture_uploads] =
+                        std::array::from_fn(|i| counts[i].wrapping_sub(self.counts[i]));
+                    // Last-save size is not cumulative; descriptor counters reset elsewhere.
+                    tracing::warn!(interval_ms, pipelines_created, shaders_translated,
+                        library_saves = "na", library_bytes = "na", texture_uploads,
+                        descriptor_copies = "na", "Present stall");
+                }
+            }
+            if self.path.is_some() {
+                self.intervals.push(now.duration_since(last).as_micros() as u64);
+            }
         }
-        if (self.intervals.len() + 1) % 300 != 0 {
+        if let Some(counts) = counts {
+            self.counts = counts;
+        }
+        if self.path.is_none() || (self.intervals.len() + 1) % 300 != 0 {
             return Ok(());
         }
         self.write()
@@ -7378,6 +7417,7 @@ impl PresentTimes {
 
     fn write(&self) -> std::io::Result<()> {
         use std::io::Write;
+        let Some(path) = &self.path else { return Ok(()) };
         let mut sorted = self.intervals.clone();
         sorted.sort_unstable();
         // Nearest-rank cumulative percentiles; the first frame has no interval.
@@ -7385,7 +7425,7 @@ impl PresentTimes {
             sorted.get((sorted.len() * p).div_ceil(100).saturating_sub(1)).copied().unwrap_or(0)
         };
         let (p50, p95, p99, max) = (percentile(50), percentile(95), percentile(99), percentile(100));
-        let mut out = std::io::BufWriter::new(std::fs::File::create(&self.path)?);
+        let mut out = std::io::BufWriter::new(std::fs::File::create(path)?);
         writeln!(out, "frame,interval_us,p50_us,p95_us,p99_us,max_us,dropped_estimate")?;
         writeln!(out, "1,,{p50},{p95},{p99},{max},0")?;
         let (mut total, mut dropped) = (0u64, 0u64);
@@ -7853,7 +7893,11 @@ impl Host {
                 if let Some(times) = &mut p.times {
                     if let Err(error) = times.frame() {
                         tracing::warn!(%error, "VICTORY_PRESENT_TIMES disabled after write failure");
-                        p.times = None;
+                        times.path = None;
+                        times.intervals.clear();
+                        if times.stall.is_none() {
+                            p.times = None;
+                        }
                     }
                 }
             }
@@ -7908,8 +7952,7 @@ impl Host {
                 ahead: Vec::new(),
                 hwnd,
                 meter: Meter::new(),
-                times: std::env::var_os("VICTORY_PRESENT_TIMES")
-                    .map(|path| PresentTimes { path, ..Default::default() }),
+                times: PresentTimes::new(),
                 sync_interval: std::env::var("VICTORY_PRESENT_SYNC").ok()
                     .and_then(|v| v.parse::<u32>().ok()).filter(|v| *v <= 4).unwrap_or(0),
             })
