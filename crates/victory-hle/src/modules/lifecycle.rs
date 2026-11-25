@@ -174,6 +174,17 @@ extern "system" fn window_proc(
         end_title("window closed", Box::new(|| {}));
         return 0;
     }
+    // Automation and other applications can send WM_CLOSE directly. Owned
+    // dialogs and hidden helper windows still handle their own close messages.
+    // SAFETY: both queries borrow the window being dispatched.
+    if message == wm::WM_CLOSE
+        && unsafe {
+            wm::IsWindowVisible(hwnd) != 0 && wm::GetAncestor(hwnd, wm::GA_ROOTOWNER) == hwnd
+        }
+    {
+        end_title("window closed", Box::new(|| {}));
+        return 0;
+    }
     // Alt or F10 puts a window into menu mode: the system runs a modal menu
     // loop on the thread that owns the window, which is the title's. The
     // title then stops (no frames, no input) until a key ends the loop, and
@@ -374,6 +385,68 @@ mod tests {
             assert!(!wm::GetPropW(hwnd, TITLE_PROC).is_null());
             wm::DestroyWindow(hwnd);
         }
+    }
+
+    #[test]
+    fn direct_close_suspends_and_exits() {
+        const CHILD: &str = "VICTORY_TEST_DIRECT_CLOSE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "modules::lifecycle::tests::direct_close_suspends_and_exits",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(output.status.success(), "close test child failed: {stderr}");
+            assert!(stderr.contains("suspend routine ran"), "{stderr}");
+            return;
+        }
+
+        extern "system" fn record_suspend(_: u8, _: *mut c_void) {
+            eprintln!("suspend routine ran");
+        }
+
+        let null = std::ptr::null_mut();
+        let create = |owner| {
+            CreateWindowExW(
+                wm::WS_EX_NOACTIVATE | wm::WS_EX_TOOLWINDOW,
+                w!("STATIC"),
+                w!("VIctory close test"),
+                wm::WS_VISIBLE | wm::WS_POPUP,
+                -10_000,
+                -10_000,
+                10,
+                10,
+                owner,
+                null,
+                null,
+                std::ptr::null(),
+            )
+        };
+        let title = create(null);
+        assert!(!title.is_null());
+        let dialog = create(title);
+        assert!(!dialog.is_null());
+        // SAFETY: both windows belong to this test thread. Closing the dialog
+        // goes to its original procedure and leaves the title window alive.
+        unsafe {
+            wm::SendMessageW(dialog, wm::WM_CLOSE, 0, 0);
+            assert_eq!(wm::IsWindow(dialog), 0);
+            assert_ne!(wm::IsWindow(title), 0);
+        }
+        let mut registration = 0;
+        assert_eq!(
+            RegisterAppStateChangeNotification(Some(record_suspend), null, &mut registration),
+            0
+        );
+        // SAFETY: this thread owns the title window.
+        unsafe { wm::SendMessageW(title, wm::WM_CLOSE, 0, 0) };
+        std::thread::sleep(SUSPEND_DEADLINE + Duration::from_secs(1));
+        panic!("direct close did not exit the title process");
     }
 
     thread_local! {
