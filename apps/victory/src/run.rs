@@ -86,13 +86,10 @@ pub fn run(
         HostPolicy::default()
     });
     let wanted = |dll: &str| title_dll(&resolver.host, dll);
-    // The exe may sit apart from the dump; the manifest and the package's
-    // virtual drive belong to the configured game directory then.
-    let content_dir = cfg
-        .game_dir
-        .as_deref()
-        .filter(|d| d.is_dir())
-        .unwrap_or(title_dir);
+    // The exe may sit apart from the dump: when its own folder is not a
+    // package (no manifest beside it), the configured game directory holds
+    // the manifest and the package's virtual drive.
+    let content_dir = package_dir(cfg.game_dir.as_deref(), title_dir);
     // A missing manifest leaves id 0 and no storage quota.
     let manifest = std::fs::read_to_string(title_dir.join("MicrosoftGame.config"))
         .or_else(|_| std::fs::read_to_string(content_dir.join("MicrosoftGame.config")))
@@ -474,6 +471,16 @@ impl LoaderLock {
     }
 }
 
+/// The folder whose package the title runs from: the exe's own when a
+/// manifest sits beside it, else the configured game directory (an exe kept
+/// apart from its dump), else the exe's folder.
+fn package_dir<'a>(configured: Option<&'a Path>, exe_dir: &'a Path) -> &'a Path {
+    if exe_dir.join("MicrosoftGame.config").is_file() {
+        return exe_dir;
+    }
+    configured.filter(|d| d.is_dir()).unwrap_or(exe_dir)
+}
+
 #[cfg(test)]
 mod absent_tests {
     use super::absent_title_dlls;
@@ -507,6 +514,29 @@ mod absent_tests {
         let wanted = |dll: &str| dll.starts_with("Title");
         assert!(absent_title_dlls(&["Title.dll", "Host.dll"], &["TITLE.DLL"], &wanted).is_empty());
         assert!(absent_title_dlls(&[], &[], &wanted).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::package_dir;
+
+    /// The exe's own folder wins when it holds a manifest; a configured game
+    /// directory only stands in for an exe kept apart from its dump.
+    #[test]
+    fn a_package_beside_the_exe_wins_over_the_configured_directory() {
+        let root = std::env::temp_dir().join(format!("victory-layout-{}", std::process::id()));
+        let (exe, configured) = (root.join("exe"), root.join("dump"));
+        std::fs::create_dir_all(&exe).unwrap();
+        std::fs::create_dir_all(&configured).unwrap();
+        // No manifest beside the exe: the configured dump is the package.
+        assert_eq!(package_dir(Some(&configured), &exe), configured);
+        // A manifest beside the exe: its own folder, whatever is configured.
+        std::fs::write(exe.join("MicrosoftGame.config"), "").unwrap();
+        assert_eq!(package_dir(Some(&configured), &exe), exe);
+        // Nothing configured: the exe's folder.
+        assert_eq!(package_dir(None, &exe), exe);
+        std::fs::remove_dir_all(&root).ok();
     }
 }
 
