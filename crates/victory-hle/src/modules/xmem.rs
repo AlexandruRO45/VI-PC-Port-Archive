@@ -1450,6 +1450,67 @@ mod tests {
         assert_eq!(query(at(1)).host.State, MEM_RESERVE);
     }
 
+    /// A range first mapped a page at a time is left as one placeholder per
+    /// page when unmapped. Mapping consecutive slices over it as one run must
+    /// leave what the per-page path leaves: the batched call is refused (the
+    /// range spans three placeholders), the per-page calls run, and the views
+    /// are the same ones. One page of the range then still unmaps on its own.
+    #[test]
+    fn scatter_maps_a_run_over_per_page_placeholders() {
+        let pages = allocate(3);
+        let a = XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            3 * PAGE,
+            MEM_RESERVE | PAGES_64K,
+            0,
+            PAGE_READWRITE,
+        );
+        assert!(!a.is_null());
+        let at = |k: usize| a.wrapping_byte_add(k * PAGE);
+        for k in 0..3 {
+            assert!(write_physical(&pages[k..], 0, &[b'0' + k as u8]));
+        }
+        for (k, page) in pages.iter().enumerate() {
+            assert_eq!(XMemMapPhysicalPages(at(k), 1, page), at(k));
+        }
+
+        // This test's views: where, how long, and which slice they show.
+        let views = || {
+            physical()
+                .views
+                .range(a as usize..a as usize + 3 * PAGE)
+                .map(|(base, (len, slice))| (*base - a as usize, *len, slice.index))
+                .collect::<Vec<_>>()
+        };
+        let per_page = views();
+        assert_eq!(per_page.len(), 3);
+
+        let addresses = [at(0), at(1), at(2)];
+        assert_eq!(
+            XMemMapPhysicalPagesScatter(addresses.as_ptr(), 3, pages.as_ptr()),
+            1
+        );
+        assert_eq!(views(), per_page);
+        for k in 0..3 {
+            assert_eq!(query(at(k)).host.State, MEM_COMMIT);
+            // SAFETY: mapped read-write.
+            assert_eq!(unsafe { at(k).cast::<u8>().read() }, b'0' + k as u8);
+        }
+
+        let middle = [at(1)];
+        assert_eq!(
+            XMemMapPhysicalPagesScatter(middle.as_ptr(), 1, std::ptr::null()),
+            1
+        );
+        assert_eq!(query(at(1)).host.State, MEM_RESERVE);
+        for k in [0, 2] {
+            // SAFETY: still mapped.
+            assert_eq!(unsafe { at(k).cast::<u8>().read() }, b'0' + k as u8);
+        }
+        assert_eq!(XMemMapPhysicalPages(a, 3, std::ptr::null()), a);
+        assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
+    }
+
     #[test]
     fn mapping_no_pages_changes_nothing() {
         let pages = allocate(2);
