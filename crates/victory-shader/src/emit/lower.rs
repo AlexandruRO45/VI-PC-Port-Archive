@@ -356,7 +356,7 @@ pub(super) const LOOP_LIMIT: u32 = 1 << 20;
 struct MemoryEntry {
     handle: V,
     offset: V,
-    /// Block × 4096 + page in the block.
+    /// Block ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â 4096 + page in the block.
     entry: V,
     block: V,
     /// The level-1 index: address bits 28-39.
@@ -1236,7 +1236,115 @@ impl<'a> Lower<'a> {
                     r
                 }
             }
-            (_, Some(_)) => return Err("a wave prefix of an operation other than a sum"),
+            (op, Some(inclusive)) => {
+                let lane = self.s.op(
+                    c,
+                    "waveGetLaneIndex",
+                    Attr::ReadOnly,
+                    i32t,
+                    111,
+                    &[],
+                );
+                let one_b = self.s.m.bool(true);
+                let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+                let ballot =
+                    self.s
+                        .op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[one_b]);
+                let b_lo = self.s.m.extract(c, ballot, 0);
+                let b_hi = self.s.m.extract(c, ballot, 1);
+                let (k0, k1, k31, k32) = (
+                    self.s.m.i32(0),
+                    self.s.m.i32(1),
+                    self.s.m.i32(31),
+                    self.s.m.i32(32),
+                );
+                let mut acc = if float {
+                    let f = self.as_float(x);
+                    let f = self.ftz(f);
+                    self.as_int(f)
+                } else {
+                    x
+                };
+                for step in [1u32, 2, 4, 8, 16, 32] {
+                    let k_step = self.s.m.i32(step);
+                    let in_bounds = self.s.m.cmp(c, pred::IUGE, lane, k_step);
+                    let cand = self.s.m.bin(c, Bin::Sub, lane, k_step);
+                    let safe_cand = self.s.m.select(c, in_bounds, cand, lane);
+                    let in_hi = self.s.m.cmp(c, pred::IUGE, safe_cand, k32);
+                    let word = self.s.m.select(c, in_hi, b_hi, b_lo);
+                    let shift = self.s.m.bin(c, Bin::And, safe_cand, k31);
+                    let bit = self.s.m.bin(c, Bin::LShr, word, shift);
+                    let bit = self.s.m.bin(c, Bin::And, bit, k1);
+                    let peer_active = self.s.m.cmp(c, pred::NE, bit, k0);
+                    let has_src = self.s.m.bin(c, Bin::And, in_bounds, peer_active);
+                    let safe_src = self.s.m.select(c, has_src, safe_cand, lane);
+                    let peer = self.read_lane(acc, safe_src);
+                    let merged = match op {
+                        Op::Or => self.s.m.bin(c, Bin::Or, peer, acc),
+                        Op::And => self.s.m.bin(c, Bin::And, peer, acc),
+                        Op::Xor => self.s.m.bin(c, Bin::Xor, peer, acc),
+                        Op::MinU => {
+                            let lt = self.s.m.cmp(c, pred::IULT, peer, acc);
+                            self.s.m.select(c, lt, peer, acc)
+                        }
+                        Op::MaxU => {
+                            let gt = self.s.m.cmp(c, pred::IUGT, peer, acc);
+                            self.s.m.select(c, gt, peer, acc)
+                        }
+                        Op::MinI => {
+                            let lt = self.s.m.cmp(c, pred::SLT, peer, acc);
+                            self.s.m.select(c, lt, peer, acc)
+                        }
+                        Op::MaxI => {
+                            let gt = self.s.m.cmp(c, pred::SGT, peer, acc);
+                            self.s.m.select(c, gt, peer, acc)
+                        }
+                        Op::MinF => {
+                            let (fa, fb) = (self.as_float(peer), self.as_float(acc));
+                            let m = self.max_min(false, fa, fb);
+                            self.as_int(m)
+                        }
+                        Op::MaxF => {
+                            let (fa, fb) = (self.as_float(peer), self.as_float(acc));
+                            let m = self.max_min(true, fa, fb);
+                            self.as_int(m)
+                        }
+                        Op::AddU | Op::AddF | Op::AddH => unreachable!(),
+                    };
+                    acc = self.s.m.select(c, has_src, merged, acc);
+                }
+                if !inclusive {
+                    let in_hi = self.s.m.cmp(c, pred::IUGE, lane, k32);
+                    let gt_32 = self.s.m.cmp(c, pred::IUGT, lane, k32);
+                    let k_all = self.s.m.i32(u32::MAX);
+                    let lo_shift = self.s.m.select(c, in_hi, k0, lane);
+                    let lo_pow = self.s.m.bin(c, Bin::Shl, k1, lo_shift);
+                    let lo_sub = self.s.m.bin(c, Bin::Sub, lo_pow, k1);
+                    let mask_lo = self.s.m.select(c, in_hi, k_all, lo_sub);
+                    let lane_sub = self.s.m.bin(c, Bin::Sub, lane, k32);
+                    let hi_shift = self.s.m.select(c, gt_32, lane_sub, k0);
+                    let hi_pow = self.s.m.bin(c, Bin::Shl, k1, hi_shift);
+                    let hi_sub = self.s.m.bin(c, Bin::Sub, hi_pow, k1);
+                    let mask_hi = self.s.m.select(c, gt_32, hi_sub, k0);
+                    let below_lo = self.s.m.bin(c, Bin::And, b_lo, mask_lo);
+                    let below_hi = self.s.m.bin(c, Bin::And, b_hi, mask_hi);
+                    let any_below = self.s.m.bin(c, Bin::Or, below_lo, below_hi);
+                    let has_prev = self.s.m.cmp(c, pred::NE, any_below, k0);
+                    let hi_nonempty = self.s.m.cmp(c, pred::NE, below_hi, k0);
+                    let hi_bit =
+                        self.s
+                            .op(c, "unaryBits.i32", Attr::ReadNone, i32t, 33, &[below_hi]);
+                    let hi_pos = self.s.m.bin(c, Bin::Add, hi_bit, k32);
+                    let lo_pos =
+                        self.s
+                            .op(c, "unaryBits.i32", Attr::ReadNone, i32t, 33, &[below_lo]);
+                    let prev_lane = self.s.m.select(c, hi_nonempty, hi_pos, lo_pos);
+                    let safe_prev = self.s.m.select(c, has_prev, prev_lane, lane);
+                    let prev_val = self.read_lane(acc, safe_prev);
+                    acc = self.s.m.select(c, has_prev, prev_val, id);
+                }
+                return Ok(acc);
+            }
             (Op::Or | Op::And | Op::Xor, None) => {
                 let k = self.s.m.i8(match op {
                     Op::And => 0,
@@ -2357,7 +2465,7 @@ impl<'a> Lower<'a> {
     /// +0 on the hardware, where the host's function of the rounded angle
     /// gives about 1e-7. Infinities and NaN give NaN.
     /// shortcut: below 2^-12 turns the hardware scales by a slightly
-    /// different constant than 2π (a last-place difference).
+    /// different constant than 2ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ (a last-place difference).
     fn trig_turns(&mut self, x: V, cosine: bool) -> V {
         let c = self.cur;
         let zero = self.s.m.f32(0);
@@ -2375,7 +2483,7 @@ impl<'a> Lower<'a> {
         self.s.m.select(c, exact, zero, r)
     }
 
-    /// The high dword of a 32 × 32-bit product.
+    /// The high dword of a 32 ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â 32-bit product.
     fn mul_hi(&mut self, a: V, b: V, signed: bool) -> V {
         let c = self.cur;
         let i64t = self.s.m.int(64);
@@ -2389,7 +2497,7 @@ impl<'a> Lower<'a> {
         self.s.m.cast(c, Cast::Trunc, hi, self.s.t.i32)
     }
 
-    /// `0 × anything = 0`, as in D3D9.
+    /// `0 ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â anything = 0`, as in D3D9.
     fn legacy_mul(&mut self, a: V, b: V) -> V {
         let c = self.cur;
         let m = self.s.m.bin(c, Bin::Mul, a, b);
@@ -3121,7 +3229,7 @@ impl<'a> Lower<'a> {
             _ => 1,
         };
         // (byte offset, dwords) per element; read2/write2 scale their two
-        // offsets by the element size (×64 for st64).
+        // offsets by the element size (ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â64 for st64).
         let pair = |n: &str| -> Vec<(u32, u32)> {
             let w = width(n);
             let scale = 4 * w * if n.contains("st64") { 64 } else { 1 };
@@ -5755,7 +5863,7 @@ impl<'a> Lower<'a> {
                 Ok(())
             }
             "v_mad_u64_u32" | "v_mad_i64_i32" => {
-                // 32 × 32 → 64-bit product plus a 64-bit addend (address
+                // 32 ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â 32 ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾Ãƒâ€šÃ‚Â¢ 64-bit product plus a 64-bit addend (address
                 // arithmetic); the carry out is a lane mask.
                 let signed = name == "v_mad_i64_i32";
                 let (a, bb) = (s(self, 0)?, s(self, 1)?);
@@ -8562,7 +8670,7 @@ impl<'a> Lower<'a> {
                         let b = self.s.m.bin(c, Bin::Mul, g[2 * k + 1], g[2 * k + 1]);
                         *l = self.s.m.bin(c, Bin::Add, a, b);
                     }
-                    // FMax, Log (base 2): 0.5 log2(max(|dx|², |dy|²) w²).
+                    // FMax, Log (base 2): 0.5 log2(max(|dx|ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â², |dy|ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â²) wÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â²).
                     let m = self.binary(35, len2[0], len2[1]);
                     let w2 = self.s.m.bin(c, Bin::Mul, w, w);
                     let m = self.s.m.bin(c, Bin::Mul, m, w2);
@@ -8749,7 +8857,7 @@ impl<'a> Lower<'a> {
     /// `|v_cubema|`, plus 1.5) and the face id (`v_cubeid`), which the
     /// host's cube sampling turns back into the same texel.
     // shortcut: the view is taken as a cube, not a cube array (whose face
-    // operand adds 8 × the slice).
+    // operand adds 8 ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â the slice).
     fn cube_direction(&mut self, s: V, t: V, face: V) -> [V; 3] {
         let c = self.cur;
         let k = |l: &mut Self, v: f32| l.s.m.f32(v.to_bits());
@@ -8901,11 +9009,11 @@ impl<'a> Lower<'a> {
     }
 
     /// The first texel of a gather's footprint along an axis of `size`
-    /// texels at coordinate `u` (bits of a float): floor(u × size − 0.5)
+    /// texels at coordinate `u` (bits of a float): floor(u ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â size ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¹ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾Ãƒâ€šÃ‚Â¢ 0.5)
     /// with the product exact and rounded to 1/256 of a texel, half up, as
     /// the hardware does (`gather_level_tests`), i.e.
-    /// (floor(u × size × 512) − 255) >> 9, in 64-bit integers. NaN is 0;
-    /// beyond ±2 every texel of the footprint is outside, as at ±2.
+    /// (floor(u ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â size ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â 512) ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¹ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾Ãƒâ€šÃ‚Â¢ 255) >> 9, in 64-bit integers. NaN is 0;
+    /// beyond ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â±2 every texel of the footprint is outside, as at ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â±2.
     fn gather_first(&mut self, u: V, size: V) -> V {
         let c = self.cur;
         let f = self.as_float(u);
@@ -8919,7 +9027,7 @@ impl<'a> Lower<'a> {
         let f = self.binary(35, f, lo);
         let f = self.binary(36, f, hi);
         let x = self.as_int(f);
-        // u = m × 2^(e − 150), e at least 1 (denormals).
+        // u = m ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â 2^(e ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¹ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾Ãƒâ€šÃ‚Â¢ 150), e at least 1 (denormals).
         let k = |l: &mut Self, v: u32| l.s.m.i32(v);
         let (k23, kff) = (k(self, 23), k(self, 0xFF));
         let e = self.s.m.bin(c, Bin::LShr, x, k23);
@@ -8931,7 +9039,7 @@ impl<'a> Lower<'a> {
         let bit = self.s.m.select(c, normal, implicit, zero);
         let m = self.s.m.bin(c, Bin::Or, m, bit);
         let e = self.s.m.select(c, normal, e, one);
-        // u × size × 512 = m × size × 2^(e − 141); |u| ≤ 2 keeps e ≤ 128.
+        // u ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â size ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â 512 = m ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â size ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â 2^(e ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¹ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾Ãƒâ€šÃ‚Â¢ 141); |u| ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â°ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¤ 2 keeps e ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â°ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¤ 128.
         let k141 = k(self, 141);
         let shift = self.s.m.bin(c, Bin::Sub, k141, e);
         let k63 = k(self, 63);
@@ -11608,6 +11716,108 @@ mod tests {
         // No parameter starts in rows 1, 3 or 4.
         for a in [1, 3, 4] {
             assert_eq!(param(a), "- - - - - - - -");
+        }
+    }
+
+    #[test]
+    fn wave_prefix_non_sum_ops_lower_and_validate() {
+        let sop1 = |sdst: u8, op: u8, src0: u8| -> u32 {
+            0xBE80_0000 | (sdst as u32) << 16 | (op as u32) << 8 | src0 as u32
+        };
+        let vop1 = |vdst: u8, op: u8, src0: u16| -> u32 {
+            (0x3F << 25) | (vdst as u32) << 17 | (op as u32) << 9 | (src0 as u32 & 0x1FF)
+        };
+        let vop2 = |vdst: u8, op: u8, src0: u16, vsrc1: u8| -> u32 {
+            (op as u32) << 25 | (vdst as u32) << 17 | (vsrc1 as u32) << 9 | (src0 as u32 & 0x1FF)
+        };
+        let dpp16 = |vsrc0: u8, ctrl: u16, row_mask: u8, bank_mask: u8, bound_ctrl: bool| -> u32 {
+            (row_mask as u32) << 28
+                | (bank_mask as u32) << 24
+                | u32::from(bound_ctrl) << 19
+                | (ctrl as u32) << 8
+                | vsrc0 as u32
+        };
+        let vop3 = |vdst: u8, op: u16, src0: u16, src1: u16, src2: u16| -> [u32; 2] {
+            [
+                0xD400_0000 | (op as u32) << 16 | vdst as u32,
+                (src0 as u32 & 0x1FF) | ((src1 as u32 & 0x1FF) << 9) | ((src2 as u32 & 0x1FF) << 18),
+            ]
+        };
+        let cases: [(u8, u32); 9] = [
+            (0x13, u32::MAX),    // v_min_u32
+            (0x14, 0),           // v_max_u32
+            (0x11, 0x7FFF_FFFF), // v_min_i32
+            (0x12, 0x8000_0000), // v_max_i32
+            (0x0F, 0x7F80_0000), // v_min_f32
+            (0x10, 0xFF80_0000), // v_max_f32
+            (0x1B, u32::MAX),    // v_and_b32
+            (0x1C, 0),           // v_or_b32
+            (0x1D, 0),           // v_xor_b32
+        ];
+        for (op, ident) in cases {
+            let mut w = Vec::new();
+            w.push(sop1(0, 0x3D, 193)); // s_or_saveexec_b32 s0, -1
+            w.extend(vop3(1, 0x101, 255, 256, 0)); // v_cndmask_b32 v1, ident, v0, s0
+            w.push(ident);
+            for shift in [1u16, 2, 4, 8] {
+                w.push(vop2(1, op, 0xFA, 1));
+                w.push(dpp16(1, 0x110 + shift, 0xF, 0xF, false));
+            }
+            w.extend(vop3(2, 0x360, 257, 128 + 15, 0)); // v_readlane_b32 s2, v1, 15
+            w.push(sop1(126, 0x03, 255)); // s_mov_b32 exec_lo, 0xFFFF_0000
+            w.push(0xFFFF_0000);
+            w.push(vop2(1, op, 2, 1));
+            // Exclusive prefix in v3 from inclusive prefix in v1.
+            w.push(sop1(126, 0x03, 193)); // s_mov_b32 exec_lo, -1
+            w.push(vop1(3, 0x01, 255)); // v_mov_b32 v3, ident
+            w.push(ident);
+            w.push(sop1(126, 0x03, 194)); // s_mov_b32 exec_lo, -2
+            w.push(vop1(3, 0x01, 0xFA)); // v_mov_b32 v3, v1 dpp:row_shr:1
+            w.push(dpp16(1, 0x111, 0xF, 0xF, false));
+            w.extend(vop3(2, 0x360, 257, 128 + 15, 0));
+            w.push(sop1(126, 0x03, 255));
+            w.push(0x0001_0000);
+            w.push(vop1(3, 0x01, 2));
+            w.push(sop1(126, 0x03, 0)); // s_mov_b32 exec_lo, s0
+            w.push(S_ENDPGM);
+
+            let code: Vec<u8> = w.iter().flat_map(|x| x.to_le_bytes()).collect();
+            let native = NativeProgram {
+                stage: HwStage::Cs,
+                wave64: false,
+                vgprs: 16,
+                layout: vec![],
+                used: vec![],
+                io: StageIo::Cs(ComputeIo {
+                    rsrc2: 1 << 7,
+                    threads: std::array::from_fn(|i| if i == 0 { 32 } else { 1 }),
+                }),
+                code,
+            };
+            let p = ir::build(&native.code, false, 16).unwrap();
+            let st = structure::structure(&p).unwrap();
+            let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+            let io = io::raise(&p, &native).unwrap();
+            let lowered = lower(&Parts {
+                native: &native,
+                p: &p,
+                st: &st,
+                io: &io,
+                res: &res,
+                inputs: Vec::new(),
+                outputs: Vec::new(),
+                prims: Vec::new(),
+                mesh_stride: 0,
+                view_marks: false,
+            })
+            .unwrap_or_else(|e| panic!("op {op:#x} failed to lower: {e}"));
+            if let Ok(mut v) =
+                crate::emit::validator::Validator::load(crate::emit::validator::Validator::default_path().as_deref())
+            {
+                let mut copy = lowered.dxil.clone();
+                v.validate(&mut copy)
+                    .unwrap_or_else(|e| panic!("op {op:#x} failed DXIL validation: {e}"));
+            }
         }
     }
 }
