@@ -56,6 +56,10 @@ struct Library {
     _blob: Vec<u8>,
     /// Pipelines stored since the last save.
     added: u64,
+    /// The names stored in this run: a library made from an empty blob knows
+    /// only these, and asking it for any other name makes the debug layer
+    /// warn (id 971) — 21 times in a first boot measured here.
+    stored: std::collections::HashSet<String>,
     /// Title pipelines the pre-build put in the library or found there, by
     /// key, and whether that list changed since the last save.
     prebuilt: HashSet<String>,
@@ -159,6 +163,7 @@ fn open(device: &ID3D12Device1, blob: Vec<u8>) -> Option<Library> {
                     library,
                     _blob: blob,
                     added: 0,
+                    stored: Default::default(),
                     prebuilt: HashSet::new(),
                     prebuilt_changed: false,
                 });
@@ -173,6 +178,7 @@ fn open(device: &ID3D12Device1, blob: Vec<u8>) -> Option<Library> {
         library,
         _blob: Vec::new(),
         added: 0,
+        stored: Default::default(),
         prebuilt: HashSet::new(),
         prebuilt_changed: false,
     })
@@ -239,6 +245,18 @@ pub(crate) fn name(kind: &str, root: &[u8], code: &[&[u8]], state: &str) -> Stri
     h.finalize().to_hex()[..32].to_owned()
 }
 
+impl Library {
+    /// Whether there is anything in the library to look a pipeline up in: a
+    /// library made from an empty blob with nothing stored yet has none, and
+    /// asking it anyway makes the debug layer warn `Load*Pipeline … does not
+    /// have a pipeline stored with name` (id 971) once per pipeline of a
+    /// first boot — 21 of them in a run measured here, which buries the
+    /// warnings that matter.
+    fn has_pipelines(&self, name: &str) -> bool {
+        !self._blob.is_empty() || self.stored.contains(name)
+    }
+}
+
 /// The pipeline named `name`: loaded from the library by `load` if it is
 /// there with the same description, else made by `create` and stored. A
 /// name asked for by several threads is loaded or made by one at a time
@@ -257,13 +275,16 @@ pub(crate) fn pipeline(
     };
     let _held = NAMES.hold(name);
     // The interface alone under the lock: loads take up to seconds. Its
-    // blob lives as long as the library, which is never dropped.
-    let loads = library
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .library
-        .clone();
-    if let Ok(pso) = load(&loads, PCWSTR(wide.as_ptr())) {
+    // blob lives as long as the library, which is never dropped. Whether
+    // the library can hold this pipeline at all is read under the same lock
+    // (`has_pipelines`): an empty one is never asked.
+    let (loads, has_pipelines) = {
+        let l = library.lock().unwrap_or_else(|e| e.into_inner());
+        (l.library.clone(), l.has_pipelines(name))
+    };
+    if has_pipelines
+        && let Ok(pso) = load(&loads, PCWSTR(wide.as_ptr()))
+    {
         LOADED.fetch_add(1, Ordering::Relaxed);
         return Ok(pso);
     }
@@ -277,6 +298,7 @@ pub(crate) fn pipeline(
     // differs) is refused, which leaves the library as it was.
     if unsafe { l.library.StorePipeline(PCWSTR(wide.as_ptr()), &pso) }.is_ok() {
         l.added += 1;
+        l.stored.insert(name.to_owned());
     }
     Ok(pso)
 }
