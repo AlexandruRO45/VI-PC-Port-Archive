@@ -204,7 +204,11 @@ fn regions_for(
     resource: &ID3D12Resource,
 ) -> Result<(u64, Vec<Region>, Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>)> {
     let desc = unsafe { resource.GetDesc() };
-    let count = subresource_count(device, &desc).ok_or(E_INVALIDARG)?;
+    let footprint_desc = (!crate::device::allocation::supports_typed_uav(device, desc.Format))
+        .then(|| crate::device::allocation::copy_footprint_desc(&desc))
+        .flatten();
+    let desc_for_footprints = footprint_desc.as_ref().unwrap_or(&desc);
+    let count = subresource_count(device, desc_for_footprints).ok_or(E_INVALIDARG)?;
     let mut layouts = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); count as usize];
     let mut rows = vec![0u32; count as usize];
     let mut row_bytes = vec![0u64; count as usize];
@@ -212,7 +216,7 @@ fn regions_for(
     // SAFETY: the three output slices have one entry per subresource.
     unsafe {
         device.GetCopyableFootprints(
-            &desc,
+            desc_for_footprints,
             0,
             count,
             0,
@@ -340,7 +344,6 @@ fn texture_layout(
 }
 
 fn record_copy(
-    list: &List,
     state: &mut super::Recording,
     device: &ID3D12Device,
     destination: LinearResource,
@@ -348,7 +351,7 @@ fn record_copy(
     bytes: u64,
 ) -> Result<()> {
     use LinearResource::{Buffer, Texture};
-    let native = &list.native;
+    let native = state.native().clone();
     match (destination, source) {
         (Buffer { resource: to, offset: to_offset }, Buffer { resource: from, offset: from_offset }) => {
             super::raytracing::retain(state, &[&to, &from])?;
@@ -357,7 +360,7 @@ fn record_copy(
                 let staging = staging_buffer(device, bytes)?;
                 super::raytracing::retain(state, &[&staging])?;
                 unsafe { native.CopyBufferRegion(&staging, 0, &from, from_offset, bytes) };
-                staging_becomes_source(native, &staging);
+                staging_becomes_source(&native, &staging);
                 unsafe { native.CopyBufferRegion(&to, to_offset, &staging, 0, bytes) };
             } else {
                 // SAFETY: both buffers belong to this open list and contain the range.
@@ -374,9 +377,9 @@ fn record_copy(
             let staging = staging_buffer(device, size)?;
             super::raytracing::retain(state, &[&to, &from, &staging])?;
             for (index, layout) in footprints {
-                record_texture(native, &from, &staging, index, layout, Direction::FromTexture);
+                record_texture(&native, &from, &staging, index, layout, Direction::FromTexture);
             }
-            staging_becomes_source(native, &staging);
+            staging_becomes_source(&native, &staging);
             // SAFETY: `used` fits both the staging buffer and the guest range.
             unsafe { native.CopyBufferRegion(&to, to_offset, &staging, 0, used) };
         }
@@ -389,9 +392,9 @@ fn record_copy(
             super::raytracing::retain(state, &[&to, &from, &staging])?;
             // SAFETY: `used` fits both the staging buffer and the guest range.
             unsafe { native.CopyBufferRegion(&staging, 0, &from, from_offset, used) };
-            staging_becomes_source(native, &staging);
+            staging_becomes_source(&native, &staging);
             for (index, layout) in footprints {
-                record_texture(native, &to, &staging, index, layout, Direction::IntoTexture);
+                record_texture(&native, &to, &staging, index, layout, Direction::IntoTexture);
             }
         }
         (Texture { .. }, Texture { .. }) => {
@@ -412,7 +415,7 @@ pub(super) unsafe extern "system" fn copy_memory(
     flags: u32,
 ) {
     let mut state = recording(list);
-    if !state.can_record(&list.native) {
+    if !state.prepare_state() {
         return;
     }
     // The console flags decompress or reinterpret surfaces during the copy.
@@ -426,6 +429,7 @@ pub(super) unsafe extern "system" fn copy_memory(
     if bytes == 0 {
         return;
     }
+    state.active.has_commands = true;
     let result = (|| -> Result<()> {
         super::memory_wait::trace_write("CopyMemoryToMemoryX", destination, bytes, 0);
         let owner = parent(&list.parent);
@@ -437,8 +441,9 @@ pub(super) unsafe extern "system" fn copy_memory(
         };
         let (to_kind, from_kind) = (kind(&to), kind(&from));
         let mut native_device: Option<ID3D12Device> = None;
-        unsafe { list.native.GetDevice(&mut native_device)? };
-        record_copy(list, &mut state, &native_device.ok_or(E_FAIL)?, to, from, bytes)?;
+        unsafe { state.native().GetDevice(&mut native_device)? };
+        record_copy(&mut state, &native_device.ok_or(E_FAIL)?, to, from, bytes)?;
+        state.record_write(destination, bytes);
         note(&format!(
             "slot 62 copied {bytes:#x} bytes from {from_kind} {source:#x} to {to_kind} {destination:#x}"
         ));
@@ -450,58 +455,5 @@ pub(super) unsafe extern "system" fn copy_memory(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn region(index: u32, offset: u64, span: u64, pitch: u32) -> Region {
-        Region {
-            index,
-            offset,
-            span,
-            pitch,
-        }
-    }
-
-    #[test]
-    fn one_plane_matches_its_row_pitch() {
-        let regions = [region(0, 0, 8_294_400, 7680)];
-        assert!(matches!(
-            plan(0, 8_294_400, 8_294_400, &regions),
-            Some(Plan::Whole)
-        ));
-    }
-
-    #[test]
-    fn mip0_is_not_the_whole_chain() {
-        let regions = [region(0, 0, 1000, 256), region(1, 1024, 500, 256)];
-        assert!(matches!(plan(0, 1000, 1524, &regions), Some(Plan::One(0))));
-    }
-
-    #[test]
-    fn packed_chain_uses_driver_offsets() {
-        let regions = [region(0, 0, 2048, 256), region(1, 2048, 1024, 256)];
-        assert!(matches!(plan(0, 3072, 3072, &regions), Some(Plan::Whole)));
-    }
-
-    #[test]
-    fn second_subresource_can_be_addressed_alone() {
-        let regions = [region(0, 0, 2048, 256), region(1, 2048, 1024, 256)];
-        assert!(matches!(
-            plan(2048, 1024, 3072, &regions),
-            Some(Plan::One(1))
-        ));
-    }
-
-    #[test]
-    fn height_padded_single_subresource_uploads_its_footprint() {
-        let regions = [region(0, 0, 0x1000, 1024)];
-        assert!(matches!(plan(0, 0x2000, 0x1000, &regions), Some(Plan::One(0))));
-        assert!(plan(0, 0x2001, 0x1000, &regions).is_none());
-    }
-
-    #[test]
-    fn oversized_guest_buffer_is_rejected() {
-        let regions = [region(0, 0, 1000, 256)];
-        assert!(plan(0, 50_000, 1000, &regions).is_none());
-    }
-}
+#[path = "../tests/commands/copy_memory.rs"]
+mod tests;

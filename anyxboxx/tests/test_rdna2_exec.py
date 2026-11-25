@@ -89,8 +89,8 @@ def test_literal_and_fused_multiply_add():
 
 
 def test_untranslated_instruction_is_named():
-    data = struct.pack("<3I", 0xF004_0000, 0, sopp("s_endpgm"))     # image_load_mip (famille MIMG)
-    with pytest.raises(rdna2_exec.Untranslated, match="instruction non traduite : image_load_mip"):
+    data = struct.pack("<3I", 0xF03C_0000, 0, sopp("s_endpgm"))     # image_atomic_swap (famille MIMG)
+    with pytest.raises(rdna2_exec.Untranslated, match="instruction non traduite : image_atomic_swap"):
         rdna2_exec.run(data)
 
 
@@ -102,9 +102,9 @@ def test_semantics_only_name_real_rdna2_instructions():
     assert 150 <= done < total
 
 
-def vop3(name, vdst, src0, src1=128, src2=128, neg=0, abs_=0, clamp=0, omod=0, sdst=0):
-    """Deux mots VOP3 (src* = codes source 9 bits, 128 = constante 0)."""
-    low = 0x35 << 26 | OPCODES["VOP3", name] << 16 | clamp << 15 | (abs_ | sdst) << 8 | vdst
+def vop3(name, vdst, src0, src1=128, src2=128, neg=0, abs_=0, clamp=0, omod=0, sdst=0, op_sel=0):
+    """Deux mots VOP3 (src* = codes source 9 bits, 128 = constante 0 ; op_sel : bits 14:11)."""
+    low = 0x35 << 26 | OPCODES["VOP3", name] << 16 | clamp << 15 | (abs_ | sdst | op_sel << 3) << 8 | vdst
     high = neg << 29 | omod << 27 | src2 << 18 | src1 << 9 | src0
     return low, high
 

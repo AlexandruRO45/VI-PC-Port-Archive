@@ -8,12 +8,13 @@ traités à part.
 import math
 import struct
 
-from emu import rdna2_exec_bits
+from emu import rdna2_exec_bits, rdna2_exec_cmp16
 
 MASK32, MASK64 = 0xFFFF_FFFF, (1 << 64) - 1
 EXEC = 126                                  # exec_lo ; exec_hi en 127
 INT32_MIN, INT32_MAX = -(1 << 31), (1 << 31) - 1
 POSITIVE_INFINITY, NEGATIVE_INFINITY = 0x7F80_0000, 0xFF80_0000
+ALMOST_ONE_F32 = 0x3F7F_FFFF                # plus grand flottant sous 1.0
 
 
 def float_bits(value):
@@ -24,8 +25,21 @@ def float_bits(value):
         return POSITIVE_INFINITY if value > 0 else NEGATIVE_INFINITY
 
 
+EXPONENT_F32, MANTISSA_F32, QUIET_F32 = 0x7F80_0000, 0x007F_FFFF, 0x0040_0000
+
+
 def bits_float(bits):
-    return struct.unpack("<f", struct.pack("<I", bits & MASK32))[0]
+    """Flottant d'un motif f32 ; un NaN signalant revient silencieux (bit 22 posé).
+
+    CPython 3.12 et 3.13 le rendaient silencieux en convertissant le float en double ; CPython 3.14 garde
+    le bit signalant (struct.unpack("<f") de 0x7F800001 puis struct.pack("<f") redonne 0x7F800001 au lieu
+    de 0x7FC00001, mesuré sur 3.12.13, 3.13.13 et 3.14.10). Le bit est posé ici pour que toutes les
+    versions suivent la même règle (celle de _first_nan et des tests de NaN).
+    """
+    bits &= MASK32
+    if bits & EXPONENT_F32 == EXPONENT_F32 and bits & MANTISSA_F32:
+        bits |= QUIET_F32
+    return struct.unpack("<f", struct.pack("<I", bits))[0]
 
 
 def signed(value, bits=32):
@@ -61,9 +75,18 @@ def _exp2(x):
         return math.inf
 
 
+def _signed_round(function):
+    """Arrondi entier qui garde le signe de x (IEEE 754 roundToIntegral : trunc(-0.5) = -0.0) ; ±infini
+    inchangé ; NaN : ValueError, rattrapée par _float_op."""
+    return lambda x: x if math.isinf(x) else math.copysign(float(function(x)), x)
+
+
 def _fract(x):
-    """x + -floor(x) (ISA) : NaN pour ±infini, où floor ne donne pas d'entier."""
-    return math.nan if math.isinf(x) else x - math.floor(x)
+    """x + -floor(x) (ISA), au plus le plus grand flottant sous 1.0 comme le modèle de LLVM
+    (ConstantFolding, amdgcn_fract) ; NaN pour ±infini, où floor ne donne pas d'entier."""
+    if math.isinf(x):
+        return math.nan
+    return min(x - _signed_round(math.floor)(x), bits_float(ALMOST_ONE_F32))
 
 
 def ldexp(x, exponent):
@@ -150,8 +173,13 @@ def _logic(function, width=1):
 
 COMPARISONS = {"eq": lambda a, b: a == b, "lg": lambda a, b: a != b, "gt": lambda a, b: a > b,
                "ge": lambda a, b: a >= b, "lt": lambda a, b: a < b, "le": lambda a, b: a <= b}
+# Sans effet architectural dans ce modèle (wave séquentiel, sans cache ni compteur de performance) :
+# invalidation du cache d'instructions, compteurs de performance, trace, attentes sur les compteurs.
+SOPP_NO_EFFECT = ("s_icache_inv", "s_incperflevel", "s_decperflevel", "s_ttracedata_imm", "s_wait_idle",
+                  "s_waitcnt_depctr")
 NO_OPERATION = ("s_nop", "s_waitcnt", "s_barrier", "s_sleep", "s_setprio", "s_clause", "s_inst_prefetch",
-                "s_waitcnt_vscnt", "s_waitcnt_vmcnt", "s_waitcnt_expcnt", "s_waitcnt_lgkmcnt", "s_ttracedata")
+                "s_waitcnt_vscnt", "s_waitcnt_vmcnt", "s_waitcnt_expcnt", "s_waitcnt_lgkmcnt", "s_ttracedata",
+                *SOPP_NO_EFFECT)
 
 SCALAR = {
     "s_add_u32": _sop2(lambda a, b, w: (a + b, (a + b) >> 32 != 0)),
@@ -285,7 +313,7 @@ def _legacy_fma(x, y, z):
 
 
 def _round_even(x):
-    return x if math.isinf(x) or math.isnan(x) else float(round(x))
+    return x if math.isinf(x) or math.isnan(x) else math.copysign(float(round(x)), x)
 
 
 def _frexp_exponent(x):
@@ -307,6 +335,12 @@ def _round_to_int(bits, rounding):
     if math.isnan(x):
         return INT32_MIN if bits >> 31 else INT32_MAX
     return _to_int(float(rounding(x)) if math.isfinite(x) else x, INT32_MIN, INT32_MAX)
+
+
+def _sat_pk_u8_i16(a):
+    """Les deux i16 de S0 saturés sur [0, 255], dans les octets 0 et 1 ; D[31:16] mis à 0."""
+    low, high = (min(max(signed(a >> shift & 0xFFFF, 16), 0), BYTE_MAX) for shift in (0, 16))
+    return high << 8 | low
 
 
 def _leading_signs(value):
@@ -337,9 +371,9 @@ VECTOR = {
     "v_log_f32": _unary_float(_log2),
     "v_sin_f32": _unary_float(lambda x: math.sin(x * 2 * math.pi)),
     "v_cos_f32": _unary_float(lambda x: math.cos(x * 2 * math.pi)),
-    "v_floor_f32": _unary_float(lambda x: x if math.isinf(x) else float(math.floor(x))),
-    "v_ceil_f32": _unary_float(lambda x: x if math.isinf(x) else float(math.ceil(x))),
-    "v_trunc_f32": _unary_float(lambda x: x if math.isinf(x) else float(math.trunc(x))),
+    "v_floor_f32": _unary_float(_signed_round(math.floor)),
+    "v_ceil_f32": _unary_float(_signed_round(math.ceil)),
+    "v_trunc_f32": _unary_float(_signed_round(math.trunc)),
     "v_rndne_f32": _unary_float(_round_even),
     "v_fract_f32": _unary_float(_fract),
     "v_add_f32": _binary_float(lambda x, y: x + y),
@@ -382,7 +416,14 @@ VECTOR = {
     "v_fmac_legacy_f32": lambda a, b, d, k, c: _float_op(_legacy_fma)(F(a), F(b), F(d)),
     "v_madmk_f32": lambda a, b, d, k, c: _float_op(_mul_add)(F(a), F(k), F(b)),
     "v_madak_f32": lambda a, b, d, k, c: _float_op(_mul_add)(F(a), F(b), F(k)),
+    "v_sat_pk_u8_i16": lambda a, b, d, k, c: _sat_pk_u8_i16(a),
 }
+# Résultat de 16 bits (spécification XML RDNA 2 : destination OperandSize 16). Mesuré sur RDNA 2
+# (gfx1036, VIctory #499, 72 entrées, VOP1 et VOP3) : D[31:16] est mis à 0, contrairement à la règle
+# générale de LLVM (GCNSubtarget::zeroesHigh16BitsOfDest). op_sel et clamp (VOP3) et SDWA, non
+# mesurés, lèvent Untranslated.
+SIXTEEN_BIT_RESULTS = frozenset({"v_sat_pk_u8_i16"})
+BYTE_MAX = 0xFF
 VECTOR_NO_OPERATION = frozenset({"v_nop", "v_pipeflush", "v_clrexcp"})
 
 # --- Comparaisons vectorielles : (test, écrit EXEC au lieu de VCC) -----------------------
@@ -406,3 +447,4 @@ for _prefix, _writes_exec in (("v_cmp", False), ("v_cmpx", True)):
     for _name, _test in INTEGER_TESTS.items():
         VECTOR_COMPARE[f"{_prefix}_{_name}_u32"] = (lambda a, b, t=_test: t(a, b), _writes_exec)
         VECTOR_COMPARE[f"{_prefix}_{_name}_i32"] = (lambda a, b, t=_test: t(signed(a), signed(b)), _writes_exec)
+VECTOR_COMPARE.update(rdna2_exec_cmp16.COMPARE16)       # i16/u16: S0[15:0] vs S1[15:0]

@@ -9,7 +9,7 @@ publique d'AMD (« RDNA 2 Instruction Set Architecture »).
 import re
 import struct
 
-from emu import rdna2_exec_atomic
+from emu import rdna2_exec_atomic, rdna2_exec_lanes, rdna2_exec_smem
 from emu.rdna2_exec_ops import MASK32, signed
 
 PAGE = 4096
@@ -45,7 +45,10 @@ LDS_HALVES = {
 HALF_BITS, HALF_MASK = 16, 0xFFFF
 CACHE_CONTROL = frozenset({"s_dcache_inv", "s_gl1_inv", "s_dcache_wb", "buffer_gl0_inv", "buffer_gl1_inv",
                            "ds_nop"})
-OTHER = frozenset({"s_memtime", "s_memrealtime", "ds_bpermute_b32"})
+OTHER = frozenset({"s_memtime", "s_memrealtime", *rdna2_exec_lanes.NAMES})
+# No VGPR address: memory_Addr = sgpr_addr(64) + inst_offset(12) + tid*4 (ISA section 12.18.3, opcodes 22-23,
+# p. 230). The ISA gives no address without SADDR: SADDR = off is refused. {name: plain access}
+ADD_TID = {"global_load_dword_addtid": "global_load_dword", "global_store_dword_addtid": "global_store_dword"}
 
 
 class Memory:
@@ -80,11 +83,11 @@ class Memory:
 def supports(name):
     """Vrai si l'interpréteur exécute cette instruction mémoire."""
     vector = VECTOR_PATTERN.match(name)
-    return bool(name in CACHE_CONTROL or name in OTHER or vector and vector.group(3) in WIDTHS
+    return bool(name in CACHE_CONTROL or name in OTHER or name in ADD_TID or vector and vector.group(3) in WIDTHS
                 or VECTOR_ATOMIC.match(name) or SCALAR_PATTERN.match(name)
                 or LDS_PATTERN.match(name) or LDS_ATOMIC.match(name) or name in LDS_HALVES
                 or rdna2_exec_atomic.vector(name) or rdna2_exec_atomic.lds(name)
-                or rdna2_exec_atomic.lds_exchange2(name))
+                or rdna2_exec_atomic.lds_exchange2(name) or rdna2_exec_smem.supports(name))
 
 
 def _to_words(data):
@@ -114,7 +117,9 @@ def execute(wave, family, name, word):
     """Exécute une instruction mémoire dont `supports(name)` est vrai ; `word` : 64 bits."""
     if name in CACHE_CONTROL:
         return
-    if family == "SMEM":
+    if family == "SMEM" and rdna2_exec_smem.supports(name):
+        rdna2_exec_smem.execute(wave, name, word)
+    elif family == "SMEM":
         _scalar(wave, name, word)
     elif family == "DS":
         _lds(wave, name, word)
@@ -160,10 +165,8 @@ def _scalar(wave, name, word):
 def _lds(wave, name, word):
     offset0, offset1 = word & 0xFF, (word >> 8) & 0xFF
     addr, data0, data1, vdst = ((word >> shift) & 0xFF for shift in (32, 40, 48, 56))
-    if name == "ds_bpermute_b32":
-        values = list(wave.v[data0])
-        for lane in wave.active():
-            wave.v[vdst][lane] = values[((wave.v[addr][lane] + (offset1 << 8 | offset0)) // DWORD) % 32]
+    if name in rdna2_exec_lanes.NAMES:
+        rdna2_exec_lanes.execute(wave, name, addr, data0, vdst, offset1 << 8 | offset0)
         return
     atomic = LDS_ATOMIC.match(name)
     found = LDS_PATTERN.match(name)
@@ -258,15 +261,44 @@ def _lds_exchange2(wave, spec, base, offsets, sources, vdst, lane):
 
 # --- FLAT / GLOBAL et MUBUF : mémoire vectorielle ------------------------------------------
 
+FLAT_OFFSET_SIGN = 0x800
+
+
+def flat_offset(family, word):
+    """Byte offset of a FLAT, GLOBAL or SCRATCH instruction, or None when it is not defined.
+
+    ISA section 9.1 (p. 83): "Scratch, Global: 12-bit signed byte offset. Flat: must be positive."; llvm-mc 20
+    (gfx1030) only accepts an 11-bit unsigned offset on FLAT and disassembles bit 11 as +2048. What the
+    hardware does with bit 11 set on FLAT is not documented, so the callers refuse it by name.
+    """
+    if family == "FLAT":
+        return None if word & FLAT_OFFSET_SIGN else word & (FLAT_OFFSET_SIGN - 1)
+    return signed(word & 0xFFF, 12)
+
+
 def _flat(wave, family, name, word):
-    offset = signed(word & 0xFFF, 12)
+    offset = flat_offset(family, word)
+    if offset is None:
+        from emu.rdna2_exec import Untranslated
+        raise Untranslated(f"{name}: FLAT offset with bit 11 set (the ISA requires a positive offset)")
     addr, data, saddr, vdst = (word >> 32) & 0xFF, (word >> 40) & 0xFF, (word >> 48) & 0x7F, (word >> 56) & 0xFF
+    if name in ADD_TID:
+        return _add_tid(wave, name, offset, data, saddr, vdst)
     for lane in wave.active():
         if family == "GLOBAL" and saddr != OFF:
             address = (wave.s[saddr] | wave.s[saddr + 1] << 32) + wave.v[addr][lane]
         else:
             address = wave.v[addr][lane] | wave.v[addr + 1][lane] << 32
         _access(wave, name, address + offset, data, vdst, lane, returns=(word >> 16) & 1)
+
+
+def _add_tid(wave, name, offset, data, saddr, vdst):
+    if saddr == OFF:
+        from emu.rdna2_exec import Untranslated
+        raise Untranslated(f"{name} with SADDR off: address not given by the RDNA 2 ISA")
+    base = wave.s[saddr] | wave.s[saddr + 1] << 32
+    for lane in wave.active():
+        _access(wave, ADD_TID[name], base + offset + lane * DWORD, data, vdst, lane)
 
 
 def _buffer(wave, name, word):

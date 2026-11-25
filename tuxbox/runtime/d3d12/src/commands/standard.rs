@@ -14,12 +14,12 @@ use super::{List, ListState, Recording, parent, recording};
 
 pub(super) unsafe extern "system" fn clear_state(list: &List, pipeline: *mut c_void) {
     let mut state = recording(list);
-    if !state.can_record(&list.native) {
+    if !state.prepare_state() {
         return;
     }
     // Bundles and copy lists have no graphics state to restore.
     if !matches!(
-        unsafe { list.native.GetType() },
+        state.list_type,
         D3D12_COMMAND_LIST_TYPE_DIRECT | D3D12_COMMAND_LIST_TYPE_COMPUTE
     ) {
         state.error = E_INVALIDARG;
@@ -36,6 +36,9 @@ pub(super) unsafe extern "system" fn clear_state(list: &List, pipeline: *mut c_v
     // Draw and dispatch replay these bindings. Clear them with the host state,
     // or the next draw puts the old tables back.
     state.bindings = super::compute_bindings::Bindings::new(pipeline);
+    state.predication = None;
+    state.graphics_state.clear();
+    state.bundle_executed = false;
     state.stencil_slot = pipeline.and_then(|pipeline| pipeline.state.stencil_slot);
     if let Some(targets) = &mut state.stencil_targets {
         targets.unbind();
@@ -46,11 +49,13 @@ pub(super) unsafe extern "system" fn clear_state(list: &List, pipeline: *mut c_v
     state.bound_placed_targets.clear();
     state.resource_heap = None;
     state.descriptor_arena = None;
+    // Earlier draws in this recording still reference their paged GPU handles,
+    // so descriptor_leases stays pinned until Reset() or Drop.
     // Desktop ClearState takes no pipeline. The guest argument is bound after
     // the reset so a following draw sees that pipeline.
-    unsafe { list.native.ClearState(None::<&ID3D12PipelineState>) };
+    unsafe { state.native().ClearState(None::<&ID3D12PipelineState>) };
     if let Some(pipeline) = pipeline {
-        unsafe { list.native.SetPipelineState(&pipeline.native) };
+        unsafe { state.native().SetPipelineState(&pipeline.native) };
     }
 }
 
@@ -125,7 +130,7 @@ pub(super) unsafe extern "system" fn copy_tiles(
     flags: D3D12_TILE_COPY_FLAGS,
 ) {
     let mut state = recording(list);
-    if !state.can_record(&list.native) {
+    if !state.can_record() {
         return;
     }
     if let Err(error) = tile_copy_flags(flags) {
@@ -164,6 +169,7 @@ pub(super) unsafe extern "system" fn copy_tiles(
         state.error = E_INVALIDARG;
         return;
     };
+    let guest_offset = offset;
     let Some(offset) = super::compute::buffer_offset(buffer, offset, bytes) else {
         state.error = E_INVALIDARG;
         return;
@@ -185,8 +191,15 @@ pub(super) unsafe extern "system" fn copy_tiles(
         state.error = error;
         return;
     }
+    if flags.contains(D3D12_TILE_COPY_FLAG_SWIZZLED_TILED_RESOURCE_TO_LINEAR_BUFFER) {
+        if let Some(base) = buffer.state.guest_address() {
+            state.record_write(base.saturating_add(guest_offset), bytes);
+        } else {
+            state.record_unknown_write();
+        }
+    }
     unsafe {
-        list.native.CopyTiles(
+        state.native().CopyTiles(
             &tiled.native,
             coordinate,
             region,
@@ -210,7 +223,7 @@ pub(super) unsafe extern "system" fn resolve_subresource(
     format: DXGI_FORMAT,
 ) {
     let mut state = recording(list);
-    if !state.can_record(&list.native) {
+    if !state.can_record() {
         return;
     }
     if !resolve_format(format) {
@@ -242,7 +255,8 @@ pub(super) unsafe extern "system" fn resolve_subresource(
         return;
     }
     unsafe {
-        list.native
+        state
+            .native()
             .ResolveSubresource(&dst.native, dst_subresource, &src.native, src_subresource, format)
     };
 }
@@ -265,7 +279,7 @@ pub(super) unsafe extern "system" fn set_predication(
     operation: D3D12_PREDICATION_OP,
 ) {
     let mut state = recording(list);
-    if !state.can_record(&list.native) {
+    if !state.prepare_state() {
         return;
     }
     if let Err(error) = predication_op(operation) {
@@ -273,7 +287,8 @@ pub(super) unsafe extern "system" fn set_predication(
         return;
     }
     if buffer.is_null() {
-        unsafe { list.native.SetPredication(None::<&ID3D12Resource>, offset, operation) };
+        state.predication = None;
+        unsafe { state.native().SetPredication(None::<&ID3D12Resource>, offset, operation) };
         return;
     }
     let Some(buffer) = (unsafe { crate::device::resource_proxy(buffer, parent(&list.parent)) }) else {
@@ -289,7 +304,12 @@ pub(super) unsafe extern "system" fn set_predication(
         state.error = E_INVALIDARG;
         return;
     };
-    unsafe { list.native.SetPredication(&buffer.native, offset, operation) };
+    state.predication = Some(super::recording::Predication {
+        resource: buffer.native.clone(),
+        offset,
+        operation,
+    });
+    unsafe { state.native().SetPredication(&buffer.native, offset, operation) };
 }
 
 fn stream_output_range(start: u32, count: u32) -> Result<(), HRESULT> {
@@ -307,7 +327,7 @@ pub(super) unsafe extern "system" fn stream_output(
     views: *const D3D12_STREAM_OUTPUT_BUFFER_VIEW,
 ) {
     let mut state = recording(list);
-    if !state.can_record(&list.native) {
+    if !state.prepare_state() {
         return;
     }
     if let Err(error) = stream_output_range(start, count) {
@@ -315,7 +335,13 @@ pub(super) unsafe extern "system" fn stream_output(
         return;
     }
     if views.is_null() || count == 0 {
-        unsafe { (list.native.vtable().SOSetTargets)(list.native.as_raw(), start, count, views) };
+        if views.is_null() {
+            for slot in start as usize..(start + count) as usize {
+                state.graphics_state.stream_output[slot] = None;
+            }
+        }
+        let cmd = state.native();
+        unsafe { (cmd.vtable().SOSetTargets)(cmd.as_raw(), start, count, views) };
         return;
     }
     let mut translated = [D3D12_STREAM_OUTPUT_BUFFER_VIEW::default(); D3D12_SO_BUFFER_SLOT_COUNT as usize];
@@ -347,18 +373,22 @@ pub(super) unsafe extern "system" fn stream_output(
             view.BufferFilledSizeLocation = filled;
         }
     }
-    unsafe { (list.native.vtable().SOSetTargets)(list.native.as_raw(), start, count, host.as_ptr()) };
+    for (i, &view) in host.iter().enumerate() {
+        state.graphics_state.stream_output[start as usize + i] = Some(view);
+    }
+    let cmd = state.native();
+    unsafe { (cmd.vtable().SOSetTargets)(cmd.as_raw(), start, count, host.as_ptr()) };
 }
 
 fn adopt_bundle(parent_state: &mut Recording, bundle: &Recording) -> Result<(), HRESULT> {
     // Queue splits and raytracing replay are applied to the submitted list. A bundle is not submitted on its own, so those recordings
     // cannot be replayed by ExecuteBundle yet.
-    if !bundle.prefix.segments.is_empty() || !bundle.scene_commands.is_empty() {
+    if !bundle.segments.is_empty() || !bundle.scene_commands.is_empty() {
         static FIRST: std::sync::Once = std::sync::Once::new();
         crate::diagnostics::log_once(&FIRST, || {
             format!(
                 "ExecuteBundle has {} waits, {} scene commands",
-                bundle.prefix.segments.len(),
+                bundle.segments.len(),
                 bundle.scene_commands.len()
             )
         });
@@ -385,6 +415,9 @@ fn adopt_bundle(parent_state: &mut Recording, bundle: &Recording) -> Result<(), 
         parent_state.indexed_arenas.push(std::sync::Arc::clone(arena));
     }
     parent_state
+        .descriptor_leases
+        .extend_from(&bundle.descriptor_leases)?;
+    parent_state
         .scalar_descriptors
         .try_reserve(bundle.scalar_descriptors.len())
         .map_err(|_| E_OUTOFMEMORY)?;
@@ -394,15 +427,16 @@ fn adopt_bundle(parent_state: &mut Recording, bundle: &Recording) -> Result<(), 
         .try_reserve(bundle.trace_samples.len())
         .map_err(|_| E_OUTOFMEMORY)?;
     parent_state.trace_samples.extend(bundle.trace_samples.iter().cloned());
+    parent_state.written_ranges.extend_from(&bundle.written_ranges);
     Ok(())
 }
 
 pub(super) unsafe extern "system" fn execute_bundle(list: &List, bundle: *mut c_void) {
     let mut state = recording(list);
-    if !state.can_record(&list.native) {
+    if !state.can_record() {
         return;
     }
-    if unsafe { list.native.GetType() } != D3D12_COMMAND_LIST_TYPE_DIRECT {
+    if state.list_type != D3D12_COMMAND_LIST_TYPE_DIRECT {
         state.error = E_INVALIDARG;
         return;
     }
@@ -416,7 +450,7 @@ pub(super) unsafe extern "system" fn execute_bundle(list: &List, bundle: *mut c_
     }
     // Lock the caller first, then the bundle. The two lists are distinct.
     let bundle_state = recording(bundle);
-    if unsafe { bundle.native.GetType() } != D3D12_COMMAND_LIST_TYPE_BUNDLE
+    if bundle_state.list_type != D3D12_COMMAND_LIST_TYPE_BUNDLE
         || !matches!(&bundle_state.phase, ListState::Closed)
         || bundle_state.error.is_err()
     {
@@ -427,7 +461,8 @@ pub(super) unsafe extern "system" fn execute_bundle(list: &List, bundle: *mut c_
         state.error = error;
         return;
     }
-    unsafe { list.native.ExecuteBundle(&bundle.native) };
+    state.bundle_executed = true;
+    unsafe { state.native().ExecuteBundle(bundle_state.native()) };
 }
 
 fn event_data(data: *const c_void, size: u32) -> Result<(), HRESULT> {
@@ -445,7 +480,7 @@ pub(super) unsafe extern "system" fn set_marker(
     size: u32,
 ) {
     let mut state = recording(list);
-    if !state.can_record(&list.native) {
+    if !state.prepare_state() {
         return;
     }
     if let Err(error) = event_data(data, size) {
@@ -460,7 +495,7 @@ pub(super) unsafe extern "system" fn begin_event(
     size: u32,
 ) {
     let mut state = recording(list);
-    if !state.can_record(&list.native) {
+    if !state.prepare_state() {
         return;
     }
     if let Err(error) = event_data(data, size) {
@@ -470,77 +505,9 @@ pub(super) unsafe extern "system" fn begin_event(
 
 pub(super) unsafe extern "system" fn end_event(list: &List) {
     let mut state = recording(list);
-    let _ = state.can_record(&list.native);
+    let _ = state.prepare_state();
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use windows::core::BOOL;
-
-    #[test]
-    fn tile_flags_accept_one_direction_and_reject_unknown_bits() {
-        assert!(tile_copy_flags(D3D12_TILE_COPY_FLAG_NONE).is_ok());
-        assert!(tile_copy_flags(
-            D3D12_TILE_COPY_FLAG_NO_HAZARD | D3D12_TILE_COPY_FLAG_LINEAR_BUFFER_TO_SWIZZLED_TILED_RESOURCE
-        ).is_ok());
-        assert_eq!(
-            tile_copy_flags(D3D12_TILE_COPY_FLAGS(0x8)).unwrap_err(),
-            E_NOTIMPL
-        );
-        assert_eq!(
-            tile_copy_flags(
-                D3D12_TILE_COPY_FLAG_LINEAR_BUFFER_TO_SWIZZLED_TILED_RESOURCE
-                    | D3D12_TILE_COPY_FLAG_SWIZZLED_TILED_RESOURCE_TO_LINEAR_BUFFER
-            ).unwrap_err(),
-            E_INVALIDARG
-        );
-    }
-
-    #[test]
-    fn tile_region_uses_the_box_or_the_tile_count() {
-        let box_region = D3D12_TILE_REGION_SIZE {
-            NumTiles: 0,
-            UseBox: BOOL::from(true),
-            Width: 2,
-            Height: 3,
-            Depth: 4,
-        };
-        assert_eq!(tile_count(&box_region).unwrap(), 24);
-        let counted = D3D12_TILE_REGION_SIZE { NumTiles: 5, UseBox: BOOL::from(false), ..box_region };
-        assert_eq!(tile_count(&counted).unwrap(), 5);
-        let empty = D3D12_TILE_REGION_SIZE { NumTiles: 0, UseBox: BOOL::from(false), ..box_region };
-        assert_eq!(tile_count(&empty).unwrap_err(), E_INVALIDARG);
-        let flat = D3D12_TILE_REGION_SIZE { Width: 0, ..box_region };
-        assert_eq!(tile_count(&flat).unwrap_err(), E_INVALIDARG);
-    }
-
-    #[test]
-    fn predication_accepts_only_the_two_desktop_operations() {
-        assert!(predication_op(D3D12_PREDICATION_OP_EQUAL_ZERO).is_ok());
-        assert!(predication_op(D3D12_PREDICATION_OP_NOT_EQUAL_ZERO).is_ok());
-        assert_eq!(predication_op(D3D12_PREDICATION_OP(2)).unwrap_err(), E_INVALIDARG);
-    }
-
-    #[test]
-    fn stream_output_stays_inside_four_slots() {
-        assert!(stream_output_range(0, 4).is_ok());
-        assert!(stream_output_range(4, 0).is_ok());
-        assert_eq!(stream_output_range(3, 2).unwrap_err(), E_INVALIDARG);
-        assert_eq!(stream_output_range(5, 0).unwrap_err(), E_INVALIDARG);
-    }
-
-    #[test]
-    fn marker_rejects_a_sized_null_payload() {
-        assert!(event_data(core::ptr::null(), 0).is_ok());
-        assert!(event_data(core::ptr::from_ref(&1u8).cast(), 1).is_ok());
-        assert_eq!(event_data(core::ptr::null(), 4).unwrap_err(), E_INVALIDARG);
-    }
-
-    #[test]
-    fn resolve_accepts_unknown_and_shared_formats_only() {
-        assert!(resolve_format(DXGI_FORMAT_UNKNOWN));
-        assert!(resolve_format(DXGI_FORMAT_B4G4R4A4_UNORM));
-        assert!(!resolve_format(DXGI_FORMAT(DXGI_FORMAT_B4G4R4A4_UNORM.0 + 1)));
-    }
-}
+#[path = "../tests/commands/standard.rs"]
+mod tests;

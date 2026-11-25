@@ -81,9 +81,7 @@ pub(crate) fn release(allocator: usize) {
 }
 
 pub(super) unsafe extern "system" fn allocate_slot(list: &List, bytes: u32, alignment: u32) -> *mut core::ffi::c_void {
-    let state = recording(list);
-    let allocator = std::sync::Arc::as_ptr(&state.resources) as usize;
-    drop(state);
+    let allocator = std::sync::Arc::as_ptr(&recording(list).resources) as usize;
     let result = allocate(allocator, bytes as usize, (alignment as usize).max(1));
     static FIRST: std::sync::Once = std::sync::Once::new();
     crate::diagnostics::log_once(&FIRST, || format!(
@@ -92,26 +90,5 @@ pub(super) unsafe extern "system" fn allocate_slot(list: &List, bytes: u32, alig
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn bump_alignment_and_reuse() {
-        let key = 0x5151_0000;
-        let a = allocate(key, 40, 8).unwrap();
-        let b = allocate(key, 56, 16).unwrap();
-        assert_eq!(b % 16, 0);
-        assert!(b >= a + 40);
-        let big = allocate(key, 3 << 20, 16).unwrap();
-        assert_eq!(big % 16, 0);
-        release(key);
-        let again = allocate(key, 40, 8).unwrap();
-        // A reset hands pages back, so a later arena reuses committed memory.
-        let pool = POOL.lock().unwrap();
-        assert!(pool.arenas[&key].chunks.iter().any(|c| c.base == again));
-        drop(pool);
-        assert!(allocate(key, 8, 3).is_none());
-        assert!(allocate(key, 0, 8).is_none());
-        release(key);
-    }
-}
+#[path = "../tests/commands/list_memory.rs"]
+mod tests;

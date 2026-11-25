@@ -415,12 +415,47 @@ void release_placed_vertices(bool done)
     }
 }
 
+// X2W_TEST_FORMATTED_VIEW=<DXGI format>:<component mapping>:<raw 0|1>:<64 hex bytes>: one typed (or raw) buffer view
+// the title creates over a placed buffer holding those bytes, at table entry 0, then one draw. The translated pixel
+// shader in tests/startup_formatted_view_draw_check.py reads element 1 through buffer_load_format_xyzw.
+int draw_formatted_view(void* guest, void* list)
+{
+    char spec[256]{};
+    if (!GetEnvironmentVariableA("X2W_TEST_FORMATTED_VIEW", spec, sizeof(spec))) return 48;
+    unsigned format = 0, mapping = 0, raw = 0;
+    char hex[129]{};
+    if (std::sscanf(spec, "%u:%x:%u:%128s", &format, &mapping, &raw, hex) != 4 || std::strlen(hex) != 128) return 48;
+    static std::array<std::uint8_t, 65536 + 256> backing{};
+    auto* const bytes = reinterpret_cast<std::uint8_t*>((ptr(backing.data()) + 0xffff) & ~Word{0xffff});
+    for (unsigned i = 0; i < 64; ++i) {
+        unsigned value = 0;
+        if (std::sscanf(hex + 2 * i, "%2x", &value) != 1) return 48;
+        bytes[i] = static_cast<std::uint8_t>(value);
+    }
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    desc.Width = 256;
+    desc.Height = desc.DepthOrArraySize = desc.MipLevels = desc.SampleDesc.Count = 1;
+    desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    void* placed = nullptr;
+    if (FAILED(static_cast<HRESULT>(invoke(guest, 133, ptr(bytes), ptr(&desc), D3D12_RESOURCE_STATE_COMMON,
+                                           0, ptr(&__uuidof(ID3D12Resource)), ptr(&placed))))) return 47;
+    Word cpu = 0;
+    if (!bind_view_table(guest, list, cpu)) return 42;
+    D3D12_SHADER_RESOURCE_VIEW_DESC view{static_cast<DXGI_FORMAT>(format), D3D12_SRV_DIMENSION_BUFFER, mapping};
+    view.Buffer.NumElements = 4;
+    view.Buffer.Flags = raw ? D3D12_BUFFER_SRV_FLAG_RAW : D3D12_BUFFER_SRV_FLAG_NONE;
+    invoke(guest, 18, ptr(placed), ptr(&view), cpu);
+    invoke(list, 12, 3, 1);
+    return 0;
+}
+
 int draw_address_buffer_srvs(ID3D12Device* desktop, void* guest, void* list)
 {
     static std::array<std::uint8_t, 65536 + 256> raw_buf0{};
-    static std::array<std::uint8_t, 65536 + 256> raw_buf1{};
+    static auto* const buf1 = static_cast<std::uint32_t*>(
+        VirtualAlloc(nullptr, 65536, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
     auto* const buf0 = reinterpret_cast<std::uint32_t*>((ptr(raw_buf0.data()) + 0xffff) & ~Word{0xffff});
-    auto* const buf1 = reinterpret_cast<std::uint32_t*>((ptr(raw_buf1.data()) + 0xffff) & ~Word{0xffff});
     std::memset(buf0, 0, 256);
     std::memset(buf1, 0, 256);
     buf0[0] = 17;
@@ -434,11 +469,10 @@ int draw_address_buffer_srvs(ID3D12Device* desktop, void* guest, void* list)
     desc.Height = desc.DepthOrArraySize = desc.MipLevels = desc.SampleDesc.Count = 1;
     desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
 
-    void* placed[2]{};
+    void* placed = nullptr;
     if (FAILED(static_cast<HRESULT>(invoke(guest, 133, ptr(buf0), ptr(&desc), D3D12_RESOURCE_STATE_COMMON,
-                                           0, ptr(&__uuidof(ID3D12Resource)), ptr(&placed[0]))))) return 47;
-    if (FAILED(static_cast<HRESULT>(invoke(guest, 133, ptr(buf1), ptr(&desc), D3D12_RESOURCE_STATE_COMMON,
-                                           0, ptr(&__uuidof(ID3D12Resource)), ptr(&placed[1]))))) return 47;
+                                           0, ptr(&__uuidof(ID3D12Resource)), ptr(&placed))))) return 47;
+    // buf1 is intentionally not placed in slot 133 to verify unplaced buffer backing in device slot 70.
 
     Word cpu = 0;
     if (!bind_view_table(guest, list, cpu)) return 42;
@@ -484,7 +518,8 @@ int draw_address_buffer_srvs(ID3D12Device* desktop, void* guest, void* list)
     structured.view.Buffer.StructureByteStride = 4;
     structured.address = ptr(buf0);
     invoke(guest, 70, ptr(&desc), ptr(&structured), cpu);
-    // An acceleration-structure view is refused; draw(4) proves the structured descriptor stayed in place.
+    // An acceleration-structure view of a placed buffer that is not in the acceleration-structure state is
+    // refused (as_wrong_state); draw(4) proves the structured descriptor stayed in place.
     ViewAt as_view{};
     as_view.view.Format = DXGI_FORMAT_UNKNOWN;
     as_view.view.ViewDimension = static_cast<D3D12_SRV_DIMENSION>(11);
@@ -705,6 +740,39 @@ int draw_d16_srvs(ID3D12Device* desktop, void* guest, void* list)
     for (UINT col = 0; col < 7; ++col) draw_at(static_cast<LONG>(col), col);
     draw_at(6, 7);  // Also test unwritten descriptor slot on column 6; must stay clear.
     draw_at(7, 8);  // Rebind R16_UNORM default SRV on column 7; must draw yellow (0x3bff) cleanly.
+    return 0;
+}
+
+// One translated pixel shader uses the same table slot across five draws. The clear color is opaque blue.
+int draw_formatted_buffer(void* guest, void* list)
+{
+    alignas(16) static const std::uint32_t zeros[4] = {};
+    alignas(16) static const std::uint32_t red[4] = {0x3f800000u};
+    const auto draw_at = [&](LONG x) {
+        const D3D12_RECT strip{x, 0, x + 1, 4};
+        invoke(list, 22, 1, ptr(&strip));
+        invoke(list, 12, 3, 1);
+    };
+    draw_at(0);  // No table binding.
+    Word cpu = 0;
+    if (!bind_view_table(guest, list, cpu)) return 42;
+    const auto store = [&](const std::uint32_t* data, std::uint32_t format) {
+        const auto address = ptr(data);
+        const std::uint32_t descriptor[4] = {static_cast<std::uint32_t>(address),
+            static_cast<std::uint32_t>(address >> 32) | (4u << 16), 4u, (format << 12) | 4u};
+        std::memcpy(reinterpret_cast<void*>(cpu), descriptor, sizeof(descriptor));
+    };
+    store(red, 2);
+    draw_at(1);  // Unknown FORMAT, readable descriptor and range.
+    store(zeros, 22);
+    draw_at(2);  // Real zero data with a supported R32_FLOAT descriptor.
+    store(nullptr, 22);
+    draw_at(3);  // Supported metadata with no resolved buffer.
+    store(red, 22);
+    // Expand the viewport from the fixture's initial four columns to all eight.
+    const D3D12_VIEWPORT viewport{0, 0, 8, 4, 0, 1};
+    invoke(list, 21, 1, ptr(&viewport));
+    draw_at(4);  // Nonzero data proves the accepted format is sampled.
     return 0;
 }
 

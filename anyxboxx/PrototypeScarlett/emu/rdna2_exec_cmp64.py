@@ -11,15 +11,15 @@ documentation publique d'AMD (« RDNA 2 Instruction Set Architecture », VOPC).
 """
 import struct
 
-from emu.rdna2_exec_ops import FLOAT_TESTS, INTEGER_TESTS, MASK32, MASK64, signed
+from emu.rdna2_exec_ops import FLOAT_TESTS, INTEGER_TESTS, MASK64, signed
 
 VGPR_FIRST, LITERAL, EXEC_LO, VCC_LO = 256, 255, 126, 106
 INLINE_INTEGERS = range(128, 209)
 INLINE_DOUBLES = {240: 0.5, 241: -0.5, 242: 1.0, 243: -1.0, 244: 2.0, 245: -2.0, 246: 4.0, 247: -4.0,
-                  248: 0.15915494309189535}
+                  248: 0.15915494309189532}       # 1/(2π) = 0x3FC45F306DC9C882, valeur exacte de l'ISA (§6.2)
 SIGN32, SIGN64 = 1 << 31, 1 << 63
 # (bits d'exposant, bits de mantisse) par largeur
-FORMATS = {32: (8, 23), 64: (11, 52)}
+FORMATS = {16: (5, 10), 32: (8, 23), 64: (11, 52)}
 
 
 def double(bits):
@@ -118,7 +118,4 @@ def execute(wave, name, codes, literal, destination=VCC_LO, abs_bits=0, neg_bits
         a, b = _sources(wave, kind, codes, lane, literal)
         a, b = _modify(a, 0, kind, abs_bits, neg_bits), _modify(b, 1, kind, abs_bits, neg_bits)
         mask |= bool(test(a, b)) << lane
-    if writes_exec:
-        wave.s[EXEC_LO] = mask & MASK32
-    else:
-        wave.write_scalar(destination, mask)
+    wave.write_mask(EXEC_LO if writes_exec else destination, mask)

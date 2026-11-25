@@ -17,7 +17,7 @@ from . import shader_cache
 REPOSITORY = Path(__file__).resolve().parents[2]
 KITS = Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")) / "Windows Kits" / "10" / "bin"
 SHADER_MODEL = "cs_6_0"
-VERTEX_MODEL, PIXEL_MODEL = "vs_6_0", "ps_6_0"
+VERTEX_MODEL, PIXEL_MODEL, PIXEL_WAVE_MODEL = "vs_6_0", "ps_6_0", "ps_6_6"
 TIMEOUT = 120
 
 
@@ -40,6 +40,23 @@ def find_runner():
     folder = Path(os.environ.get("ANYXBOXX_RUNTIME") or REPOSITORY / "runtime" / "build" / "bin")
     runner = folder / "anyxboxx_gpu_run.exe"
     return runner if runner.is_file() else None
+
+
+def adapter():
+    """Champs de `anyxboxx_gpu_run.exe --adaptateur` pour l'adaptateur choisi par ANYXBOXX_GPU."""
+    runner = find_runner()
+    if runner is None:
+        raise GpuUnavailable("anyxboxx_gpu_run.exe introuvable : compilez runtime/ avec CMake")
+    result = subprocess.run([str(runner), "--adaptateur"], capture_output=True, encoding="utf-8",
+                            errors="replace", timeout=TIMEOUT)
+    if result.returncode != 0:
+        raise GpuUnavailable(f"adaptateur introuvable :\n{result.stderr}")
+    return dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
+
+
+def supports_doubles():
+    """Vrai si l'adaptateur exécute des doubles dans les shaders (certains GPU intégrés ne le font pas)."""
+    return adapter().get("double_precision") == "oui"
 
 
 def available():
@@ -82,7 +99,8 @@ def draw(vertex_hlsl, pixel_hlsl, memory, vertices, width, height, cache=None):
         vs, ps, image = Path(folder) / "vs.dxil", Path(folder) / "ps.dxil", Path(folder) / "memory.bin"
         vs.write_bytes(compile_dxil(vertex_hlsl, cache, VERTEX_MODEL))
         if pixel_hlsl is not None:
-            ps.write_bytes(compile_dxil(pixel_hlsl, cache, PIXEL_MODEL))
+            ps_model = PIXEL_WAVE_MODEL if "IsHelperLane()" in pixel_hlsl else PIXEL_MODEL
+            ps.write_bytes(compile_dxil(pixel_hlsl, cache, ps_model))
         image.write_bytes(memory)
         arguments = [str(runner), "--draw", str(vs), str(ps) if pixel_hlsl is not None else "-", str(image),
                      str(vertices), str(width), str(height)]

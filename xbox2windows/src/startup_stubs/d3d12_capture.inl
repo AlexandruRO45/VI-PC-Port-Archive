@@ -15,6 +15,8 @@ struct PipelineInfo {
     D3D12_BLEND_DESC stream_blend{};
     bool has_stream_depth_stencil = false;
     D3D12_DEPTH_STENCIL_DESC stream_depth_stencil{};
+    bool has_stream_rasterizer = false;
+    D3D12_RASTERIZER_DESC stream_rasterizer{};
     DXGI_FORMAT stream_dsv_format = DXGI_FORMAT_UNKNOWN;
     int path = 0;                    // creating device slot: 57, 67, 55, 86, 62
     Wrapper* base = nullptr;         // slot 55: the pipeline it derives from
@@ -94,7 +96,8 @@ bool title_backed(u64 title_handle, u64 bytes)
 void note_pipeline(Wrapper* w, int path, const void* base, const void* desc, std::size_t bytes,
                    Translation* translation = nullptr, const D3D12_BLEND_DESC* blend = nullptr,
                    const D3D12_DEPTH_STENCIL_DESC* depth_stencil = nullptr,
-                   DXGI_FORMAT dsv_format = DXGI_FORMAT_UNKNOWN)
+                   DXGI_FORMAT dsv_format = DXGI_FORMAT_UNKNOWN,
+                   const D3D12_RASTERIZER_DESC* rasterizer = nullptr)
 {
     PipelineInfo info;
     info.stream_translation = translation;
@@ -105,6 +108,10 @@ void note_pipeline(Wrapper* w, int path, const void* base, const void* desc, std
     if (depth_stencil) {
         info.stream_depth_stencil = *depth_stencil;
         info.has_stream_depth_stencil = true;
+    }
+    if (rasterizer) {
+        info.stream_rasterizer = *rasterizer;
+        info.has_stream_rasterizer = true;
     }
     info.stream_dsv_format = dsv_format;
     info.path = path;
@@ -304,7 +311,17 @@ void note_view(int slot, u64 resource, u64 counter, const void* desc, std::size_
         view_ids()[hash] = record.id;
         ++views_distinct;
     }
-    if (std::uint32_t* slot = shadow_slot(dest_desktop)) *slot = record.id + 1;
+    if (std::uint32_t* slot_ptr = shadow_slot(dest_desktop)) {
+        const std::uint32_t prev = *slot_ptr;
+        *slot_ptr = record.id + 1;
+        if (prev != record.id + 1) {
+            if (slot == 18 && resource && materialized) retire_add_view_ref(reinterpret_cast<const void*>(resource));
+            if (prev && prev - 1 < view_records().size() && view_records()[prev - 1].slot == 18 && view_materialized()[prev - 1])
+                retire_release_view_ref(reinterpret_cast<const void*>(view_records()[prev - 1].resource));
+        }
+    } else if (slot == 18 && resource) {
+        retire_leave_class(reinterpret_cast<const void*>(resource));
+    }
     ReleaseSRWLockExclusive(&note_lock);
     const std::size_t token_bytes = slot == 22 ? x2w_startup::title_sampler_stride : 32u;
     if (dest_title != dest_desktop && title_backed(dest_title, token_bytes) &&
@@ -322,8 +339,36 @@ void note_copy(u64 dest_title, u64 src_title, u64 dest_desktop, u64 src_desktop,
     std::uint32_t* to = shadow_slot(dest_desktop, &dest_room);
     const std::uint32_t* from = shadow_slot(src_desktop, &src_room);
     if (to && count <= dest_room) {
-        if (from && count <= src_room) std::memmove(to, from, u64{count} * 4);
-        else std::memset(to, 0, u64{count} * 4);
+        if (from && count <= src_room) {
+            for (UINT i = 0; i < count; ++i) {
+                const std::uint32_t src_id = from[i];
+                if (src_id && src_id - 1 < view_records().size() &&
+                    view_records()[src_id - 1].slot == 18 && view_materialized()[src_id - 1])
+                    retire_add_view_ref(reinterpret_cast<const void*>(view_records()[src_id - 1].resource));
+            }
+            for (UINT i = 0; i < count; ++i) {
+                const std::uint32_t old_id = to[i];
+                if (old_id && old_id - 1 < view_records().size() &&
+                    view_records()[old_id - 1].slot == 18 && view_materialized()[old_id - 1])
+                    retire_release_view_ref(reinterpret_cast<const void*>(view_records()[old_id - 1].resource));
+            }
+            std::memmove(to, from, u64{count} * 4);
+        } else {
+            for (UINT i = 0; i < count; ++i) {
+                const std::uint32_t old_id = to[i];
+                if (old_id && old_id - 1 < view_records().size() &&
+                    view_records()[old_id - 1].slot == 18 && view_materialized()[old_id - 1])
+                    retire_release_view_ref(reinterpret_cast<const void*>(view_records()[old_id - 1].resource));
+            }
+            std::memset(to, 0, u64{count} * 4);
+        }
+    } else if (from && count <= src_room) {
+        for (UINT i = 0; i < count; ++i) {
+            const std::uint32_t src_id = from[i];
+            if (src_id && src_id - 1 < view_records().size() &&
+                view_records()[src_id - 1].slot == 18 && view_materialized()[src_id - 1])
+                retire_leave_class(reinterpret_cast<const void*>(view_records()[src_id - 1].resource));
+        }
     }
     ReleaseSRWLockExclusive(&note_lock);
     const UINT stride = title_descriptor_stride(dest_title, increment);
