@@ -238,6 +238,22 @@ pub(crate) struct Translated {
 }
 
 #[cfg(windows)]
+static COMPUTE_WAVE64: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(windows)]
+static COMPUTE_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Compute shaders translated so far that declared `WaveSize(64)`, and total
+/// compute shaders translated.
+#[cfg(windows)]
+pub(crate) fn compute_wave_counts() -> (u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        COMPUTE_WAVE64.load(Relaxed),
+        COMPUTE_TOTAL.load(Relaxed),
+    )
+}
+
+#[cfg(windows)]
 impl Shader {
     /// The translation, made on first use; a shader that does not
     /// translate is logged once.
@@ -253,18 +269,27 @@ impl Shader {
                     dump(self);
                 }
                 match &done {
-                    Ok(t) => tracing::info!(
-                        stage = self.stage,
-                        hash = %self.hash,
-                        user_data = t.host.user_data.len(),
-                        samplers = t.host.samplers.len(),
-                        // As Radeon GPU Detective names a shader in flight.
-                        dxil = %t.host.dxil.get(4..20).map_or(String::new(), |d| {
-                            let half = |at: usize| u64::from_le_bytes(d[at..at + 8].try_into().unwrap_or([0; 8]));
-                            format!("{:016x}{:016x}", half(0), half(8))
-                        }),
-                        "shader translated"
-                    ),
+                    Ok(t) => {
+                        if t.host.stage == victory_shader::HwStage::Cs {
+                            use std::sync::atomic::Ordering::Relaxed;
+                            COMPUTE_TOTAL.fetch_add(1, Relaxed);
+                            if victory_shader::emit::dxil_wave_size(&t.host.dxil) == Some(64) {
+                                COMPUTE_WAVE64.fetch_add(1, Relaxed);
+                            }
+                        }
+                        tracing::info!(
+                            stage = self.stage,
+                            hash = %self.hash,
+                            user_data = t.host.user_data.len(),
+                            samplers = t.host.samplers.len(),
+                            // As Radeon GPU Detective names a shader in flight.
+                            dxil = %t.host.dxil.get(4..20).map_or(String::new(), |d| {
+                                let half = |at: usize| u64::from_le_bytes(d[at..at + 8].try_into().unwrap_or([0; 8]));
+                                format!("{:016x}{:016x}", half(0), half(8))
+                            }),
+                            "shader translated"
+                        );
+                    }
                     Err(e) => tracing::warn!(
                         stage = self.stage,
                         hash = %self.hash,

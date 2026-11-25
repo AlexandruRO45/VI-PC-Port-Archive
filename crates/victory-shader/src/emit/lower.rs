@@ -1226,7 +1226,10 @@ impl<'a> Lower<'a> {
             }
             if split {
                 s.wave_size = Some(32);
-            } else if console_lanes || one_wave && s.lds_dwords > 0 {
+            } else if console_lanes
+                || (one_wave && s.lds_dwords > 0)
+                || (x.native.wave64 && x.target.runs(64) && super::force_wave64())
+            {
                 s.wave_size = Some(wave);
             }
         }
