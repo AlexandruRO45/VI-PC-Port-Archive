@@ -1877,6 +1877,8 @@ impl State {
         indexed: &[RootIndexedView],
         compute: bool,
     ) -> Vec<(u8, u32)> {
+        #[cfg(feature = "diagnostics")]
+        let heading = std::time::Instant::now();
         let tables = |u: &&UsedResource| u.root == RootType::Table;
         let mut fresh: Vec<u8> = used
             .iter()
@@ -1910,8 +1912,15 @@ impl State {
         for u in used.iter().filter(tables) {
             if !fresh.contains(&u.slot) {
                 self.table_entry(list, u, compute);
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::TableEntries, 1);
             }
         }
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(
+            crate::copystat::C::TableHeadNs,
+            heading.elapsed().as_nanos() as u64,
+        );
         let mut made = Vec::new();
         for slot in fresh {
             let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
@@ -1961,7 +1970,11 @@ impl State {
                 once!(slot, n, "fresh descriptor table exceeds the available span");
                 continue;
             }
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::TableAsked, 1);
             // The table and what its entries hold (record words).
+            #[cfg(feature = "diagnostics")]
+            let hashing = std::time::Instant::now();
             let key = {
                 use std::hash::{Hash, Hasher};
                 let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -1972,7 +1985,17 @@ impl State {
                 }
                 (table, n, h.finish())
             };
+            #[cfg(feature = "diagnostics")]
+            {
+                crate::copystat::add(crate::copystat::C::TableHashed, n as u64);
+                crate::copystat::add(
+                    crate::copystat::C::TableHashNs,
+                    hashing.elapsed().as_nanos() as u64,
+                );
+            }
             if let Some(&first) = self.fresh_tables.get(&key) {
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::TableReused, 1);
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
                     if let Some(view) = crate::descriptor::view(handle) {
@@ -2000,6 +2023,8 @@ impl State {
                 continue;
             };
             self.fresh_tables.insert(key, first);
+            #[cfg(feature = "diagnostics")]
+            let copying = std::time::Instant::now();
             self.dynamic
                 .push((std::ptr::from_ref(heap) as usize, first, n));
             // The title's own slots of this table: what the draw reads of
@@ -2048,6 +2073,15 @@ impl State {
                         }
                     }
                 }
+            }
+            #[cfg(feature = "diagnostics")]
+            {
+                crate::copystat::add(crate::copystat::C::TableMade, 1);
+                crate::copystat::add(crate::copystat::C::TableCopied, n as u64);
+                crate::copystat::add(
+                    crate::copystat::C::TableCopyNs,
+                    copying.elapsed().as_nanos() as u64,
+                );
             }
             made.push((slot, first * 32));
         }

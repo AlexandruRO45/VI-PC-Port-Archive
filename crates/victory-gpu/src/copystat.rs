@@ -57,6 +57,21 @@ pub(crate) enum C {
     DynamicAsked,
     DynamicRefused,
     DynamicNs,
+    /// A draw's fresh descriptor tables: asked for, found already in the
+    /// list with the same contents (no copy), made; the title slots hashed
+    /// to tell them apart and the slots copied into dynamic ones, and the
+    /// time each of those took.
+    TableAsked,
+    TableReused,
+    TableMade,
+    TableHashed,
+    TableCopied,
+    TableHashNs,
+    TableCopyNs,
+    /// Bringing a draw's non-fresh table entries up to date (one call an
+    /// entry), and its time.
+    TableEntries,
+    TableHeadNs,
     /// Marker texts for device-removed data (`HostList::note`).
     NoteNs,
     /// Ranges given to shaders (steps), their snapshots, and the bytes
@@ -134,8 +149,24 @@ pub(crate) enum C {
     WaitsForGroups,
     WaitsForBuffers,
     IndirectBounded,
+    /// Host descriptors made per draw, by what they view: a constant
+    /// buffer, a shader resource, an unordered access, a sampler, and a
+    /// view of memory with no resource object; and their time, all of it
+    /// inside `descriptor::host::make`.
+    ViewsCbv,
+    ViewsSrv,
+    ViewsUav,
+    ViewsSampler,
+    ViewsOther,
+    ViewsNs,
+    /// Descriptors this frame's own cache already held (a 32-byte copy) and
+    /// the ones the driver had to make.
+    ViewsHit,
+    ViewsMiss,
 }
-const COUNTERS: usize = 80;
+/// One slot per [`C`], so a counter added to the enum cannot index past the
+/// array that holds it (it did: 80 slots for 82 variants aborted the title).
+const COUNTERS: usize = C::ViewsMiss as usize + 1;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -1098,18 +1129,39 @@ pub(crate) fn log(frames: f64) {
     );
     tracing::info!(
         "recording per frame ({frames:.0} frames): {:.0} list calls {:.1} ms (all recording \
-         threads); {:.1} ms waiting for pipelines; dynamic slots: {:.0} tables asked, {:.0} \
-         refused, {:.1} ms searching; notes {:.1} ms; shader-written ranges: {:.0} steps in \
-         {:.1} submissions, snapshots {:.1} ms, {:.1} MB compared back; sparse reads {:.1} ms; \
-         guards {:.1} ms; {:.1} MB copied whole (memory not watched); {:.1} frame waits \
-         sleeping {:.1} ms (all threads); ranges of shaders that cannot store to buffers: \
-         {:.0} steps {:.1} MB left out",
+          threads); {:.1} ms waiting for pipelines; dynamic slots: {:.0} tables asked, {:.0} \
+          refused, {:.1} ms searching; fresh tables: {:.0} asked, {:.0} already held with the \
+          same contents, {:.0} made, {:.0} slots hashed in {:.2} ms and {:.0} slots copied in \
+          {:.2} ms; entries brought up to date: {:.0} in {:.2} ms; host views made: {:.0} of a \
+          constant buffer, {:.0} of a resource, {:.0} unordered, {:.0} samplers, {:.0} other, in \
+          {:.2} ms ({:.0} copied from this frame's cache, {:.0} made); notes {:.1} ms;           shader-written ranges: {:.0} steps in {:.1} submissions, \
+          snapshots {:.1} ms, {:.1} MB \
+          compared back; sparse reads {:.1} ms; guards {:.1} ms; {:.1} MB copied whole (memory \
+          not watched); {:.1} frame waits sleeping {:.1} ms (all threads); ranges of shaders \
+          that cannot store to buffers: {:.0} steps {:.1} MB left out",
         c[C::RecordCalls as usize],
         c[C::RecordNs as usize] / 1e6,
         ms(c[C::PipelineWaitUs as usize]),
         c[C::DynamicAsked as usize],
         c[C::DynamicRefused as usize],
         c[C::DynamicNs as usize] / 1e6,
+        c[C::TableAsked as usize],
+        c[C::TableReused as usize],
+        c[C::TableMade as usize],
+        c[C::TableHashed as usize],
+        c[C::TableHashNs as usize] / 1e6,
+        c[C::TableCopied as usize],
+        c[C::TableCopyNs as usize] / 1e6,
+        c[C::TableEntries as usize],
+        c[C::TableHeadNs as usize] / 1e6,
+        c[C::ViewsCbv as usize],
+        c[C::ViewsSrv as usize],
+        c[C::ViewsUav as usize],
+        c[C::ViewsSampler as usize],
+        c[C::ViewsOther as usize],
+        c[C::ViewsNs as usize] / 1e6,
+        c[C::ViewsHit as usize],
+        c[C::ViewsMiss as usize],
         c[C::NoteNs as usize] / 1e6,
         c[C::GpuWrites as usize],
         c[C::BackSubmissions as usize],

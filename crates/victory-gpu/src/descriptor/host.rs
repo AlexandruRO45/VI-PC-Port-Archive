@@ -1844,9 +1844,122 @@ fn twin_uav(
     Some(desc)
 }
 
-/// Makes the host descriptor for `view` at `at`: the host resource it
-/// views, or `None` if it cannot.
+/// Makes the host descriptor for `view` at `at`, and says what that cost
+/// (`VICTORY_COPY_MODE`'s line, diagnostics builds): a descriptor the driver
+/// makes per call is the expensive half of a draw's table work, and which
+/// kind of view it is decides what can be cached.
 fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
+    #[cfg(feature = "diagnostics")]
+    let started = std::time::Instant::now();
+    let made = match cached(view, at) {
+        Some(keeps) => Some(keeps),
+        None => {
+            let keeps = make_view(view, at);
+            if let Some(what) = &keeps {
+                remember(view, at, what);
+            }
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::ViewsMiss, 1);
+            keeps
+        }
+    };
+    #[cfg(feature = "diagnostics")]
+    {
+        use crate::copystat::{add, C};
+        add(
+            match view {
+                View::Constant(..) => C::ViewsCbv,
+                View::Shader(..) => C::ViewsSrv,
+                View::Unordered(..) => C::ViewsUav,
+                View::Sampler(..) | View::ConsoleSampler(..) => C::ViewsSampler,
+                _ => C::ViewsOther,
+            },
+            1,
+        );
+        add(C::ViewsNs, started.elapsed().as_nanos() as u64);
+    }
+    made
+}
+
+/// A descriptor the driver made, as the bytes it wrote and what the slot
+/// shows, so the same view again is a 32-byte copy.
+struct Made {
+    bytes: [u8; 32],
+    keeps: Kept,
+}
+
+/// Descriptors made this frame, by what they view.
+///
+/// A descriptor is 32 opaque bytes the driver wrote for a view, and copying
+/// those bytes into another slot is what `CopyDescriptorsSimple` does
+/// between heaps: for the same view at another slot, it is the same
+/// descriptor. The map is cleared every frame, so a resource freed and
+/// another made at its address cannot be shown by a stale entry, and the
+/// entry holds what its slot shows (`Kept`), so a hit keeps the resource
+/// alive exactly as a miss does.
+static MADE: Mutex<Option<(u64, std::collections::HashMap<View, Made>)>> = Mutex::new(None);
+
+/// Above this many entries the frame's map is dropped rather than grown.
+const MADE_MOST: usize = 1 << 16;
+
+/// `VICTORY_VIEW_CACHE=0`: make every descriptor with the driver, as before
+/// this cache existed.
+fn view_cache() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("VICTORY_VIEW_CACHE")
+            .is_none_or(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
+    })
+}
+
+/// The descriptor for `view` if this frame already made one, written into
+/// `at`.
+fn cached(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
+    if !view_cache() {
+        return None;
+    }
+    let frame = crate::frame::current();
+    let mut made = MADE.lock().unwrap_or_else(|e| e.into_inner());
+    let (for_frame, map) = made.get_or_insert_with(|| (frame, std::collections::HashMap::new()));
+    if *for_frame != frame {
+        map.clear();
+        *for_frame = frame;
+    }
+    let hit = map.get(view)?;
+    // SAFETY: `at` is a slot of a shader-visible heap (the caller makes the
+    // descriptor there) and `bytes` is what the driver wrote for this same
+    // view in another slot of one; a descriptor is these 32 bytes.
+    unsafe {
+        std::ptr::copy_nonoverlapping(hit.bytes.as_ptr(), at.ptr as *mut u8, 32);
+    }
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(crate::copystat::C::ViewsHit, 1);
+    Some(hit.keeps.clone())
+}
+
+/// Keeps what `make_view` wrote at `at` for this frame's later draws.
+fn remember(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE, keeps: &Kept) {
+    if !view_cache() {
+        return;
+    }
+    let frame = crate::frame::current();
+    let mut made = MADE.lock().unwrap_or_else(|e| e.into_inner());
+    let (for_frame, map) = made.get_or_insert_with(|| (frame, std::collections::HashMap::new()));
+    if *for_frame != frame || map.len() >= MADE_MOST {
+        map.clear();
+        *for_frame = frame;
+    }
+    let mut bytes = [0u8; 32];
+    // SAFETY: the slot `make_view` just wrote, read back as the bytes it
+    // holds.
+    unsafe {
+        std::ptr::copy_nonoverlapping(at.ptr as *const u8, bytes.as_mut_ptr(), 32);
+    }
+    map.insert(view.clone(), Made { bytes, keeps: keeps.clone() });
+}
+
+/// The descriptor itself.
+fn make_view(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
     let host = host()?;
     let device = &host.device;
     match view {
