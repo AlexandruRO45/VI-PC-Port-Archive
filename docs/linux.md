@@ -6,8 +6,9 @@ platform. These notes are what has worked for testers.
 
 ## Setup
 
-- A Proton build with vkd3d-proton (tested: proton-cachyos 11.0,
-  vkd3d-proton 3.2.0; GE-Proton 11 is reported to work too). Run
+- A Proton build with vkd3d-proton (tested: proton-cachyos 11.0 with the
+  vkd3d-proton it ships, which reports itself as 3.2.0, build `2576c0b4`;
+  GE-Proton 11 is reported to work too). Run
   `victory.exe` with `proton runinprefix` in a prefix of its own.
 - Use the native Direct3D 12 DLLs:
   `WINEDLLOVERRIDES="d3d12,d3d12core,dxgi=n,b"`, with vkd3d-proton's
