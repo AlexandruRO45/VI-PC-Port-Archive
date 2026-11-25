@@ -6,6 +6,12 @@ use std::sync::OnceLock;
 
 use windows::Win32::Foundation::RECT;
 
+/// Maximum rectangles passed to a single `ClearRenderTargetView` call.
+/// NVIDIA's D3D12 driver (`nvwgf2umx.dll`) terminates with `0xc0000409`
+/// (`STATUS_STACK_BUFFER_OVERRUN`) when a single call passes 64 or more
+/// rectangles (a typical readout like `"30.0 FPS  33 MS"` emits ~98).
+pub(crate) const MAX_CLEAR_RECTS: usize = 16;
+
 /// Whether the readout is drawn.
 pub(crate) fn on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
@@ -88,5 +94,78 @@ mod tests {
         );
         assert!(rects(" ", (0, 0), 4).is_empty());
         assert_eq!(size("12 FPS"), (37, 9));
+    }
+
+    /// Verifies that recording typical readout strings in `MAX_CLEAR_RECTS`
+    /// chunks succeeds on the host D3D12 device without triggering driver
+    /// limits (e.g. NVIDIA `nvwgf2umx.dll` `0xc0000409` on >= 64 rects).
+    #[test]
+    fn clear_readout_rects_in_chunks_succeeds_on_host() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::*;
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 1920,
+            Height: 1080,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+            ..Default::default()
+        };
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT,
+            ..Default::default()
+        };
+        let mut rt: Option<ID3D12Resource> = None;
+        // SAFETY: plain render-target resource creation on the host device.
+        unsafe {
+            host.device
+                .CreateCommittedResource(
+                    &heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &desc,
+                    D3D12_RESOURCE_STATE_RENDER_TARGET,
+                    None,
+                    &mut rt,
+                )
+                .expect("create render target");
+        }
+        let rt = rt.unwrap();
+        // SAFETY: plain 1-slot RTV heap and RTV on the host device.
+        let rtv: ID3D12DescriptorHeap = unsafe {
+            host.device
+                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
+                    NumDescriptors: 1,
+                    ..Default::default()
+                })
+                .expect("create RTV heap")
+        };
+        // SAFETY: `rt` is a live render target and `rtv` has 1 slot.
+        let view = unsafe { rtv.GetCPUDescriptorHandleForHeapStart() };
+        // SAFETY: `rt` matches the RTV heap.
+        unsafe { host.device.CreateRenderTargetView(&rt, None, view) };
+
+        let list = host.new_list().expect("new list");
+        for text in ["30.0 FPS  33 MS", "230.0 FPS  4 MS", "888.8 FPS  888 MS"] {
+            let marks = rects(text, (15, 15), 5);
+            assert!(marks.len() >= 64);
+            for chunk in marks.chunks(MAX_CLEAR_RECTS) {
+                // SAFETY: open list, live RTV, rectangles inside 1920x1080.
+                unsafe {
+                    list.list
+                        .ClearRenderTargetView(view, &[1.0, 0.9, 0.1, 1.0], Some(chunk));
+                }
+            }
+        }
+        list.close();
+        host.execute(&[&list]);
+        // SAFETY: plain query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     }
 }
