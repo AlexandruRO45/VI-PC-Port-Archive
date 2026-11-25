@@ -41,7 +41,58 @@ static DIR: OnceLock<PathBuf> = OnceLock::new();
 
 /// Keeps the pipeline library and the early list in `dir` from now on.
 pub fn use_pipeline_cache(dir: PathBuf) {
+    sweep_staging_files(&dir, std::process::id(), STAGING_STALE_AFTER);
     let _ = DIR.set(dir);
+}
+
+/// How old another process's staging file must be before it is removed: the
+/// cache folder is shared and nothing stops two runs from using it at once.
+const STAGING_STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// The pid in `name`, if it is `<file>.tmp-<pid>-<n>` of one of the cache's
+/// files. Digits are ASCII and not empty.
+fn staging_pid(name: &str) -> Option<u32> {
+    let rest = [LIBRARY_FILE, EARLY_FILE]
+        .iter()
+        .find_map(|f| name.strip_prefix(f)?.strip_prefix(".tmp-"))?;
+    let (pid, n) = rest.split_once('-')?;
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    if digits(pid) && digits(n) {
+        pid.parse().ok()
+    } else {
+        None
+    }
+}
+
+/// Removes the staging files a cut write left in `dir` (`write_atomically`):
+/// those of process `own` at once, those of others once `stale_after` old.
+/// Only regular files are touched; a file whose age is not known is kept.
+fn sweep_staging_files(dir: &std::path::Path, own: u32, stale_after: std::time::Duration) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let now = std::time::SystemTime::now();
+    for entry in entries.flatten() {
+        let Some(pid) = entry.file_name().to_str().and_then(staging_pid) else {
+            continue;
+        };
+        let path = entry.path();
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if !meta.file_type().is_file() {
+            continue;
+        }
+        let stale = pid == own
+            || meta
+                .modified()
+                .ok()
+                .and_then(|m| now.duration_since(m).ok())
+                .is_some_and(|age| age >= stale_after);
+        if stale {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
 }
 
 /// Host pipelines created, loaded from the library, and title pipelines
@@ -444,6 +495,98 @@ pub(crate) fn note_used(key: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn touch(dir: &std::path::Path, name: &str, age: std::time::Duration) {
+        let file = std::fs::File::create(dir.join(name)).unwrap();
+        file.set_modified(std::time::SystemTime::now() - age).unwrap();
+    }
+
+    #[test]
+    fn staging_names_are_strict() {
+        assert_eq!(staging_pid("host-pipelines.bin.tmp-12-3"), Some(12));
+        assert_eq!(staging_pid("early-pipelines.txt.tmp-7-0"), Some(7));
+        for bad in [
+            "host-pipelines.bin",
+            "early-pipelines.txt",
+            "prebuilt-pipelines.txt.tmp-1-2",
+            "host-pipelines.bin.tmp-foo-1",
+            "host-pipelines.bin.tmp-1-",
+            "host-pipelines.bin.tmp--1",
+            "host-pipelines.bin.tmp-1-2-3",
+            "host-pipelines.bin.tmp-+1-2",
+            "host-pipelines.bin.tmp-1-2x",
+            "host-pipelines.bin.tmp-\u{661}-2",
+            "xhost-pipelines.bin.tmp-1-2",
+        ] {
+            assert_eq!(staging_pid(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn sweep_removes_own_and_stale_staging_files_only() {
+        use std::time::Duration;
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        let old = Duration::from_secs(3600);
+        let fresh = Duration::from_secs(5);
+        touch(d, "host-pipelines.bin.tmp-100-0", fresh); // own: removed
+        touch(d, "early-pipelines.txt.tmp-100-1", fresh); // own: removed
+        touch(d, "host-pipelines.bin.tmp-200-0", fresh); // other, fresh: kept
+        touch(d, "early-pipelines.txt.tmp-200-1", old); // other, stale: removed
+        touch(d, "host-pipelines.bin.tmp-300-0", old); // other, stale: removed
+        touch(d, "host-pipelines.bin", old);
+        touch(d, "early-pipelines.txt", old);
+        touch(d, "host-pipelines.bin.tmp-foo-1", old);
+        touch(d, "host-pipelines.bin.tmp-100", old);
+        // A directory with a matching name stays, with what is in it.
+        std::fs::create_dir(d.join("host-pipelines.bin.tmp-100-9")).unwrap();
+        touch(&d.join("host-pipelines.bin.tmp-100-9"), "x", old);
+        // A future mtime counts as an unknown age: kept.
+        let future = std::fs::File::create(d.join("host-pipelines.bin.tmp-400-0")).unwrap();
+        future
+            .set_modified(std::time::SystemTime::now() + Duration::from_secs(3600))
+            .unwrap();
+        drop(future);
+
+        sweep_staging_files(d, 100, Duration::from_secs(600));
+
+        let mut left: Vec<String> = std::fs::read_dir(d)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            [
+                "early-pipelines.txt",
+                "host-pipelines.bin",
+                "host-pipelines.bin.tmp-100",
+                "host-pipelines.bin.tmp-100-9",
+                "host-pipelines.bin.tmp-200-0",
+                "host-pipelines.bin.tmp-400-0",
+                "host-pipelines.bin.tmp-foo-1",
+            ]
+        );
+        assert!(d.join("host-pipelines.bin.tmp-100-9").join("x").exists());
+    }
+
+    #[test]
+    fn sweep_in_a_missing_folder_does_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        sweep_staging_files(&dir.path().join("none"), 1, std::time::Duration::ZERO);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sweep_leaves_symlinks_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        std::fs::write(&target, b"x").unwrap();
+        let link = dir.path().join("host-pipelines.bin.tmp-100-0");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        sweep_staging_files(dir.path(), 100, std::time::Duration::ZERO);
+        assert!(link.symlink_metadata().is_ok() && target.exists());
+    }
 
     #[test]
     fn names_change_with_what_goes_into_the_pipeline() {
