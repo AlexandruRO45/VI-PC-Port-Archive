@@ -1740,6 +1740,99 @@ mod tests {
         lanes_max: 64,
     };
 
+    /// A wave64 compute program with a sample with implicit derivatives:
+    /// texture at table entry 0, sampler at the second table, the result
+    /// stored to the UAV at entry 2. With `lane_read` it also reads lane 40,
+    /// which on a host without 64-lane waves needs the console flow.
+    fn implicit_sample(lane_read: bool) -> crate::NativeProgram {
+        use crate::native::{ResourceType, RootParam, RootType, UsedResource};
+        let mut words: Vec<u32> = vec![
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xBE86_0301, // s_mov_b32 s6, s1
+            0xBE87_0380, // s_mov_b32 s7, 0
+            0xF40C_0602,
+            0xFA00_0000, // s_load_dwordx8 s[24:31], s[4:5], 0x0
+            0xF408_0203,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[6:7], 0x0
+            0xF408_0A02,
+            0xFA00_0040, // s_load_dwordx4 s[40:43], s[4:5], 0x40
+            0x7E04_0D00, // v_cvt_f32_u32 v2, v0
+            0x7E06_0302, // v_mov_b32 v3, v2
+            0x3420_0082, // v_lshlrev_b32 v16, 2, v0
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        ];
+        if lane_read {
+            words.extend([
+                0xD760_002C,
+                0x0001_5100, // v_readlane_b32 s44, v0, 40
+                0x7E06_022C, // v_mov_b32 v3, s44
+            ]);
+        }
+        words.extend([
+            0xF080_0F08,
+            0x0046_0C02, // image_sample v[12:15], v[2:3], s[24:31], s[8:11] dmask:0xf 2D
+            0xBF8C_3F70, // s_waitcnt vmcnt(0)
+            0xE070_1000,
+            0x800A_0C10, // buffer_store_dword v12, v16, s[40:43], 0 offen
+            0xBF81_0000, // s_endpgm
+        ]);
+        let table = |user_data: u8| RootParam {
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            sgprs: 1,
+            base_register: 0,
+            user_data,
+            slot: user_data,
+        };
+        let range = |kind, table_offset_dwords, dwords, user_data| UsedResource {
+            kind,
+            root: RootType::Table,
+            table_offset_dwords,
+            lower_bound: 0,
+            stride: 0,
+            dwords,
+            user_data,
+            slot: user_data,
+        };
+        crate::NativeProgram {
+            stage: crate::HwStage::Cs,
+            wave64: true,
+            vgprs: 32,
+            layout: vec![table(0), table(1)],
+            used: vec![
+                range(ResourceType::Srv, 0, 8, 0),
+                range(ResourceType::Uav, 16, 4, 0),
+                range(ResourceType::Sampler, 0, 4, 1),
+            ],
+            io: crate::native::StageIo::Cs(crate::native::ComputeIo {
+                rsrc2: 2 << 1,
+                threads: [64, 1, 1],
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        }
+    }
+
+    /// A compute sample with implicit derivatives has no valid DXIL form;
+    /// in the console flow in halves (group barriers in its branches and
+    /// loops) it stops, by name. The per-lane form and a host with 64-lane
+    /// waves are unchanged.
+    #[test]
+    fn implicit_samples_stop_the_console_flow_in_halves() {
+        let why = |r: Result<super::HostShader, crate::ShaderError>| match r {
+            Err(crate::ShaderError::Unsupported { what, .. }) => Some(what),
+            Err(e) => panic!("{e}"),
+            Ok(_) => None,
+        };
+        assert_eq!(
+            why(emit_for(&implicit_sample(true), NVIDIA)),
+            Some(super::lower::IMPLICIT_SAMPLE_IN_HALVES)
+        );
+        assert_eq!(why(emit_for(&implicit_sample(true), RDNA)), None);
+        assert_eq!(why(emit_for(&implicit_sample(false), NVIDIA)), None);
+        assert_eq!(why(emit_for(&implicit_sample(false), RDNA)), None);
+    }
+
     #[test]
     fn console_lanes_translate_only_for_hosts_with_that_wave_size() {
         let words = [
