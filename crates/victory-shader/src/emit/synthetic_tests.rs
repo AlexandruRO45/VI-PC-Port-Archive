@@ -138,6 +138,28 @@ fn lowered(native: &NativeProgram) -> Result<lower::Lowered, crate::ShaderError>
     })
 }
 
+#[test]
+fn compute_implicit_sample_forms_validate_with_explicit_levels() {
+    // Keep the result live through the first UAV store. The input record
+    // supplies the coordinates and, in the extended forms, the LOD clamp.
+    let mut words = program(false);
+    let at = words.iter().position(|&word| word == 0xF110_0108).unwrap();
+    words.drain(at + 2..at + 6);
+    let later_stores = words.iter().position(|&word| word == 0xE078_1010).unwrap();
+    words.drain(later_stores..later_stores + 4);
+    let mut validator = validator::Validator::load(validator::Validator::default_path().as_deref());
+    for (opcode, address) in [(0x20, 13), (0x21, 13), (0x25, 12), (0x26, 12)] {
+        words[at] = 0xF000_0F08 | (opcode << 18);
+        words[at + 1] = 0x0043_0400 | address;
+        let mut shader = build(&words).unwrap_or_else(|e| panic!("opcode {opcode:#x}: {e}"));
+        if let Ok(validator) = &mut validator {
+            validator
+                .validate(&mut shader.dxil)
+                .unwrap_or_else(|e| panic!("opcode {opcode:#x}: {e}"));
+        }
+    }
+}
+
 /// The first texel of a footprint (see `Lower::gather_first`).
 fn first(u: f32, size: u32) -> i64 {
     let u = if u.is_nan() { 0.0 } else { u.clamp(-2.0, 2.0) };

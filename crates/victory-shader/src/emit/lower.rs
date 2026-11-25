@@ -202,8 +202,8 @@ struct Lower<'a> {
     lane_bits: HashMap<Value, V>,
     /// IR phi location by value.
     phi_at: HashMap<Value, (usize, usize)>,
-    mask_phis: HashMap<Value, V>,
-    pending_masks: Vec<(V, usize, usize)>,
+    mask_phis: HashMap<(Value, Value), V>,
+    pending_masks: Vec<(V, usize, (Value, Value))>,
     data_phis: Vec<(V, usize, usize)>,
     read_phis: HashSet<Value>,
     params: HashMap<Value, (usize, u32)>,
@@ -540,7 +540,7 @@ impl<'a> Lower<'a> {
                     x.st.bools
                         .support(g)
                         .iter()
-                        .any(|a| matches!(a, Atom::Opaque(_) | Atom::Constant(_)))
+                        .any(|a| matches!(a, Atom::Opaque(..) | Atom::Constant(_)))
                 })
             };
             let wave = if x.native.wave64 { 64 } else { 32 };
@@ -2520,18 +2520,20 @@ impl<'a> Lower<'a> {
                 }
                 Val::Missing(w) => Err(w),
             },
-            Atom::Phi(id) => {
-                if let Some(&v) = self.mask_phis.get(&id) {
+            Atom::Phi(lo, hi) => {
+                let key = (lo, hi);
+                if let Some(&v) = self.mask_phis.get(&key) {
                     return Ok(v);
                 }
-                let &(b, i) = self
+                let &(b, _) = self
                     .phi_at
-                    .get(&id)
+                    .get(&lo)
+                    .or_else(|| self.phi_at.get(&hi))
                     .ok_or("a lane-mask join without a phi")?;
                 let blk = self.block[b].ok_or("an unreachable join")?;
                 let v = self.s.m.phi(blk, self.s.t.i1);
-                self.mask_phis.insert(id, v);
-                self.pending_masks.push((v, b, i));
+                self.mask_phis.insert(key, v);
+                self.pending_masks.push((v, b, key));
                 Ok(v)
             }
             // shortcut: "some lane of the quad is set" is taken as true: the
@@ -2540,26 +2542,25 @@ impl<'a> Lower<'a> {
             Atom::Quad(_) => Ok(self.s.m.bool(true)),
             // With console lanes, a mask held as a number is the console's:
             // the lane tests its own bit.
-            Atom::Opaque(v) if self.console_lanes => {
-                let hi = match self.pair_high(v) {
-                    Some(h) => Some(self.get(h)?),
-                    None => None,
-                };
-                let lo = self.get(v)?;
+            Atom::Opaque(lo, hi) if self.console_lanes => {
                 let word = |w: Val| match w {
                     Val::I32(x) => Ok(x),
                     _ => Err("an opaque lane mask"),
                 };
-                let lo = word(lo)?;
-                let hi = hi.map(word).transpose()?;
-                Ok(self.lane_bit(at, lo, hi))
+                let low = word(self.get(lo)?)?;
+                let high = if self.x.native.wave64 {
+                    Some(word(self.get(hi)?)?)
+                } else {
+                    None
+                };
+                Ok(self.lane_bit(at, low, high))
             }
             Atom::Constant(k) if self.console_lanes => {
                 let lo = self.s.m.i32(k as u32);
                 let hi = self.s.m.i32((k >> 32) as u32);
                 Ok(self.lane_bit(at, lo, Some(hi)))
             }
-            Atom::Opaque(_) => Err("an opaque lane mask"),
+            Atom::Opaque(..) => Err("an opaque lane mask"),
             Atom::Constant(_) => Err("a constant lane mask"),
         }
     }
@@ -2616,38 +2617,6 @@ impl<'a> Lower<'a> {
         let t = self.s.m.bin(at, Bin::LShr, word, sh);
         let t = self.s.m.bin(at, Bin::And, t, one);
         self.s.m.cmp(at, pred::NE, t, z)
-    }
-
-    /// The value of the high dword of the wave64 register pair whose low
-    /// dword holds `lo` (none in wave32).
-    fn pair_high(&self, lo: Value) -> Option<Value> {
-        if !self.x.native.wave64 {
-            return None;
-        }
-        let p = self.x.p;
-        let pick = |reg: Reg| match reg {
-            Reg::S(c) => Some(Reg::S(c + 1)),
-            _ => None,
-        };
-        if let Some(&(reg, _)) = p.inputs.iter().find(|i| i.1 == lo) {
-            let h = pick(reg)?;
-            return p.inputs.iter().find(|i| i.0 == h).map(|i| i.1);
-        }
-        if let Some(&(b, i)) = self.phi_at.get(&lo) {
-            let h = pick(p.blocks[b].phis[i].reg)?;
-            return p.blocks[b]
-                .phis
-                .iter()
-                .find(|q| q.reg == h)
-                .map(|q| q.value);
-        }
-        let b = *self.def_block.get(&lo)?;
-        let inst = p.blocks[b]
-            .insts
-            .iter()
-            .find(|i| i.writes.iter().any(|w| w.1 == lo))?;
-        let &(reg, _) = inst.writes.iter().find(|w| w.1 == lo)?;
-        inst.write(pick(reg)?)
     }
 
     fn guard(&mut self, b: usize, i: usize) -> Result<Option<V>, Why> {
@@ -7501,12 +7470,16 @@ impl<'a> Lower<'a> {
                     let all = self.lane_edge(q, to);
                     let block = &self.x.p.blocks[to];
                     let n = block.preds.iter().position(|&p| p == q).expect("an edge");
-                    let links: Vec<(Bool, Bool)> = block
-                        .phis
+                    let links: Vec<(Bool, Bool)> = atoms
                         .iter()
-                        .filter(|ph| atoms.contains(&Atom::Phi(ph.value)))
-                        .filter_map(|ph| {
-                            Some((*st.masks.get(&ph.value)?, *st.masks.get(&ph.args[n])?))
+                        .filter_map(|a| {
+                            let Atom::Phi(lo, hi) = *a else { return None };
+                            let &(b, _) = self.phi_at.get(&lo).or_else(|| self.phi_at.get(&hi))?;
+                            if b != to {
+                                return None;
+                            }
+                            let m = st.mask_bits(lo, self.x.p.wave64.then_some(hi))?;
+                            Some((m, st.mask_edges(lo, hi)?[n]))
                         })
                         .collect();
                     (all, to, links)
@@ -7852,6 +7825,14 @@ impl<'a> Lower<'a> {
             "image_sample" | "image_sample_o" => (60, true),
             "image_sample_lz" | "image_sample_l" => (62, true),
             "image_sample_b" => (61, true),
+            "image_sample_cl" | "image_sample_cl_o" if self.x.native.stage == HwStage::Cs => {
+                (60, true)
+            }
+            "image_sample_b_o" | "image_sample_b_cl" | "image_sample_b_cl_o"
+                if self.x.native.stage == HwStage::Cs =>
+            {
+                (61, true)
+            }
             "image_sample_c_lz" => (65, true),
             "image_sample_d" | "image_sample_d_cl" => (63, true),
             "image_get_lod" if self.s.pixel => (81, true),
@@ -7932,8 +7913,7 @@ impl<'a> Lower<'a> {
             // Texel offsets (`_o`) come first: x in bits 0-5, y in 8-13,
             // signed (programmable offsets: gathers only).
             let offset_word = name.ends_with("_o");
-            let first =
-                usize::from(offset_word) + usize::from(name == "image_sample_b") + usize::from(cmp);
+            let first = usize::from(offset_word) + usize::from(op == 61) + usize::from(cmp);
             // Coordinates the size divides (not the array slice); explicit
             // gradients (x then y) come before the coordinates.
             let spatial = coords - usize::from(kind == 6 || kind == 7);
@@ -8015,7 +7995,7 @@ impl<'a> Lower<'a> {
             let mut args = vec![h, sh];
             args.extend(&cs);
             match op {
-                60 => {
+                60 | 61 => {
                     if offset_word {
                         // DXIL takes immediate offsets in -8..=7; the
                         // console's are 6-bit and may be computed.
@@ -8036,23 +8016,34 @@ impl<'a> Lower<'a> {
                         }
                     }
                     args.extend(&os);
-                    args.push(fu);
-                    self.s
-                        .op(c, "sample.f32", Attr::ReadOnly, self.s.t.res_ret, 60, &args)
-                }
-                61 => {
-                    let bias = addr_val(self, 0)?;
-                    let bias = to_float(self, bias);
-                    args.extend(&os);
-                    args.extend([bias, fu]);
-                    self.s.op(
-                        c,
-                        "sampleBias.f32",
-                        Attr::ReadOnly,
-                        self.s.t.res_ret,
-                        61,
-                        &args,
-                    )
+                    let bias = if op == 61 {
+                        let word = addr_val(self, usize::from(offset_word))?;
+                        Some(to_float(self, word))
+                    } else {
+                        None
+                    };
+                    let (intrinsic, opcode) = if self.x.native.stage == HwStage::Cs {
+                        // The host compute shader has no implicit derivatives.
+                        // Approximate the base mip as zero, keeping the bias
+                        // and the instruction's explicit minimum LOD.
+                        let level = bias.unwrap_or_else(|| self.s.m.f32(0));
+                        let level = if name.ends_with("_cl") || name.ends_with("_cl_o") {
+                            let clamp = addr_val(self, first + coords)?;
+                            let clamp = to_float(self, clamp);
+                            self.binary(35, level, clamp)
+                        } else {
+                            level
+                        };
+                        args.push(level);
+                        ("sampleLevel.f32", 62)
+                    } else if let Some(bias) = bias {
+                        args.extend([bias, fu]);
+                        ("sampleBias.f32", 61)
+                    } else {
+                        args.push(fu);
+                        ("sample.f32", 60)
+                    };
+                    self.s.op(c, intrinsic, Attr::ReadOnly, self.s.t.res_ret, opcode, &args)
                 }
                 63 if kind == 5 => {
                     // A cube's gradients are the face's: ds, dt per step in x,
@@ -9612,11 +9603,13 @@ impl<'a> Lower<'a> {
                 continue;
             }
             let v = match atom {
-                Atom::Lane(v)
-                | Atom::Uniform(v)
-                | Atom::Phi(v)
-                | Atom::Quad(v)
-                | Atom::Opaque(v) => Some(v),
+                Atom::Lane(v) | Atom::Uniform(v) | Atom::Quad(v) => Some(v),
+                Atom::Phi(lo, hi) | Atom::Opaque(lo, hi) => {
+                    if tainted.contains(&lo) || tainted.contains(&hi) {
+                        return true;
+                    }
+                    None
+                }
                 Atom::Constant(_) => None,
             };
             if v.is_some_and(|v| tainted.contains(&v)) {
@@ -9956,6 +9949,26 @@ impl<'a> Lower<'a> {
 
     fn fill_phis(&mut self) -> Result<(), Stop> {
         let p = self.x.p;
+        // A numeric incoming mask can read data phis. Record those reads
+        // before deciding which data-phi edges are live.
+        while let Some((v, b, key)) = self.pending_masks.pop() {
+            let offset = p.blocks[b].offset;
+            let masks = self.x.st.mask_edges(key.0, key.1).ok_or_else(|| {
+                unsupported(offset, "a lane-mask join without incoming pairs")
+            })?;
+            let mut incoming = Vec::new();
+            for (n, &q) in p.blocks[b].preds.iter().enumerate() {
+                let Some(qb) = self.tail[q] else { continue };
+                let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
+                let x = if self.never_taken(q, b) {
+                    self.s.m.bool(false)
+                } else {
+                    self.boolean(masks[n], qb).map_err(|w| unsupported(offset, w))?
+                };
+                incoming.push((x, qb));
+            }
+            self.s.m.set_phi(v, incoming);
+        }
         let live = self.live_edges();
         for (v, b, i) in std::mem::take(&mut self.data_phis) {
             let phi = &p.blocks[b].phis[i];
@@ -10006,22 +10019,6 @@ impl<'a> Lower<'a> {
         }
         for (phi, incoming) in std::mem::take(&mut self.counters).into_values() {
             self.s.m.set_phi(phi, incoming);
-        }
-        while let Some((v, b, i)) = self.pending_masks.pop() {
-            let phi = &p.blocks[b].phis[i];
-            let offset = p.blocks[b].offset;
-            let mut incoming = Vec::new();
-            for (n, &q) in p.blocks[b].preds.iter().enumerate() {
-                let Some(qb) = self.tail[q] else { continue };
-                let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
-                let m =
-                    *self.x.st.masks.get(&phi.args[n]).ok_or_else(|| {
-                        unsupported(offset, "a lane-mask join of an untracked mask")
-                    })?;
-                let x = self.boolean(m, qb).map_err(|w| unsupported(offset, w))?;
-                incoming.push((x, qb));
-            }
-            self.s.m.set_phi(v, incoming);
         }
         Ok(())
     }

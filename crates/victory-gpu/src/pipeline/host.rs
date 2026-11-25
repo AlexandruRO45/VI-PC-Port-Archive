@@ -461,6 +461,7 @@ impl HostPipeline {
             root_blob,
             compute.is_some(),
             mesh.is_some(),
+            compile,
         )
     }
 }
@@ -602,6 +603,7 @@ impl HostPipeline {
         root_blob: Vec<u8>,
         compute: bool,
         mesh: bool,
+        compile: &mut super::make::Compile,
     ) -> Option<Self> {
         let host = host()?;
         let code = |i: usize| {
