@@ -134,6 +134,8 @@ struct Window {
     base: u64,
     records: u32,
     scratch: ID3D12Resource,
+    /// Where in `scratch` the window's first record lies.
+    scratch_at: u64,
 }
 
 /// The most records clamped in one pass ([`windows`]).
@@ -3197,7 +3199,7 @@ impl State {
             .as_ref()
             .filter(|w| same(w) && offset >= w.base)
             .filter(|w| (offset - w.base) % u64::from(w.step) == 0 && (offset - w.base) / u64::from(w.step) < u64::from(w.records))
-            .map(|w| (w.scratch.clone(), offset - w.base, w.step));
+            .map(|w| (w.scratch.clone(), w.scratch_at + (offset - w.base), w.step));
         // A record that misses its window: a slot the list's prelude fills,
         // if the list still gathers ([`gathers`]).
         let gathered = if hit.is_none() && windowed && gathers() {
@@ -3211,7 +3213,8 @@ impl State {
         let (bounded, at) = match (hit, gathered) {
             (Some((scratch, at, step)), _) => {
                 // Diagnostics of windows: the record clamped again and
-                // compared (`crate::indirect::window_check`).
+                // compared (`crate::indirect::window_check`). A window's
+                // records are in the list's ring where there is one.
                 if crate::indirect::window_check()
                     && crate::indirect::check_hit(
                         list,
@@ -3219,6 +3222,7 @@ impl State {
                         (kind, step),
                         &scratch,
                         at,
+                        crate::indirect::ring(),
                     )
                 {
                     self.host_pipeline = 0;
@@ -3239,8 +3243,9 @@ impl State {
                 // submitted, as for a record clamped in the list.
                 args.refresh(list, arguments, len);
                 // Diagnostics of windows, for gathered records too: the
-                // record clamped again here and compared.
-                if crate::indirect::window_check() && crate::indirect::check_hit(list, (&args.buffer, offset), (kind, stride), &scratch, at) {
+                // record clamped again here and compared (its slot is in
+                // its set's scratch buffer, never in the list's ring).
+                if crate::indirect::window_check() && crate::indirect::check_hit(list, (&args.buffer, offset), (kind, stride), &scratch, at, false) {
                     self.host_pipeline = 0;
                     self.host_roots[1] = 0;
                 }
@@ -3297,8 +3302,8 @@ impl State {
                     s.refresh(list, *at, 4);
                 }
                 // Bounded first: the clamp binds a compute pipeline of its
-                // own and copies clamped active records into a scratch
-                // buffer at offset 0.
+                // own and copies clamped active records into room of the
+                // list's ring, or its scratch buffer at offset 0.
                 let count_arg = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
                 // More than the record asked for: a window clamped ahead,
                 // whose unfilled slots must not spend the list's budget.
@@ -3307,7 +3312,7 @@ impl State {
                 } else {
                     crate::indirect::bound(list, (&args.buffer, offset), count_arg, (kind, step, records))
                 };
-                let Some(bounded) = bounded else {
+                let Some((bounded, bounded_at)) = bounded else {
                     self.window = None;
                     why("not bounded (no clamp, or arguments not 4-byte aligned)");
                     return false;
@@ -3347,8 +3352,9 @@ impl State {
                     base: offset,
                     records,
                     scratch: bounded.clone(),
+                    scratch_at: bounded_at,
                 });
-                (bounded, 0)
+                (bounded, bounded_at)
             }
         };
         #[cfg(feature = "diagnostics")]
