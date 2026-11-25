@@ -192,6 +192,9 @@ static AT_WORK: Mutex<Vec<(u32, Arc<Pending>)>> = Mutex::new(Vec::new());
 fn worker(i: usize, screen: bool) {
     let spawned = std::thread::Builder::new()
         .name(format!("victory-pipelines-{i}"))
+        // The emitter lowers recursively; the title's world shaders are
+        // deep enough to overflow the default 2 MiB thread stack.
+        .stack_size(16 << 20)
         .spawn(move || {
             // Below the title's own threads (loading, recording).
             // SAFETY: a plain call on our own thread.
