@@ -351,12 +351,12 @@ mod tests {
             super::TEST_SPLIT_LDS.set(Some(false));
             let baseline = crate::emit::translate(&bytes).unwrap();
             assert_eq!(wave_bounds(&baseline.dxil), [64, 64]);
-            assert!(!baseline.dispatch_x_one);
+            assert_eq!(baseline.dispatch_contract, crate::emit::DispatchContract::None);
 
             super::TEST_SPLIT_LDS.set(Some(true));
             let result = crate::emit::translate(&bytes).unwrap();
             if crate::emit::group_sync() == 0 {
-                assert!(!result.dispatch_x_one);
+                assert_eq!(result.dispatch_contract, crate::emit::DispatchContract::None);
                 assert_eq!(result.dxil, baseline.dxil);
                 continue;
             }
@@ -365,7 +365,7 @@ mod tests {
                 [32, 32],
                 "host heap limit {limit}"
             );
-            assert!(result.dispatch_x_one);
+            assert_eq!(result.dispatch_contract, crate::emit::DispatchContract::Visibility);
             #[cfg(windows)]
             {
                 use crate::emit::validator::Validator;

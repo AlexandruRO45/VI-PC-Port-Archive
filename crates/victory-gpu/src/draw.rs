@@ -10,6 +10,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use victory_shader::emit::DispatchContract;
 use victory_shader::resource::RootIndexedView;
 use victory_shader::{ResourceType, RootType, UsedResource};
 
@@ -24,8 +25,12 @@ use crate::host::HostList;
 use crate::object::This;
 use crate::pipeline::host::HostPipeline;
 
-fn dispatch_contract_allows(required: bool, groups: [u32; 3]) -> bool {
-    groups.contains(&0) || !required || groups[0] == 1
+fn dispatch_contract_allows(contract: DispatchContract, groups: [u32; 3]) -> bool {
+    groups.contains(&0) || match contract {
+        DispatchContract::None => true,
+        DispatchContract::Visibility => groups[0] == 1,
+        DispatchContract::Prefilter => groups[2] == 1,
+    }
 }
 
 fn indirect_contract_allows(required: bool, max: u32) -> bool {
@@ -34,7 +39,10 @@ fn indirect_contract_allows(required: bool, max: u32) -> bool {
 
 /// A constrained shader must name at least one CBV, all through fixed table
 /// entries whose descriptor offsets are aligned to a title heap slot.
-fn immutable_cbv_metadata(used: &[UsedResource]) -> bool {
+fn immutable_cbv_metadata(used: &[UsedResource], contract: DispatchContract) -> bool {
+    if contract == DispatchContract::Prefilter && !used.iter().any(|u|
+        u.kind == ResourceType::Cbv && u.root == RootType::Table && u.slot == 1 && u.table_offset_dwords == 72)
+    { return false; }
     let mut found = false;
     for u in used.iter().filter(|u| u.kind == ResourceType::Cbv) {
         found = true;
@@ -47,60 +55,71 @@ fn immutable_cbv_metadata(used: &[UsedResource]) -> bool {
     found
 }
 
-fn valid_immutable_cbv(address: u64, size: u32) -> bool {
-    address != 0 && (16..=65536).contains(&size)
+fn valid_immutable_cbv(address: u64, size: u32, minimum: u32) -> bool {
+    address != 0 && (minimum..=65536).contains(&size)
         && address.checked_add(u64::from(size)).is_some()
         && usize::try_from(address).is_ok()
 }
 
-fn immutable_cbv_tables_complete(used: &[UsedResource], made: &[(u8, u32)]) -> bool {
-    immutable_cbv_metadata(used) && !made.iter().any(|m| m.1 == u32::MAX)
+fn immutable_cbv_tables_complete(used: &[UsedResource], made: &[(u8, u32)], contract: DispatchContract) -> bool {
+    immutable_cbv_metadata(used, contract) && !made.iter().any(|m| m.1 == u32::MAX)
         && used.iter().filter(|u| u.kind == ResourceType::Cbv)
             .all(|u| made.iter().any(|&(slot, _)| slot == u.slot))
 }
 
 #[cfg(test)]
 mod dispatch_contract_tests {
+    use super::*;
     #[test]
-    fn direct_contract_allows_only_one_x_or_empty_work() {
-        assert!(super::dispatch_contract_allows(true, [1, 3, 2]));
-        assert!(!super::dispatch_contract_allows(true, [2, 1, 1]));
-        assert!(super::dispatch_contract_allows(true, [0, 3, 2]));
-        assert!(super::dispatch_contract_allows(true, [2, 0, 1]));
-        assert!(super::dispatch_contract_allows(true, [2, 1, 0]));
-        assert!(super::dispatch_contract_allows(false, [2, 1, 1]));
+    fn direct_contracts_and_noops() {
+        assert!(dispatch_contract_allows(DispatchContract::Visibility, [1, 3, 2]));
+        assert!(!dispatch_contract_allows(DispatchContract::Visibility, [2, 1, 1]));
+        assert!(dispatch_contract_allows(DispatchContract::Prefilter, [2, 3, 1]));
+        assert!(!dispatch_contract_allows(DispatchContract::Prefilter, [1, 1, 2]));
+        assert!(dispatch_contract_allows(DispatchContract::None, [2, 3, 2]));
+        for c in [DispatchContract::Visibility, DispatchContract::Prefilter] {
+            assert!(dispatch_contract_allows(c, [0, 3, 2]));
+            assert!(dispatch_contract_allows(c, [2, 0, 2]));
+            assert!(dispatch_contract_allows(c, [2, 3, 0]));
+        }
+        assert!(!indirect_contract_allows(true, 1));
+        assert!(!indirect_contract_allows(true, u32::MAX));
+        assert!(indirect_contract_allows(true, 0));
+        assert!(indirect_contract_allows(false, 1));
     }
 
     #[test]
-    fn indirect_contract_fails_closed_when_any_records_may_run() {
-        assert!(!super::indirect_contract_allows(true, 1));
-        assert!(!super::indirect_contract_allows(true, u32::MAX));
-        assert!(super::indirect_contract_allows(true, 0));
-        assert!(super::indirect_contract_allows(false, 1));
-    }
-
-    #[test]
-    fn immutable_cbv_requires_valid_table_metadata_and_range() {
-        use victory_shader::{ResourceType, RootType, UsedResource};
+    fn visibility_still_requires_a_fixed_table_cbv() {
         let cbv = UsedResource { kind: ResourceType::Cbv, root: RootType::Table,
-            table_offset_dwords: 96, lower_bound: 0, stride: 0, dwords: 4, user_data: 0, slot: 0 };
-        assert!(!super::immutable_cbv_metadata(&[]));
-        assert!(super::immutable_cbv_metadata(&[cbv]));
-        let mut bad = cbv;
-        bad.root = RootType::Descriptor;
-        assert!(!super::immutable_cbv_metadata(&[bad]));
-        bad = cbv;
-        bad.table_offset_dwords = 97;
-        assert!(!super::immutable_cbv_metadata(&[bad]));
-        assert!(super::valid_immutable_cbv(0x10010, 16));
-        assert!(!super::valid_immutable_cbv(0, 16));
-        assert!(!super::valid_immutable_cbv(0x10000, 15));
-        assert!(!super::valid_immutable_cbv(0x10000, 65537));
-        assert!(!super::valid_immutable_cbv(u64::MAX - 7, 16));
-        assert!(!super::immutable_cbv_tables_complete(&[cbv], &[]));
-        assert!(!super::immutable_cbv_tables_complete(&[], &[]));
-        assert!(!super::immutable_cbv_tables_complete(&[cbv], &[(0, u32::MAX)]));
-        assert!(super::immutable_cbv_tables_complete(&[cbv], &[(0, 64)]));
+            table_offset_dwords: 96, lower_bound: 7, stride: 0, dwords: 4, user_data: 4, slot: 0 };
+        let contract = DispatchContract::Visibility;
+        assert!(!immutable_cbv_metadata(&[], contract));
+        assert!(immutable_cbv_metadata(&[cbv], contract));
+        assert!(!immutable_cbv_metadata(&[UsedResource { root: RootType::Descriptor, ..cbv }], contract));
+        assert!(!immutable_cbv_metadata(&[UsedResource { table_offset_dwords: 97, ..cbv }], contract));
+        assert!(valid_immutable_cbv(0x10010, 16, 16));
+        assert!(!valid_immutable_cbv(0, 16, 16));
+        assert!(!valid_immutable_cbv(0x10000, 15, 16));
+        assert!(!valid_immutable_cbv(0x10000, 65537, 16));
+        assert!(!immutable_cbv_tables_complete(&[cbv], &[(0, u32::MAX)], contract));
+        assert!(immutable_cbv_tables_complete(&[cbv], &[(0, 64)], contract));
+    }
+
+    #[test]
+    fn prefilter_requires_fixed_cbv_and_80_bytes() {
+        let cbv = UsedResource { kind: ResourceType::Cbv, root: RootType::Table,
+            table_offset_dwords: 72, lower_bound: 0, stride: 0, dwords: 4, user_data: 0, slot: 1 };
+        assert!(!immutable_cbv_metadata(&[], DispatchContract::Prefilter));
+        assert!(immutable_cbv_metadata(&[cbv], DispatchContract::Prefilter));
+        let mut bad = cbv; bad.slot = 0;
+        assert!(!immutable_cbv_metadata(&[bad], DispatchContract::Prefilter));
+        bad = cbv; bad.table_offset_dwords = 64;
+        assert!(!immutable_cbv_metadata(&[bad], DispatchContract::Prefilter));
+        assert!(!valid_immutable_cbv(0x10000, 79, 80));
+        assert!(valid_immutable_cbv(0x10000, 80, 80));
+        assert!(!valid_immutable_cbv(u64::MAX - 7, 80, 80));
+        assert!(!immutable_cbv_tables_complete(&[cbv], &[], DispatchContract::Prefilter));
+        assert!(immutable_cbv_tables_complete(&[cbv], &[(1, 64)], DispatchContract::Prefilter));
     }
 }
 
@@ -978,8 +997,9 @@ impl State {
         }
         for stage in &p.stages {
             let t = stage.translated();
-            let strict_cbv = compute && t.host.dispatch_x_one;
-            if strict_cbv && (!immutable_cbv_metadata(&t.used)
+            let contract = if compute { t.host.dispatch_contract } else { DispatchContract::None };
+            let strict_cbv = contract != DispatchContract::None;
+            if strict_cbv && (!immutable_cbv_metadata(&t.used, contract)
                 || stage.user_data.is_none()
                 || !stage.root_cbvs.is_empty()
                 || t.used.iter().filter(|u| u.kind == ResourceType::Cbv).any(|u| {
@@ -991,9 +1011,9 @@ impl State {
                 return false;
             }
             STORES.set(t.stores);
-            let made = self.tables(list, &t.used, &t.host.root_indexed_views, compute, strict_cbv);
+            let made = self.tables(list, &t.used, &t.host.root_indexed_views, compute, contract);
             STORES.set(true);
-            if strict_cbv && !immutable_cbv_tables_complete(&t.used, &made) {
+            if strict_cbv && !immutable_cbv_tables_complete(&t.used, &made, contract) {
                 once!("constrained dispatch dropped: required CBV could not be staged");
                 return false;
             }
@@ -1811,9 +1831,9 @@ impl State {
             once!("a dispatch with a graphics pipeline");
             return;
         }
-        if !dispatch_contract_allows(p.dispatch_x_one(), [x, y, z]) {
+        if !dispatch_contract_allows(p.dispatch_contract(), [x, y, z]) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
-            once!(x, y, z, "dispatch dropped: translated shader requires group count X = 1");
+            once!(x, y, z, contract = ?p.dispatch_contract(), "dispatch dropped: translated shader dispatch contract violated");
             return;
         }
         if !self.bind(list, p, true) {
@@ -1830,10 +1850,16 @@ impl State {
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
         #[cfg(feature = "diagnostics")]
-        if p.dispatch_x_one() {
-            static LOGGED: std::sync::Once = std::sync::Once::new();
-            LOGGED.call_once(|| tracing::info!(x, y, z, pipeline = %p.name,
-                "constrained compute dispatch recorded"));
+        if p.dispatch_contract() != DispatchContract::None {
+            static VISIBILITY_LOGGED: std::sync::Once = std::sync::Once::new();
+            static PREFILTER_LOGGED: std::sync::Once = std::sync::Once::new();
+            let logged = match p.dispatch_contract() {
+                DispatchContract::Visibility => &VISIBILITY_LOGGED,
+                DispatchContract::Prefilter => &PREFILTER_LOGGED,
+                DispatchContract::None => unreachable!(),
+            };
+            logged.call_once(|| tracing::info!(x, y, z, pipeline = %p.name,
+                contract = ?p.dispatch_contract(), "constrained compute dispatch recorded"));
         }
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
     }
@@ -1992,8 +2018,9 @@ impl State {
         used: &[UsedResource],
         indexed: &[RootIndexedView],
         compute: bool,
-        strict_cbv: bool,
+        contract: DispatchContract,
     ) -> Vec<(u8, u32)> {
+        let strict_cbv = contract != DispatchContract::None;
         let tables = |u: &&UsedResource| u.root == RootType::Table;
         let mut fresh: Vec<u8> = used
             .iter()
@@ -2142,7 +2169,7 @@ impl State {
                 };
                 match view {
                     Some(View::Constant(address, size)) => {
-                        if required_cbv && (!valid_immutable_cbv(address, size)
+                        if required_cbv && (!valid_immutable_cbv(address, size, if contract == DispatchContract::Prefilter && slot == 1 && k == 9 { 80 } else { 16 })
                             || !crate::texture::committed(address as *const u8, size as usize))
                         {
                             made.push((slot, u32::MAX));
@@ -2450,9 +2477,9 @@ impl State {
             return false;
         };
         // GPU-produced indirect arguments cannot be certified while recording.
-        if kind == DISPATCH && p.dispatch_x_one() {
+        if kind == DISPATCH && p.dispatch_contract() != DispatchContract::None {
             if !indirect_contract_allows(true, max) {
-                why("translated shader requires group count X = 1; indirect counts are unknown");
+                why("translated shader has a dispatch contract; indirect counts are unknown");
                 return false;
             }
             return true;

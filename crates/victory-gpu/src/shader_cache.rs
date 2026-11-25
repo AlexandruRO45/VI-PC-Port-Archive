@@ -14,7 +14,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use victory_pipeline::{Cache, Converter};
-use victory_shader::emit::{HostShader, StaticSampler, UserData};
+use victory_shader::emit::{DispatchContract, HostShader, StaticSampler, UserData};
 use victory_shader::resource::RootIndexedView;
 use victory_shader::{HwStage, RootType};
 
@@ -73,6 +73,8 @@ fn build() -> &'static [u8; 32] {
                 // executable had cached with the switch unset.
                 for name in [
                     "VICTORY_SPLIT_LDS",
+                    "VICTORY_SPLIT_PREFILTER",
+                    "VICTORY_FIRSTLANE_OWN",
                     "VICTORY_WAVE_WIDE",
                     "VICTORY_WAVE_DEEP_SKIPS",
                     "VICTORY_WAVE_OWN_BITS",
@@ -160,7 +162,7 @@ fn cached(
     (converter.translate)(container)
 }
 
-const MAGIC: &[u8; 4] = b"VSH2";
+const MAGIC: &[u8; 4] = b"VSH3";
 const STAGES: [HwStage; 8] = [
     HwStage::Ls,
     HwStage::Hs,
@@ -202,7 +204,7 @@ fn encode(s: &HostShader) -> Vec<u8> {
     let word = |out: &mut Vec<u8>, v: u32| out.extend(v.to_le_bytes());
     let stage = STAGES.iter().position(|&x| x == s.stage).unwrap_or(0) as u32;
     word(&mut out, stage);
-    word(&mut out, u32::from(s.dispatch_x_one));
+    word(&mut out, match s.dispatch_contract { DispatchContract::None => 0, DispatchContract::Visibility => 1, DispatchContract::Prefilter => 2 });
     word(&mut out, s.dxil.len() as u32);
     out.extend(&s.dxil);
     word(&mut out, s.user_data.len() as u32);
@@ -276,9 +278,10 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         return None;
     }
     let stage = *STAGES.get(r.word()? as usize)?;
-    let dispatch_x_one = match r.word()? {
-        0 => false,
-        1 if stage == HwStage::Cs => true,
+    let dispatch_contract = match r.word()? {
+        0 => DispatchContract::None,
+        1 if stage == HwStage::Cs => DispatchContract::Visibility,
+        2 if stage == HwStage::Cs => DispatchContract::Prefilter,
         _ => return None,
     };
     let dxil = r.list()?;
@@ -327,7 +330,7 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
     }
     r.0.is_empty().then_some(HostShader {
         stage,
-        dispatch_x_one,
+        dispatch_contract,
         dxil,
         user_data,
         samplers,
@@ -347,21 +350,23 @@ mod tests {
     fn cached_shader_preserves_dispatch_contract() {
         let mut compute = shader();
         compute.stage = HwStage::Cs;
-        compute.dispatch_x_one = true;
-        assert!(decode(&encode(&compute)).unwrap().dispatch_x_one);
-        compute.dispatch_x_one = false;
-        assert!(!decode(&encode(&compute)).unwrap().dispatch_x_one);
+        for contract in [DispatchContract::None, DispatchContract::Visibility, DispatchContract::Prefilter] {
+            compute.dispatch_contract = contract;
+            assert_eq!(decode(&encode(&compute)).unwrap().dispatch_contract, contract);
+        }
         compute.stage = HwStage::Ps;
-        compute.dispatch_x_one = true;
-        assert!(decode(&encode(&compute)).is_none());
+        for contract in [DispatchContract::Visibility, DispatchContract::Prefilter] {
+            compute.dispatch_contract = contract;
+            assert!(decode(&encode(&compute)).is_none());
+        }
     }
 
     #[test]
-    fn split_lds_setting_changes_cache_key_material() {
+    fn split_prefilter_setting_changes_cache_key_material() {
         let mut off = Vec::new();
         let mut on = Vec::new();
-        append_switch(&mut off, "VICTORY_SPLIT_LDS", None);
-        append_switch(&mut on, "VICTORY_SPLIT_LDS", Some(std::ffi::OsStr::new("1")));
+        append_switch(&mut off, "VICTORY_SPLIT_PREFILTER", None);
+        append_switch(&mut on, "VICTORY_SPLIT_PREFILTER", Some(std::ffi::OsStr::new("1")));
         assert_ne!(blake3::hash(&off), blake3::hash(&on));
     }
 
@@ -369,7 +374,7 @@ mod tests {
     fn shader() -> HostShader {
         HostShader {
             stage: HwStage::Ps,
-            dispatch_x_one: false,
+            dispatch_contract: DispatchContract::None,
             dxil: b"DXBC and the rest".to_vec(),
             user_data: vec![UserData {
                 index: 8,

@@ -1,21 +1,21 @@
 //! Convergence proof for a split-wave LDS branch candidate. This runs on
 //! the emitted control flow, including the loop caps and predicated loads.
 
-use super::{Bin, Const, Module, Op, Term, TypeDef, V, pred};
+use super::{Attr, Bin, Const, Module, Op, Term, TypeDef, V, pred};
 use std::cell::Cell;
 use std::collections::HashSet;
 
 struct ControlFlow {
     succ: Vec<Vec<usize>>,
     pred: Vec<Vec<usize>>,
+    reachable: Vec<bool>,
     dom: Dominators,
     postdom: Dominators,
 }
 
 impl ControlFlow {
-    fn new(m: &Module) -> Option<Self> {
+    fn new(m: &Module, allow_dead: bool) -> Option<Self> {
         let mut succ = Vec::new();
-        let mut pred = vec![Vec::new(); m.blocks.len()];
         let mut exit = None;
         for (b, block) in m.blocks.iter().enumerate() {
             let next = match block.term? {
@@ -28,13 +28,29 @@ impl ControlFlow {
                 }
                 Term::Ret => return None,
             };
-            for &t in &next {
-                pred[t].push(b);
-            }
             succ.push(next);
         }
         let exit = exit?;
-        if !reaches_every_block(&succ, 0) || !reaches_every_block(&pred, exit) {
+        // The writer omits blocks made unreachable by module optimization.
+        let reachable = reachable_from(&succ, 0);
+        if !allow_dead && reachable.iter().any(|&live| !live) {
+            return None;
+        }
+        let mut pred = vec![Vec::new(); m.blocks.len()];
+        for (b, next) in succ.iter_mut().enumerate() {
+            if !reachable[b] {
+                next.clear();
+            }
+            for &t in next.iter() {
+                pred[t].push(b);
+            }
+        }
+        let reaches_exit = reachable_from(&pred, exit);
+        if reachable
+            .iter()
+            .zip(reaches_exit)
+            .any(|(&live, exits)| live && !exits)
+        {
             return None;
         }
         let dom = Dominators::new(&pred, 0);
@@ -42,6 +58,7 @@ impl ControlFlow {
         Some(Self {
             succ,
             pred,
+            reachable,
             dom,
             postdom,
         })
@@ -92,7 +109,7 @@ impl ControlFlow {
     }
 }
 
-fn reaches_every_block(edges: &[Vec<usize>], root: usize) -> bool {
+fn reachable_from(edges: &[Vec<usize>], root: usize) -> Vec<bool> {
     let mut seen = vec![false; edges.len()];
     let mut pending = vec![root];
     while let Some(b) = pending.pop() {
@@ -101,7 +118,7 @@ fn reaches_every_block(edges: &[Vec<usize>], root: usize) -> bool {
             pending.extend(edges[b].iter().copied());
         }
     }
-    seen.into_iter().all(|s| s)
+    seen
 }
 
 struct Dominators(Vec<Vec<u64>>);
@@ -153,30 +170,120 @@ struct Proof<'a> {
 
 impl Module {
     pub(crate) fn certifies_split_lds(&self, snapshot_slot: Option<u32>) -> bool {
-        let Some(cfg) = ControlFlow::new(self) else {
+        let Some(mut proof) = self.group_proof(snapshot_slot, false) else {
             return false;
         };
+        proof.bound_loops()
+            && proof.align_meetings()
+            && (snapshot_slot.is_none() || proof.snapshot_seen.get())
+    }
+
+    pub(crate) fn certifies_prefilter(&self, gate: V, ready: V, waits: &[V; 11]) -> bool {
+        let Some(mut proof) = self.group_proof(None, true) else {
+            return false;
+        };
+        proof.prefilter_waits(gate, ready, waits) && proof.bound_loops() && proof.align_meetings()
+    }
+
+    fn group_proof(&self, snapshot_slot: Option<u32>, allow_dead: bool) -> Option<Proof<'_>> {
+        let cfg = ControlFlow::new(self, allow_dead)?;
         let mut block_of = vec![usize::MAX; self.insts.len()];
         for (b, block) in self.blocks.iter().enumerate() {
+            if !cfg.reachable[b] {
+                continue;
+            }
             for &i in block.phis.iter().chain(&block.body) {
                 block_of[i as usize] = b;
             }
         }
-        let mut proof = Proof {
+        Some(Proof {
             m: self,
             cfg,
             block_of,
             caps: vec![None; self.blocks.len()],
             snapshot_slot,
             snapshot_seen: Cell::new(false),
-        };
-        proof.bound_loops()
-            && proof.align_meetings()
-            && (snapshot_slot.is_none() || proof.snapshot_seen.get())
+        })
     }
 }
 
 impl Proof<'_> {
+    /// Five pairs of exchange waits, followed by the guest's TGSM and UAV
+    /// barrier. Every admitted group runs all eleven in this order.
+    fn prefilter_waits(&self, gate: V, ready: V, waits: &[V; 11]) -> bool {
+        let mut branches = self
+            .m
+            .blocks
+            .iter()
+            .enumerate()
+            .filter(|(b, _)| self.cfg.reachable[*b])
+            .filter_map(|(b, block)| match block.term {
+                Some(Term::CondBr(v, yes, no)) if v == gate && yes != no => Some((b, yes)),
+                _ => None,
+            });
+        let Some((check, active)) = branches.next() else {
+            return false;
+        };
+        let Some((prepared, sync)) = self.def(ready) else {
+            return false;
+        };
+        if branches.next().is_some()
+            || self.wait_mode(sync) != Some(9)
+            || !self.cfg.dom.has(check, prepared)
+            || !self.cfg.postdom.has(0, prepared)
+            || !self.prefilter_rejected_path(active)
+        {
+            return false;
+        }
+        let mut previous = None;
+        for (i, &wait) in waits.iter().enumerate() {
+            let Some((b, op)) = self.def(wait) else {
+                return false;
+            };
+            let V::Inst(id) = wait else { return false };
+            let Some(at) = self.m.blocks[b].body.iter().position(|&n| n == id) else {
+                return false;
+            };
+            let mode = if i == waits.len() - 1 { 11 } else { 9 };
+            if self.wait_mode(op) != Some(mode)
+                || !self.cfg.dom.has(b, active)
+                || !self.cfg.postdom.has(active, b)
+                || previous
+                    .is_some_and(|(p, prior)| !self.cfg.dom.has(b, p) || b == p && at <= prior)
+            {
+                return false;
+            }
+            previous = Some((b, at));
+        }
+        true
+    }
+
+    // Exiting before the gate may read data and initialize private TGSM.
+    // Nothing outside the admitted path may modify memory visible to callers.
+    fn prefilter_rejected_path(&self, active: usize) -> bool {
+        self.m
+            .blocks
+            .iter()
+            .enumerate()
+            .filter(|(b, _)| self.cfg.reachable[*b] && !self.cfg.dom.has(*b, active))
+            .flat_map(|(_, b)| &b.body)
+            .all(|&i| match &self.m.insts[i as usize].op {
+                op @ Op::Call(f, _) => {
+                    let f = &self.m.funcs[*f as usize];
+                    matches!(f.attr, Some(Attr::ReadNone | Attr::ReadOnly))
+                        || f.name == "dx.op.waveReadLaneFirst.i32"
+                        || self.wait_mode(op) == Some(9)
+                }
+                Op::Store(ptr, _) | Op::AtomicRmw(_, ptr, _) | Op::CmpXchg(ptr, ..) => {
+                    matches!(
+                        self.m.types[self.m.type_of(*ptr).0 as usize],
+                        TypeDef::Ptr(_, 3)
+                    )
+                }
+                _ => true,
+            })
+    }
+
     fn def(&self, v: V) -> Option<(usize, &Op)> {
         let V::Inst(i) = v else { return None };
         let b = self.block_of[i as usize];
@@ -272,11 +379,13 @@ impl Proof<'_> {
             .m
             .blocks
             .iter()
-            .map(|b| {
-                b.body.iter().any(|&i| {
-                    self.wait_mode(&self.m.insts[i as usize].op)
-                        .is_some_and(|mode| mode & 1 != 0)
-                })
+            .enumerate()
+            .map(|(b, block)| {
+                self.cfg.reachable[b]
+                    && block.body.iter().any(|&i| {
+                        self.wait_mode(&self.m.insts[i as usize].op)
+                            .is_some_and(|mode| mode & 1 != 0)
+                    })
             })
             .collect();
         if !checkpoints.iter().any(|&wait| wait) {
@@ -290,6 +399,7 @@ impl Proof<'_> {
             .filter_map(|(b, block)| {
                 if let Some(Term::CondBr(v, t, f)) = block.term
                     && t != f
+                    && self.cfg.reachable[b]
                 {
                     Some((b, v, self.cfg.region(b)))
                 } else {
@@ -462,14 +572,14 @@ mod tests {
         barrier(m, block, 9);
     }
 
-    fn barrier(m: &mut Module, block: usize, mode: u32) {
+    fn barrier(m: &mut Module, block: usize, mode: u32) -> V {
         let void = m.void();
         let i32t = m.int(32);
         let ty = m.func_ty(void, vec![i32t, i32t]);
         let barrier = m.function("dx.op.barrier", ty, Some(Attr::NoDuplicate), false);
         let op = m.i32(80);
         let mode = m.i32(mode);
-        m.call(block, barrier, vec![op, mode]);
+        m.call(block, barrier, vec![op, mode])
     }
 
     #[test]
@@ -479,6 +589,53 @@ mod tests {
         barrier(&mut m, entry, 8);
         m.terminate(entry, Term::Ret);
         assert!(!m.certifies_split_lds(None));
+    }
+
+    #[test]
+    fn prefilter_requires_a_uniform_gate_before_writes_and_all_witnessed_waits() {
+        for (varying, early_store, native_mode, swap_waits, accepted) in [
+            (false, false, 11, false, true),
+            (true, false, 11, false, false),
+            (false, true, 11, false, false),
+            (false, false, 9, false, false),
+            (false, false, 11, true, false),
+        ] {
+            let mut m = Module::default();
+            let entry = m.new_block();
+            let active = m.new_block();
+            let done = m.new_block();
+            let dead = m.new_block();
+            let i32t = m.int(32);
+            let index = if varying {
+                lane_index(&mut m, entry)
+            } else {
+                let ty = m.func_ty(i32t, vec![i32t, i32t]);
+                let group = m.function("dx.op.groupId.i32", ty, Some(Attr::ReadNone), false);
+                let op = m.i32(94);
+                let axis = m.i32(0);
+                m.call(entry, group, vec![op, axis])
+            };
+            let zero = m.i32(0);
+            let gate = m.cmp(entry, pred::EQ, index, zero);
+            let ready = barrier(&mut m, entry, 9);
+            let void = m.void();
+            let ty = m.func_ty(void, vec![i32t]);
+            let store = m.function("dx.op.textureStore.f32", ty, Some(Attr::NoUnwind), false);
+            let op = m.i32(67);
+            m.call(if early_store { entry } else { active }, store, vec![op]);
+            m.terminate(entry, Term::CondBr(gate, active, done));
+            let mut waits = std::array::from_fn(|i| {
+                barrier(&mut m, active, if i == 10 { native_mode } else { 9 })
+            });
+            if swap_waits {
+                waits.swap(2, 3);
+            }
+            m.terminate(active, Term::Br(done));
+            // The optimizer leaves detached slots that the writer omits.
+            m.terminate(dead, Term::Br(active));
+            m.terminate(done, Term::Ret);
+            assert_eq!(m.certifies_prefilter(gate, ready, &waits), accepted);
+        }
     }
 
     fn lane_index(m: &mut Module, block: usize) -> V {

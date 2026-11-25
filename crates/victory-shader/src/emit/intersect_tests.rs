@@ -179,7 +179,7 @@ fn build(
         mesh_stride: 0,
     })?;
     let shader = HostShader {
-        dispatch_x_one: false,
+        dispatch_contract: crate::emit::DispatchContract::None,
         stage: HwStage::Cs,
         dxil: lowered.dxil,
         user_data: lowered.user_data,

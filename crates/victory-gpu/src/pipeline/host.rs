@@ -311,8 +311,11 @@ pub(crate) struct HostPipeline {
 }
 
 impl HostPipeline {
-    pub(crate) fn dispatch_x_one(&self) -> bool {
-        self.compute && self.stages.iter().any(|s| s.translated().host.dispatch_x_one)
+    pub(crate) fn dispatch_contract(&self) -> victory_shader::emit::DispatchContract {
+        use victory_shader::emit::DispatchContract;
+        if !self.compute { return DispatchContract::None; }
+        self.stages.iter().map(|s| s.translated().host.dispatch_contract)
+            .find(|c| *c != DispatchContract::None).unwrap_or(DispatchContract::None)
     }
 }
 

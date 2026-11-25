@@ -24,6 +24,7 @@ use crate::structure::{Atom, Bool, LaneExit, Structured};
 /// it shares the emitter's state.
 #[path = "intersect.rs"]
 pub(super) mod intersect;
+mod prefilter;
 mod split_lds;
 
 use split_lds::{VISIBILITY_SNAPSHOT_SLOT, lds_snapshot_meetings, split_lds_on, visibility_initializer};
@@ -62,8 +63,7 @@ pub(crate) struct Lowered {
     pub samplers: Vec<[u32; 4]>,
     /// The wave size the shader requires of the host, if any.
     pub wave_size: Option<u32>,
-    /// The shader may only run on a direct dispatch with one group in X.
-    pub dispatch_x_one: bool,
+    pub dispatch_contract: super::DispatchContract,
     /// Heap handles made with a non-uniform index.
     #[cfg(test)]
     pub nonuniform_handles: u32,
@@ -92,6 +92,9 @@ enum Stop {
 }
 
 pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
+    if let Some(lowered) = prefilter::try_lower(parts) {
+        return Ok(lowered);
+    }
     let mut bad = HashMap::new();
     let mut try_snapshot = split_lds_on()
         && host_max_wave() == 32
@@ -100,7 +103,7 @@ pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
         && visibility_initializer(parts);
     loop {
         let prior_needs = NEEDS.with_borrow(Vec::len);
-        let lower = Lower::new(parts, &bad, try_snapshot);
+        let lower = Lower::new(parts, &bad, try_snapshot, false);
         let snapshot = lower.lds_snapshot;
         let result = lower.run();
         if snapshot && result.is_err() {
@@ -267,6 +270,7 @@ struct Lower<'a> {
     lds_meet: Option<(Vec<bool>, Vec<(bool, bool)>)>,
     /// A fixed LDS load used as a group-wide snapshot. The final DXIL must certify its meetings.
     lds_snapshot: bool,
+    prefilter: Option<prefilter::Witness>,
     /// A console wave64 program run as two host waves of 32 that exchange through LDS: the first
     /// of two exchange dwords, whether the group has no upper half (32 threads or fewer), and per
     /// IR block whether every lane runs it (exchanges need both halves there).
@@ -1254,7 +1258,12 @@ fn unsupported(offset: usize, what: Why) -> Stop {
 }
 
 impl<'a> Lower<'a> {
-    fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>, try_snapshot: bool) -> Self {
+    fn new(
+        x: &'a Parts<'a>,
+        bad: &'a HashMap<Value, Why>,
+        try_snapshot: bool,
+        prefilter: bool,
+    ) -> Self {
         let p = x.p;
         let mut phi_at = HashMap::new();
         for (b, block) in p.blocks.iter().enumerate() {
@@ -1559,6 +1568,7 @@ impl<'a> Lower<'a> {
             split_lds,
             lds_meet,
             lds_snapshot,
+            prefilter: prefilter.then(prefilter::Witness::default),
             local: exchange.is_some() && LOCAL_WAVES.get(),
             local_ok: false,
             local_any: LOCAL_ANY.get(),
@@ -2177,6 +2187,10 @@ impl<'a> Lower<'a> {
                 self.counters.insert(b, (phi, Vec::new()));
             }
         }
+        if self.prefilter.is_some() {
+            self.prefilter_counter_init()?;
+            self.block[order[0]] = Some(self.s.entry);
+        }
         self.cur = self.s.entry;
         self.find_sections();
         self.inputs()?;
@@ -2241,9 +2255,23 @@ impl<'a> Lower<'a> {
         let root_uavs = self.s.root_uavs.iter().map(|r| r.0).collect();
         let cmp_samplers = self.s.cmp_samplers;
         let wave_size = self.s.wave_size;
+        let prefilter = self
+            .prefilter
+            .map(|p| {
+                p.certificate()
+                    .filter(|_| wave_size == Some(32))
+                    .ok_or_else(|| unsupported(0, "an incomplete prefilter exchange"))
+            })
+            .transpose()?;
         Ok(Lowered {
             wave_size,
-            dispatch_x_one: self.lds_snapshot,
+            dispatch_contract: if prefilter.is_some() {
+                super::DispatchContract::Prefilter
+            } else if self.lds_snapshot {
+                super::DispatchContract::Visibility
+            } else {
+                super::DispatchContract::None
+            },
             cmp_samplers,
             root_cbvs,
             root_srvs,
@@ -2254,7 +2282,7 @@ impl<'a> Lower<'a> {
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
             dxil: self
                 .s
-                .finish_checked(self.lds_snapshot.then_some(VISIBILITY_SNAPSHOT_SLOT))
+                .finish_checked(self.lds_snapshot.then_some(VISIBILITY_SNAPSHOT_SLOT), prefilter.as_ref())
                 .ok_or_else(|| unsupported(0, "an LDS snapshot without a convergence proof"))?,
             user_data,
             samplers: self.samplers,
@@ -3620,10 +3648,15 @@ impl<'a> Lower<'a> {
         let (e, i32t) = (self.s.entry, self.s.t.i32);
         let lds = self.s.lds();
         let k = self.s.m.i32(slot);
-        let ptr = self.s.m.element(e, lds, k);
         let zero = self.s.m.i32(0);
-        self.s.m.store(e, ptr, zero);
-        self.group_sync(e);
+        if self.prefilter.is_none() {
+            let ptr = self.s.m.element(e, lds, k);
+            self.s.m.store(e, ptr, zero);
+        }
+        let ready = self.group_sync(e);
+        if let Some(proof) = &mut self.prefilter {
+            proof.counter_ready = Some(ready);
+        }
         let lane = self.s.op(e, "waveGetLaneIndex", Attr::ReadOnly, i32t, 111, &[]);
         let first = self.s.m.cmp(e, pred::EQ, lane, zero);
         let k32 = self.s.m.i32(32);
@@ -3672,10 +3705,10 @@ impl<'a> Lower<'a> {
     }
 
     /// A group barrier with an LDS fence in `block`.
-    fn group_sync(&mut self, block: usize) {
+    fn group_sync(&mut self, block: usize) -> V {
         let mode = self.s.m.i32(meeting_mode());
         let void = self.s.t.void;
-        self.s.op(block, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+        self.s.op(block, "barrier", Attr::NoDuplicate, void, 80, &[mode])
     }
 
     /// `exchange`: each host wave gives `mine` (the same in all its lanes) for its half; both get
@@ -4789,12 +4822,21 @@ impl<'a> Lower<'a> {
                 }
                 let mode = self.s.m.i32(mode);
                 let void = self.s.t.void;
-                self.s
+                let barrier = self
+                    .s
                     .op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+                if let Some(proof) = &mut self.prefilter {
+                    proof.native_barrier(offset, barrier);
+                }
                 Ok(())
             }
             Fields::Sopp { .. } => Ok(()),
-            Fields::Smem { .. } => self.smem(inst, (b, i)),
+            Fields::Smem { .. } => self.smem(inst, (b, i)).and_then(|()| {
+                if self.prefilter.is_some() && offset == 0x78 {
+                    self.prefilter_gate(inst)?;
+                }
+                Ok(())
+            }),
             Fields::Valu(_) if name.starts_with("v_interp_") => self.interp(inst, (b, i)),
             Fields::Valu(_) => self.valu(inst, b, i),
             Fields::Vintrp { .. } => self.interp(inst, (b, i)),
@@ -7420,10 +7462,13 @@ impl<'a> Lower<'a> {
                     self.s.m.store(self.cur, ptr, a);
                     self.end_guarded(at, &[]);
                     let c2 = self.cur;
-                    self.group_sync(c2);
+                    let before = self.group_sync(c2);
                     let ptr = self.s.m.element(c2, lds, k);
                     let r = self.s.m.load(c2, ptr);
-                    self.group_sync(c2);
+                    let after = self.group_sync(c2);
+                    if let Some(proof) = &mut self.prefilter {
+                        proof.exchange(inst.machine.offset, before, after);
+                    }
                     return int(self, r);
                 }
                 let r = self.read_lane(a, lane);
@@ -10909,6 +10954,7 @@ impl<'a> Lower<'a> {
                 }
                 Term::CondBr(cond, t, f)
             }
+            LaneExit::End if self.prefilter.is_some() => Term::Br(self.abort_block()),
             LaneExit::End => {
                 if self.s.pixel && !self.exported[b] && !self.has_done_export(b) {
                     // A lane leaving without its final export was killed.

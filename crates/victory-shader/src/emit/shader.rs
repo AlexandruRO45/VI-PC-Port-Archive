@@ -458,11 +458,15 @@ impl Shader {
 
     /// The finished container.
     pub fn finish(self) -> Vec<u8> {
-        self.finish_checked(None)
+        self.finish_checked(None, None)
             .expect("ordinary shader serialization")
     }
 
-    pub(super) fn finish_checked(mut self, snapshot_slot: Option<u32>) -> Option<Vec<u8>> {
+    pub(super) fn finish_checked(
+        mut self,
+        snapshot_slot: Option<u32>,
+        prefilter: Option<&(V, V, [V; 11])>,
+    ) -> Option<Vec<u8>> {
         let ud_size = (self.user_data * 4).next_multiple_of(16);
         self.fix_user_data_size(ud_size);
         // The clean-up, before anything is declared about the code: a
@@ -486,6 +490,11 @@ impl Shader {
             }
         }
         if snapshot_slot.is_some() && !self.m.certifies_split_lds(snapshot_slot) {
+            return None;
+        }
+        if prefilter
+            .is_some_and(|(gate, ready, waits)| !self.m.certifies_prefilter(*gate, *ready, waits))
+        {
             return None;
         }
         let mut resources = None;
