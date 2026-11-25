@@ -56,7 +56,7 @@ fn copies_back_what_changed_in_declared_ranges() {
     let ranges = [(100, 2 * PAGE), (PAGE, 3 * PAGE), (6 * PAGE + 8, 64)];
     assert_eq!(shadow.update(start, LEN), LEN);
     for &(at, len) in &ranges {
-        shadow.writing(start + at, len);
+        shadow.writing(start + at, len, false);
     }
     let written = [150, PAGE + 5, 2 * PAGE, 4 * PAGE - 1, 6 * PAGE + 8];
     // SAFETY: inside the mapping and the title's memory.
@@ -85,7 +85,7 @@ fn copies_back_what_changed_in_declared_ranges() {
 }
 
 /// Two pages of title memory and a copy of it.
-fn copy_of(title: &[u8]) -> Option<Shadow> {
+fn copy_of(title: &[u8]) -> Option<std::sync::Arc<Shadow>> {
     let (buffer, data) = host()?.shared_buffer(title.len() as u64)?;
     Some(Shadow::new(
         buffer,
@@ -110,8 +110,8 @@ fn a_dropped_copy_leaves_no_snapshot() {
     let Some(a) = copy_of(&title) else {
         return; // no host GPU here
     };
-    a.writing(title.as_ptr() as usize, 100);
-    a.writing(title.as_ptr() as usize + PAGE, 300);
+    a.writing(title.as_ptr() as usize, 100, false);
+    a.writing(title.as_ptr() as usize + PAGE, 300, false);
     assert_eq!(all_kept(), (2, 400));
     drop(a);
     assert_eq!(all_kept(), (0, 0));
@@ -128,10 +128,10 @@ fn two_copies_keep_their_snapshots_apart() {
     };
     let (at, bt) = (first.as_ptr() as usize, second.as_ptr() as usize);
     assert_eq!(a.update(at, 2 * PAGE) + b.update(bt, 2 * PAGE), 4 * PAGE);
-    a.writing(at, 100);
-    b.writing(bt, 200);
-    a.writing(at + PAGE, 300);
-    b.writing(bt + PAGE, 400);
+    a.writing(at, 100, false);
+    b.writing(bt, 200, false);
+    a.writing(at + PAGE, 300, false);
+    b.writing(bt + PAGE, 400, false);
     assert_eq!(all_kept(), (4, 1000));
     // SAFETY: inside both mappings: what shaders wrote, one byte undeclared.
     unsafe {
