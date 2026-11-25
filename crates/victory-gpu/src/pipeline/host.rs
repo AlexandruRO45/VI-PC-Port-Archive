@@ -209,7 +209,8 @@ impl GraphicsState {
         let mut next = [0u32; 32];
         self.inputs
             .iter()
-            .map(|e| {
+            .enumerate()
+            .map(|(i, e)| {
                 let slot = e.InputSlot.min(31) as usize;
                 let format = e.Format.0 as u32;
                 let bytes = crate::resource::element(format).map_or(0, |(b, _)| b as u32);
@@ -230,6 +231,9 @@ impl GraphicsState {
                     offset,
                     format,
                     per_instance: e.InputSlotClass == D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA,
+                    position: e.SemanticIndex == 0 && self.names.get(i).is_some_and(|name| {
+                        name.to_bytes().eq_ignore_ascii_case(b"POSITION")
+                    }),
                 }
             })
             .collect()
@@ -243,6 +247,7 @@ pub(crate) struct Input {
     pub(crate) offset: u32,
     pub(crate) format: u32,
     pub(crate) per_instance: bool,
+    pub(crate) position: bool,
 }
 
 /// The console's own primitive topology types.
@@ -816,6 +821,12 @@ mod tests {
     /// A different corner order on the color stream corrupts the second triangle.
     #[test]
     fn cpu_rectangle_uses_the_position_corner_order_for_split_vertex_streams() {
+        for color_first in [false, true] {
+            check_split_rectangle(color_first);
+        }
+    }
+
+    fn check_split_rectangle(color_first: bool) {
         use crate::object::{S_OK, This, guid, slot};
         use victory_shader::{HwStage, emit::HostShader};
         use windows::Win32::Foundation::RECT;
@@ -901,15 +912,22 @@ float4 ps(Vertex input) : SV_Target { return input.color; }
         graphics.depth.DepthEnable = false.into();
         graphics.targets.NumRenderTargets = 1;
         graphics.targets.RTFormats[0] = format;
+        graphics.names = vec![c"POSITION".to_owned(), c"COLOR".to_owned()];
+        let color_format = if color_first {
+            DXGI_FORMAT_R32G32_FLOAT
+        } else {
+            DXGI_FORMAT_R8G8B8A8_UNORM
+        };
         graphics.inputs = vec![
             D3D12_INPUT_ELEMENT_DESC {
-                SemanticName: s!("POSITION"),
+                SemanticName: PCSTR(graphics.names[0].as_ptr().cast()),
+                InputSlot: u32::from(color_first),
                 ..element(DXGI_FORMAT_R32G32_FLOAT, 0)
             },
             D3D12_INPUT_ELEMENT_DESC {
-                SemanticName: s!("COLOR"),
-                InputSlot: 1,
-                ..element(DXGI_FORMAT_R8G8B8A8_UNORM, 0)
+                SemanticName: PCSTR(graphics.names[1].as_ptr().cast()),
+                InputSlot: u32::from(!color_first),
+                ..element(color_format, 0)
             },
         ];
         let null = std::ptr::null();
@@ -936,12 +954,21 @@ float4 ps(Vertex input) : SV_Target { return input.color; }
                 [-1.0, -1.0],
                 [1.0, 1.0],
             ]);
-            address(color).cast::<[[u8; 4]; 4]>().write_unaligned([
-                [0; 4],
-                [0, 0, 0, 255],
-                [0, 255, 0, 255],
-                [255, 0, 0, 255],
-            ]);
+            if color_first {
+                address(color).cast::<[[f32; 2]; 4]>().write_unaligned([
+                    [0.0; 2],
+                    [0.0, 0.0],
+                    [1.0, 1.0],
+                    [0.0, 1.0],
+                ]);
+            } else {
+                address(color).cast::<[[u8; 4]; 4]>().write_unaligned([
+                    [0; 4],
+                    [0, 0, 0, 255],
+                    [0, 255, 0, 255],
+                    [255, 0, 0, 255],
+                ]);
+            }
         }
         let allocator_iid = guid(
             0x6102dee4,
@@ -971,7 +998,8 @@ float4 ps(Vertex input) : SV_Target { return input.color; }
             size: u32,
             stride: u32,
         }
-        let views = [
+        let color_stride = if color_first { 8 } else { 4 };
+        let mut views = [
             Vb {
                 address: address(position) as u64,
                 size: 32,
@@ -979,10 +1007,13 @@ float4 ps(Vertex input) : SV_Target { return input.color; }
             },
             Vb {
                 address: address(color) as u64,
-                size: 16,
-                stride: 4,
+                size: color_stride * 4,
+                stride: color_stride,
             },
         ];
+        if color_first {
+            views.swap(0, 1);
+        }
         slot::<extern "system" fn(This, u32, u32, *const Vb)>(guest, 0x180)(
             guest,
             0,
@@ -1101,7 +1132,12 @@ float4 ps(Vertex input) : SV_Target { return input.color; }
         for o in [guest, allocator, pipeline, position, color] {
             assert_eq!(slot::<extern "system" fn(This) -> u32>(o, 0x10)(o), 0);
         }
-        assert_eq!(actual, [[0.25, 0.25, 0.0, 1.0], [0.75, 0.75, 0.0, 1.0]]);
+        let expected = if color_first {
+            [[0.25, 0.5, 0.0, 1.0], [0.75, 1.5, 0.0, 1.0]]
+        } else {
+            [[0.25, 0.25, 0.0, 1.0], [0.75, 0.75, 0.0, 1.0]]
+        };
+        assert_eq!(actual, expected, "color_first={color_first}");
     }
 
     fn element(format: DXGI_FORMAT, offset: u32) -> D3D12_INPUT_ELEMENT_DESC {

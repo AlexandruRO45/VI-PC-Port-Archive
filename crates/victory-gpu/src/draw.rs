@@ -1540,12 +1540,9 @@ impl State {
         let rects = u64::from(count / 3);
         let mut streams = Vec::new();
         for slot in 0..32 {
-            let elements: Vec<(u32, u32)> = p
-                .inputs
-                .iter()
-                .filter(|e| e.slot == slot && !e.per_instance)
-                .map(|e| (e.offset, e.format))
-                .collect();
+            let inputs = p.inputs.iter().filter(|e| e.slot == slot && !e.per_instance);
+            let position = inputs.clone().find(|e| e.position).map(|e| (e.offset, e.format));
+            let elements: Vec<_> = inputs.map(|e| (e.offset, e.format)).collect();
             if elements.is_empty() {
                 continue;
             }
@@ -1564,7 +1561,7 @@ impl State {
                 return false;
             };
             let (from, to, stride) = (from as usize, to as usize, stride as usize);
-            streams.push((from, to, stride, elements));
+            streams.push((from, to, stride, elements, position));
             let view = D3D12_VERTEX_BUFFER_VIEW {
                 BufferLocation: gpu,
                 SizeInBytes: (rects * 6 * stride as u64) as u32,
@@ -1576,13 +1573,25 @@ impl State {
         if !streams.is_empty() {
             let n = rects as usize;
             list.defer_host(move || {
-                let corners = streams.iter().find_map(|(from, _, stride, elements)| {
+                let corners_from = |from: usize, stride, elements: &[(u32, u32)]| {
                     // SAFETY: the source range was checked when recording.
-                    let src = unsafe { std::slice::from_raw_parts(*from as *const u8, n * 3 * stride) };
-                    crate::primitive::rectangle_corners(src, *stride, elements)
-                });
+                    let src = unsafe { std::slice::from_raw_parts(from as *const u8, n * 3 * stride) };
+                    crate::primitive::rectangle_corners(src, stride, elements)
+                };
+                // An explicit POSITION takes priority over the first float
+                // attribute, which might be a color or texture coordinate.
+                let corners = streams
+                    .iter()
+                    .find_map(|(from, _, stride, _, position)| {
+                        corners_from(*from, *stride, std::slice::from_ref(position.as_ref()?))
+                    })
+                    .or_else(|| {
+                        streams.iter().find_map(|(from, _, stride, elements, _)| {
+                            corners_from(*from, *stride, elements)
+                        })
+                    });
                 let corners = corners.as_deref().unwrap_or_default();
-                for (from, to, stride, elements) in &streams {
+                for (from, to, stride, elements, _) in &streams {
                     // SAFETY: the source is in its checked vertex buffer; the
                     // destination is a distinct slice of list-owned scratch.
                     let (src, dst) = unsafe {
