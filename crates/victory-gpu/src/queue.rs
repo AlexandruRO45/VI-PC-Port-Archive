@@ -383,7 +383,14 @@ fn show(shown: Option<object::Ref>, over: Option<object::Ref>) {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(32768)
         });
-        if budget > 0 {
+        static AFTER: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        let after = *AFTER.get_or_init(|| {
+            std::env::var("VICTORY_SCAN_AFTER")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(4000)
+        });
+        if budget > 0 && frame >= after {
             crate::descriptor::scan_hosts(budget);
         }
     }
