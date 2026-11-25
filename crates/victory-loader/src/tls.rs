@@ -10,6 +10,7 @@
 use std::ffi::c_void;
 
 use anyhow::{Result, bail};
+use iced_x86::{Decoder, DecoderOptions, FlowControl};
 use victory_pe::ImageInfo;
 use windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache;
 use windows_sys::Win32::System::Memory::{
@@ -60,7 +61,7 @@ pub(crate) unsafe fn redirect(base: usize, info: &ImageInfo) -> Result<usize> {
         }
         // SAFETY: writable now, and no title code runs yet.
         let code = unsafe { std::slice::from_raw_parts_mut(start as *mut u8, len) };
-        patched += patch(code, start, thunks);
+        patched += patch(code, section.rva, start, thunks, &info.code_ranges);
         // SAFETY: restoring the protection we changed; flushing our own code.
         unsafe {
             VirtualProtect(start as _, len, old, &mut old);
@@ -73,36 +74,109 @@ pub(crate) unsafe fn redirect(base: usize, info: &ImageInfo) -> Result<usize> {
     Ok(patched)
 }
 
-/// Rewrites each `mov r64, gs:[0x58]` in `code` (at address `at`) as
+/// Rewrites each decoded `mov r64, gs:[0x58]` in `code` (at address `at`) as
 /// `call thunks[r]; nop4`. `thunks` must be within 2 GiB of `code`.
-fn patch(code: &mut [u8], at: usize, thunks: usize) -> usize {
-    let mut count = 0;
-    let mut i = 0;
-    while i + LOAD_LEN <= code.len() {
-        let c = &code[i..i + LOAD_LEN];
-        let rex = c[1];
-        let reg = usize::from((c[3] >> 3) & 7) | if rex & 4 != 0 { 8 } else { 0 };
-        // shortcut: a byte match, not a decode. In the title all
-        // 53,246 hits are instruction starts and none is missed (checked
-        // against a full disassembly); decode .text if a title shows one.
-        if c[0] == 0x65
-            && (rex == 0x48 || rex == 0x4C)
-            && c[2] == 0x8B
-            && c[3] & 0xC7 == 0x04
-            && c[4..] == [0x25, 0x58, 0, 0, 0]
-            && reg != 4
-        {
-            let rel = (thunks + reg * THUNK_SIZE) as i64 - (at + i + 5) as i64;
-            code[i] = 0xE8;
-            code[i + 1..i + 5].copy_from_slice(&(rel as i32).to_le_bytes());
-            code[i + 5..i + 9].copy_from_slice(&[0x0F, 0x1F, 0x40, 0x00]);
-            count += 1;
-            i += LOAD_LEN;
-        } else {
-            i += 1;
+fn patch(
+    code: &mut [u8],
+    section_rva: u32,
+    at: usize,
+    thunks: usize,
+    ranges: &[(u32, u32)],
+) -> usize {
+    // Start decoding at function entries from the x64 exception table and
+    // follow direct control flow. This skips data in executable sections and
+    // avoids treating arbitrary byte offsets as instruction boundaries.
+    let mut todo = Vec::new();
+    let mut visited = std::collections::HashSet::new();
+    let mut matches = Vec::new();
+    for &(begin, end) in ranges {
+        let Some(start) = begin.checked_sub(section_rva).map(|v| v as usize) else {
+            continue;
+        };
+        let Some(stop) = end.checked_sub(section_rva).map(|v| v as usize) else {
+            continue;
+        };
+        if start < stop && stop <= code.len() {
+            todo.push((start, start, stop));
         }
     }
-    count
+    while let Some((block, begin, end)) = todo.pop() {
+        if block < begin || block >= end || !visited.insert(block) {
+            continue;
+        }
+        let mut decoder = Decoder::with_ip(64, &code[block..end], (at + block) as u64, DecoderOptions::AMD);
+        while decoder.can_decode() {
+            let instruction = decoder.decode();
+            if instruction.is_invalid() {
+                break;
+            }
+            let Some(offset) = instruction
+                .ip()
+                .checked_sub(at as u64)
+                .and_then(|offset| usize::try_from(offset).ok())
+            else {
+                break;
+            };
+            if instruction.len() == LOAD_LEN
+                && let Some(c) = code.get(offset..offset + LOAD_LEN)
+            {
+                let rex = c[1];
+                let reg = usize::from((c[3] >> 3) & 7) | if rex & 4 != 0 { 8 } else { 0 };
+                if c[0] == 0x65
+                    && (rex == 0x48 || rex == 0x4C)
+                    && c[2] == 0x8B
+                    && c[3] & 0xC7 == 0x04
+                    && c[4..] == [0x25, 0x58, 0, 0, 0]
+                    && reg != 4
+                {
+                    matches.push((offset, reg));
+                }
+            }
+            let next = offset + instruction.len();
+            let target = instruction
+                .near_branch_target()
+                .checked_sub(at as u64)
+                .and_then(|v| usize::try_from(v).ok());
+            match instruction.flow_control() {
+                FlowControl::Next | FlowControl::Call => {
+                    if instruction.flow_control() == FlowControl::Call
+                        && let Some(target) = target
+                        && (begin..end).contains(&target)
+                    {
+                        todo.push((target, begin, end));
+                    }
+                }
+                FlowControl::ConditionalBranch => {
+                    if let Some(target) = target
+                        && (begin..end).contains(&target)
+                    {
+                        todo.push((target, begin, end));
+                    }
+                }
+                FlowControl::UnconditionalBranch => {
+                    if let Some(target) = target
+                        && (begin..end).contains(&target)
+                    {
+                        todo.push((target, begin, end));
+                    }
+                    break;
+                }
+                _ => break,
+            }
+            if next >= end {
+                break;
+            }
+        }
+    }
+    matches.sort_unstable();
+    matches.dedup();
+    for &(offset, reg) in &matches {
+        let rel = (thunks + reg * THUNK_SIZE) as i64 - (at + offset + 5) as i64;
+        code[offset] = 0xE8;
+        code[offset + 1..offset + 5].copy_from_slice(&(rel as i32).to_le_bytes());
+        code[offset + 5..offset + 9].copy_from_slice(&[0x0F, 0x1F, 0x40, 0x00]);
+    }
+    matches.len()
 }
 
 /// Fills `block` with one thunk per register: `mov r, gs:[0x58];
@@ -205,7 +279,7 @@ mod tests {
             // SAFETY: the page is ours and writable.
             let bytes = unsafe { std::slice::from_raw_parts_mut(page, code.len()) };
             bytes.copy_from_slice(&code);
-            assert_eq!(patch(bytes, page as usize, thunks), 1);
+            assert_eq!(patch(bytes, 0, page as usize, thunks, &[(0, code.len() as u32)]), 1);
             let mut old = 0;
             // SAFETY: our page, made executable to run the patched code.
             unsafe { VirtualProtect(page as _, 4096, PAGE_EXECUTE_READ, &mut old) };
@@ -216,4 +290,5 @@ mod tests {
             unsafe { VirtualProtect(page as _, 4096, PAGE_READWRITE, &mut old) };
         }
     }
+
 }
