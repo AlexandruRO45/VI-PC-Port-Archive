@@ -1394,7 +1394,23 @@ extern "system" fn wait64(this: This, address: u64, cmp: u32, reference: u64, fl
     wait_memory(this, address, cmp, reference, flags, 8);
 }
 
+#[cfg(windows)]
+fn wait_value_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        let enabled = std::env::var_os("VICTORY_WAIT_VALUE").as_deref() != Some(std::ffi::OsStr::new("0"));
+        if !enabled {
+            tracing::info!("list memory waits disabled by VICTORY_WAIT_VALUE=0");
+        }
+        enabled
+    })
+}
+
 fn wait_memory(this: This, address: u64, cmp: u32, value: u64, flags: u32, width: u8) {
+    #[cfg(windows)]
+    if !wait_value_enabled() {
+        return;
+    }
     if cmp == 8 {
         return; // ALWAYS
     }
@@ -1609,7 +1625,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn memory_wait_slots_record_width_and_survive_reset_of_pending_list() {
+    fn memory_wait_slots_follow_policy_and_survive_reset_of_pending_list() {
         let null = std::ptr::null();
         let mut allocator = null;
         let mut list = null;
@@ -1632,9 +1648,14 @@ mod tests {
             assert!(!std::sync::Arc::ptr_eq(&old, &fresh));
             assert!(fresh.gates().is_empty());
             let gates = old.gates();
-            assert_eq!(gates.len(), 2);
-            assert_eq!((gates[0].0, gates[0].1, gates[0].2, gates[0].3), (at as usize, 3, 17, 4));
-            assert_eq!((gates[1].0, gates[1].1, gates[1].2, gates[1].3), (at as usize + 8, 7, 0x1_0000_0019, 8));
+            // Run this test both with the default and VICTORY_WAIT_VALUE=0.
+            if std::env::var("VICTORY_WAIT_VALUE").as_deref() == Ok("0") {
+                assert!(gates.is_empty(), "opt-out must not record either slot");
+            } else {
+                assert_eq!(gates.len(), 2);
+                assert_eq!((gates[0].0, gates[0].1, gates[0].2, gates[0].3), (at as usize, 3, 17, 4));
+                assert_eq!((gates[1].0, gates[1].1, gates[1].2, gates[1].3), (at as usize + 8, 7, 0x1_0000_0019, 8));
+            }
             assert_eq!(crate::fence::read_cell(at as usize, 4), Some(0));
         }
         assert_eq!(list_release(list), 0);
