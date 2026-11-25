@@ -301,11 +301,17 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
+/// Held by a save from start to end.
+static SAVING: Mutex<()> = Mutex::new(());
+
 /// Writes the library and the early list if pipelines were added since the
 /// last save and `SAVE_EVERY` has passed (or `now`).
 pub(crate) fn save(now: bool) {
     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
     const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
+    // One save at a time, from serialising to the last file: an older blob
+    // never lands over a newer, nor beside another's prebuilt list.
+    let _saving = SAVING.lock().unwrap_or_else(|e| e.into_inner());
     let (Some(dir), Some(library)) = (DIR.get(), library()) else { return };
     {
         let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
@@ -537,6 +543,25 @@ mod tests {
         let again = Used::read(&list.join("\n"));
         assert!(used.now.iter().all(|k| again.before[k] < used.now.len()));
         assert!(again.before[&key(0)] < again.before[&key(1)]);
+    }
+
+    /// A save waits for the one running (the worker's and shutdown's do not
+    /// interleave their files).
+    #[test]
+    fn a_save_waits_for_the_save_running() {
+        let running = SAVING.lock().unwrap();
+        let done = std::sync::Arc::new(AtomicBool::new(false));
+        let second = {
+            let done = done.clone();
+            std::thread::spawn(move || {
+                save(true);
+                done.store(true, Ordering::SeqCst);
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(!done.load(Ordering::SeqCst), "a second save ran under the first");
+        drop(running);
+        second.join().unwrap();
     }
 
     /// The pre-build's list holds only for the library bytes it was
