@@ -568,6 +568,22 @@ mod tests {
     }
 
     #[test]
+    fn the_wait_skip_is_opt_in_because_a_skip_drops_the_draw() {
+        // Do not make this the default: a skipped wait drops the draw, and a
+        // dropped draw is missing geometry — a cutscene rendered black on
+        // 2026-11-24 when every run of the skip was the default (4b2d7bc).
+        // The cheaper frame is a complaint; a black frame is a defect. What
+        // replaces waiting is a pipeline made before the frame asks for it.
+        if std::env::var_os("VICTORY_PIPELINE_WAIT_BY_DURATION").is_some() {
+            return; // the environment decides; this pins the default alone
+        }
+        assert!(
+            !wait_by_duration(),
+            "the wait skip is opt-in: the default waits, and pays for it"
+        );
+    }
+
+    #[test]
     fn draws_promote_early_pipelines_without_claiming_them_twice() {
         let earlier = Arc::new(Pending::new(Vec::new(), None));
         let promoted = Arc::new(Pending::new(Vec::new(), None));
