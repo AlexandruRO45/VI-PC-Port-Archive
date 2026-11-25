@@ -1,5 +1,4 @@
-//! Command queues. Submitted lists run on the host GPU and are waited for,
-//! so fence signals complete at once.
+//! Title command queues share one host GPU queue and its completion order.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -110,7 +109,7 @@ extern "system" fn release(this: This) -> u32 {
     object::release_boxed::<Queue>(this)
 }
 
-/// Runs the lists' host lists and waits for them (decision 0007).
+/// Runs the lists' host lists (decision 0007).
 extern "system" fn execute(_: This, count: u32, lists: *const This) {
     if lists.is_null() {
         return;
@@ -119,6 +118,11 @@ extern "system" fn execute(_: This, count: u32, lists: *const This) {
     if let Some(host) = crate::host::host() {
         // SAFETY: the title passes `count` lists.
         let lists = unsafe { std::slice::from_raw_parts(lists, count as usize) };
+        if crate::host::async_submit_on() {
+            let owned: Vec<_> = lists.iter().filter_map(|&l| crate::list::retain_host_list(l)).collect();
+            host.execute_title(&owned);
+            return;
+        }
         let host_lists: Vec<_> = lists
             .iter()
             .filter_map(|&l| crate::list::host_list(l))
@@ -144,8 +148,7 @@ pub(crate) struct Plane {
 extern "system" fn execute_x(this: This, count: u32, lists: *const This, _token: u64, _flags: u32) {
     execute(this, count, lists);
 }
-/// Signal with sync settings for the top and bottom of the pipe; our
-/// submissions are complete when they return, so it signals at once.
+/// Signal with sync settings for the top and bottom of the pipe.
 extern "system" fn signal2_x(
     this: This,
     fence: This,
@@ -161,11 +164,22 @@ extern "system" fn signal(_: This, fence: This, value: u64) -> HRESULT {
     if fence.is_null() {
         return E_INVALIDARG;
     }
+    #[cfg(windows)]
+    if crate::host::async_submit_on() && let Some(host) = crate::host::host() {
+        host.signal_title(fence, value);
+        return S_OK;
+    }
     crate::fence::signal(fence, value)
 }
-/// Nothing runs on the queue, so waiting for a fence never blocks it.
+/// Drains preceding host work. A wait for a future title signal is still
+/// treated as a no-op because all title queues share one host queue.
 extern "system" fn wait(_: This, fence: This, _value: u64) -> HRESULT {
-    if fence.is_null() { E_INVALIDARG } else { S_OK }
+    if fence.is_null() {
+        return E_INVALIDARG;
+    }
+    #[cfg(windows)]
+    crate::host::drain_async();
+    S_OK
 }
 /// Ticks per second of GPU timestamps (see [`Written::GpuTimestamp`]).
 extern "system" fn timestamp_frequency(_: This, out: *mut u64) -> HRESULT {
@@ -288,6 +302,8 @@ extern "system" fn present(
     plane_parameters: *const Plane,
     _parameters: *const u8,
 ) -> HRESULT {
+    #[cfg(windows)]
+    crate::host::drain_async();
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
     if frame.is_power_of_two() {
         let (draws, dispatches) = crate::list::take_counts();
@@ -408,8 +424,7 @@ const PAGE: u64 = 64 << 10;
 /// pages of a pool (memory the title mapped physical pages into) at the
 /// batches' addresses. Grand Theft Auto VI streams textures into pool pages
 /// and maps them into its tiled heap this way (title+0xf2c470, ranges of
-/// one constant page or of unmapped pages). Done at once: every earlier
-/// submission has run.
+/// one constant page or of unmapped pages). Runs after earlier submissions.
 extern "system" fn copy_page_mappings(
     _: This,
     count: u32,
@@ -424,6 +439,8 @@ extern "system" fn copy_page_mappings(
     if batches.is_null() && count > 0 {
         return E_INVALIDARG;
     }
+    #[cfg(windows)]
+    crate::host::drain_async();
     let batches = (count > 0).then(|| {
         // SAFETY: the title passes `count` batches.
         unsafe { std::slice::from_raw_parts(batches, count as usize) }

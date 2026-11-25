@@ -204,7 +204,7 @@ pub(crate) fn usage_bitmap(list: &crate::host::HostList, heap: usize) -> Option<
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::info!("heap usage feedback in default heap with per-list readback"));
             let data = data as usize;
-            list.defer_after(move || {
+            list.defer_feedback(move || {
                 // A submission can execute one list twice; its final
                 // readback contains both executions, processed once.
                 if pending.swap(false, std::sync::atomic::Ordering::Relaxed) {
@@ -226,7 +226,7 @@ pub(crate) fn usage_bitmap(list: &crate::host::HostList, heap: usize) -> Option<
     let gpu = unsafe { bitmap.GetGPUVirtualAddress() };
     list.keep(&bitmap);
     let data = data as usize;
-    list.defer_after(move || {
+    list.defer_feedback(move || {
         // SAFETY: the bitmap is mapped and the list's run is over.
         let marks = unsafe { std::slice::from_raw_parts_mut(data as *mut u32, words) };
         publish_usage(heap, marks.iter_mut().map(|mark| {
@@ -839,6 +839,12 @@ extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT
     object::answer(DESCRIPTOR_HEAP, iid, found, out)
 }
 extern "system" fn release(this: This) -> u32 {
+    #[cfg(windows)]
+    if matches!(heap(this).desc.kind, 0 | 1) {
+        // Lists hold the native heap, while its backing views and metadata
+        // still belong to this title heap.
+        crate::host::drain_async();
+    }
     object::release_boxed::<Heap>(this)
 }
 extern "system" fn desc(this: This, out: *mut HeapDesc) {

@@ -1,11 +1,8 @@
 //! The host GPU: one D3D12 device and direct queue (decision 0007), and a
 //! window to present on.
-//!
-//! shortcut: every submission is waited for, so CPU and GPU never overlap;
-//! overlap them with per-submission fences once more than clears run.
 
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
@@ -40,10 +37,13 @@ pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
     queue: ID3D12CommandQueue,
     fence: ID3D12Fence,
-    /// Serializes submissions (and VRAM readbacks) on `queue` and `fence`.
-    submitted: Mutex<()>,
+    /// Serializes submissions (and VRAM readbacks) on `queue`, `fence`, and `event`.
+    submitted: Mutex<Submitted>,
     /// The last value signalled on `fence`.
     fence_value: AtomicU64,
+    completion_worker: OnceLock<Option<mpsc::Sender<CompletionWork>>>,
+    /// GPU access to existing shader-visible slots, including their side tables.
+    descriptor_reads: Mutex<u64>,
     event: HANDLE,
     rtvs: ID3D12DescriptorHeap,
     rtv_size: u32,
@@ -70,10 +70,75 @@ pub(crate) struct Host {
 }
 
 // SAFETY: D3D12 devices, queues, fences and descriptor heaps are
-// free-threaded; the event handle is only waited on under `submitted`.
+// free-threaded. The submission lock or its outstanding worker owns the event.
 unsafe impl Send for Host {}
 // SAFETY: as above.
 unsafe impl Sync for Host {}
+
+type CompletionWork = Box<dyn FnOnce() + Send>;
+
+#[derive(Default)]
+struct Submitted {
+    pending: Option<mpsc::Receiver<()>>,
+}
+
+impl Submitted {
+    fn drain(&mut self) {
+        if let Some(done) = self.pending.take() {
+            let start = Instant::now();
+            if done.recv().is_err() {
+                fail(format_args!("host GPU completion worker stopped"));
+            }
+            ASYNC_STATS[2].fetch_add(start.elapsed().as_micros() as u64, Ordering::Relaxed);
+        }
+    }
+
+    fn defer(&mut self, worker: &mpsc::Sender<CompletionWork>, work: impl FnOnce() + Send + 'static) {
+        let (done, pending) = mpsc::channel();
+        if worker.send(Box::new(move || {
+            work();
+            let _ = done.send(());
+        })).is_err() {
+            fail(format_args!("host GPU completion worker stopped"));
+        }
+        // The worker runs in order, so this acknowledgment covers earlier work too.
+        self.pending = Some(pending);
+    }
+
+    fn signal_title(
+        &mut self,
+        worker: Option<&mpsc::Sender<CompletionWork>>,
+        fence: crate::object::This,
+        value: u64,
+    ) {
+        if let Some(worker) = worker && self.pending.is_some() {
+            self.defer(worker, crate::fence::retained_signal(fence, value));
+        } else {
+            crate::fence::publish(fence, value);
+        }
+    }
+}
+
+static ASYNC_STATS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+
+pub(crate) fn async_submit_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| matches!(std::env::var("VICTORY_ASYNC_SUBMIT").as_deref(), Ok("1")))
+}
+
+pub(crate) fn drain_async() {
+    if async_submit_on() && let Some(host) = host() {
+        host.drain();
+    }
+}
+
+pub(crate) fn guard_descriptor_write() -> Option<std::sync::MutexGuard<'static, u64>> {
+    if async_submit_on() {
+        host().map(Host::descriptor_write)
+    } else {
+        None
+    }
+}
 
 /// Time spent in submissions since the last frame-rate line, in
 /// microseconds: preparing them on the CPU (title memory copies, texture
@@ -254,8 +319,10 @@ fn create() -> windows::core::Result<Host> {
             device,
             queue,
             fence,
-            submitted: Mutex::new(()),
+            submitted: Mutex::new(Submitted::default()),
             fence_value: AtomicU64::new(0),
+            completion_worker: OnceLock::new(),
+            descriptor_reads: Mutex::new(0),
             event,
             rtvs,
             rtv_size,
@@ -343,6 +410,146 @@ mod tests {
         host.execute(&[&list]);
         list.reset();
         assert_eq!(list.scratch(512).unwrap(), first);
+        list.close();
+    }
+
+    #[test]
+    fn async_submit_returns_while_the_gpu_is_waiting() {
+        let Some(host) = host() else { return };
+        let list = Arc::new(host.new_list().unwrap());
+        let finished = Arc::new(AtomicBool::new(false));
+        let on_completion = finished.clone();
+        list.defer_feedback(move || on_completion.store(true, Ordering::Release));
+        list.close();
+        // SAFETY: an unsignalled gate for the native D3D12 queue.
+        let gate: ID3D12Fence = unsafe { host.device.CreateFence(0, D3D12_FENCE_FLAG_NONE) }.unwrap();
+        let mut submitted = host.submitted.lock().unwrap();
+        submitted.drain();
+        // SAFETY: valid host queue and test fence, which the helper always opens.
+        unsafe { host.queue.Wait(&gate, 1) }.unwrap();
+        let (open, requested) = mpsc::channel::<()>();
+        let release = std::thread::spawn(move || {
+            // A broken synchronous path still finishes the test.
+            let before_timeout = requested.recv_timeout(Duration::from_secs(3)).is_ok();
+            // SAFETY: the test owns this native fence.
+            unsafe { gate.Signal(1) }.unwrap();
+            before_timeout
+        });
+
+        host.execute_locked(&[&list], Some((host, std::slice::from_ref(&list))), submitted);
+        let in_flight = list.in_flight.load(Ordering::Acquire);
+        let completed_before_gate = finished.load(Ordering::Acquire);
+        let _ = open.send(());
+        let returned_before_timeout = release.join().unwrap();
+        list.wait_for_reuse();
+        host.drain();
+        assert!(returned_before_timeout && in_flight);
+        assert!(!completed_before_gate);
+        assert!(finished.load(Ordering::Acquire));
+        assert!(!list.in_flight.load(Ordering::Acquire));
+        list.reset();
+        list.close();
+    }
+
+    #[test]
+    fn async_submit_finishes_title_readback_and_writes_before_returning() {
+        let Some(host) = host() else { return };
+        let list = Arc::new(host.new_list().unwrap());
+        let readback = Arc::new(AtomicBool::new(false));
+        let publish = readback.clone();
+        list.defer_after(move || publish.store(true, Ordering::Release));
+        let mut title = 0u64;
+        list.defer_write((&raw mut title).cast(), crate::queue::Written::Value(42), 8);
+        list.close();
+        host.execute_title(&[list]);
+        assert_eq!(title, 42);
+        assert!(readback.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn async_submission_publishes_title_fences_in_order_after_the_native_fence() {
+        use crate::object::{self, S_OK, This, slot};
+        let Some(host) = host() else { return };
+        let worker = host.worker().unwrap();
+        // SAFETY: a real fence controlling completion of this worker job.
+        let gate: ID3D12Fence = unsafe { host.device.CreateFence(0, D3D12_FENCE_FLAG_NONE) }.unwrap();
+        let native = gate.clone();
+        let mut submitted = Submitted::default();
+        let mut fence = std::ptr::null();
+        assert_eq!(crate::fence::create(
+            std::ptr::null(), 0, 0, &crate::fence::FENCE_IIDS[0], &mut fence,
+        ), S_OK);
+        // The title can poll this address directly.
+        let address = slot::<extern "system" fn(This) -> u64>(fence, 0x60)(fence);
+        // SAFETY: a reference to the test-owned atomic fence value.
+        let value = unsafe { &*(address as *const AtomicU64) };
+        submitted.defer(worker, move || {
+            // SAFETY: the test signals the gate below.
+            unsafe { native.SetEventOnCompletion(1, HANDLE::default()) }.unwrap();
+        });
+        submitted.signal_title(Some(worker), fence, 3);
+        submitted.signal_title(Some(worker), fence, 5);
+        let before = value.load(Ordering::Acquire);
+        // SAFETY: the test owns this native fence.
+        unsafe { gate.Signal(1) }.unwrap();
+        submitted.drain();
+        assert_eq!(before, 0);
+        assert_eq!(value.load(Ordering::Acquire), 5);
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(fence, 0x10)(fence), 0);
+        let _ = object::S_OK;
+    }
+
+    #[test]
+    fn async_descriptor_write_waits_until_the_in_flight_fence_completes() {
+        let Some(host) = host() else { return };
+        let list = Arc::new(host.new_list().unwrap());
+        list.close();
+        // SAFETY: an unsignalled gate for the native D3D12 queue.
+        let gate: ID3D12Fence = unsafe { host.device.CreateFence(0, D3D12_FENCE_FLAG_NONE) }.unwrap();
+        let mut submitted = host.submitted.lock().unwrap();
+        submitted.drain();
+        // SAFETY: valid host queue and test fence, which this test signals below.
+        unsafe { host.queue.Wait(&gate, 1) }.unwrap();
+        host.execute_locked(&[&list], Some((host, std::slice::from_ref(&list))), submitted);
+
+        let (entered_tx, entered_rx) = mpsc::channel::<()>();
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+        let waiter = std::thread::spawn(move || {
+            let _ = entered_tx.send(());
+            let _guard = host.descriptor_write();
+            let _ = done_tx.send(());
+        });
+        entered_rx.recv().unwrap();
+        assert!(
+            done_rx.recv_timeout(Duration::from_millis(20)).is_err(),
+            "descriptor_write must block while the async submission fence is pending"
+        );
+        // SAFETY: the test owns this native fence.
+        unsafe { gate.Signal(1) }.unwrap();
+        assert!(done_rx.recv_timeout(Duration::from_secs(3)).is_ok());
+        waiter.join().unwrap();
+        host.drain();
+        list.reset();
+        list.close();
+    }
+
+    #[test]
+    fn async_preparation_only_fills_private_uploads_before_the_first_title_write() {
+        let Some(host) = host() else { return };
+        let list = host.new_list().unwrap();
+        let mut source = Box::new(1u8);
+        let next = 2u8;
+        let (_, first) = list.scratch(1).unwrap();
+        let (_, last) = list.scratch(1).unwrap();
+        list.defer_fill(first, &raw const *source, 1);
+        list.defer_copy(&raw mut *source, &raw const next, 1);
+        list.defer_fill(last, &raw const *source, 1);
+        let prefetched = list.fill_prefix();
+        let mut batch = Batch::default();
+        list.run_deferred(&mut batch, prefetched);
+        assert_eq!(prefetched, 1);
+        // SAFETY: both bytes were filled and belong to this list's scratch.
+        assert_eq!(unsafe { (first.read(), last.read()) }, (1, 2));
         list.close();
     }
 
@@ -482,6 +689,7 @@ pub(crate) struct HostList {
     pub(crate) list: ID3D12GraphicsCommandList,
     /// Work for submission time, in recorded order.
     deferred: Mutex<Deferred>,
+    in_flight: AtomicBool,
     /// Upload memory for data the list's draws make (expanded vertices),
     /// reused after a reset.
     scratch: Mutex<Scratch>,
@@ -683,7 +891,7 @@ struct Deferred {
     /// Host objects the list's commands name (pipelines, root signatures,
     /// descriptor heaps): the title may release its objects before it
     /// submits the list.
-    kept: Vec<windows::core::IUnknown>,
+    kept: Vec<KeptHostObject>,
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
@@ -697,11 +905,28 @@ struct Deferred {
     /// Work done once the list has run, before the bottom-of-pipe writes
     /// (title memory shaders wrote at addresses they computed goes back).
     after: Vec<Box<dyn Fn() + Send>>,
+    /// Completion effects the title can observe outside the queue API.
+    must_complete: bool,
     /// Asked once the list has run, before anything goes back: whether its
     /// shaders read title memory with no copy (`crate::memory`); then what
     /// they wrote through views does not go back either.
     missed: Vec<Box<dyn Fn() -> bool + Send>>,
 }
+
+impl Deferred {
+    fn can_overlap(&self) -> bool {
+        !self.must_complete && self.writes.is_empty() && self.missed.is_empty()
+            && !self.copies.iter().any(|s| matches!(s, Step::GpuWrite(..) | Step::Memory(_)))
+    }
+}
+
+struct KeptHostObject {
+    _object: windows::core::IUnknown,
+}
+
+// SAFETY: keep accepts only thread-safe interfaces. Their IUnknown can be
+// released across threads just like the original interface.
+unsafe impl Send for KeptHostObject {}
 
 struct HeapUsageCopy {
     bitmap: ID3D12Resource,
@@ -815,6 +1040,7 @@ impl Host {
                 allocator,
                 list,
                 deferred: Mutex::default(),
+                in_flight: AtomicBool::new(false),
                 scratch: Mutex::default(),
                 states: Mutex::default(),
                 twins: Mutex::default(),
@@ -837,10 +1063,99 @@ impl Host {
 
     /// Runs closed lists and waits for them.
     pub(crate) fn execute(&self, runs: &[&HostList]) {
+        self.execute_lists(runs, None);
+    }
+
+    pub(crate) fn execute_title(&'static self, lists: &[Arc<HostList>]) {
+        let runs: Vec<_> = lists.iter().map(Arc::as_ref).collect();
+        self.execute_lists(&runs, Some((self, lists)));
+    }
+
+    fn worker(&self) -> Option<&mpsc::Sender<CompletionWork>> {
+        self.completion_worker
+            .get_or_init(|| {
+                let (send, receive) = mpsc::channel::<CompletionWork>();
+                match std::thread::Builder::new()
+                    .name("victory-gpu-completion".into())
+                    .spawn(move || {
+                        for work in receive {
+                            work();
+                        }
+                    }) {
+                    Ok(_) => Some(send),
+                    Err(error) => {
+                        tracing::warn!(%error, "GPU completion worker unavailable");
+                        None
+                    }
+                }
+            })
+            .as_ref()
+    }
+
+    pub(crate) fn drain(&self) {
+        self.submitted.lock().unwrap_or_else(|e| e.into_inner()).drain();
+    }
+
+    pub(crate) fn signal_title(&self, fence: crate::object::This, value: u64) {
+        let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        submitted.signal_title(self.completion_worker.get().and_then(Option::as_ref), fence, value);
+    }
+
+    /// Protect existing shader-visible slots and their side tables from a
+    /// recording thread while an asynchronous submission can read them.
+    fn descriptor_write(&self) -> std::sync::MutexGuard<'_, u64> {
+        let mut readers = self.descriptor_reads.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: a plain query. A completed fence needs no event.
+        if *readers > unsafe { self.fence.GetCompletedValue() } {
+            let start = Instant::now();
+            // SAFETY: a null event blocks until this fence value is reached.
+            if let Err(e) = unsafe { self.fence.SetEventOnCompletion(*readers, HANDLE::default()) } {
+                fail(format_args!("host descriptor wait failed ({e})"));
+            }
+            ASYNC_STATS[5].fetch_add(start.elapsed().as_micros() as u64, Ordering::Relaxed);
+        }
+        *readers = 0;
+        readers
+    }
+
+    fn execute_lists(
+        &self,
+        runs: &[&HostList],
+        owned: Option<(&'static Host, &[Arc<HostList>])>,
+    ) {
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
-        #[cfg_attr(not(feature = "diagnostics"), allow(unused_variables))]
         let submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        self.execute_locked(runs, owned, submitted);
+    }
+
+    fn next_fence(&self) -> u64 {
+        self.fence_value.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    fn execute_locked(
+        &self,
+        runs: &[&HostList],
+        owned: Option<(&'static Host, &[Arc<HostList>])>,
+        mut submitted: std::sync::MutexGuard<'_, Submitted>,
+    ) {
+        // A first list's private uploads can be filled while the GPU runs.
+        // The outstanding submission cannot write title bytes. The prefix
+        // ends at the first step that could depend on shared preparation.
+        let (filled, fill_us) = if owned.is_some()
+            && submitted.pending.is_some()
+            && let Some(first) = runs.first()
+            && !first.in_flight.load(Ordering::Acquire)
+        {
+            let start = Instant::now();
+            let filled = first.fill_prefix();
+            let fill_us = if filled == 0 { 0 } else { start.elapsed().as_micros() as u64 };
+            ASYNC_STATS[4].fetch_add(fill_us, Ordering::Relaxed);
+            (filled, fill_us)
+        } else {
+            (0, 0)
+        };
+        submitted.drain();
         let started = std::time::Instant::now();
         let preparing = crate::cpuprof::time(crate::cpuprof::Stage::Prepare);
         #[cfg(feature = "diagnostics")]
@@ -878,7 +1193,7 @@ impl Host {
         drop(uploading);
         let runs: Vec<&HostList> = uploads
             .as_ref()
-            .map(|u| u.list())
+            .map(Arc::as_ref)
             .into_iter()
             .chain(runs.iter().copied())
             .collect();
@@ -909,9 +1224,10 @@ impl Host {
         // Where each run's lists start in `lists`.
         let mut firsts = Vec::with_capacity(runs.len());
         let mut batch = Batch::default();
-        for list in runs {
+        for (i, list) in runs.iter().enumerate() {
+            let filled = if i == usize::from(uploads.is_some()) { filled } else { 0 };
             let deferred = crate::cpuprof::time(crate::cpuprof::Stage::RunDeferred);
-            list.run_deferred(&mut batch);
+            list.run_deferred(&mut batch, filled);
             drop(deferred);
             firsts.push(if firsts.is_empty() && has_reset { 0 } else { lists.len() });
             #[cfg(feature = "diagnostics")]
@@ -929,6 +1245,7 @@ impl Host {
         drop(syncing);
         drop(preparing);
         let prepared = std::time::Instant::now();
+        let preparation_us = (prepared - started).as_micros() as u64 + fill_us;
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::FaultsPrep, crate::copystat::page_faults().saturating_sub(faults));
         // Diagnostics: each list on its own, timed (`VICTORY_GPU_TIMING`).
@@ -958,41 +1275,56 @@ impl Host {
         };
         #[cfg(not(feature = "diagnostics"))]
         let groups = [&lists[..]];
-        let mut removed_in = None;
-        #[cfg(feature = "diagnostics")]
-        let mut profile_complete = true;
-        for (i, group) in groups.iter().enumerate() {
-            let seq = self.fence_value.fetch_add(1, Ordering::Relaxed) + 1;
-            let started = std::time::Instant::now();
+        let serial_diagnostics = {
             #[cfg(feature = "diagnostics")]
-            crate::resource::life::note(0, crate::resource::life::SUBMITTED, seq, 0);
-            // SAFETY: closed lists; the fence and event are ours.
-            unsafe {
-                self.queue.ExecuteCommandLists(group);
-                let waited = self
-                    .queue
-                    .Signal(&self.fence, seq)
-                    .and_then(|()| self.fence.SetEventOnCompletion(seq, self.event));
-                match waited {
-                    Ok(()) => {
-                        let status = WaitForSingleObject(self.event, INFINITE);
-                        #[cfg(feature = "diagnostics")]
-                        {
-                            profile_complete &= status == windows::Win32::Foundation::WAIT_OBJECT_0;
-                        }
-                        let _ = status;
-                    }
-                    Err(e) => {
-                        #[cfg(feature = "diagnostics")]
-                        {
-                            profile_complete = false;
-                        }
-                        tracing::warn!(error = %e, "host submission not waited for");
-                    }
+            { traced || timing() }
+            #[cfg(not(feature = "diagnostics"))]
+            { false }
+        };
+        if let Some((host, owned)) = owned {
+            if !serial_diagnostics
+                && !owned.is_empty()
+                && runs.iter().all(|list| list.deferred().can_overlap())
+                && let Some(worker) = host.worker()
+            {
+                let keep: Vec<_> = uploads.iter().chain(owned).cloned().collect();
+                for list in &keep {
+                    list.in_flight.store(true, Ordering::Release);
                 }
+                let mut readers = self.descriptor_reads.lock().unwrap_or_else(|e| e.into_inner());
+                let value = self.next_fence();
+                if let Err(e) = self.submit(&lists, value) {
+                    fail(format_args!("host GPU submission could not signal its fence ({e})"));
+                }
+                *readers = value;
+                drop(readers);
+                ASYNC_STATS[0].fetch_add(1, Ordering::Relaxed);
+                submitted.defer(worker, move || {
+                    if let Err(e) = host.wait_submission(value) {
+                        fail(format_args!("host GPU submission could not wait for its fence ({e})"));
+                    }
+                    ASYNC_STATS[3].fetch_add(prepared.elapsed().as_micros() as u64, Ordering::Relaxed);
+                    let runs: Vec<_> = keep.iter().map(Arc::as_ref).collect();
+                    host.finish_submission(&runs, preparation_us, prepared, None, true);
+                    for list in &keep {
+                        list.in_flight.store(false, Ordering::Release);
+                    }
+                });
+                return;
             }
-            #[cfg(feature = "diagnostics")]
-            crate::resource::life::note(0, crate::resource::life::RAN, seq, 0);
+            ASYNC_STATS[1].fetch_add(1, Ordering::Relaxed);
+        }
+        let mut removed_in = None;
+        let mut complete = true;
+        for (i, group) in groups.iter().enumerate() {
+            let seq = self.next_fence();
+            let started = std::time::Instant::now();
+            if let Err(e) = self.submit(group, seq)
+                .and_then(|()| self.wait_submission(seq))
+            {
+                complete = false;
+                tracing::warn!(error = %e, "host submission not waited for");
+            }
             #[cfg(feature = "diagnostics")]
             if groups.len() > 1 && started.elapsed() > std::time::Duration::from_millis(50) {
                 // SAFETY: a plain query.
@@ -1010,8 +1342,58 @@ impl Host {
             let _ = (i, started);
         }
         let _ = &firsts;
+        self.finish_submission(runs, preparation_us, prepared, removed_in, complete);
+        // Captures submit their own lists.
+        #[cfg(feature = "diagnostics")]
+        if traced {
+            let sub = self.fence_value.load(Ordering::Relaxed);
+            drop(submitted);
+            let mut targets: Vec<(usize, String)> = Vec::new();
+            for r in runs {
+                for t in r.targets.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+                    if !targets.iter().any(|x| x.0 == t.0) {
+                        targets.push(t.clone());
+                    }
+                }
+            }
+            crate::capture::dump_submission(sub, &targets);
+        }
+    }
+
+    fn submit(&self, group: &[Option<ID3D12CommandList>], value: u64) -> windows::core::Result<()> {
+        #[cfg(feature = "diagnostics")]
+        crate::resource::life::note(0, crate::resource::life::SUBMITTED, value, 0);
+        // SAFETY: closed lists and the host's own fence.
+        unsafe {
+            self.queue.ExecuteCommandLists(group);
+            self.queue.Signal(&self.fence, value)
+        }
+    }
+
+    fn wait_submission(&self, value: u64) -> windows::core::Result<()> {
+        // SAFETY: the submission owns this event until its wait completes.
+        unsafe {
+            self.fence.SetEventOnCompletion(value, self.event)?;
+            let status = WaitForSingleObject(self.event, INFINITE);
+            if status != windows::Win32::Foundation::WAIT_OBJECT_0 {
+                return Err(windows::core::Error::from_thread());
+            }
+        }
+        #[cfg(feature = "diagnostics")]
+        crate::resource::life::note(0, crate::resource::life::RAN, value, 0);
+        Ok(())
+    }
+
+    fn finish_submission(
+        &self,
+        runs: &[&HostList],
+        preparation_us: u64,
+        prepared: Instant,
+        removed_in: Option<usize>,
+        _complete: bool,
+    ) {
         let gpu = prepared.elapsed();
-        SUBMISSION_US[0].fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
+        SUBMISSION_US[0].fetch_add(preparation_us, Ordering::Relaxed);
         SUBMISSION_US[1].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
         // The host resets a device whose submission runs for about 2 s.
         if gpu > std::time::Duration::from_millis(250) {
@@ -1032,7 +1414,7 @@ impl Host {
             ));
         }
         #[cfg(feature = "diagnostics")]
-        if profile_complete && crate::profile::enabled()
+        if _complete && crate::profile::enabled()
             // SAFETY: this submission's fence has completed.
             && let Ok(frequency @ 1..) = unsafe { self.queue.GetTimestampFrequency() }
         {
@@ -1116,25 +1498,9 @@ impl Host {
                 what.write(at as *mut u8, bytes);
             }
         }
-        // The submission has run and the next waits for our lock.
+        // The submission has run, and the next has yet to prepare.
         release_retired();
         self.log_messages();
-        // A listed frame: what this submission's lists drew, as it is now
-        // (the dumps submit lists of their own).
-        #[cfg(feature = "diagnostics")]
-        if traced {
-            let sub = self.fence_value.load(Ordering::Relaxed);
-            drop(submitted);
-            let mut targets: Vec<(usize, String)> = Vec::new();
-            for r in runs {
-                for t in r.targets.lock().unwrap_or_else(|e| e.into_inner()).iter() {
-                    if !targets.iter().any(|x| x.0 == t.0) {
-                        targets.push(t.clone());
-                    }
-                }
-            }
-            crate::capture::dump_submission(sub, &targets);
-        }
     }
 
     /// With `VICTORY_D3D12_DRED`: the faulting address and the allocations
@@ -1960,7 +2326,24 @@ impl HostList {
     /// Runs `work` once the list has run (each submission), before its
     /// bottom-of-pipe writes.
     pub(crate) fn defer_after(&self, work: impl Fn() + Send + 'static) {
+        let mut deferred = self.deferred();
+        deferred.must_complete = true;
+        deferred.after.push(Box::new(work));
+    }
+
+    /// Feeds the next host submission, with no title-memory result.
+    pub(crate) fn defer_feedback(&self, work: impl Fn() + Send + 'static) {
         self.deferred().after.push(Box::new(work));
+    }
+
+    pub(crate) fn require_completion(&self) {
+        self.deferred().must_complete = true;
+    }
+
+    pub(crate) fn wait_for_reuse(&self) {
+        if self.in_flight.load(Ordering::Acquire) && let Some(host) = host() {
+            host.drain();
+        }
     }
 
     /// A GPU-local feedback bitmap and its CPU-readable copy. The queue
@@ -2079,10 +2462,10 @@ impl HostList {
     }
 
     /// Keeps `object` alive until the list is reset.
-    pub(crate) fn keep(&self, object: &impl Interface) {
+    pub(crate) fn keep(&self, object: &(impl Interface + Send + Sync)) {
         crate::cpuprof::count(crate::cpuprof::Count::Kept);
         if let Ok(object) = object.cast::<windows::core::IUnknown>() {
-            self.deferred().kept.push(object);
+            self.deferred().kept.push(KeptHostObject { _object: object });
         }
     }
 
@@ -2110,13 +2493,29 @@ impl HostList {
         self.deferred().copies.push(Step::Texture(staging));
     }
 
-    /// Runs the list's submission-time steps; refreshes go into `batch`
+    fn fill_prefix(&self) -> usize {
+        let deferred = self.deferred();
+        let mut filled = 0;
+        for step in &deferred.copies {
+            let &Step::Fill(dst, src, len) = step else { break };
+            let started = Instant::now();
+            #[cfg(feature = "diagnostics")]
+            let _timed = crate::watch::Timed(started, crate::copystat::C::StepCopyUs);
+            fill_upload(dst, src, len);
+            PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+            PREPARING[1].fetch_add(len as u64, Ordering::Relaxed);
+            filled += 1;
+        }
+        filled
+    }
+
+    /// Runs the list's remaining submission-time steps; refreshes go into `batch`
     /// (the title's big buffers, a 174 MB one among them, are read by most
     /// lists of a submission, through many ranges).
-    fn run_deferred(&self, batch: &mut Batch) {
+    fn run_deferred(&self, batch: &mut Batch, filled: usize) {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
-        for step in &self.deferred().copies {
+        for step in &self.deferred().copies[filled..] {
             let started = std::time::Instant::now();
             crate::cpuprof::count(crate::cpuprof::Count::Steps);
             let _step = crate::cpuprof::time(match step {
@@ -2153,12 +2552,7 @@ impl HostList {
                     len
                 }
                 &Step::Fill(dst, src, len) => {
-                    #[cfg(feature = "diagnostics")]
-                    {
-                        add(C::Copies, 1);
-                        add(C::CopyBytes, len as u64);
-                    }
-                    copy_mapped(dst as *mut u8, src as *const u8, len, false);
+                    fill_upload(dst, src, len);
                     len
                 }
                 Step::Refresh(shadow, address, len) => {
@@ -2210,6 +2604,15 @@ impl HostList {
             PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
         }
     }
+}
+
+fn fill_upload(dst: usize, src: usize, len: usize) {
+    #[cfg(feature = "diagnostics")]
+    {
+        crate::copystat::add(crate::copystat::C::Copies, 1);
+        crate::copystat::add(crate::copystat::C::CopyBytes, len as u64);
+    }
+    copy_mapped(dst as *mut u8, src as *const u8, len, false);
 }
 
 /// A submission's refreshes not done yet, merged per buffer copy into the
@@ -2895,6 +3298,18 @@ impl Meter {
                  {indirect:.0} indirect; {root_views:.0} root-view slots/frame",
                 making = crate::pipeline::making()
             );
+            if async_submit_on() {
+                let [queued, synchronous, drain_us, gpu_us, fill_us, descriptor_us] =
+                    ASYNC_STATS.each_ref().map(|n| n.swap(0, Ordering::Relaxed));
+                tracing::info!(
+                    queued, synchronous,
+                    drain_ms = drain_us as f64 / 1000.0,
+                    async_gpu_ms = gpu_us as f64 / 1000.0,
+                    upload_overlap_ms = fill_us as f64 / 1000.0,
+                    descriptor_wait_ms = descriptor_us as f64 / 1000.0,
+                    "async GPU submissions (last 5 s)"
+                );
+            }
             let (textures, bytes, used, shared, saved, replaced) = crate::resource::texture_counts();
             tracing::info!(
                 "host textures: {textures} ({:.0} MB, {:.0} MB of them used by lists), title textures sharing one {shared} (saving {:.0} MB), replacing one {replaced}; \

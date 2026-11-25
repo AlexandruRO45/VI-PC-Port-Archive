@@ -116,7 +116,7 @@ struct List {
     /// calls record into (decision 0007), and the draw state the title set.
     uploads: std::sync::Mutex<Vec<Upload>>,
     #[cfg(windows)]
-    host: Option<crate::host::HostList>,
+    host: Option<std::sync::Arc<crate::host::HostList>>,
     #[cfg(windows)]
     state: std::sync::Mutex<crate::draw::State>,
 }
@@ -140,7 +140,16 @@ pub(crate) fn host_list<'a>(this: This) -> Option<&'a crate::host::HostList> {
         return None;
     }
     // SAFETY: the title passes one of our lists.
-    unsafe { (*this.cast::<List>()).host.as_ref() }
+    unsafe { (*this.cast::<List>()).host.as_deref() }
+}
+
+#[cfg(windows)]
+pub(crate) fn retain_host_list(this: This) -> Option<std::sync::Arc<crate::host::HostList>> {
+    if this.is_null() {
+        return None;
+    }
+    // SAFETY: the title holds the list for the duration of submission.
+    unsafe { (*this.cast::<List>()).host.clone() }
 }
 
 pub(crate) extern "system" fn create_allocator(
@@ -223,7 +232,7 @@ fn new_list(
         uploads: Default::default(),
         #[cfg(windows)]
         host: crate::host::host().and_then(|h| match h.new_list() {
-            Ok(list) => Some(list),
+            Ok(list) => Some(std::sync::Arc::new(list)),
             Err(e) => {
                 tracing::warn!(error = %e, "no host command list");
                 None
@@ -259,6 +268,10 @@ extern "system" fn list_query(this: This, iid: *const Iid, out: *mut This) -> HR
     object::answer(LIST, iid, object::is(iid, &LIST_IIDS).then_some(this), out)
 }
 extern "system" fn list_release(this: This) -> u32 {
+    #[cfg(windows)]
+    if let Some(host) = host_list(this) {
+        host.wait_for_reuse();
+    }
     object::release_boxed::<List>(this)
 }
 extern "system" fn list_type(this: This) -> u32 {
@@ -276,7 +289,10 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
     if allocator.is_null() {
         return E_INVALIDARG;
     }
-    // Every submission of the list has run (submissions are waited for).
+    #[cfg(windows)]
+    if let Some(host) = host_list(this) {
+        host.wait_for_reuse();
+    }
     // SAFETY: the title passes one of our lists.
     let uploads = unsafe { &(*this.cast::<List>()).uploads };
     uploads.lock().unwrap_or_else(|e| e.into_inner()).clear();

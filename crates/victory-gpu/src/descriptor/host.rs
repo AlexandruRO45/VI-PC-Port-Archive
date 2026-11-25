@@ -704,6 +704,7 @@ impl HostHeap {
             // Not a view of ours (never written, or of a resource the
             // title released): nothing to read.
             if made.load(Acquire) != 0 {
+                let _gpu = crate::host::guard_descriptor_write();
                 made.store(0, Release);
                 self.make_null(index);
                 self.note_address(index, None);
@@ -713,6 +714,7 @@ impl HostHeap {
         if made.load(Acquire) != key {
             crate::cpuprof::count(crate::cpuprof::Count::SlotRemade);
             let _making = crate::cpuprof::time(crate::cpuprof::Stage::MirrorMake);
+            let _gpu = crate::host::guard_descriptor_write();
             self.set_stride(index, Some(&view));
             self.note_address(index, Some(&view));
             // Shaders index the heap itself (`crate::bindless`): buffer views

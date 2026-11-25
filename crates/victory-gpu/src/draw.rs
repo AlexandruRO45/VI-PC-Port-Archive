@@ -576,6 +576,7 @@ impl State {
         // The bound view heap's mark table and the bitmap shaders mark
         // their writes through views in (`crate::shadow::copy_back_marks`).
         if let Some((table_param, bitmap_param)) = p.marks {
+            list.require_completion();
             let heap = match self.heaps[0] {
                 0 => crate::memory::heap(),
                 h => crate::descriptor::heap(h as This).host(),
@@ -604,6 +605,9 @@ impl State {
         // to date at submission (`crate::bindless`).
         if p.stages.iter().any(|s| s.translated().host.heap) {
             let writes = p.stages.iter().any(|s| s.translated().host.heap_writes);
+            if writes {
+                list.require_completion();
+            }
             if let Some(host) = (self.heaps[0] != 0)
                 .then(|| crate::descriptor::heap(self.heaps[0] as This).host())
                 .flatten()

@@ -1707,6 +1707,8 @@ extern "system" fn resource_release(this: This) -> u32 {
 /// `out` only asks for residency.
 extern "system" fn map(this: This, _sub: u32, _read: *const c_void, out: *mut *mut u8) -> HRESULT {
     if !out.is_null() {
+        #[cfg(windows)]
+        crate::host::drain_async();
         // SAFETY: checked non-null; the title passes room for a pointer.
         unsafe { out.write(resource(this).data()) };
     }
