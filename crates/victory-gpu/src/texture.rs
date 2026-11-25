@@ -33,13 +33,15 @@ macro_rules! once {
     }};
 }
 
-/// A texture's upload state: the staging buffer laid out as the host
-/// texture's subresources, and what was last detiled.
+/// A texture's upload state: how a staging buffer lays out the host
+/// texture's subresources, and what was last detiled. The buffer itself is
+/// taken for each upload from a small pool shared by all textures
+/// ([`staging_buffer`]; kept for each texture's life, the buffers took its
+/// size again in system memory: 2.6-2.8 GB with placed textures made on
+/// read, run integ2).
 pub(crate) struct Staging {
-    buffer: ID3D12Resource,
-    /// Its bytes.
+    /// A staging buffer's bytes.
     size: u64,
-    data: *mut u8,
     footprints: Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
     rows: Vec<u32>,
     layout: victory_formats::texture::Layout,
@@ -49,30 +51,181 @@ pub(crate) struct Staging {
     /// The memory's pages changed since detiled (none: not the runtime's
     /// memory, hashed instead).
     tracked: Option<crate::watch::Tracked>,
+    /// Per subresource, the bytes of the texture's memory it lies in (from
+    /// its start, whole layout blocks); empty where the layout gives none.
+    spans: Vec<(usize, usize)>,
     last: Mutex<Last>,
+    /// Uploads [`record_upload`] recorded, and the subresources they
+    /// copied.
+    uploads: std::sync::atomic::AtomicU64,
+    copied: std::sync::atomic::AtomicU64,
+    #[cfg(test)]
+    band_copies: std::sync::atomic::AtomicU64,
 }
 
-/// What a texture's staging buffer holds: the hash of the memory detiled
-/// (memory not tracked), with room to read tracked memory into.
+/// What was last detiled: the hash of the memory (not tracked), or of each
+/// subresource's bytes (tracked).
 #[derive(Default)]
 struct Last {
     hash: Option<blake3::Hash>,
-    read: Vec<u8>,
-    // True only if the previous tracked refresh recorded a bindless upload.
-    band_base: bool,
+    hashes: Vec<Option<blake3::Hash>>,
+    full_prepared: bool,
 }
 
-// SAFETY: the staging mapping is written only at submission, under
-// `last`'s lock; the title memory is only read.
+/// Per subresource of `layout` (`mips` per array slice; a 3D texture's
+/// are its mips), the bytes of the texture's memory it lies in, rounded out
+/// to the layout's blocks; empty if the layout cannot say.
+fn spans(layout: &victory_formats::texture::Layout, count: u32, mips: u32) -> Vec<(usize, usize)> {
+    use victory_formats::texture::Dimension;
+    let d = &layout.desc;
+    let block = layout.alignment.max(256);
+    (0..count)
+        .map(|i| {
+            let (mip, slice) = (i % mips, i / mips);
+            let m = layout.mips.get(mip as usize)?;
+            let (z0, z1) = if d.dimension == Dimension::Tex3d { (0, m.depth.max(1) - 1) } else { (slice, slice) };
+            let first = layout.offset(mip, 0, 0, z0).ok()?;
+            let last = layout.offset(mip, m.width.max(1) - 1, m.height.max(1) - 1, z1).ok()? + u64::from(d.element_bytes);
+            let (from, to) = (first / block * block, last.div_ceil(block) * block);
+            Some((from as usize, (to.min(layout.size)) as usize))
+        })
+        .collect::<Option<Vec<_>>>()
+        .unwrap_or_default()
+}
+
+/// Staging buffers for detiles to reuse, by size: the menu movie rewrites
+/// the same textures every frame, and a fresh 12.7 MB of upload buffers a
+/// frame cost ~5 ms (run textures8). Uploads run only inside
+/// `Host::execute`, which waits for each submission, so the buffers of one
+/// submission are free from the next on.
+struct Buffers {
+    /// (bytes, buffer, mapping), oldest first.
+    free: std::collections::VecDeque<(u64, ID3D12Resource, usize)>,
+    free_bytes: u64,
+    /// Taken by the submission being prepared.
+    used: Vec<(u64, ID3D12Resource, usize)>,
+}
+
+// SAFETY: the mappings are persistent mappings of the upload buffers.
+unsafe impl Send for Buffers {}
+
+static BUFFERS: Mutex<Buffers> = Mutex::new(Buffers {
+    free: std::collections::VecDeque::new(),
+    free_bytes: 0,
+    used: Vec::new(),
+});
+
+/// Free staging buffers kept at most.
+const KEPT_BYTES: u64 = 64 << 20;
+
+/// Called before a submission's uploads: the buffers of the last one are
+/// free again (the oldest dropped past `KEPT_BYTES`).
+pub(crate) fn recycle() {
+    {
+        let mut c = CHUNKS.lock().unwrap_or_else(|e| e.into_inner());
+        (c.current, c.used) = (0, 0);
+        c.all.truncate(CHUNKS_KEPT);
+    }
+    let mut b = BUFFERS.lock().unwrap_or_else(|e| e.into_inner());
+    let b = &mut *b;
+    for e in b.used.drain(..) {
+        b.free_bytes += e.0;
+        b.free.push_back(e);
+    }
+    while b.free_bytes > KEPT_BYTES
+        && let Some((n, ..)) = b.free.pop_front()
+    {
+        b.free_bytes -= n;
+    }
+}
+
+/// A free staging buffer of `size` bytes, or a new one.
+/// Sizes are taken in powers of two (at least 64 KiB), so a buffer serves
+/// textures of other sizes too: a new shot's textures came in new sizes and
+/// made buffers 10 % of the submitting thread (run evict5).
+fn staging_buffer(size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+    let class = size.max(1 << 16).next_power_of_two();
+    let taken = {
+        let mut b = BUFFERS.lock().unwrap_or_else(|e| e.into_inner());
+        let i = b.free.iter().position(|e| e.0 == class);
+        i.and_then(|i| b.free.remove(i)).inspect(|_| b.free_bytes -= class)
+    };
+    // Made without the pool's lock (refreshes run on several threads).
+    let e = match taken {
+        Some(e) => e,
+        None => {
+            let (buffer, data) = host()?.upload_buffer(class)?;
+            crate::host::name(&buffer, || "texture staging".into());
+            (class, buffer, data as usize)
+        }
+    };
+    let made = (e.1.clone(), e.2 as *mut u8);
+    BUFFERS.lock().unwrap_or_else(|e| e.into_inner()).used.push(e);
+    Some(made)
+}
+
+/// Staging space carved from large upload buffers, front to back: most
+/// textures take a part of one instead of a buffer of their own (making
+/// upload buffers was 10 % of the submitting thread in a new shot, run
+/// evict5). Rewound at each submission ([`recycle`]): the last one has run.
+struct Chunks {
+    /// (buffer, mapping), [`CHUNK`] bytes each.
+    all: Vec<(ID3D12Resource, usize)>,
+    /// The chunk being carved and the bytes taken from it.
+    current: usize,
+    used: u64,
+}
+
+// SAFETY: the mappings are persistent mappings of the upload buffers.
+unsafe impl Send for Chunks {}
+
+static CHUNKS: Mutex<Chunks> = Mutex::new(Chunks { all: Vec::new(), current: 0, used: 0 });
+
+const CHUNK: u64 = 32 << 20;
+/// Chunks kept between submissions (more are made while one needs them).
+const CHUNKS_KEPT: usize = 16;
+
+/// `size` bytes of staging space: a buffer, the offset of the space in it
+/// (a multiple of 512, as texture copies need) and its mapping there.
+/// Space larger than a chunk is a buffer of its own ([`staging_buffer`]).
+fn staging_space(size: u64) -> Option<(ID3D12Resource, u64, *mut u8)> {
+    if size > CHUNK {
+        return staging_buffer(size).map(|(b, data)| (b, 0, data));
+    }
+    let mut c = CHUNKS.lock().unwrap_or_else(|e| e.into_inner());
+    loop {
+        if let Some((buffer, data)) = c.all.get(c.current) {
+            let at = c.used.next_multiple_of(512);
+            if at + size <= CHUNK {
+                let made = (buffer.clone(), at, (*data + at as usize) as *mut u8);
+                c.used = at + size;
+                return Some(made);
+            }
+            (c.current, c.used) = (c.current + 1, 0);
+            continue;
+        }
+        let (buffer, data) = host()?.upload_buffer(CHUNK)?;
+        crate::host::name(&buffer, || "texture staging chunk".into());
+        c.all.push((buffer, data as usize));
+    }
+}
+
+// SAFETY: the title memory is only read, under `last`'s lock.
 unsafe impl Send for Staging {}
 // SAFETY: as above.
 unsafe impl Sync for Staging {}
 
-/// A host copy or resolve writes `resource`: its host texture's contents
-/// are the host's, not title memory's, which stays as it was.
-pub(crate) fn host_written(resource: This) {
+/// A host copy or resolve that `list` records writes `resource`: from the
+/// submission that runs `list` on, its host texture's contents are the
+/// host's, not title memory's, which stays as it was. Marked when that
+/// submission is made, not when `list` is recorded: a list recorded before
+/// it but run after it must not upload title memory over the host's texels
+/// (submissions run in the order they are made, which need not be the
+/// order their lists were recorded in), and one run before it must still
+/// get its upload.
+pub(crate) fn host_writes(list: &HostList, resource: This) {
     if let Some(copy) = crate::resource::host_copy(resource) {
-        copy.host_written.store(true, std::sync::atomic::Ordering::Relaxed);
+        list.defer_host(move || copy.host_written.store(true, std::sync::atomic::Ordering::Relaxed));
     }
 }
 
@@ -150,7 +303,7 @@ pub(crate) fn alias_copy(list: &HostList, from: This, to: This) {
     }
     let Some(buffer) = host.default_buffer(total) else { return };
     list.keep(&buffer);
-    crate::texture::host_written(to);
+    crate::texture::host_writes(list, to);
     crate::list::ensure_state(list, from, COPY_SOURCE);
     crate::list::ensure_state(list, to, COPY_DEST);
     let place = |r: &ID3D12Resource, f: D3D12_PLACED_SUBRESOURCE_FOOTPRINT| D3D12_TEXTURE_COPY_LOCATION {
@@ -169,7 +322,7 @@ pub(crate) fn alias_copy(list: &HostList, from: This, to: This) {
     // SAFETY: an open list; live resources in the states named.
     unsafe {
         for i in 0..n {
-            l.CopyTextureRegion(&place(&buffer, fa[i as usize]), 0, 0, 0, &sub(a, i), None);
+            l.CopyTextureRegion(&place(&buffer, fa[i as usize]), 0, 0, 0, &sub(&a, i), None);
         }
         l.ResourceBarrier(&[crate::host::transition(
             &buffer,
@@ -177,7 +330,7 @@ pub(crate) fn alias_copy(list: &HostList, from: This, to: This) {
             D3D12_RESOURCE_STATE_COPY_SOURCE,
         )]);
         for i in 0..n {
-            l.CopyTextureRegion(&sub(b, i), 0, 0, 0, &place(&buffer, fb[i as usize]), None);
+            l.CopyTextureRegion(&sub(&b, i), 0, 0, 0, &place(&buffer, fb[i as usize]), None);
         }
     }
     ALIAS_COPIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -189,71 +342,123 @@ pub(crate) fn alias_copy(list: &HostList, from: This, to: This) {
     }
 }
 
-/// Records, once per list, the copy of `resource`'s staging buffer into
-/// its host copy, and the detiling that refreshes the staging buffer at
-/// submission if the memory changed. Leaves the texture in the copy
-/// destination state.
+/// Has `resource`'s host copy brought up to date at the submission that
+/// runs `list`: its staging buffer detiled again if the memory changed, and
+/// then copied into the host texture by the submission's own upload list,
+/// once for all its lists (`crate::bindless::uploads`).
+///
+/// shortcut: a title copy into texture memory recorded in the same
+/// submission shows from the next one on.
 pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) {
     // shortcut: a texture the host copied into keeps the host's contents
     // even if the title later writes its memory too.
     // Once per list for each host texture, however many title textures of
     // its memory the list samples.
-    if is_host_written(resource) || !list.first_use(texture.as_raw() as usize) {
-        return;
-    }
-    let Some(staging) = staging(resource, texture) else {
-        return;
-    };
-    // The staging buffer lives as long as `staging`, which the deferred
-    // refresh below holds until the list is reset.
-    record(list, resource, texture, &staging, None);
-    // Once per submission however many of its lists sample the texture.
-    list.defer_texture(staging);
-}
-
-/// For textures shaders reach through the heap itself, at submission
-/// (`crate::bindless::uploads`): brings the staging buffer up to date and
-/// records its copy into `list` only if the memory changed since (or was
-/// never uploaded). True if it recorded; the texture is then in the copy
-/// destination state.
-pub(crate) fn upload_changed(list: &HostList, resource: This, texture: &ID3D12Resource) -> bool {
     if is_host_written(resource) {
-        return false;
+        #[cfg(feature = "diagnostics")]
+        {
+            static SEEN: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::new(None);
+            if SEEN.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_default().insert(resource as usize) {
+                let memory = crate::resource::texture_memory(resource).map(|(m, _)| m);
+                // SAFETY: a live resource.
+                let desc = unsafe { texture.GetDesc() };
+                tracing::debug!(?resource, ?memory, ?desc, "a sampled texture keeps what the host copied into it: not uploaded from title memory");
+            }
+        }
+        return;
     }
-    let Some(staging) = staging(resource, texture) else {
-        return false;
+    if !list.first_use(texture.as_raw() as usize) {
+        return;
+    }
+    let (Some(staging), Some(copy)) = (staging(resource, texture), crate::resource::host_copy(resource)) else {
+        return;
     };
-    let (changed, band) = staging.refresh_for_upload(bands_enabled());
-    if !changed {
-        return false;
-    }
-    record(list, resource, texture, &staging, band);
-    list.keep(&staging.buffer);
-    true
+    // Each list recorded the copy before (run perf7: 149 textures uploaded
+    // 3,195 times in a frame, 17 ms of GPU time), changed or not.
+    list.defer_texture(staging, copy);
 }
 
-/// Copies the selected band, or every subresource, into the host texture,
-/// moving it to the copy destination state first.
-fn record(
+/// Records into `list` the copy of `buffer` (laid out as `staging` says)
+/// into host texture `copy`. Returns the barrier that leaves it readable by
+/// shaders, for the caller to record with the others after every copy: one
+/// barrier per texture between the copies kept the GPU from overlapping
+/// them (new shots copy hundreds of textures, run evict6).
+#[must_use]
+pub(crate) fn record_upload(
     list: &HostList,
-    resource: This,
+    copy: &Arc<crate::resource::HostTexture>,
+    staging: &Staging,
+    upload: &Upload,
+) -> Option<D3D12_RESOURCE_BARRIER> {
+    const COPY_DEST: u32 = 0x400;
+    const SHADER_RESOURCE: u32 = 0x40 | 0x80;
+    if let Some(b) = list.move_texture(copy, COPY_DEST) {
+        // SAFETY: an open list; the barrier names a live texture.
+        unsafe { list.list.ResourceBarrier(&[b]) };
+    }
+    let (buffer, count) = match upload {
+        Upload::Full(buffer, at, subresources) => {
+            copies(list, &copy.texture, staging, (buffer, *at), subresources, String::new);
+            (buffer, subresources.len() as u64)
+        }
+        Upload::Band(buffer, footprint, top) => {
+            record_band(list, &copy.texture, buffer, *footprint, *top);
+            #[cfg(test)]
+            staging.band_copies.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            (buffer, 1)
+        }
+    };
+    list.keep(buffer);
+    staging.uploads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    staging.copied.fetch_add(count, std::sync::atomic::Ordering::Relaxed);
+    list.move_texture(copy, SHADER_RESOURCE)
+}
+
+/// The uploads [`record_upload`] recorded into `resource`'s host texture
+/// (tests: counts of their own texture, whatever other tests upload
+/// meanwhile).
+#[cfg(test)]
+pub(crate) fn uploads(resource: This) -> u64 {
+    let staging = crate::resource::host_copy(resource).and_then(|c| c.staging.lock().unwrap_or_else(|e| e.into_inner()).clone());
+    staging.map_or(0, |s| s.uploads.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// The subresources those uploads copied (tests, as [`uploads`]).
+#[cfg(test)]
+pub(crate) fn copied(resource: This) -> u64 {
+    let staging = crate::resource::host_copy(resource).and_then(|c| c.staging.lock().unwrap_or_else(|e| e.into_inner()).clone());
+    staging.map_or(0, |s| s.copied.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+
+/// Records the copy of `subresources` of `buffer` (laid out as `staging`
+/// says) into `texture` (in the copy destination state); `name` names it
+/// in diagnostics notes.
+#[cfg_attr(not(feature = "diagnostics"), allow(unused_variables))]
+fn copies(
+    list: &HostList,
     texture: &ID3D12Resource,
     staging: &Staging,
-    band: Option<RowBand>,
+    (buffer, at): (&ID3D12Resource, u64),
+    subresources: &[u32],
+    name: impl Fn() -> String,
 ) {
-    const COPY_DEST: u32 = 0x400;
-    crate::list::ensure_state(list, resource, COPY_DEST);
-    for (i, footprint) in staging.footprints.iter().enumerate() {
+    for &i in subresources {
+        let i = i as usize;
+        let mut footprint = staging.footprints[i];
+        footprint.Offset += at;
+        let footprint = &footprint;
         #[cfg(feature = "diagnostics")]
         {
             let f = footprint.Footprint;
             // SAFETY: live resources.
-            let (gpu, d) = unsafe { (staging.buffer.GetGPUVirtualAddress(), texture.GetDesc()) };
+            let (gpu, d) = unsafe { (buffer.GetGPUVirtualAddress(), texture.GetDesc()) };
             let len = u64::from(f.RowPitch) * u64::from(staging.rows[i]) * u64::from(f.Depth);
             list.note_read(
                 || {
                     format!(
-                        "texture upload {resource:?} ({}x{}x{} f{} mips {}) sub {i} of {} from staging {gpu:#x}+{:#x}: offset {:#x} {}x{}x{} pitch {}",
+                        "texture upload {} ({}x{}x{} f{} mips {}) sub {i} of {} from staging {gpu:#x}+{:#x}: offset {:#x} {}x{}x{} pitch {}",
+                        name(),
                         d.Width,
                         d.Height,
                         d.DepthOrArraySize,
@@ -281,35 +486,15 @@ fn record(
         };
         let from = D3D12_TEXTURE_COPY_LOCATION {
             // SAFETY: as above.
-            pResource: unsafe { std::mem::transmute_copy(&staging.buffer) },
+            pResource: unsafe { std::mem::transmute_copy(buffer) },
             Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
             Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
                 PlacedFootprint: *footprint,
             },
         };
-        copy_band(&list.list, &to, &from, footprint.Footprint.Width, band);
+        // SAFETY: an open list; both locations name live resources.
+        unsafe { list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
     }
-}
-
-fn copy_band(
-    list: &ID3D12GraphicsCommandList,
-    to: &D3D12_TEXTURE_COPY_LOCATION,
-    from: &D3D12_TEXTURE_COPY_LOCATION,
-    width: u32,
-    band: Option<RowBand>,
-) {
-    let bounds = band.map(|b| D3D12_BOX {
-        left: 0,
-        top: b.top,
-        front: 0,
-        right: width,
-        bottom: b.bottom,
-        back: 1,
-    });
-    let y = band.map_or(0, |b| b.top);
-    // SAFETY: an open list; both locations name live resources, and the
-    // region is in bounds in both copies and aligned to compressed blocks.
-    unsafe { list.CopyTextureRegion(to, 0, y, 0, from, bounds.as_ref().map(std::ptr::from_ref)) };
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -366,80 +551,210 @@ fn dirty_band(
         .then_some(RowBand { top, bottom, source_start, source_end })
 }
 
+#[cfg(test)]
+thread_local! {
+    static TEST_BANDS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
 fn bands_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_BANDS.get() { return on; }
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED
         .get_or_init(|| std::env::var_os("VICTORY_TEXTURE_UPLOAD_BANDS").is_some_and(|v| v == "1"))
 }
 
+/// Staging for either complete subresources or a compact single band.
+#[derive(Clone)]
+pub(crate) enum Upload {
+    Full(ID3D12Resource, u64, Vec<u32>),
+    Band(ID3D12Resource, D3D12_PLACED_SUBRESOURCE_FOOTPRINT, u32),
+}
+
+fn record_band(
+    list: &HostList,
+    texture: &ID3D12Resource,
+    buffer: &ID3D12Resource,
+    footprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
+    top: u32,
+) {
+    let to = D3D12_TEXTURE_COPY_LOCATION {
+        // SAFETY: a borrowed pointer the location never releases.
+        pResource: unsafe { std::mem::transmute_copy(texture) },
+        Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+    };
+    let from = D3D12_TEXTURE_COPY_LOCATION {
+        // SAFETY: a borrowed pointer the location never releases.
+        pResource: unsafe { std::mem::transmute_copy(buffer) },
+        Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: footprint },
+    };
+    // SAFETY: an open list and live resources; footprint and destination
+    // are block-aligned, and the band fits entirely in both resources.
+    unsafe { list.list.CopyTextureRegion(&to, 0, top, 0, &from, None) };
+}
+
+/// Runs `f(i)` for each `i` below `n` on up to a quarter of the CPUs (four
+/// at most: the title's own threads need the rest), here when that is
+/// fewer than two.
+pub(crate) fn in_parallel(n: usize, f: impl Fn(usize) + Sync) {
+    use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+    let threads = std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(1, 4).min(n);
+    if threads < 2 {
+        (0..n).for_each(f);
+        return;
+    }
+    let next = AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        for _ in 0..threads {
+            scope.spawn(|| {
+                loop {
+                    let i = next.fetch_add(1, Relaxed);
+                    if i >= n {
+                        break;
+                    }
+                    f(i);
+                }
+            });
+        }
+    });
+}
+
+/// [`Staging::refresh`] of each of `work`, those whose memory may have
+/// changed on several threads at once (reading title memory and detiling
+/// cost ~6 ms of frame a MB on one thread in a new shot, run evict5).
+pub(crate) fn refresh_all(work: &[(Arc<Staging>, Arc<crate::resource::HostTexture>)]) -> Vec<Option<Upload>> {
+    let use_bands = bands_enabled();
+    // Most find nothing changed (their trackers' clean bits say so): those
+    // are not handed to threads.
+    let changed: Vec<usize> = (0..work.len()).filter(|&i| work[i].0.maybe_changed()).collect();
+    let results: Vec<Mutex<Option<Upload>>> = changed.iter().map(|_| Mutex::new(None)).collect();
+    in_parallel(changed.len(), |k| {
+        *results[k].lock().unwrap_or_else(|e| e.into_inner()) = work[changed[k]].0.refresh(use_bands);
+    });
+    let mut out: Vec<Option<Upload>> = vec![None; work.len()];
+    for (k, r) in results.into_iter().enumerate() {
+        out[changed[k]] = r.into_inner().unwrap_or_else(|e| e.into_inner());
+    }
+    out
+}
+
 impl Staging {
-    /// Detiles the texture memory into the staging buffer if it changed
-    /// since the last time (and is mapped at all): whether it did.
-    pub(crate) fn refresh(&self) -> bool {
-        self.refresh_for_upload(false).0
+    /// Whether its memory may have changed since it was last detiled (an
+    /// untracked texture always may).
+    pub(crate) fn maybe_changed(&self) -> bool {
+        self.tracked.as_ref().is_none_or(|t| !t.clean())
     }
 
-    fn refresh_for_upload(&self, use_bands: bool) -> (bool, Option<RowBand>) {
+    /// A staging buffer with the texture memory detiled into it if it
+    /// changed since the last time (and is mapped at all), and the
+    /// subresources that changed (only those are detiled and to be copied).
+    fn refresh(&self, use_bands: bool) -> Option<Upload> {
         use std::sync::atomic::Ordering::Relaxed;
         let started = std::time::Instant::now();
-        let (read, changed, band) = self.refresh_now(use_bands);
+        let (read, buffer) = self.refresh_now(use_bands);
         let preparing = &crate::host::PREPARING;
         preparing[2].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
         preparing[3].fetch_add(read as u64, Relaxed);
-        (changed, band)
+        buffer
     }
 
-    /// Bytes read, whether anything changed, and an optional upload band.
-    fn refresh_now(&self, use_bands: bool) -> (usize, bool, Option<RowBand>) {
+    /// Returns the bytes of title memory read, and the buffer it detiled
+    /// into with the subresources detiled.
+    fn refresh_now(&self, use_bands: bool) -> (usize, Option<Upload>) {
+        let all = || (0..self.footprints.len() as u32).collect::<Vec<_>>();
         let size = self.layout.size as usize;
         let start = self.memory as usize;
         let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
         let last = &mut *last;
         if let Some(t) = &self.tracked {
-            let dirty = t.take(start, start + size);
-            if dirty.is_empty() {
-                return (0, false, None);
+            // Most refreshes find nothing: the tracker's dense bit says so
+            // without its lock (123,000 refreshes a frame, run evict3).
+            if t.clean() {
+                return (0, None);
             }
-            let band = if use_bands
-                && last.band_base
-                && matches!(self.footprints.as_slice(), [f] if
-                    f.Footprint.Width == self.layout.desc.width
-                        && f.Footprint.Height == self.layout.desc.height
-                        && f.Footprint.Depth == 1)
+            let ranges = t.take(start, start + size);
+            if ranges.is_empty() {
+                return (0, None);
+            }
+            // A band needs an existing full copy. Both paths run in the
+            // same submission upload pass and have the same lifetime.
+            if use_bands && last.full_prepared
+                && self.uploads.load(std::sync::atomic::Ordering::Relaxed) != 0
+                && let (Some(low), Some(high)) = (
+                    ranges.iter().map(|&(lo, _)| lo).min(),
+                    ranges.iter().map(|&(_, hi)| hi).max(),
+                )
+                && let Some(band) = dirty_band(&self.layout, low - start..high - start)
+                && let Some(upload) = self.detile_band(band)
             {
-                let from = dirty.first().unwrap().0 - start;
-                let to = dirty.last().unwrap().1 - start;
-                dirty_band(&self.layout, from..to)
-            } else {
-                None
-            };
-            // A deferred eager copy might have refreshed staging without a
-            // bindless upload. In that case, the next changed bindless upload
-            // takes the original full-copy path.
+                last.hashes.fill(None);
+                let bytes = band.source_end - band.source_start;
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::TexWatched, bytes as u64);
+                return (bytes, Some(upload));
+            }
+            // Only the subresources in the pages that changed (streamed
+            // textures change page by page; a whole re-read and detile of
+            // each cost up to 430 MB a frame, run integ2).
+            let n = self.footprints.len();
+            let span = |i: usize| self.spans.get(i).copied().unwrap_or((0, size));
+            let touched: Vec<usize> = (0..n)
+                .filter(|&i| {
+                    let (a, b) = span(i);
+                    ranges.iter().any(|&(f, e)| f - start < b && a < e - start)
+                })
+                .collect();
             // Read through the copy, which stands unmapped pages: memory of
-            // big pools is too slow to ask page by page.
-            last.read.resize(size, 0);
-            if let Some(band) = band {
-                let from = band.source_start;
-                let len = band.source_end - from;
-                crate::host::copy_mapped(
-                    last.read.as_mut_ptr().wrapping_add(from),
-                    self.memory.wrapping_add(from),
-                    len,
-                    false,
-                );
-                if self.detile(&last.read, Some(band)) {
-                    #[cfg(feature = "diagnostics")]
-                    crate::copystat::add(crate::copystat::C::TexWatched, len as u64);
-                    return (len, true, Some(band));
+            // big pools is too slow to ask page by page. Not kept: it would
+            // double each texture's system memory. Only the touched spans
+            // are written, and only they are hashed and detiled.
+            let mut scratch = Scratch::take(size);
+            let read = &mut scratch.0[..size];
+            let mut bytes = 0;
+            let mut done: Vec<(usize, usize)> = Vec::new();
+            for &i in &touched {
+                let (a, b) = span(i);
+                if !done.contains(&(a, b)) {
+                    // SAFETY: inside the buffer of the texture's size.
+                    crate::host::copy_mapped(unsafe { read.as_mut_ptr().add(a) }, self.memory.wrapping_add(a), b - a, false);
+                    (bytes, _) = (bytes + b - a, done.push((a, b)));
                 }
             }
-            crate::host::copy_mapped(last.read.as_mut_ptr(), self.memory, size, false);
-            let complete = self.detile(&last.read, None);
-            last.band_base = use_bands && complete;
+            // A changed page that holds only the subresource's bytes says it
+            // changed. Pages it shares with other data the title writes
+            // (small textures): its own bytes decide. (Hashing a movie frame
+            // cost 8 ms a frame.)
+            let page = crate::watch::PAGE;
+            last.hashes.resize(n, None);
+            let fresh: Vec<u32> = touched
+                .into_iter()
+                .filter(|&i| {
+                    let (a, b) = span(i);
+                    let (a0, b0) = (start + a, start + b);
+                    if ranges.iter().any(|&(f, e)| f.max(a0).next_multiple_of(page) + page <= e.min(b0)) {
+                        last.hashes[i] = None;
+                        return true;
+                    }
+                    let hash = blake3::hash(&read[a..b]);
+                    last.hashes[i].replace(hash) != Some(hash)
+                })
+                .map(|i| i as u32)
+                .collect();
+            if fresh.is_empty() {
+                return (bytes, None);
+            }
+            let buffer = self.detile(read, &fresh);
+            last.full_prepared = buffer.is_some();
+            if buffer.is_none() {
+                for &i in &fresh {
+                    last.hashes[i as usize] = None;
+                }
+            }
             #[cfg(feature = "diagnostics")]
-            crate::copystat::add(crate::copystat::C::TexWatched, size as u64);
-            return (size, true, None);
+            crate::copystat::add(crate::copystat::C::TexWatched, bytes as u64);
+            return (bytes, buffer.map(|(b, at)| Upload::Full(b, at, fresh)));
         }
         if !committed(self.memory, size) {
             #[cfg(feature = "diagnostics")]
@@ -449,7 +764,16 @@ impl Staging {
                 desc = ?self.layout.desc,
                 "a sampled texture's memory is not committed"
             );
-            return (0, false, None);
+            // Never uploaded: zeros, as a committed texture starts (one in
+            // a heap of textures starts with whatever the range held).
+            if last.hash.is_some() {
+                return (0, None);
+            }
+            let zeros = vec![0u8; size];
+            let every = all();
+            let buffer = self.detile(&zeros, &every);
+            last.hash = buffer.is_some().then(|| blake3::hash(&zeros));
+            return (0, buffer.map(|(b, at)| Upload::Full(b, at, every)));
         }
         // SAFETY: committed memory of the texture's layout size.
         let tiled = unsafe { std::slice::from_raw_parts(self.memory, size) };
@@ -457,48 +781,114 @@ impl Staging {
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
         if last.hash == Some(hash) {
-            return (size, false, None);
+            return (size, None);
         }
-        last.hash = Some(hash);
-        let _ = self.detile(tiled, None);
+        let every = all();
+        let buffer = self.detile(tiled, &every);
+        last.hash = buffer.is_some().then_some(hash);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
-        (size, true, None)
+        (size, buffer.map(|(b, at)| Upload::Full(b, at, every)))
     }
 
-    /// Detiles `tiled` (the texture's memory) into the staging buffer.
-    fn detile(&self, tiled: &[u8], band: Option<RowBand>) -> bool {
-        #[cfg(feature = "diagnostics")]
-        if band.is_none() && tiled.iter().all(|&b| b == 0) {
-            tracing::debug!(
-                memory = ?self.memory,
-                desc = ?self.layout.desc,
-                "a sampled texture's memory is all zero (not streamed yet, or a failed BCPack read)"
+    /// Reads the tiled bytes of a band and detiles into a compact, aligned
+    /// suballocation of the normal submission staging buffer pool.
+    fn detile_band(&self, band: RowBand) -> Option<Upload> {
+        let [footprint] = self.footprints.as_slice() else { return None };
+        let mut footprint = *footprint;
+        let block = self.layout.desc.block;
+        footprint.Footprint.Height = band.bottom - band.top;
+        let rows = footprint.Footprint.Height / block;
+        let pitch = footprint.Footprint.RowPitch;
+        let len = u64::from(rows) * u64::from(pitch);
+        let mut scratch = Scratch::take(self.layout.size as usize);
+        let src = &mut scratch.0[..self.layout.size as usize];
+        // SAFETY: the source band is in the layout, the scratch range is
+        // writable and copy_mapped tolerates unmapped title pages.
+        unsafe {
+            crate::host::copy_mapped(
+                src.as_mut_ptr().add(band.source_start),
+                self.memory.wrapping_add(band.source_start),
+                band.source_end - band.source_start,
+                false,
             );
         }
-        for (i, (footprint, &rows)) in self.footprints.iter().zip(&self.rows).enumerate() {
-            let (mip, slice) = (i as u32 % self.mips, i as u32 / self.mips);
+        let (buffer, at, data) = staging_space(len)?;
+        footprint.Offset = at;
+        // SAFETY: this suballocation has len mapped bytes.
+        let linear = unsafe { std::slice::from_raw_parts_mut(data, len as usize) };
+        self.layout.detile_rows(src, linear, pitch as usize, band.top / block..band.bottom / block).ok()?;
+        Some(Upload::Band(buffer, footprint, band.top))
+    }
+
+    /// Detiles `subresources` of `tiled` (the texture's memory) into a
+    /// staging buffer (`None` if none could be had or a subresource could
+    /// not be read).
+    fn detile(&self, tiled: &[u8], subresources: &[u32]) -> Option<(ID3D12Resource, u64)> {
+        let (buffer, at, data) = staging_space(self.size)?;
+        #[cfg(feature = "diagnostics")]
+        // Scanned only when its message is wanted: a pass over every
+        // texture read, in timing runs too.
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            if tiled.iter().all(|&b| b == 0) {
+                tracing::debug!(
+                    memory = ?self.memory,
+                    desc = ?self.layout.desc,
+                    "a sampled texture's memory is all zero (not streamed yet, or a failed BCPack read)"
+                );
+            } else {
+                tracing::debug!(memory = ?self.memory, desc = ?self.layout.desc, "a sampled texture detiled");
+            }
+        }
+        for &i in subresources {
+            let (footprint, rows) = (&self.footprints[i as usize], self.rows[i as usize]);
+            let (mip, slice) = (i % self.mips, i / self.mips);
             let f = footprint.Footprint;
             let pitch = f.RowPitch as usize;
             let len = subresource_len(footprint.Offset, pitch, rows, f.Depth, self.size);
             // SAFETY: `subresource_len` clamps `len` to `self.size - footprint.Offset`,
             // keeping the slice strictly inside the mapped staging buffer even when
             // GetCopyableFootprints does not pad the final row of the last subresource.
-            let linear = unsafe {
-                std::slice::from_raw_parts_mut(self.data.add(footprint.Offset as usize), len)
-            };
-            let result = if let Some(band) = band {
-                let block = self.layout.desc.block;
-                self.layout.detile_rows(tiled, linear, pitch, band.top / block..band.bottom / block)
-            } else {
-                self.layout.detile(tiled, mip, slice, linear, pitch, pitch * rows as usize)
-            };
-            if let Err(e) = result {
+            let linear = unsafe { std::slice::from_raw_parts_mut(data.add(footprint.Offset as usize), len) };
+            if let Err(e) =
+                self.layout
+                    .detile(tiled, mip, slice, linear, pitch, pitch * rows as usize)
+            {
                 tracing::warn!(?e, mip, slice, "texture not detiled");
-                return false;
+                return None;
             }
         }
-        true
+        Some((buffer, at))
+    }
+}
+
+/// A buffer for the title memory a refresh reads, kept by the thread for
+/// its next refresh: a fresh one for each texture cost a zero-fill and a
+/// page fault per 4 KiB (129,000 faults in a frame, run placed1).
+struct Scratch(Vec<u8>);
+
+thread_local! {
+    static SCRATCH: std::cell::Cell<Vec<u8>> = const { std::cell::Cell::new(Vec::new()) };
+}
+
+impl Scratch {
+    /// The thread's buffer, at least `size` bytes.
+    fn take(size: usize) -> Self {
+        let mut v = SCRATCH.take();
+        if v.len() < size {
+            v.resize(size, 0);
+        }
+        Scratch(v)
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        // The largest textures' buffers are not kept.
+        const KEEP: usize = 32 << 20;
+        if self.0.len() <= KEEP {
+            SCRATCH.set(std::mem::take(&mut self.0));
+        }
     }
 }
 
@@ -545,7 +935,7 @@ pub(crate) fn committed(at: *const u8, len: usize) -> bool {
 
 /// The staging state of a title texture's host texture, made on first use
 /// (one for all title textures of its memory).
-fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
+pub(crate) fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     let copy = crate::resource::host_copy(resource)?;
     let mut held = copy.staging.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(s) = held.as_ref() {
@@ -588,26 +978,23 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
             Some(&mut total),
         );
     }
-    let (buffer, data) = host.upload_buffer(total)?;
-    crate::host::name(&buffer, || {
-        format!(
-            "staging of {resource:?} {}x{}x{} f{}",
-            d.Width, d.Height, d.DepthOrArraySize, d.Format.0
-        )
-    });
     tracing::debug!(?desc, total, "texture contents uploaded from title memory");
     let layout_size = layout.size as usize;
+    let spans = spans(&layout, count, u32::from(d.MipLevels));
     let s = Arc::new(Staging {
-        buffer,
         size: total,
-        data,
         footprints,
         rows,
         layout,
         mips: u32::from(d.MipLevels),
         memory,
         tracked: crate::watch::track(memory as usize, layout_size, true),
+        spans,
         last: Mutex::default(),
+        uploads: Default::default(),
+        copied: Default::default(),
+        #[cfg(test)]
+        band_copies: Default::default(),
     });
     *held = Some(s.clone());
     Some(s)
@@ -617,341 +1004,187 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
 mod tests {
     use super::*;
 
-    fn layout(
-        width: u32,
-        height: u32,
-        block: u32,
-        swizzle: victory_formats::texture::Swizzle,
-    ) -> victory_formats::texture::Layout {
-        use victory_formats::texture::{Desc, Dimension, Layout};
-        Layout::new(&Desc {
-            dimension: Dimension::Tex2d,
-            width,
-            height,
-            depth: 1,
-            mips: 1,
-            element_bytes: if block == 4 { 16 } else { 4 },
-            block,
-            samples: 1,
-            swizzle,
-        })
-        .unwrap()
-    }
-
     #[test]
-    fn dirty_bands_enclose_mapped_elements() {
-        use victory_formats::texture::Swizzle;
-        for swizzle in [Swizzle::LINEAR, Swizzle::SW_4KB_S, Swizzle::SW_64KB_D] {
-            for block in [1, 4] {
-                let l = layout(132, 1024, block, swizzle);
-                let m = &l.mips[0];
-                for y in [0, 31, m.height / 2, m.height - 1] {
-                    for x in [0, m.width / 2, m.width - 1] {
-                        let at = l.offset(0, x, y, 0).unwrap() as usize;
-                        let b = dirty_band(&l, at..at + l.desc.element_bytes as usize).unwrap();
-                        assert!(
-                            b.top <= y * block && b.bottom >= (y + 1) * block,
-                            "{swizzle:?}, {block}, {x}, {y}: {b:?}"
-                        );
-                        assert_eq!(b.top % block, 0);
-                        assert_eq!(b.bottom % block, 0);
+    fn pooled_bands_match_full_rgba8_and_bc3() {
+        use victory_formats::texture::{Desc, Dimension, Layout, Swizzle};
+        use windows::Win32::Graphics::Dxgi::Common::{
+            DXGI_FORMAT_BC3_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SAMPLE_DESC,
+        };
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        let bench = std::env::var_os("VICTORY_BAND_BENCH").is_some();
+        let Some(h) = host() else {
+            assert!(!bench, "D3D12 required for the benchmark");
+            return;
+        };
+        for (width, height, block, element, format) in [
+            (if bench { 4096 } else { 256 }, if bench { 4096 } else { 1024 }, 1, 4, DXGI_FORMAT_R8G8B8A8_UNORM),
+            (260, 516, 4, 16, DXGI_FORMAT_BC3_UNORM),
+        ] {
+            let l = Layout::new(&Desc {
+                dimension: Dimension::Tex2d,
+                width, height, depth: 1, mips: 1, samples: 1, block, element_bytes: element,
+                swizzle: Swizzle::SW_64KB_D,
+            }).unwrap();
+            let row_bytes = (width / block * element) as usize;
+            let rows = height / block;
+            let pitch = (row_bytes as u32).next_multiple_of(256);
+            let bytes = u64::from(pitch) * u64::from(rows);
+            let footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                Offset: 0,
+                Footprint: D3D12_SUBRESOURCE_FOOTPRINT { Format: format, Width: width, Height: height, Depth: 1, RowPitch: pitch },
+            };
+            let tex_desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D, Width: u64::from(width), Height: height,
+                MipLevels: 1, DepthOrArraySize: 1, Format: format, SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                ..Default::default()
+            };
+            let read_desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER, Width: bytes, Height: 1,
+                MipLevels: 1, DepthOrArraySize: 1, SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR, ..Default::default()
+            };
+            let alloc = |desc: &D3D12_RESOURCE_DESC, ty| -> ID3D12Resource {
+                let mut out = None;
+                // SAFETY: descriptors remain live through creation.
+                unsafe { h.device.CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES { Type: ty, ..Default::default() },
+                    D3D12_HEAP_FLAG_NONE, desc, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut out,
+                ).unwrap(); }
+                out.unwrap()
+            };
+            let make = || {
+                // SAFETY: private committed memory of the texture's tiled size.
+                let mem = unsafe { VirtualAlloc(std::ptr::null(), l.size as usize,
+                    MEM_RESERVE | MEM_COMMIT | 0x0020_0000, PAGE_READWRITE) }.cast::<u8>();
+                assert!(!mem.is_null());
+                // SAFETY: the whole test allocation is writable.
+                unsafe { mem.write_bytes(17, l.size as usize); }
+                let staging = Arc::new(Staging {
+                    size: bytes, footprints: vec![footprint], rows: vec![rows],
+                    spans: spans(&l, 1, 1), layout: l.clone(), mips: 1, memory: mem,
+                    tracked: Some(crate::watch::track(mem as usize, l.size as usize, true).unwrap()),
+                    last: Mutex::default(), uploads: Default::default(), copied: Default::default(),
+                    band_copies: Default::default(),
+                });
+                let copy = Arc::new(crate::resource::HostTexture::new(
+                    alloc(&tex_desc, D3D12_HEAP_TYPE_DEFAULT), D3D12_RESOURCE_STATE_COPY_DEST.0 as u32, vec![],
+                ));
+                (mem, [(staging, copy)])
+            };
+            let cases = [make(), make()];
+            let submit = h.new_list().unwrap();
+            submit.close();
+            let run = |work: &[(Arc<Staging>, Arc<crate::resource::HostTexture>)], on| {
+                TEST_BANDS.set(Some(on));
+                submit.reset();
+                for (staging, copy) in work {
+                    submit.defer_texture(staging.clone(), copy.clone());
+                }
+                submit.close();
+                h.execute(&[&submit]);
+                TEST_BANDS.set(None);
+            };
+            for (i, (_, work)) in cases.iter().enumerate() {
+                run(work, i == 1);
+                assert_eq!(work[0].0.band_copies.load(std::sync::atomic::Ordering::Relaxed), 0);
+            }
+            let readback = alloc(&read_desc, D3D12_HEAP_TYPE_READBACK);
+            let read = h.new_list().unwrap();
+            read.close();
+            let sparse = l.offset(0, 0, if block == 4 { rows - 1 } else { rows / 2 }, 0).unwrap() as usize;
+            let mut expected_tiled = vec![17u8; l.size as usize];
+            for (dense, pooled) in [(false, false), (true, false), (false, true)] {
+                let offsets: Vec<usize> = if dense {
+                    (0..l.size as usize).step_by(65536).collect()
+                } else { vec![sparse] };
+                let repeats = if bench && block == 1 && !pooled { 28 } else { 1 };
+                if pooled {
+                    // Two compact uploads in one submission: at least one
+                    // must use a nonzero offset in the shared staging chunk.
+                    let work: Vec<_> = cases.iter().map(|(_, work)| work[0].clone()).collect();
+                    let before: Vec<_> = work.iter().map(|(s, _)| s.band_copies.load(std::sync::atomic::Ordering::Relaxed)).collect();
+                    for (i, (mem, _)) in cases.iter().enumerate() {
+                        // SAFETY: sparse lies in the live source allocation.
+                        unsafe { mem.add(sparse).write_volatile(150 + i as u8); }
+                    }
+                    run(&work, true);
+                    for (i, (s, _)) in work.iter().enumerate() {
+                        assert_eq!(s.band_copies.load(std::sync::atomic::Ordering::Relaxed), before[i] + 1);
                     }
                 }
-                assert_eq!(dirty_band(&l, 0..l.size as usize), None);
-                assert_eq!(dirty_band(&l, 123..123), None);
-            }
-        }
-    }
-
-    #[test]
-    fn partial_detile_matches_full_detile_without_touching_other_rows() {
-        use victory_formats::texture::Swizzle;
-        for swizzle in [Swizzle::LINEAR, Swizzle::SW_256B_S, Swizzle::SW_4KB_S, Swizzle::SW_64KB_D] {
-            for block in [1, 4] {
-                let l = layout(260, 1032, block, swizzle);
-                let m = l.mips[0];
-                let pitch = (m.width * l.desc.element_bytes) as usize;
-                let tiled: Vec<u8> = (0..l.size as usize).map(|i| ((i ^ (i >> 8)) % 239) as u8).collect();
-                let mut full = vec![255; pitch * m.height as usize];
-                l.detile(&tiled, 0, 0, &mut full, pitch, 0).unwrap();
-                for y in [0, m.height / 2, m.height - 1] {
-                    let x = m.width / 2;
-                    let at = l.offset(0, x, y, 0).unwrap() as usize;
-                    let band = dirty_band(&l, at..at + l.desc.element_bytes as usize).unwrap();
-                    let rows = band.top / block..band.bottom / block;
-                    let mut staged = vec![255; tiled.len()];
-                    staged[band.source_start..band.source_end]
-                        .copy_from_slice(&tiled[band.source_start..band.source_end]);
-                    let mut partial = vec![255; full.len()];
-                    l.detile_rows(&staged, &mut partial, pitch, rows.clone()).unwrap();
-                    for (row, (a, b)) in partial.chunks_exact(pitch).zip(full.chunks_exact(pitch)).enumerate() {
-                        if rows.contains(&(row as u32)) {
-                            assert_eq!(a, b, "{swizzle:?} block {block} row {row}");
-                        } else {
-                            assert!(a.iter().all(|&value| value == 255));
+                for i in 0..if pooled { 0 } else { repeats } {
+                    for mode in [i % 2 == 1, i % 2 == 0] {
+                        let (mem, work) = &cases[usize::from(mode)];
+                        let value = (40 + i + if dense { 64 } else { 0 }) as u8;
+                        let count = || work[0].0.band_copies.load(std::sync::atomic::Ordering::Relaxed);
+                        let old = count();
+                        let t = std::time::Instant::now();
+                        for &offset in &offsets {
+                            // SAFETY: every offset is inside the tracked allocation.
+                            unsafe { mem.add(offset).write_volatile(value); }
+                        }
+                        run(work, mode);
+                        let us = t.elapsed().as_secs_f64() * 1e6;
+                        assert_eq!(count() - old, u64::from(mode && !dense), "format {format:?}");
+                        if bench && i >= 4 {
+                            println!("PORT_BAND,{dense},{i},{mode},{us:.3}");
                         }
                     }
                 }
-            }
-        }
-    }
-    #[test]
-    fn tracked_refresh_keeps_first_and_uncertain_uploads_full() {
-        use windows_sys::Win32::System::Memory::{
-            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
-            VirtualFree,
-        };
-        let Some(host) = host() else {
-            assert!(
-                std::env::var_os("VICTORY_BAND_BENCH").is_none(),
-                "D3D12 unavailable"
-            );
-            return;
-        };
-        let l = layout(512, 512, 1, victory_formats::texture::Swizzle::SW_64KB_D);
-        // SAFETY: create a write-watched range for this isolated texture.
-        let mem = unsafe {
-            VirtualAlloc(
-                std::ptr::null(),
-                l.size as usize,
-                MEM_RESERVE | MEM_COMMIT | 0x0020_0000,
-                PAGE_READWRITE,
-            )
-        };
-        assert!(!mem.is_null());
-        let (buffer, data) = host.upload_buffer(512 * 512 * 4).unwrap();
-        let at = l.offset(0, 91, 301, 0).unwrap() as usize;
-        let staging = Staging {
-            buffer,
-            size: 512 * 512 * 4,
-            data,
-            footprints: vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
-                Offset: 0,
-                Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
-                    Width: 512,
-                    Height: 512,
-                    Depth: 1,
-                    RowPitch: 2048,
-                    Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM,
-                },
-            }],
-            rows: vec![512],
-            layout: l,
-            mips: 1,
-            memory: mem.cast(),
-            tracked: Some(crate::watch::track(mem as usize, 512 * 512 * 4, true).unwrap()),
-            last: Mutex::default(),
-        };
-        assert_eq!(staging.refresh_for_upload(true), (true, None));
-        assert_eq!(staging.refresh_for_upload(true), (false, None));
-        // SAFETY: both offsets refer to the live test range; the write tracker handles the fault.
-        unsafe {
-            mem.cast::<u8>().add(at).write_volatile(73);
-        }
-        let (changed, band) = staging.refresh_for_upload(true);
-        assert!(changed);
-        let region = band.unwrap();
-        assert!((region.top..region.bottom).contains(&301));
-        // SAFETY: live tracked allocation.
-        unsafe {
-            mem.cast::<u8>().add(at).write_volatile(74);
-        }
-        assert!(staging.refresh());
-        // SAFETY: live tracked allocation.
-        unsafe {
-            mem.cast::<u8>().add(at).write_volatile(75);
-        }
-        assert_eq!(staging.refresh_for_upload(true), (true, None));
-        drop(staging);
-        // SAFETY: no tracker or references remain for this allocation.
-        assert_ne!(unsafe { VirtualFree(mem, 0, MEM_RELEASE) }, 0);
-    }
-
-    #[test]
-    fn gpu_texture_band_preserves_bytes_outside_the_box() {
-        use windows::Win32::Graphics::Dxgi::Common::{
-            DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SAMPLE_DESC,
-        };
-        let Some(host) = host() else {
-            assert!(
-                std::env::var_os("VICTORY_BAND_BENCH").is_none(),
-                "D3D12 unavailable"
-            );
-            return;
-        };
-        let bench = std::env::var_os("VICTORY_BAND_BENCH").is_some();
-        let side = if bench { 4096u32 } else { 256u32 };
-        let bytes = u64::from(side) * u64::from(side) * 4;
-        let (upload_a, a) = host.upload_buffer(bytes).unwrap();
-        let (upload_b, b) = host.upload_buffer(bytes).unwrap();
-        let texture_desc = D3D12_RESOURCE_DESC {
-            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
-            Width: u64::from(side),
-            Height: side,
-            MipLevels: 1,
-            DepthOrArraySize: 1,
-            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
-            SampleDesc: DXGI_SAMPLE_DESC {
-                Count: 1,
-                Quality: 0,
-            },
-            ..Default::default()
-        };
-        let buffer_desc = D3D12_RESOURCE_DESC {
-            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-            Width: bytes,
-            Height: 1,
-            MipLevels: 1,
-            DepthOrArraySize: 1,
-            SampleDesc: DXGI_SAMPLE_DESC {
-                Count: 1,
-                Quality: 0,
-            },
-            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
-            ..Default::default()
-        };
-        let make = |d: &D3D12_RESOURCE_DESC, ty| -> ID3D12Resource {
-            let mut out = None;
-            // SAFETY: descriptors live through the call; no optimized clear value.
-            unsafe {
-                host.device
-                    .CreateCommittedResource(
-                        &D3D12_HEAP_PROPERTIES {
-                            Type: ty,
-                            ..Default::default()
-                        },
-                        D3D12_HEAP_FLAG_NONE,
-                        d,
-                        D3D12_RESOURCE_STATE_COPY_DEST,
-                        None,
-                        &mut out,
-                    )
-                    .unwrap();
-            }
-            out.unwrap()
-        };
-        let image = make(&texture_desc, D3D12_HEAP_TYPE_DEFAULT);
-        let readback = make(&buffer_desc, D3D12_HEAP_TYPE_READBACK);
-        let footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
-            Offset: 0,
-            Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
-                Format: DXGI_FORMAT_R8G8B8A8_UNORM,
-                Width: side,
-                Height: side,
-                Depth: 1,
-                RowPitch: side * 4,
-            },
-        };
-        let loc = |r: &ID3D12Resource, buf| D3D12_TEXTURE_COPY_LOCATION {
-            // SAFETY: the location borrows its resource for recording only.
-            pResource: unsafe { std::mem::transmute_copy(r) },
-            Type: if buf {
-                D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT
-            } else {
-                D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX
-            },
-            Anonymous: if buf {
-                D3D12_TEXTURE_COPY_LOCATION_0 {
-                    PlacedFootprint: footprint,
+                if !pooled {
+                    for &offset in &offsets {
+                        expected_tiled[offset] = (40 + repeats - 1 + if dense { 64 } else { 0 }) as u8;
+                    }
                 }
-            } else {
-                D3D12_TEXTURE_COPY_LOCATION_0 {
-                    SubresourceIndex: 0,
+                let mut expected = vec![0u8; bytes as usize];
+                for (i, (_, work)) in cases.iter().enumerate() {
+                    if pooled {
+                        expected_tiled[sparse] = 150 + i as u8;
+                    }
+                    l.detile(&expected_tiled, 0, 0, &mut expected, pitch as usize, bytes as usize).unwrap();
+                    let copy = &work[0].1;
+                    read.reset();
+                    let barrier = read.move_texture(copy, D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32);
+                    let src = D3D12_TEXTURE_COPY_LOCATION {
+                        // SAFETY: copy owns the resource throughout the readback.
+                        pResource: unsafe { std::mem::transmute_copy(&copy.texture) },
+                        Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+                    };
+                    let dst = D3D12_TEXTURE_COPY_LOCATION {
+                        // SAFETY: readback remains live until after completion.
+                        pResource: unsafe { std::mem::transmute_copy(&readback) },
+                        Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: footprint },
+                    };
+                    // SAFETY: an open list, correct copy states and live resources.
+                    unsafe {
+                        if let Some(barrier) = barrier { read.list.ResourceBarrier(&[barrier]); }
+                        read.list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
+                    }
+                    read.close();
+                    h.execute(&[&read]);
+                    let mut ptr = std::ptr::null_mut();
+                    // SAFETY: execution has completed and the allocation has bytes.
+                    unsafe {
+                        readback.Map(0, None, Some(&mut ptr)).unwrap();
+                        let actual = std::slice::from_raw_parts(ptr.cast::<u8>(), bytes as usize);
+                        for row in 0..rows as usize {
+                            let at = row * pitch as usize;
+                            assert_eq!(&actual[at..at+row_bytes], &expected[at..at+row_bytes], "format {format:?}, row {row}");
+                        }
+                        readback.Unmap(0, Some(&D3D12_RANGE { Begin: 0, End: 0 }));
+                    }
                 }
-            },
-        };
-        let l = layout(side, side, 1, victory_formats::texture::Swizzle::SW_64KB_D);
-        let at = l.offset(0, 0, side / 2, 0).unwrap() as usize;
-        let page = at / 65536 * 65536;
-        let band = dirty_band(&l, page..page + 65536).unwrap();
-        // SAFETY: the two upload mappings remain live and are `bytes` long.
-        unsafe {
-            std::ptr::write_bytes(a, 17, bytes as usize);
-            std::ptr::write_bytes(b, 83, bytes as usize);
-        }
-        let list = host.new_list().unwrap();
-        copy_band(
-            &list.list,
-            &loc(&image, false),
-            &loc(&upload_a, true),
-            side,
-            None,
-        );
-        list.close();
-        host.execute(&[&list]);
-        list.reset();
-        copy_band(
-            &list.list,
-            &loc(&image, false),
-            &loc(&upload_b, true),
-            side,
-            Some(band),
-        );
-        // SAFETY: open list, live textures, and correct initial and target states.
-        unsafe {
-            list.list.ResourceBarrier(&[crate::host::transition(
-                &image,
-                D3D12_RESOURCE_STATE_COPY_DEST,
-                D3D12_RESOURCE_STATE_COPY_SOURCE,
-            )]);
-            list.list
-                .CopyTextureRegion(&loc(&readback, true), 0, 0, 0, &loc(&image, false), None);
-        }
-        list.close();
-        host.execute(&[&list]);
-        let mut mapped = std::ptr::null_mut();
-        // SAFETY: execute waited for the copy; the readback holds `bytes` initialized bytes.
-        unsafe {
-            readback.Map(0, None, Some(&mut mapped)).unwrap();
-            for (y, row) in std::slice::from_raw_parts(mapped.cast::<u8>(), bytes as usize)
-                .chunks_exact(side as usize * 4)
-                .enumerate()
-            {
-                let expected = if (band.top..band.bottom).contains(&(y as u32)) {
-                    83
-                } else {
-                    17
-                };
-                assert!(row.iter().all(|&x| x == expected), "row {y}");
             }
-            readback.Unmap(0, Some(&D3D12_RANGE { Begin: 0, End: 0 }));
-        }
-        if !bench {
-            return;
-        }
-        list.reset();
-        // SAFETY: the prior command left the texture in COPY_SOURCE.
-        unsafe {
-            list.list.ResourceBarrier(&[crate::host::transition(
-                &image,
-                D3D12_RESOURCE_STATE_COPY_SOURCE,
-                D3D12_RESOURCE_STATE_COPY_DEST,
-            )]);
-        }
-        list.close();
-        host.execute(&[&list]);
-        for i in 0..24 {
-            for partial in [i % 2 == 1, i % 2 == 0] {
-                list.reset();
-                let start = std::time::Instant::now();
-                copy_band(
-                    &list.list,
-                    &loc(&image, false),
-                    &loc(&upload_b, true),
-                    side,
-                    partial.then_some(band),
-                );
-                list.close();
-                host.execute(&[&list]);
-                println!(
-                    "BAND_RESULT,{i},{partial},{},{:.2}",
-                    if partial {
-                        u64::from(band.bottom - band.top) * u64::from(side) * 4
-                    } else {
-                        bytes
-                    },
-                    start.elapsed().as_secs_f64() * 1e6
-                );
+            drop(submit);
+            drop(read);
+            for (mem, work) in cases {
+                drop(work);
+                // SAFETY: no remaining tracker or owner reads the allocation.
+                assert_ne!(unsafe { VirtualFree(mem.cast(), 0, MEM_RELEASE) }, 0);
             }
         }
     }
