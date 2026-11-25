@@ -507,6 +507,90 @@ pub(crate) fn name(kind: &str, root: &[u8], code: &[&[u8]], state: &str) -> Stri
     h.finalize().to_hex()[..32].to_owned()
 }
 
+/// Pipelines a driver's compiler crashed on (names, one per line).
+const CRASHED_FILE: &str = "crashed.txt";
+
+/// The pipeline named `name` is left out from the next run on.
+fn note_crashed(name: &str) {
+    use std::io::Write;
+    let Some(dir) = DIR.get() else { return };
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join(CRASHED_FILE));
+    if let Ok(mut f) = file {
+        let _ = writeln!(f, "{name}");
+    }
+}
+
+/// Whether the driver crashed making the pipeline named `name` before.
+fn crashed(name: &str) -> bool {
+    static NAMES: OnceLock<HashSet<String>> = OnceLock::new();
+    NAMES
+        .get_or_init(|| {
+            DIR.get()
+                .and_then(|d| std::fs::read_to_string(d.join(CRASHED_FILE)).ok())
+                .map(|t| t.lines().map(str::to_owned).collect())
+                .unwrap_or_default()
+        })
+        .contains(name)
+}
+
+thread_local! {
+    /// The pipeline the driver makes on this thread.
+    static MAKING: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+}
+
+/// Guards a driver pipeline compile so an AMD compiler crash is logged to
+/// `crashed.txt` and the faulting worker thread is parked instead of taking
+/// down the process.
+struct Making;
+
+impl Making {
+    fn new(name: &str) -> Making {
+        use windows_sys::Win32::System::Diagnostics::Debug::AddVectoredExceptionHandler;
+        static HANDLER: std::sync::Once = std::sync::Once::new();
+        // SAFETY: a handler that lives as long as the process.
+        HANDLER.call_once(|| unsafe {
+            AddVectoredExceptionHandler(1, Some(compiler_crashed));
+        });
+        MAKING.with(|m| name.clone_into(&mut m.borrow_mut()));
+        Making
+    }
+}
+
+impl Drop for Making {
+    fn drop(&mut self) {
+        MAKING.with(|m| m.borrow_mut().clear());
+    }
+}
+
+/// Workers parked after an AMD driver compiler crash; replaced on the next `make::start`.
+pub(crate) static LOST: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+unsafe extern "system" fn compiler_crashed(
+    info: *mut windows_sys::Win32::System::Diagnostics::Debug::EXCEPTION_POINTERS,
+) -> i32 {
+    const ACCESS_VIOLATION: i32 = 0xc000_0005_u32 as i32;
+    // SAFETY: the system passes a live record.
+    let record = unsafe { &*(*info).ExceptionRecord };
+    let name = MAKING
+        .try_with(|m| m.try_borrow().map(|m| m.clone()).unwrap_or_default())
+        .unwrap_or_default();
+    if record.ExceptionCode != ACCESS_VIOLATION
+        || name.is_empty()
+        || record.ExceptionInformation[1] >= 0x10000
+    {
+        return 0; // not ours
+    }
+    tracing::error!(name, "the driver's compiler crashed making a pipeline: it is left out");
+    note_crashed(&name);
+    LOST.fetch_add(1, Ordering::Relaxed);
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(3600));
+    }
+}
+
 /// The pipeline named `name`: loaded from the library by `load` if it is
 /// there with the same description, else made by `create` and stored.
 pub(crate) fn pipeline(
@@ -515,6 +599,13 @@ pub(crate) fn pipeline(
     create: impl FnOnce() -> windows::core::Result<ID3D12PipelineState>,
 ) -> windows::core::Result<ID3D12PipelineState> {
     let wide = HSTRING::from(name);
+    if crashed(name) {
+        return Err(windows::core::Error::from_hresult(windows::core::HRESULT(0x8000_4005_u32 as i32)));
+    }
+    let create = || {
+        let _making = Making::new(name);
+        create()
+    };
     let Some(library) = library() else {
         MADE.fetch_add(1, Ordering::Relaxed);
         return create();
@@ -524,6 +615,7 @@ pub(crate) fn pipeline(
         let _all = one_call();
         let _one = same_name(name);
         let _call = call("load", name);
+        let _making = Making::new(name);
         load(&library.library, PCWSTR(wide.as_ptr()))
     };
     // The load read the library's file (see `trim`).
