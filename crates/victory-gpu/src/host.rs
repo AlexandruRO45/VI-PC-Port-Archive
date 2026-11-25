@@ -1646,6 +1646,51 @@ unsafe impl Send for CardWork {}
 
 static CARD_WORK: Mutex<Option<CardWork>> = Mutex::new(None);
 
+impl CardWork {
+    /// [`Host::card_done`]: the plan's lists are free for the next plan,
+    /// and its run of the results and the ring's slots its compare took go
+    /// back ([`card_run_done`]).
+    fn plan_done(&mut self, plan: CardPlan) {
+        // `CardPlan::take_run` gives a plan of the ring its run with the
+        // count's dword; without it the count would be refused, and the
+        // ring's slots would stop.
+        debug_assert!(
+            !plan.in_ring || plan.run.is_none() || plan.count_at.is_some(),
+            "a plan of the card compare's ring holds a run of the results without the count's dword"
+        );
+        for (check, list) in plan.lists {
+            if check { self.check.push(list) } else { self.sync.push(list) }
+        }
+        // SAFETY: the mappings of the results and of the ring; the plan's
+        // compare has run, and its run is given to no other plan before
+        // this one gives it back.
+        unsafe {
+            card_run_done(
+                &mut self.areas,
+                self.differs.1 as *const u32,
+                self.ring.as_ref().map(|(_, data, _)| *data as *mut u8),
+                plan.run,
+                plan.count_at,
+            )
+        };
+    }
+}
+
+/// Whether an eighth or less of the compare's results of `work`
+/// ([`CARD_WORK`]) is free (`Host::card_results_low`).
+fn card_results_low_of(work: &Mutex<Option<CardWork>>) -> bool {
+    work.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|work| work.areas.low())
+}
+
+/// With [`relay_exact`], whether the wait of a submission that found the
+/// compare's results of `work` ([`CARD_WORK`]) low is over, as `line`
+/// stands ([`results_wait_over`] with them as they are now). Called under
+/// the line's lock: it takes `work`'s, and nothing takes the line's under
+/// that.
+fn room_wait_over(work: &Mutex<Option<CardWork>>, line: &Line) -> bool {
+    results_wait_over(card_results_low_of(work), line)
+}
+
 /// A plan's run of the compare's results ([`CardAreas`]), as it gives it
 /// back: where it starts and ends, in dwords counted since the area was
 /// made. A run that would pass the area's end starts again at its first
@@ -1656,13 +1701,26 @@ pub(crate) struct ResultRun {
     to: u64,
 }
 
-/// A run taken ([`CardAreas`]): whether its plan is done with, and the
-/// ring's count its compare left.
+/// A run taken ([`CardAreas`]): its plan's compared pieces, whether its
+/// compare takes counts of the ring, whether the plan is done with, and
+/// what its compare left.
 #[derive(Debug)]
 struct Taken {
     run: ResultRun,
+    pieces: u64,
+    ring: bool,
     done: bool,
-    count: Option<u32>,
+    left: Option<Left>,
+}
+
+/// What a plan's compare left in its run with the ring ([`card_run_done`]):
+/// the ring's count after its compares, and how many of its pieces it
+/// flagged. Each piece it flags takes one count, with a slot or past the
+/// limit, and no other piece does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Left {
+    pub(crate) count: u32,
+    pub(crate) flagged: u32,
 }
 
 /// The host's side of the compare's two areas between plans ([`CardWork`]):
@@ -1698,6 +1756,18 @@ struct Taken {
 /// of the plans whose runs were out then (its own too), each piece with a
 /// dword of the results (2^18 in all). An older limit, read while the host
 /// writes a newer one, only gives fewer slots.
+///
+/// So the count a plan of the ring left is taken only for what it must be
+/// ([`CardAreas::done`], plans in the queue's order): the count taken
+/// before it (0 before the first) and one more for each piece its compare
+/// flagged, which is between 0 and its pieces. Anything else, a dword read
+/// in another place (a flag, another plan's count) or a count that holds
+/// counts a later plan's compares took, which is how a boundary that is no
+/// full barrier would show on a real card, is refused: the limit stays,
+/// the ring's slots run out, and the landings fetch the pieces (the
+/// correct way, and the slower); [`card_run_done`] says so at the 1st,
+/// 2nd, 4th... refusal. Once a plan that flagged pieces was refused the
+/// counts after it are refused too: the slots stay stopped.
 #[derive(Debug)]
 pub(crate) struct CardAreas {
     /// Dwords of the results.
@@ -1709,6 +1779,8 @@ pub(crate) struct CardAreas {
     /// With the ring: its slots, and the count every slot below which was
     /// merged.
     ring: Option<(u32, u32)>,
+    /// Counts of the ring refused.
+    refused: u64,
 }
 
 impl CardAreas {
@@ -1718,6 +1790,7 @@ impl CardAreas {
             head: 0,
             runs: std::collections::VecDeque::new(),
             ring: slots.map(|slots| (slots.max(1), 0)),
+            refused: 0,
         }
     }
 
@@ -1742,7 +1815,13 @@ impl CardAreas {
             return None;
         }
         let run = ResultRun { from: self.head, to: start + n };
-        self.runs.push_back(Taken { run, done: false, count: None });
+        self.runs.push_back(Taken {
+            run,
+            pieces,
+            ring,
+            done: false,
+            left: None,
+        });
         self.head = run.to;
         Some(((start % self.size) as u32, run))
     }
@@ -1769,30 +1848,73 @@ impl CardAreas {
         })
     }
 
-    /// The plan holding `run` is done with; `count` is what its compare
-    /// left in the run's last dword (with the ring). Its run is free once
+    /// The plan holding `run` is done with; `left` is what its compare left
+    /// in the run with the ring ([`card_run_done`]). Its run is free once
     /// the runs before it are; the ring's limit for the compares, if that
-    /// moved it.
-    pub(crate) fn done(&mut self, run: ResultRun, count: Option<u32>) -> Option<u32> {
+    /// moved it. Plans of the ring are passed in the order taken, each once
+    /// every plan before it is: its count is the one merged from then on
+    /// only if it is the count merged so far and one for each piece its
+    /// compare flagged; else, or with nothing left (no dword for the
+    /// count), it is refused and the count merged stays.
+    pub(crate) fn done(&mut self, run: ResultRun, left: Option<Left>) -> Option<u32> {
         if let Some(t) = self.runs.iter_mut().find(|t| t.run == run) {
             t.done = true;
-            t.count = count;
+            t.left = left;
         }
-        let mut passed = None;
+        let mut moved = false;
         while self.runs.front().is_some_and(|t| t.done) {
-            if let Some(t) = self.runs.pop_front() {
-                passed = t.count.or(passed);
+            let Some(t) = self.runs.pop_front() else {
+                break;
+            };
+            let Some((slots, merged)) = self.ring else {
+                continue;
+            };
+            if !t.ring {
+                continue;
+            }
+            match t.left {
+                // A count per piece flagged, no fewer and no more: no other
+                // value is the count the plan's compare left after the
+                // plan before it.
+                Some(left) if u64::from(left.flagged) <= t.pieces && left.count.wrapping_sub(merged) == left.flagged => {
+                    moved |= left.count != merged;
+                    self.ring = Some((slots, left.count));
+                }
+                _ => self.refused += 1,
             }
         }
-        let (Some(count), Some((_, merged))) = (passed, self.ring.as_mut()) else {
-            return None;
-        };
-        // Counts go up (wrapping), as plans are done with in order.
-        if count.wrapping_sub(*merged) as i32 <= 0 {
-            return None;
+        if moved { self.limit() } else { None }
+    }
+
+    /// With the ring, where the compare of the plan holding `run` leaves
+    /// the count: the run's last dword ([`CardAreas::lay_out`]), and the
+    /// dwords before it, one per piece, that hold its pieces' flags. `None`
+    /// for a run not taken, or not for the ring.
+    pub(crate) fn count_place(&self, run: ResultRun) -> Option<(u32, std::ops::Range<u32>)> {
+        let t = self.runs.iter().find(|t| t.run == run && t.ring)?;
+        // A run never passes the area's end ([`CardAreas::take`]).
+        let at = (t.run.to - 1) % self.size;
+        Some((at as u32, (at - t.pieces) as u32..at as u32))
+    }
+
+    /// Counts of the ring refused so far ([`CardAreas::done`]).
+    pub(crate) fn refused(&self) -> u64 {
+        self.refused
+    }
+
+    /// With the ring: the count every slot below which was merged.
+    pub(crate) fn merged(&self) -> Option<u32> {
+        self.ring.map(|(_, merged)| merged)
+    }
+
+    /// Tests: as if plans of the ring had taken counts up to `count`, all
+    /// merged (nothing out).
+    #[cfg(test)]
+    pub(crate) fn jump(&mut self, count: u32) {
+        assert!(self.runs.is_empty(), "a jump with runs out");
+        if let Some(ring) = self.ring.as_mut() {
+            ring.1 = count;
         }
-        *merged = count;
-        self.limit()
     }
 
     /// The ring's limit ([`CARD_RING_LIMIT`]).
@@ -1837,12 +1959,15 @@ pub(crate) struct RunLayout {
 }
 
 /// What [`Host::card_done`] does with a plan's run of the compare's
-/// results ([`CardAreas`]) and with the ring of pieces: the count the
-/// plan's compare left in the run's last dword (`count_at`, with the ring)
-/// is read from `results`, the run is given back, and the ring's limit is
-/// written where the compares read it ([`set_card_limit`]). At every plan
-/// done with, moved or not, so that a write lost on the way is put right
-/// by the next.
+/// results ([`CardAreas`]) and with the ring of pieces: with the ring, the
+/// count the plan's compare left in the run's last dword (`count_at`) is
+/// read from `results`, and the pieces it flagged in the dwords before it;
+/// the run is given back, and the ring's limit is written where the
+/// compares read it ([`set_card_limit`]). At every plan done with, moved or
+/// not, so that a write lost on the way is put right by the next. A
+/// `count_at` that is not the run's last dword is read nowhere: that plan's
+/// count is refused, as is one off what its flags say
+/// ([`CardAreas::done`]); refusals are said at the 1st, 2nd, 4th... time.
 ///
 /// # Safety
 /// `results` maps the compare's results and `ring` the ring's first slot's
@@ -1856,10 +1981,31 @@ pub(crate) unsafe fn card_run_done(
     count_at: Option<u32>,
 ) {
     if let Some(run) = run {
-        // SAFETY: the caller's: the run's last dword, which the compare
-        // wrote.
-        let count = count_at.map(|at| unsafe { results.add(at as usize).read_volatile() });
-        areas.done(run, count);
+        let left = count_at
+            .zip(areas.count_place(run))
+            .filter(|(at, (place, _))| at == place)
+            .map(|(at, (_, flags))| {
+                // SAFETY: the caller's: the run's dwords, which its compare
+                // wrote.
+                let read = |d: u32| unsafe { results.add(d as usize).read_volatile() };
+                Left {
+                    count: read(at),
+                    flagged: flags.filter(|&d| read(d) != 0).count() as u32,
+                }
+            });
+        let (before, merged) = (areas.refused(), areas.merged());
+        areas.done(run, left);
+        let refused = areas.refused();
+        if (before + 1..=refused).any(u64::is_power_of_two) {
+            tracing::warn!(
+                refused,
+                ?left,
+                ?merged,
+                "the card compare's ring: the count a plan's compare left is not the count before it and one for each \
+                 piece it flagged (read in another place, or holding counts a later submission's compares took): \
+                 the ring's limit stays, its slots run out, and the landings fetch; said at the 1st, 2nd, 4th... time"
+            );
+        }
     }
     if let (Some(ring), Some(limit)) = (ring, areas.limit()) {
         // SAFETY: the caller's.
@@ -1885,15 +2031,16 @@ pub(crate) unsafe fn set_card_limit(ring: *mut u8, limit: u32) {
 /// flights to land (`Host::card_results_low`, counted as lists in the
 /// air). As each plan takes its run, [`Host::card_before`] asks whether
 /// runs are out past [`OVERDUE_RUNS`] times [`late_most`] (the plans in the
-/// air are fewer than their lists) or the results were low for
-/// [`OVERDUE_LOW`] plans in a row (with the relay, each found them low
-/// even after its submission waited for room), and says so at the 1st,
-/// 2nd, 4th... time.
+/// air are fewer than their lists) or, with the relay, the results were
+/// low for [`OVERDUE_LOW`] plans in a row (each found them low even after
+/// its submission waited for room; without the relay nothing waits for
+/// room, and results low for a while say nothing), and says so at the 1st,
+/// 2nd, 4th... time of each time the areas look so.
 #[derive(Debug, Default)]
 struct CardOverdue {
-    /// Plans in a row that found the results low.
+    /// Plans in a row that found the results low, with the relay.
     low: u32,
-    /// Plans that found the areas so.
+    /// Plans in a row that found the areas so.
     seen: u64,
 }
 
@@ -1904,12 +2051,16 @@ const OVERDUE_RUNS: usize = 4;
 const OVERDUE_LOW: u32 = 64;
 
 impl CardOverdue {
-    /// A plan takes its run: whether the results are low, the runs out
-    /// ([`CardAreas::out`]) and the most host lists in the air. `Some`: how
-    /// many plans found the areas so, when that is to be said.
-    fn look(&mut self, low: bool, out: usize, most: usize) -> Option<u64> {
-        self.low = if low { self.low.saturating_add(1) } else { 0 };
+    /// A plan takes its run: whether the results are low, whether the
+    /// relay is on ([`relay`]: only then did its submission wait for room
+    /// first), the runs out ([`CardAreas::out`]) and the most host lists in
+    /// the air. `Some`: how many plans in a row found the areas so, when
+    /// that is to be said. Once they do not, the next time is said from the
+    /// first again.
+    fn look(&mut self, low: bool, relay: bool, out: usize, most: usize) -> Option<u64> {
+        self.low = if low && relay { self.low.saturating_add(1) } else { 0 };
         if out <= OVERDUE_RUNS.saturating_mul(most) && self.low < OVERDUE_LOW {
+            self.seen = 0;
             return None;
         }
         self.seen += 1;
@@ -1920,9 +2071,14 @@ impl CardOverdue {
 #[cfg(test)]
 mod card_area_tests {
     use super::{
-        CARD_COMPARE, CARD_RING_LIMIT, CARD_SLOT_BYTES, CardAreas, CardOverdue, Late, Line, OVERDUE_LOW, RunLayout, card_run_done,
-        results_wait_over, set_card_limit,
+        CARD_COMPARE, CARD_RING_LIMIT, CARD_SLOT_BYTES, CardAreas, CardOverdue, Late, Left, Line, OVERDUE_LOW, RunLayout,
+        card_run_done, results_wait_over, set_card_limit,
     };
+
+    /// What a plan's compare left: the count, and the pieces it flagged.
+    fn left(count: u32, flagged: u32) -> Option<Left> {
+        Some(Left { count, flagged })
+    }
 
     /// Runs follow one another and never pass the area's end: one that
     /// would starts again at the first dword, and holds the end it skips
@@ -2002,17 +2158,18 @@ mod card_area_tests {
         let (_, b) = areas.take(8, true).unwrap();
         let (_, c) = areas.take(8, false).unwrap();
         let (_, d) = areas.take(8, true).unwrap();
-        // b's compare left the count at 9, a's at 5 (taken before b's).
-        assert_eq!(areas.done(b, Some(9)), None, "a holds slots below 5");
+        // a's compare flagged five pieces, b's four after them: b left the
+        // count at 9, a at 5.
+        assert_eq!(areas.done(b, left(9, 4)), None, "a holds slots below 5");
         assert_eq!(areas.limit(), Some(16));
-        assert_eq!(areas.done(a, Some(5)), Some(9 + 16), "a and b: every slot below 9 was merged");
+        assert_eq!(areas.done(a, left(5, 5)), Some(9 + 16), "a and b: every slot below 9 was merged");
         // A plan not in the ring moves nothing; d's count moves it on.
         assert_eq!(areas.done(c, None), None);
-        assert_eq!(areas.done(d, Some(20)), Some(36));
-        // An older count never moves it back.
+        assert_eq!(areas.done(d, left(17, 8)), Some(33));
+        // A plan that flagged nothing leaves the count as it was.
         let (_, e) = areas.take(1, true).unwrap();
-        assert_eq!(areas.done(e, Some(20)), None);
-        assert_eq!(areas.limit(), Some(36));
+        assert_eq!(areas.done(e, left(17, 0)), None);
+        assert_eq!((areas.limit(), areas.refused()), (Some(33), 0));
     }
 
     /// The count is never set back, and `count % slots` must go on from
@@ -2026,20 +2183,23 @@ mod card_area_tests {
         let round = u32::MAX - 3;
         assert_eq!(round % slots, 0);
         let mut areas = CardAreas::new(1024, Some(slots));
-        let pass = |areas: &mut CardAreas, count: u32| {
-            let (_, run) = areas.take(1, true).unwrap();
-            areas.done(run, Some(count))
+        // A plan of eight pieces, `flagged` of them flagged.
+        let pass = |areas: &mut CardAreas, flagged: u32| {
+            let (_, run) = areas.take(8, true).unwrap();
+            let count = areas.merged().unwrap().wrapping_add(flagged);
+            areas.done(run, left(count, flagged))
         };
-        // Up in steps of less than 2^31, as plans take them.
-        for count in [1u32 << 30, 2 << 30, 3 << 30] {
-            assert_eq!(pass(&mut areas, count), Some(count + slots));
-        }
-        assert_eq!(pass(&mut areas, round - 10), Some(round - 3));
-        assert_eq!(pass(&mut areas, round - 7), Some(round));
-        assert_eq!(pass(&mut areas, round - 1), Some(round), "not past the last multiple");
-        assert_eq!(pass(&mut areas, round), Some(round));
-        assert_eq!(pass(&mut areas, round + 2), Some(round), "past it, no slot until the count wraps");
-        assert_eq!(pass(&mut areas, 1), Some(1 + slots), "gone round: on from slot 1");
+        // As if plans had taken the count that far.
+        areas.jump(1 << 31);
+        assert_eq!(pass(&mut areas, 5), Some((1 << 31) + 5 + slots));
+        areas.jump(round - 15);
+        assert_eq!(pass(&mut areas, 5), Some(round - 3));
+        assert_eq!(pass(&mut areas, 3), Some(round));
+        assert_eq!(pass(&mut areas, 6), Some(round), "not past the last multiple");
+        assert_eq!(pass(&mut areas, 1), Some(round));
+        assert_eq!(pass(&mut areas, 2), Some(round), "past it, no slot until the count wraps");
+        assert_eq!(pass(&mut areas, 3), Some(1 + slots), "gone round: on from slot 1");
+        assert_eq!(areas.refused(), 0);
     }
 
     /// Only the results ask for flights to land (`Host::card_results_low`):
@@ -2049,19 +2209,19 @@ mod card_area_tests {
     #[test]
     fn only_the_results_ask_flights_to_land() {
         let mut areas = CardAreas::new(800, Some(16));
-        let (_, a) = areas.take(8, true).unwrap();
+        let (_, a) = areas.take(12, true).unwrap();
         let (_, b) = areas.take(8, true).unwrap();
         // a's compare took 12 of the 16 slots; b is still in the air.
-        let limit = areas.done(a, Some(12));
+        let limit = areas.done(a, left(12, 12));
         assert!(!areas.low(), "a ring count past half its slots");
         assert_eq!(limit, Some(28));
         let (_, c) = areas.take(600, true).unwrap();
         assert!(!areas.low());
         let (_, d) = areas.take(90, false).unwrap();
         assert!(areas.low(), "an eighth of the results left");
-        assert_eq!(areas.done(b, Some(13)), Some(29));
+        assert_eq!(areas.done(b, left(13, 1)), Some(29));
         assert!(!areas.low());
-        areas.done(c, Some(14));
+        areas.done(c, left(14, 1));
         areas.done(d, None);
         assert_eq!(areas.free(), 800);
     }
@@ -2070,31 +2230,40 @@ mod card_area_tests {
     /// first dword, in the order given, and with the ring the count goes in
     /// the run's last dword: the next run starts right after it, and a run
     /// that starts again at the area's first dword has its count at its own
-    /// end too.
+    /// end too. The host looks for the count, and for the pieces' flags
+    /// before it, where the run was laid out.
     #[test]
     fn a_plan_lays_out_its_run() {
         let mut areas = CardAreas::new(32, Some(4));
+        let place = |areas: &CardAreas, laid: &RunLayout| areas.count_place(laid.run);
         let a = areas.lay_out(&[3, 5, 2], true).unwrap();
         assert_eq!((&a.ats[..], a.count_at), (&[0, 3, 8][..], Some(10)), "the count after the ranges");
+        assert_eq!(place(&areas, &a), Some((10, 0..10)));
         let b = areas.lay_out(&[4], false).unwrap();
         assert_eq!((&b.ats[..], b.count_at), (&[11][..], None), "the next run right after the count");
+        assert_eq!(place(&areas, &b), None, "no count without the ring");
         let c = areas.lay_out(&[6, 6], true).unwrap();
         assert_eq!((&c.ats[..], c.count_at), (&[15, 21][..], Some(27)));
-        areas.done(a.run, Some(1));
+        assert_eq!(place(&areas, &c), Some((27, 15..27)));
+        areas.done(a.run, left(1, 1));
+        assert_eq!(place(&areas, &a), None, "given back");
         // 28 + 6 would pass the end at 32.
         let d = areas.lay_out(&[5], true).unwrap();
         assert_eq!((&d.ats[..], d.count_at), (&[0][..], Some(5)), "from the first dword again");
+        assert_eq!(place(&areas, &d), Some((5, 0..5)));
         // The last five dwords before b's.
         let e = areas.lay_out(&[4], true).unwrap();
         assert_eq!((&e.ats[..], e.count_at), (&[6][..], Some(10)));
+        assert_eq!(place(&areas, &e), Some((10, 6..10)));
         assert!(areas.lay_out(&[1], false).is_none());
     }
 
     /// What `Host::card_done` does with the run and the ring
     /// (`card_run_done`): the count the plan's compare left is read in its
-    /// run's last dword, the run is given back, and the limit is written
-    /// where the compares read it, at every plan done with: one lost on the
-    /// way is written again, moved or not. The count is the compares' own.
+    /// run's last dword, with the flags of its pieces before it, the run is
+    /// given back, and the limit is written where the compares read it, at
+    /// every plan done with: one lost on the way is written again, moved or
+    /// not. The count is the compares' own.
     #[test]
     fn the_host_reads_the_count_and_writes_the_limit() {
         let mut areas = CardAreas::new(64, Some(16));
@@ -2111,21 +2280,27 @@ mod card_area_tests {
         let a = areas.lay_out(&[3, 2], true).unwrap();
         let b = areas.lay_out(&[4], true).unwrap();
         let c = areas.lay_out(&[5], false).unwrap();
-        // a's compare left the count at 9, b's at 12.
-        results[a.count_at.unwrap() as usize] = 9;
-        results[b.count_at.unwrap() as usize] = 12;
+        // What their compares left: a flagged three of its pieces (one past
+        // the limit) and left the count at 3, b two more (5).
+        let leave = |results: &mut [u32], laid: &RunLayout, flags: &[u32], count: u32| {
+            let at = laid.count_at.unwrap() as usize;
+            results[at - flags.len()..at].copy_from_slice(flags);
+            results[at] = count;
+        };
+        leave(&mut results, &a, &[2, 0, 1, 0, 3], 3);
+        leave(&mut results, &b, &[0, 4, 0, 5], 5);
         let done = |areas: &mut CardAreas, results: &[u32], laid: &RunLayout| {
             // SAFETY: the whole results and ring.
             unsafe { card_run_done(areas, results.as_ptr(), Some(ring), Some(laid.run), laid.count_at) }
         };
         done(&mut areas, &results, &a);
-        assert_eq!(limit(), 9 + 16, "a's count, read where its compare left it");
+        assert_eq!(limit(), 3 + 16, "a's count, read where its compare left it");
         // c, done with before b, moves nothing.
         lose_limit();
         done(&mut areas, &results, &c);
-        assert_eq!(limit(), 9 + 16, "written again, not moved");
+        assert_eq!(limit(), 3 + 16, "written again, not moved");
         done(&mut areas, &results, &b);
-        assert_eq!(limit(), 12 + 16);
+        assert_eq!(limit(), 5 + 16);
         assert_eq!(count(), 0, "the count is the compares' own");
         // Without the ring nothing is written; a plan with no run of the
         // results writes the limit all the same.
@@ -2133,7 +2308,101 @@ mod card_area_tests {
         unsafe { card_run_done(&mut areas, results.as_ptr(), None, None, None) };
         assert_eq!(limit(), 3);
         unsafe { card_run_done(&mut areas, results.as_ptr(), Some(ring), None, None) };
-        assert_eq!(limit(), 12 + 16);
+        assert_eq!(limit(), 5 + 16);
+        assert_eq!(areas.refused(), 0);
+    }
+
+    /// A plan's count is taken only if it is the count before it and one
+    /// for each piece its compare flagged: a flag read as the count (0, 1 or
+    /// 2 + a slot), another plan's count, the count one off, a count that
+    /// holds pieces a later plan's compare flagged, or the count's dword
+    /// passed one off (the next run's first dword, or the last flag) is
+    /// refused, and the limit stays where it was. (A flag can be the count
+    /// itself only where the count is small, at the start: then it is the
+    /// count, whichever dword gave it.)
+    #[test]
+    fn a_count_off_what_the_flags_say_moves_nothing() {
+        const SLOTS: u32 = 16;
+        // Four pieces after plans that took the count to 100: three
+        // flagged, two of them with slots 4 and 5.
+        let flags = [2 + 4, 0, 1, 2 + 5];
+        let right = 100 + 3;
+        // What the host makes of it with `read` in the count's dword and
+        // `next` in the one after, told the count's dword is `off` dwords
+        // away: the count merged, the limit written and the counts refused.
+        let with_next = |read: u32, off: i32, next: u32| {
+            let mut areas = CardAreas::new(64, Some(SLOTS));
+            areas.jump(100);
+            let mut results = vec![0u32; 64];
+            let mut first_slot = vec![0u32; CARD_SLOT_BYTES / 4];
+            let ring = first_slot.as_mut_ptr().cast::<u8>();
+            let laid = areas.lay_out(&[4], true).unwrap();
+            let at = laid.count_at.unwrap();
+            results[at as usize - 4..at as usize].copy_from_slice(&flags);
+            results[at as usize] = read;
+            results[at as usize + 1] = next;
+            // SAFETY: the whole results and ring.
+            unsafe {
+                card_run_done(&mut areas, results.as_ptr(), Some(ring), Some(laid.run), Some(at.wrapping_add_signed(off)));
+                (areas.merged(), ring.add(CARD_RING_LIMIT).cast::<u32>().read(), areas.refused())
+            }
+        };
+        // A later plan's first flag after it.
+        let with = |read: u32, off: i32| with_next(read, off, 2 + 7);
+        assert_eq!(with(right, 0), (Some(right), right + SLOTS, 0), "the count before and one per piece flagged");
+        let refused = (Some(100), 100 + SLOTS, 1);
+        for flag in [0, 1, 2, 2 + 4, 2 + SLOTS - 1] {
+            assert_eq!(with(flag, 0), refused, "a flag {flag} read as the count");
+        }
+        assert_eq!(with(100, 0), refused, "the count of the plan before");
+        assert_eq!(with(93, 0), refused, "an older plan's count");
+        assert_eq!(with(right + 1, 0), refused, "one more");
+        assert_eq!(with(right - 1, 0), refused, "one fewer");
+        assert_eq!(with(right + 2, 0), refused, "with pieces a later plan's compare flagged");
+        assert_eq!(with(right + 4, 0), refused, "past the plan's own pieces");
+        assert_eq!(with(right, 1), refused, "the dword after the count's: read nowhere");
+        assert_eq!(with_next(0, 1, right), refused, "not even where it holds the count's value");
+        assert_eq!(with(right, -1), refused, "the dword before it");
+    }
+
+    /// Once a plan whose compare flagged pieces had its count refused, the
+    /// counts after it are refused too: the count merged stays below the
+    /// counts that plan took, the limit stays, and the ring's slots run out
+    /// (the landings fetch). A plan refused that flagged nothing took no
+    /// count: the next one goes on. A plan of the ring given back with
+    /// nothing left (no dword for the count) is refused, as is one said to
+    /// have flagged more pieces than it compared; one not of the ring has
+    /// nothing to refuse.
+    #[test]
+    fn the_ring_stops_after_a_count_refused() {
+        let mut areas = CardAreas::new(256, Some(16));
+        let (_, a) = areas.take(4, true).unwrap();
+        let (_, b) = areas.take(4, true).unwrap();
+        // a flagged nothing and its count was read wrong; b flagged two.
+        assert_eq!(areas.done(a, left(7, 0)), None);
+        assert_eq!(areas.done(b, left(2, 2)), Some(2 + 16));
+        assert_eq!(areas.refused(), 1);
+        // c flagged three, and its count holds a piece of a later plan.
+        let (_, c) = areas.take(4, true).unwrap();
+        let (_, d) = areas.take(4, true).unwrap();
+        let (_, e) = areas.take(4, false).unwrap();
+        let (_, f) = areas.take(4, true).unwrap();
+        // d, done with before c, waits for it: its count 7 is 5 + its 2.
+        assert_eq!(areas.done(d, left(7, 2)), None);
+        assert_eq!(areas.done(c, left(6, 3)), None, "c refused, and with it d");
+        assert_eq!((areas.merged(), areas.limit(), areas.refused()), (Some(2), Some(18), 3));
+        assert_eq!(areas.done(e, None), None);
+        assert_eq!(areas.done(f, left(8, 1)), None);
+        assert_eq!(areas.refused(), 4);
+        // A plan of the ring that left nothing.
+        let (_, g) = areas.take(4, true).unwrap();
+        assert_eq!(areas.done(g, None), None);
+        assert_eq!((areas.merged(), areas.refused()), (Some(2), 5));
+        // No plan flags more pieces than it compared.
+        let mut areas = CardAreas::new(256, Some(16));
+        let (_, h) = areas.take(4, true).unwrap();
+        assert_eq!(areas.done(h, left(5, 5)), None);
+        assert_eq!((areas.merged(), areas.refused()), (Some(0), 1));
     }
 
     /// The compare reads the limit where the host writes it, and cuts the
@@ -2146,27 +2415,40 @@ mod card_area_tests {
     }
 
     /// Plans never done with are said once the areas look so, then at the
-    /// 2nd, 4th, 8th... time: runs out past a few times the lists in the
-    /// air, or the results low for many plans in a row. Results low now and
-    /// then, with runs as many as the lists in the air allow, say nothing.
+    /// 2nd, 4th, 8th... plan in a row, and from the first again each time
+    /// they look so anew: runs out past a few times the lists in the air,
+    /// or with the relay the results low for many plans in a row. Results
+    /// low now and then, with runs as many as the lists in the air allow,
+    /// say nothing; nor do results low for long without the relay, where
+    /// no submission waits for room.
     #[test]
     fn plans_never_done_with_are_said() {
         let mut overdue = CardOverdue::default();
         for i in 0..1000 {
-            assert_eq!(overdue.look(i % 50 == 0, 128, 128), None);
+            assert_eq!(overdue.look(i % 50 == 0, true, 128, 128), None);
         }
         for _ in 1..OVERDUE_LOW {
-            assert_eq!(overdue.look(true, 10, 128), None);
+            assert_eq!(overdue.look(true, true, 10, 128), None);
         }
-        assert_eq!(overdue.look(false, 10, 128), None, "room again: counted from the start");
-        let said: Vec<(u32, u64)> = (1..=300u32).filter_map(|n| overdue.look(true, 10, 128).map(|times| (n, times))).collect();
+        assert_eq!(overdue.look(false, true, 10, 128), None, "room again: counted from the start");
+        let said: Vec<(u32, u64)> = (1..=300u32).filter_map(|n| overdue.look(true, true, 10, 128).map(|times| (n, times))).collect();
         assert_eq!(said[0], (OVERDUE_LOW, 1), "said at the plan that makes it many in a row");
         assert_eq!(said.iter().map(|s| s.1).collect::<Vec<u64>>(), [1, 2, 4, 8, 16, 32, 64, 128]);
+        // Room again, then low as long again: said from the first time.
+        assert_eq!(overdue.look(false, true, 10, 128), None);
+        let again: Vec<u64> = (0..=OVERDUE_LOW).filter_map(|_| overdue.look(true, true, 10, 128)).collect();
+        assert_eq!(again, [1, 2], "a new time, said from its first plan");
+        // Without the relay.
         let mut overdue = CardOverdue::default();
-        assert_eq!(overdue.look(false, 4 * 128, 128), None);
-        assert_eq!(overdue.look(false, 4 * 128 + 1, 128), Some(1), "runs out past four times the lists in the air");
-        assert_eq!(overdue.look(false, 4 * 128 + 2, 128), Some(2));
-        assert_eq!(overdue.look(false, 4 * 128 + 3, 128), None);
+        assert!((0..1000).all(|_| overdue.look(true, false, 10, 128).is_none()), "nothing waited for room");
+        // Runs out: with the relay or without.
+        let mut overdue = CardOverdue::default();
+        assert_eq!(overdue.look(false, false, 4 * 128, 128), None);
+        assert_eq!(overdue.look(false, false, 4 * 128 + 1, 128), Some(1), "runs out past four times the lists in the air");
+        assert_eq!(overdue.look(false, true, 4 * 128 + 2, 128), Some(2));
+        assert_eq!(overdue.look(false, false, 4 * 128 + 3, 128), None);
+        assert_eq!(overdue.look(false, false, 4 * 128, 128), None, "back within");
+        assert_eq!(overdue.look(false, false, 4 * 128 + 1, 128), Some(1), "out again: said from the first time");
     }
 
     /// With the relay's second stage a submission that found the results
@@ -2193,6 +2475,131 @@ mod card_area_tests {
         line.line.push(Late::Signal(0, 1));
         assert!(!results_wait_over(true, &line), "flights in the air");
         assert!(results_wait_over(false, &line));
+    }
+}
+
+/// The host's own code around the compare's areas, on the host device
+/// (`host()`): the work made as `Host::card_ready` makes it, with a ring
+/// (`Host::make_card_work`); a plan's run taken as `Host::card_before`
+/// takes it (`CardPlan::take_run`) and given back as `Host::card_done`
+/// gives it (`CardWork::plan_done`); and the wait of a submission for room
+/// in the results (`room_wait_over`). What the compares leave is written
+/// here where they leave it (the compare itself on the card:
+/// `crate::indirect`'s `warp_card_compare_*`).
+#[cfg(test)]
+mod card_work_tests {
+    use super::{CARD_RING_LIMIT, CardPlan, Late, Line, card_results_low_of, room_wait_over};
+
+    fn plan(in_ring: bool) -> CardPlan {
+        CardPlan {
+            ranges: Vec::new(),
+            check: None,
+            _synced: Vec::new(),
+            lists: Vec::new(),
+            sent_as: 0,
+            in_ring,
+            run: None,
+            count_at: None,
+        }
+    }
+
+    /// A plan of the ring keeps its run's last dword for the count; given
+    /// back, the count is read there, with the flags before it, and the
+    /// limit is written in the ring where the compares read it. A plan not
+    /// of the ring keeps no count's dword; a count off what the flags say
+    /// moves nothing; and a plan of the ring holding a run without the
+    /// count's dword is a bug (a debug assertion), its count refused.
+    #[test]
+    fn the_host_gives_a_plans_run_back_through_its_ring() {
+        let Some(host) = super::host() else {
+            return;
+        };
+        let mut work = host.make_card_work(Some(16)).expect("the compare's work, with a ring");
+        let (ring, slots) = work.ring.as_ref().map(|r| (r.1 as *mut u8, r.2)).expect("a ring of 16 MB");
+        let results = work.differs.1 as *mut u32;
+        // SAFETY (each): inside the ring's first slot's worth of bytes and
+        // the results, both mapped while `work` lives.
+        let count = || unsafe { ring.cast::<u32>().read_volatile() };
+        let limit = || unsafe { ring.add(CARD_RING_LIMIT).cast::<u32>().read_volatile() };
+        let put = |d: u32, value: u32| unsafe { results.add(d as usize).write_volatile(value) };
+        assert_eq!((count(), limit()), (0, slots), "made with no count, and the limit at the slots");
+        // Two ranges, of 3 and 2 pieces: their compares flagged three, the
+        // count went from 0 to 3.
+        let mut a = plan(true);
+        assert!(a.take_run(&mut work.areas, &[3, 2]));
+        let at = a.count_at.expect("in the ring, the count's dword");
+        for (d, flag) in (at - 5..at).zip([2, 0, 1, 0, 3]) {
+            put(d, flag);
+        }
+        put(at, 3);
+        // The next run's first dword, as a later plan's compare may leave it.
+        put(at + 1, 2 + 9);
+        work.plan_done(a);
+        assert_eq!((work.areas.merged(), limit()), (Some(3), 3 + slots), "the count read where the compare left it");
+        // Not of the ring.
+        let mut b = plan(false);
+        assert!(b.take_run(&mut work.areas, &[4]));
+        assert_eq!(b.count_at, None);
+        work.plan_done(b);
+        assert_eq!(limit(), 3 + slots);
+        // A count one past what its flags say.
+        let mut c = plan(true);
+        assert!(c.take_run(&mut work.areas, &[2]));
+        let at = c.count_at.unwrap();
+        put(at - 2, 2 + 3);
+        put(at - 1, 0);
+        put(at, 5);
+        work.plan_done(c);
+        assert_eq!((work.areas.merged(), limit(), work.areas.refused()), (Some(3), 3 + slots, 1));
+        assert_eq!(count(), 0, "the count is the compares' own");
+        // No count's dword.
+        let mut d = plan(true);
+        assert!(d.take_run(&mut work.areas, &[1]));
+        d.count_at = None;
+        let done = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| work.plan_done(d)));
+        assert_eq!(done.is_err(), cfg!(debug_assertions), "a debug assertion");
+        if done.is_ok() {
+            assert_eq!((work.areas.merged(), work.areas.refused()), (Some(3), 2));
+        }
+    }
+
+    /// The wait of a submission that found the compare's results low
+    /// (`VICTORY_RELAY=2`) looks at the host's own results: it goes on
+    /// while they are low with flights in the air, and is over with room
+    /// again, or with nothing in the air.
+    #[test]
+    fn a_wait_for_room_looks_at_the_card_compares_results() {
+        let Some(host) = super::host() else {
+            return;
+        };
+        let work = std::sync::Mutex::new(Some(host.make_card_work(None).expect("the compare's work")));
+        let mut line = Line {
+            line: vec![Late::Signal(0, 1)],
+            written: Vec::new(),
+            lists: 1,
+            target: 0,
+            settling: false,
+            poke: false,
+            landed: Vec::new(),
+            in_hand: Vec::new(),
+        };
+        assert!(room_wait_over(&work, &line), "room");
+        // Plans in the air hold seven eighths of the results.
+        let held = {
+            let mut guard = work.lock().unwrap();
+            let w = guard.as_mut().unwrap();
+            let dwords = w.differs.2 / 4;
+            w.areas.take(dwords / 8 * 7, false).expect("room for seven eighths").1
+        };
+        assert!(card_results_low_of(&work));
+        assert!(!room_wait_over(&work, &line), "low, with flights in the air: the wait goes on");
+        line.line.clear();
+        assert!(room_wait_over(&work, &line), "nothing in the air: over");
+        line.line.push(Late::Signal(0, 2));
+        work.lock().unwrap().as_mut().unwrap().areas.done(held, None);
+        assert!(!card_results_low_of(&work));
+        assert!(room_wait_over(&work, &line), "room again");
+        assert!(room_wait_over(&std::sync::Mutex::new(None), &line), "no compare: nothing to wait for");
     }
 }
 
@@ -2332,7 +2739,7 @@ pub(crate) const CARD_SLOT_BYTES: usize = 65792;
 /// host's.
 pub(crate) const CARD_RING_LIMIT: usize = 256;
 
-const _: () = assert!(CARD_RING_LIMIT >= 256 && CARD_RING_LIMIT % 4 == 0 && CARD_RING_LIMIT + 4 <= CARD_SLOT_BYTES);
+const _: () = assert!(CARD_RING_LIMIT >= 256 && CARD_RING_LIMIT.is_multiple_of(4) && CARD_RING_LIMIT + 4 <= CARD_SLOT_BYTES);
 
 /// Where the bytes of piece `piece` of a copy start in its slot of the
 /// ring: the piece's first offset in the copy as [`CARD_COMPARE`] widens
@@ -2419,7 +2826,9 @@ pub(crate) unsafe fn record_card_compare(
             // call, take counts only after this has left it. Were they to
             // run beside it, the count left could hold slots they took, and
             // the host would let the limit past those slots before their
-            // landing merged them ([`CardAreas`]).
+            // landing merged them; it takes the count only if it is the
+            // count before this plan and one per piece flagged here
+            // ([`CardAreas`]).
             list.ResourceBarrier(&[all_uavs()]);
             let constants = [0, 0, 0, 0, at * 4, 3, views.slots, 0];
             list.SetComputeRoot32BitConstants(0, 8, constants.as_ptr().cast(), 0);
@@ -2440,6 +2849,16 @@ pub(crate) unsafe fn record_card_compare(
 fn relay_snapshot() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| relay() && std::env::var_os("VICTORY_RELAY_SNAPSHOT").is_some_and(|v| v == "1"))
+}
+
+/// The ring's megabytes with [`relay_snapshot`] (`VICTORY_RELAY_SNAPSHOT_MB`,
+/// 256; from 16 to 4096).
+fn card_ring_mb() -> u64 {
+    std::env::var("VICTORY_RELAY_SNAPSHOT_MB")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(256)
+        .clamp(16, 4096)
 }
 
 /// Since the last frame-rate line, of [`relay_snapshot`]: landings merged
@@ -2609,6 +3028,29 @@ struct CardPlan {
     /// With the ring: the run's last dword, where the compare leaves the
     /// ring's count after it.
     count_at: Option<u32>,
+}
+
+impl CardPlan {
+    /// Takes the plan's run of the compare's results ([`CardAreas::lay_out`])
+    /// for its compared ranges, which hold `pieces` pieces each, in their
+    /// order: each range gets its first dword, and in the ring the plan
+    /// keeps the run's last dword, where its compare leaves the count.
+    /// Without room none of its ranges is compared (every piece of them is
+    /// fetched): false.
+    fn take_run(&mut self, areas: &mut CardAreas, pieces: &[u32]) -> bool {
+        let Some(laid) = areas.lay_out(pieces, self.in_ring) else {
+            for r in &mut self.ranges {
+                r.compared = false;
+            }
+            return false;
+        };
+        for (r, at) in self.ranges.iter_mut().filter(|r| r.compared).zip(laid.ats) {
+            r.at = at;
+        }
+        self.run = Some(laid.run);
+        self.count_at = laid.count_at;
+        true
+    }
 }
 
 /// One piece of submission-time work, in recorded order.
@@ -3718,6 +4160,16 @@ fn relay_wait(why: usize, done: impl Fn(&Line) -> bool) {
 /// still not hold the next plan's run (an eighth of the results, in two
 /// parts if it goes round): that plan then compares nothing, and its
 /// landing fetches, as when the room ran out before.
+///
+/// Not a wait until the plan's own run fits ([`CardAreas::take`]): its
+/// pieces are known only inside `Host::card_before`, from the declared
+/// ranges joined per copy and the copies hashed for the first time, under
+/// the queue's order and the compare's lock, which the thread that lands
+/// flights takes too; a wait there would stop it. Counting them before
+/// would go over every list's steps once more per submission, for plans
+/// past half the room left (16,000 pieces and more, a GiB of declared
+/// ranges in one submission) where a frame's plans held some 14,000
+/// dwords in all.
 fn results_wait_over(low: bool, line: &Line) -> bool {
     !low || line.line.is_empty() && !line.settling
 }
@@ -4458,7 +4910,7 @@ impl Host {
     /// card's memory only if it has.
     pub(crate) fn card_ready(&self) -> bool {
         static READY: OnceLock<bool> = OnceLock::new();
-        *READY.get_or_init(|| match self.make_card_work() {
+        *READY.get_or_init(|| match self.make_card_work(relay_snapshot().then(card_ring_mb)) {
             Ok(work) => {
                 *CARD_WORK.lock().unwrap_or_else(|e| e.into_inner()) = Some(work);
                 true
@@ -4470,7 +4922,10 @@ impl Host {
         })
     }
 
-    fn make_card_work(&self) -> windows::core::Result<CardWork> {
+    /// What copies in the card's memory need ([`CardWork`]); with
+    /// `ring_mb`, the ring of pieces of that many megabytes
+    /// ([`relay_snapshot`]).
+    fn make_card_work(&self, ring_mb: Option<u64>) -> windows::core::Result<CardWork> {
         use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
         use windows::Win32::Graphics::Direct3D::ID3DBlob;
         let mut code: Option<ID3DBlob> = None;
@@ -4501,22 +4956,15 @@ impl Host {
         // The ring of pieces the compare copies (`relay_snapshot`): its
         // first slot's worth of bytes holds the count and the limit
         // (`CardAreas`).
-        let ring = relay_snapshot()
-            .then(|| {
-                let mb: u64 = std::env::var("VICTORY_RELAY_SNAPSHOT_MB")
-                    .ok()
-                    .and_then(|v| v.trim().parse().ok())
-                    .unwrap_or(256)
-                    .clamp(16, 4096);
-                let slots = ((mb << 20) / CARD_SLOT_BYTES as u64).saturating_sub(1).max(1) as u32;
-                let bytes = (u64::from(slots) + 1) * CARD_SLOT_BYTES as u64;
-                let (ring, data) = self.shared_buffer(bytes)?;
-                name(&ring, || "card compare ring of pieces".into());
-                tracing::info!(slots, mb, "pieces the card's compare finds differing are copied in the queue's order (VICTORY_RELAY_SNAPSHOT=1)");
-                Some((ring, data as usize, slots))
-            })
-            .flatten();
-        if relay_snapshot() && ring.is_none() {
+        let ring = ring_mb.and_then(|mb| {
+            let slots = ((mb << 20) / CARD_SLOT_BYTES as u64).saturating_sub(1).max(1) as u32;
+            let bytes = (u64::from(slots) + 1) * CARD_SLOT_BYTES as u64;
+            let (ring, data) = self.shared_buffer(bytes)?;
+            name(&ring, || "card compare ring of pieces".into());
+            tracing::info!(slots, mb, "pieces the card's compare finds differing are copied in the queue's order (VICTORY_RELAY_SNAPSHOT=1)");
+            Some((ring, data as usize, slots))
+        });
+        if ring_mb.is_some() && ring.is_none() {
             tracing::warn!("no ring for the pieces the card's compare finds differing: they are fetched as before");
         }
         let areas = CardAreas::new(RESULTS / 4, ring.as_ref().map(|r| r.2));
@@ -4746,7 +5194,7 @@ impl Host {
         // them is fetched.
         let pieces: Vec<u32> = plan.ranges.iter().filter(|r| r.compared).map(|r| r.span.pieces).collect();
         if pieces.iter().any(|&p| p > 0) {
-            if let Some(times) = work.overdue.look(work.areas.low(), work.areas.out(), late_most()) {
+            if let Some(times) = work.overdue.look(work.areas.low(), relay(), work.areas.out(), late_most()) {
                 tracing::warn!(
                     times,
                     runs_out = work.areas.out(),
@@ -4754,25 +5202,12 @@ impl Host {
                     low_in_a_row = work.overdue.low,
                     free = work.areas.free(),
                     "the card compare's results look held by a plan never done with: every run after its run stays out, \
-                     and submissions sent ahead wait for flights to land (\"lists in the air\"); said at the 1st, 2nd, 4th... time"
+                     and submissions sent ahead wait for flights to land (\"lists in the air\"); said at the 1st, 2nd, 4th... \
+                     plan in a row that finds them so"
                 );
             }
-            match work.areas.lay_out(&pieces, slots != 0) {
-                Some(laid) => {
-                    for (r, at) in plan.ranges.iter_mut().filter(|r| r.compared).zip(laid.ats) {
-                        r.at = at;
-                    }
-                    plan.run = Some(laid.run);
-                    plan.count_at = laid.count_at;
-                }
-                None => {
-                    for r in &mut plan.ranges {
-                        r.compared = false;
-                    }
-                    if relay_snapshot() {
-                        SNAPSHOT_STATS[5].fetch_add(1, Ordering::Relaxed);
-                    }
-                }
+            if !plan.take_run(&mut work.areas, &pieces) && relay_snapshot() {
+                SNAPSHOT_STATS[5].fetch_add(1, Ordering::Relaxed);
             }
         }
         if plan.ranges.iter().any(|r| r.compared) {
@@ -4839,7 +5274,7 @@ impl Host {
     /// the air are capped first.) Not the ring of pieces: a piece with no
     /// slot is fetched, as before.
     fn card_results_low(&self) -> bool {
-        CARD_WORK.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|work| work.areas.low())
+        card_results_low_of(&CARD_WORK)
     }
 
     /// The plan's submission has run and its results were read and merged
@@ -4847,27 +5282,11 @@ impl Host {
     /// for the next plan, and its run of the results and the ring's slots
     /// its compare took once the plans before it are done with too
     /// (`CardAreas`; plans are done with in the queue's order). The ring's
-    /// limit is written either way ([`card_run_done`]).
+    /// limit is written either way ([`CardWork::plan_done`]).
     fn card_done(&self, plan: CardPlan) {
-        let mut work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(work) = work.as_mut() else {
-            return;
-        };
-        for (check, list) in plan.lists {
-            if check { work.check.push(list) } else { work.sync.push(list) }
+        if let Some(work) = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+            work.plan_done(plan);
         }
-        // SAFETY: the mappings of the results and of the ring; the plan's
-        // compare has run, and its run is given to no other plan before
-        // this one gives it back.
-        unsafe {
-            card_run_done(
-                &mut work.areas,
-                work.differs.1 as *const u32,
-                work.ring.as_ref().map(|(_, data, _)| *data as *mut u8),
-                plan.run,
-                plan.count_at,
-            )
-        };
     }
 
     /// The relay's own list, fence, event for [`Host::relay_card_back`].
@@ -5811,9 +6230,7 @@ impl Host {
         if flown && self.card_results_low() {
             let settling = std::time::Instant::now();
             if relay_exact() {
-                // (The compare's areas under the line's lock: nothing
-                // takes the line's under theirs.)
-                relay_wait(WHY_MOST, |line| results_wait_over(self.card_results_low(), line));
+                relay_wait(WHY_MOST, |line| room_wait_over(&CARD_WORK, line));
             } else {
                 self.settle(&mut submitted, WHY_MOST);
             }

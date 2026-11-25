@@ -937,7 +937,9 @@ void main() {
     /// `record_card_compare`, `card_run_done`), with two ranges: each
     /// range's flags land in its own dwords, the count after the compares
     /// in the run's last dword, where the host reads it, and the limit
-    /// where the compares read it. Across 2^32 too.
+    /// where the compares read it; and each count the compares leave is the
+    /// one before and one per piece they flagged, which the host checks
+    /// before it moves the limit. Across 2^32 too.
     #[test]
     fn warp_card_compare_ring_goes_round_behind_the_limit() {
         use crate::host::{CardAreas, CompareViews, RangeCompare, RunLayout};
@@ -1014,21 +1016,20 @@ void main() {
             let flags = ranges.iter().flat_map(|r| (r.at..r.at + r.pieces).map(read)).collect();
             (laid, flags, read(count_at))
         };
-        // What `Host::card_done` does with the run and the ring.
+        // What `Host::card_done` does with the run and the ring: the count
+        // read, with the flags before it.
         let done = |areas: &mut CardAreas, laid: &RunLayout| {
             // SAFETY: the mappings of the results and of the ring; the
             // plan's compare has run.
             unsafe { crate::host::card_run_done(areas, results, Some(ring_ptr), Some(laid.run), laid.count_at) };
         };
-        // Plans whose compares left these counts, done with one by one:
-        // the count as if plans had gone on (none runs: each count is put
-        // where its compare would have left it).
-        let pass = |areas: &mut CardAreas, counts: &[u32]| {
-            for &gone in counts {
-                let laid = areas.lay_out(&[1], true).unwrap();
-                unsafe { results.add(laid.count_at.unwrap() as usize).write_volatile(gone) };
-                done(areas, &laid);
-            }
+        // As if plans had taken the count to `count` (none runs), and one
+        // with no run of the results was done with: the limit written.
+        let jump = |areas: &mut CardAreas, count: u32| {
+            areas.jump(count);
+            set_count(count);
+            // SAFETY: as `done`.
+            unsafe { crate::host::card_run_done(areas, results, Some(ring_ptr), None, None) };
         };
         // The slots a compare gave, sorted, and the pieces found differing
         // (sorted), and how many of them got no slot.
@@ -1059,8 +1060,11 @@ void main() {
         // The hashes, and the count's place in the run.
         let (hashed, flags, left) = plan(&mut warp, &mut areas, 0);
         assert_eq!((flags, left), (vec![0xDEAD; PIECES as usize], 0), "hashing writes no flag, takes no slot and leaves the count");
+        // No plan of the ring only hashes: its dwords, marked before it,
+        // read as pieces flagged with no count taken. The host refuses
+        // such a count, and nothing moves.
         done(&mut areas, &hashed);
-        assert_eq!(limit(), SLOTS);
+        assert_eq!((limit(), areas.refused()), (SLOTS, 1));
 
         // a: counts 0, 1, 2.
         change(&mut content, &[1, 2, 3]);
@@ -1108,8 +1112,7 @@ void main() {
 
         // Near 2^32.
         let round = u32::MAX / SLOTS * SLOTS;
-        pass(&mut areas, &[1 << 30, 2 << 30, 3 << 30, round - 2]);
-        set_count(round - 2);
+        jump(&mut areas, round - 2);
         assert_eq!((areas.limit(), limit()), (Some(round), round));
 
         // e: counts round - 2 and round - 1, slots 2 and 3; round gets none.
@@ -1144,8 +1147,7 @@ void main() {
         // the last multiple below it: round - 1 gets slot 3; the counts
         // from round on, also those that have wrapped (0 to 3, below the
         // limit as unsigned numbers), get none.
-        pass(&mut areas, &[1 << 30, 2 << 30, 3 << 30, round - 1]);
-        set_count(round - 1);
+        jump(&mut areas, round - 1);
         assert_eq!((areas.limit(), limit()), (Some(round), round));
         change(&mut content, &[0, 1, 2, 3, 4, 5, 6, 7, 8]);
         let (h, flags, left) = plan(&mut warp, &mut areas, 2);
@@ -1155,6 +1157,9 @@ void main() {
         assert_eq!((count(), left), (4, 4), "h: the count it left, gone round");
         done(&mut areas, &h);
         assert_eq!(limit(), 4 + SLOTS);
+        // Every count the compares left was the one before and one per
+        // piece they flagged: none refused but the pass that only hashed.
+        assert_eq!(areas.refused(), 1);
     }
 
     /// The clamp compiles with the system's compiler and the host takes it.
