@@ -1382,6 +1382,17 @@ static SENT_OPS: Mutex<std::collections::VecDeque<(u32, Op)>> =
 /// The ops [`SENT_OPS`] keeps.
 const SENT_OPS_KEPT: usize = 64;
 
+/// Adds the ops of list `id` to `sent` ([`SENT_OPS`]), which keeps the
+/// newest [`SENT_OPS_KEPT`].
+fn keep_sent(sent: &mut std::collections::VecDeque<(u32, Op)>, id: u32, ops: &[Op]) {
+    for &op in &ops[ops.len().saturating_sub(SENT_OPS_KEPT)..] {
+        if sent.len() == SENT_OPS_KEPT {
+            sent.pop_front();
+        }
+        sent.push_back((id, op));
+    }
+}
+
 /// Pipelines by key ([`pipeline_key`]), for the device-removed report.
 static PIPELINE_NAMES: Mutex<Option<std::collections::HashMap<u64, String>>> = Mutex::new(None);
 
@@ -4160,7 +4171,6 @@ impl Host {
         }
         for list in runs {
             list.run_deferred(&mut batch);
-            list.sent_ops();
             firsts.push(lists.len());
             if let Some(prelude) = list.prelude() {
                 lists.push(Some(prelude));
@@ -4195,6 +4205,9 @@ impl Host {
         let prepared = std::time::Instant::now();
         if late {
             *submitted += 1;
+            for list in runs {
+                list.sent_ops();
+            }
             // SAFETY: closed lists; the fence is ours.
             let signalled = unsafe {
                 self.queue.ExecuteCommandLists(&lists);
@@ -4235,6 +4248,15 @@ impl Host {
         submitting(2, runs.len());
         for (i, group) in groups.iter().enumerate() {
             *submitted += 1;
+            // The group's runs: with timing one each, else all of them.
+            let sending = if groups.len() == 1 {
+                runs
+            } else {
+                &runs[i..=i]
+            };
+            for list in sending {
+                list.sent_ops();
+            }
             let started = std::time::Instant::now();
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
@@ -5063,18 +5085,19 @@ impl HostList {
     }
 
     /// The list goes to the card: its last ops go into [`SENT_OPS`].
+    /// Called just before `ExecuteCommandLists`, not while the submission
+    /// is prepared: a settle in the preparing may report a removal, which
+    /// must not name ops that were never sent.
     fn sent_ops(&self) {
         if dred() == Dred::Off {
             return;
         }
         let ops = self.ops.lock().unwrap_or_else(|e| e.into_inner());
-        let mut sent = SENT_OPS.lock().unwrap_or_else(|e| e.into_inner());
-        for &op in &ops[ops.len().saturating_sub(SENT_OPS_KEPT)..] {
-            if sent.len() == SENT_OPS_KEPT {
-                sent.pop_front();
-            }
-            sent.push_back((self.id, op));
-        }
+        keep_sent(
+            &mut SENT_OPS.lock().unwrap_or_else(|e| e.into_inner()),
+            self.id,
+            &ops,
+        );
     }
 
     /// For the device-removed report, where the list stopped at command
@@ -6830,6 +6853,36 @@ mod dred {
             ops[2],
         ];
         assert!(stopped_ops(&wrong, &history, 4).contains("do not match"));
+    }
+
+    /// The sent ops keep the newest, oldest first: a list of at least
+    /// [`SENT_OPS_KEPT`] ops leaves only its own, so they are added only
+    /// when the list is sent.
+    #[test]
+    fn the_sent_ops_keep_the_newest() {
+        let op = |pipeline| Op {
+            kind: OpKind::Draw,
+            pipeline,
+        };
+        let mut sent = std::collections::VecDeque::new();
+        keep_sent(&mut sent, 1, &[op(1), op(2)]);
+        keep_sent(&mut sent, 2, &[op(3)]);
+        assert_eq!(sent, [(1, op(1)), (1, op(2)), (2, op(3))]);
+        let many: Vec<Op> = (0..SENT_OPS_KEPT as u64 + 10)
+            .map(|p| op(100 + p))
+            .collect();
+        keep_sent(&mut sent, 3, &many);
+        assert_eq!(sent.len(), SENT_OPS_KEPT);
+        assert!(
+            sent.iter().all(|&(list, _)| list == 3),
+            "the earlier lists are gone"
+        );
+        assert_eq!(sent.front(), Some(&(3, op(110))));
+        assert_eq!(sent.back(), Some(&(3, op(100 + SENT_OPS_KEPT as u64 + 9))));
+        keep_sent(&mut sent, 4, &[op(7)]);
+        assert_eq!(sent.len(), SENT_OPS_KEPT);
+        assert_eq!(sent.front(), Some(&(3, op(111))));
+        assert_eq!(sent.back(), Some(&(4, op(7))));
     }
 }
 
