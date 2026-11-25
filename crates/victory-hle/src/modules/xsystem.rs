@@ -395,7 +395,7 @@ mod tests {
         let info = unsafe { info.assume_init() };
         assert_eq!(size_of::<AnalyticsInfo>(), 0x90);
         assert_eq!(info.os.build, 22000);
-        // The GDK names the family `Windows.Xbox`, not `Xbox`.
+        // The documented family is `Windows.Xbox`, not `Xbox`.
         assert_eq!(&info.family[..12], b"Windows.Xbox");
         assert_eq!(info.family[12], 0);
         assert_eq!(&info.form[..14], b"Xbox Series X\0");
