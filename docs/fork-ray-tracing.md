@@ -1,15 +1,15 @@
-# Ray tracing in this fork: what the title does and what has been built
+# Ray tracing
 
-Status, 2026-11-25: **nothing is lit by ray tracing yet.** Most of the
-machinery translates and is unit-tested; it has not yet run end to end in the
-game. Everything here is off by default.
+The local RTX 4090 prologue test on revision `fd505a5` ran with the ray-tracing
+structure builder disabled. The captures showed stepped shadow edges and
+missing or uneven lighting. See the [local test results](../README.md#local-test-results)
+for the machine, configuration, and frame timing.
 
 ## What the title does
 
 The title's indirect light (probes, bounce, reflections) and the
-shadows of its lamps and sun are ray traced. Without them, anything the sun
-does not hit directly is black: interiors, the shadowed side of a face, rooms
-lit only by lamps.
+shadows of its lamps and sun use ray tracing. These effects contribute to
+interior lighting, the shaded side of characters, and exterior shadows.
 
 The title does not use a ray-tracing API:
 
@@ -33,10 +33,10 @@ describes to it, and the traversal loops live in 64 of the title's own
 programs. This fork runs the title's builder and traversal as translated
 shaders and emulates the one instruction.
 
-## What this fork adds
+## Implementation
 
-1. **The builder programs translate** (49 of 52; all that the title creates in
-   the scenes tested). They pass buffer addresses in a spilled parameter table
+1. **Builder shader translation.** The shaders pass buffer addresses in a
+   spilled parameter table
    rather than in descriptors. Added: the spilled user-data table, root
    unordered-access views (translator and host binding), byte and 16-bit buffer
    accesses, and several control-flow shapes.
@@ -48,31 +48,25 @@ shaders and emulates the one instruction.
 3. **The ray test, emulated in DXIL.** Four slab tests and a sorting network
    for box nodes; a watertight ray/triangle test for triangle nodes; both forms
    of the instruction. A plain Rust reference lives in
-   `crates/victory-shader/src/bvh.rs`; tests run the emitted DXIL on the GPU
-   over 311 ray/node cases and compare with the reference bit for bit.
-4. **The trace and shading programs translate** (59 of 64 trace programs, and
-   the irradiance-cache shading program). This needed lane masks treated as
-   plain numbers on some paths, and exact forms for programs written for
-   64-lane waves running on a GPU with 32-lane waves.
+   `crates/victory-shader/src/bvh.rs` for comparison with emitted DXIL.
+4. **Trace and shading shader translation.** The translator treats lane masks
+   as scalar values where required and has dedicated handling for console
+   shaders that use 64-lane waves on a GPU with 32-lane waves.
 5. **A safety rule on the host side.** The builder's stages run only while
    every builder pipeline the title has created has a host pipeline; otherwise
    none run (`VICTORY_BVH_BUILDER=1` asks for it; `VICTORY_BVH_QUARANTINE=1`
-   also keeps the builder's stores out of title memory, for a first test). A
-   partly working builder wrote garbage bounds into title memory and crashed
-   the title.
+   also keeps the builder's stores out of title memory for diagnostics).
 
 ## Known gaps
 
-- With `VICTORY_BVH_BUILDER=1` the builder still stays off in a real run: a few
-  of its pipelines are refused by the host (they still ask for 64-lane waves on
-  a 32-lane GPU) or do not translate.
-- Five shadow-mask trace programs do not translate yet.
+- With `VICTORY_BVH_BUILDER=1`, the host requires a translated pipeline for
+  every builder stage the title creates before enabling its dispatches.
 - An access to a title page that has no host copy is lost (a read gives zero, a
   store is dropped).
 - Not publicly documented, and assumed: the instruction's rounding, the order
   of two boxes entered at the same distance, and the result for a ray exactly
   through an edge.
-- Cost on the GPU is unmeasured.
+- The local frame timings were recorded with the builder disabled.
 
 ## Where to look
 
