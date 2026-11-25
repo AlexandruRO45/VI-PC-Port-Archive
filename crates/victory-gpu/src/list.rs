@@ -1323,6 +1323,13 @@ pub(crate) static UPLOADS: [std::sync::atomic::AtomicU64; 2] =
 /// arguments, nothing returned.
 extern "system" fn ignored_state(_: This) {}
 
+extern "system" fn depth_bounds(this: This, min: f32, max: f32) {
+    #[cfg(windows)]
+    with_state(this, |list, s| s.set_depth_bounds(list, min, max));
+    #[cfg(not(windows))]
+    let _ = (this, min, max);
+}
+
 /// The title's draw state (decision 0007, step 3), kept for its draws or
 /// set on the host list at once. Without a host GPU these do nothing.
 #[cfg(windows)]
@@ -1767,7 +1774,7 @@ const METHODS: [(usize, *const ()); 52] = [
     (52, clear_rtv as *const ()),                 // 0x1a0
     (59, execute_indirect as *const ()),          // 0x1d8 indirect
     (60, copy_memory as *const ()),               // 0x1e0
-    (68, ignored_state as *const ()),             // 0x220 depth bounds
+    (68, depth_bounds as *const ()),              // 0x220
     (69, write32 as *const ()),                   // 0x228
     (70, write64 as *const ()),                   // 0x230
     (71, wait32 as *const ()),                    // 0x238 (newer 0x248)
@@ -1843,16 +1850,20 @@ const fn list_table(newer: bool) -> [*const (); 160] {
 static LIST_FUNCTIONS: Table<160> = Table(list_table(false));
 static NEWER_LIST_FUNCTIONS: Table<160> = Table(list_table(true));
 
-/// Resolve an original slot against the table chosen when a test list was made.
+#[cfg(all(test, windows))]
+pub(crate) fn has_newer_table(list: This) -> bool {
+    // SAFETY: one of our lists; its first field is the table. The device
+    // tests can switch layouts, so use this list's table.
+    let table = unsafe { *list.cast::<*const *const ()>() };
+    table == NEWER_LIST_FUNCTIONS.0.as_ptr()
+}
+
+/// Resolves an original test slot against the list's actual table.
 #[cfg(all(test, windows))]
 pub(crate) fn slot_offset_for_test(list: This, offset: usize) -> usize {
-    let slot = offset / 8;
-    let expected = LIST_FUNCTIONS.0[slot];
-    if object::slot::<*const ()>(list, offset) == expected {
-        offset
+    if has_newer_table(list) {
+        newer_slot(offset / 8) * 8
     } else {
-        let offset = newer_slot(slot) * 8;
-        assert_eq!(object::slot::<*const ()>(list, offset), expected);
         offset
     }
 }
