@@ -97,6 +97,9 @@ impl Host {
     /// refused, so hardware-only checks never run on WARP.
     pub fn new(warp: bool) -> Result<Self, String> {
         let warp = warp || std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1");
+        if Self::debug_on() {
+            Self::enable_debug_layer();
+        }
         // SAFETY: plain D3D12/DXGI calls with valid out pointers.
         unsafe {
             let mut device: Option<ID3D12Device> = None;
@@ -297,7 +300,7 @@ impl Host {
             ..Default::default()
         };
         // SAFETY: the description points at live data.
-        unsafe { self.device.CreateComputePipelineState(&desc) }.map_err(err)
+        self.capture_pipeline_error(|| unsafe { self.device.CreateComputePipelineState(&desc) })
     }
 
     /// A graphics pipeline from a vertex and a pixel shader, with float or
@@ -363,7 +366,11 @@ impl Host {
                 BytecodeLength: ps.len(),
             },
             GS: D3D12_SHADER_BYTECODE {
-                pShaderBytecode: if gs.is_empty() { std::ptr::null() } else { gs.as_ptr().cast() },
+                pShaderBytecode: if gs.is_empty() {
+                    std::ptr::null()
+                } else {
+                    gs.as_ptr().cast()
+                },
                 BytecodeLength: gs.len(),
             },
             SampleMask: u32::MAX,
@@ -403,8 +410,7 @@ impl Host {
             desc.DepthStencilState.StencilEnable = true.into();
         }
         // SAFETY: the description points at live data.
-        let pso = unsafe { self.device.CreateGraphicsPipelineState(&desc) };
-        pso.map_err(err)
+        self.capture_pipeline_error(|| unsafe { self.device.CreateGraphicsPipelineState(&desc) })
     }
 
     /// A mesh pipeline from a mesh and a pixel shader (user data of the mesh
@@ -514,7 +520,175 @@ impl Host {
         };
         let device: ID3D12Device2 = self.device.cast().map_err(err)?;
         // SAFETY: the stream points at live data and outlives the call.
-        unsafe { device.CreatePipelineState(&desc) }.map_err(err)
+        self.capture_pipeline_error(|| unsafe { device.CreatePipelineState(&desc) })
+    }
+
+    fn debug_on() -> bool {
+        std::env::var_os("VICTORY_D3D12_DEBUG").is_some_and(|v| v != "0")
+    }
+
+    fn enable_debug_layer() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            let mut layer: Option<ID3D12Debug> = None;
+            // SAFETY: valid out-pointer to an optional `ID3D12Debug` interface.
+            if unsafe { D3D12GetDebugInterface(&mut layer) }.is_ok()
+                && let Some(layer) = layer
+            {
+                // SAFETY: `EnableDebugLayer` is called once before creating any device.
+                unsafe { layer.EnableDebugLayer() };
+            }
+        });
+    }
+
+    fn clean_message(raw: &str) -> String {
+        raw.trim_end_matches('\0')
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    fn format_pipeline_error(reason: Option<String>, e: windows::core::Error) -> String {
+        let base = err(e);
+        match reason {
+            Some(reason) if !base.is_empty() => format!("{reason} ({base})"),
+            Some(reason) => reason,
+            None => base,
+        }
+    }
+
+    fn read_info_queue(queue: &ID3D12InfoQueue) -> Option<String> {
+        // SAFETY: `queue` is a live `ID3D12InfoQueue` owned by `self.device`.
+        unsafe {
+            let count = queue.GetNumStoredMessages();
+            for i in 0..count {
+                let mut size = 0;
+                if queue.GetMessage(i, None, &mut size).is_err() || size == 0 {
+                    continue;
+                }
+                let mut buffer = vec![0u64; size.div_ceil(8)];
+                let message = buffer.as_mut_ptr().cast::<D3D12_MESSAGE>();
+                if queue.GetMessage(i, Some(message), &mut size).is_ok() {
+                    let m = &*message;
+                    if m.Severity.0 <= D3D12_MESSAGE_SEVERITY_ERROR.0 && !m.pDescription.is_null() {
+                        let bytes =
+                            std::slice::from_raw_parts(m.pDescription, m.DescriptionByteLength);
+                        let cleaned = Self::clean_message(&String::from_utf8_lossy(bytes));
+                        if !cleaned.is_empty() {
+                            return Some(cleaned);
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    fn start_callback(
+        queue1: &ID3D12InfoQueue1,
+    ) -> Option<
+        impl FnOnce(windows::core::Result<ID3D12PipelineState>) -> Result<ID3D12PipelineState, String>
+        + '_,
+    > {
+        thread_local! {
+            static CAPTURED: std::cell::RefCell<Option<Option<String>>> =
+                const { std::cell::RefCell::new(None) };
+        }
+        unsafe extern "system" fn on_message(
+            _category: D3D12_MESSAGE_CATEGORY,
+            severity: D3D12_MESSAGE_SEVERITY,
+            _id: D3D12_MESSAGE_ID,
+            pdescription: PCSTR,
+            _context: *mut std::ffi::c_void,
+        ) {
+            if severity.0 > D3D12_MESSAGE_SEVERITY_ERROR.0 || pdescription.is_null() {
+                return;
+            }
+            // SAFETY: D3D12 passes a null-terminated ANSI message during the callback.
+            let raw = unsafe { std::ffi::CStr::from_ptr(pdescription.0.cast()) }.to_string_lossy();
+            let cleaned = Host::clean_message(&raw);
+            if cleaned.is_empty() {
+                return;
+            }
+            CAPTURED.with(|cell| {
+                if let Ok(mut slot) = cell.try_borrow_mut()
+                    && let Some(slot) = slot.as_mut()
+                    && slot.is_none()
+                {
+                    *slot = Some(cleaned);
+                }
+            });
+        }
+        struct Guard<'a> {
+            queue: &'a ID3D12InfoQueue1,
+            cookie: u32,
+        }
+        impl Drop for Guard<'_> {
+            fn drop(&mut self) {
+                CAPTURED.with(|cell| {
+                    *cell.borrow_mut() = None;
+                });
+                // SAFETY: `self.cookie` came from `RegisterMessageCallback` on `self.queue`.
+                let _ = unsafe { self.queue.UnregisterMessageCallback(self.cookie) };
+            }
+        }
+
+        let mut cookie = 0u32;
+        // SAFETY: `on_message` matches `D3D12MessageFunc`, no context pointer is used,
+        // and `cookie` points to valid writable storage.
+        unsafe {
+            queue1
+                .RegisterMessageCallback(
+                    Some(on_message),
+                    D3D12_MESSAGE_CALLBACK_FLAG_NONE,
+                    std::ptr::null_mut(),
+                    &mut cookie,
+                )
+                .ok()?;
+        }
+        CAPTURED.with(|cell| {
+            *cell.borrow_mut() = Some(None);
+        });
+        let guard = Guard {
+            queue: queue1,
+            cookie,
+        };
+        Some(move |res: windows::core::Result<ID3D12PipelineState>| {
+            let _guard = guard;
+            let reason = res.as_ref().err().and_then(|_| {
+                CAPTURED.with(|cell| cell.borrow_mut().as_mut().and_then(Option::take))
+            });
+            res.map_err(|e| Self::format_pipeline_error(reason, e))
+        })
+    }
+
+    fn capture_pipeline_error(
+        &self,
+        op: impl FnOnce() -> windows::core::Result<ID3D12PipelineState>,
+    ) -> Result<ID3D12PipelineState, String> {
+        if !Self::debug_on() {
+            return op().map_err(err);
+        }
+        if let Ok(queue1) = self.device.cast::<ID3D12InfoQueue1>()
+            && let Some(finish) = Self::start_callback(&queue1)
+        {
+            return finish(op());
+        }
+        if let Ok(queue) = self.device.cast::<ID3D12InfoQueue>() {
+            static INFO_QUEUE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+            let _lock = INFO_QUEUE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            // SAFETY: `queue` is a live `ID3D12InfoQueue` on `self.device`.
+            unsafe { queue.ClearStoredMessages() };
+            let res = op();
+            let reason = res
+                .as_ref()
+                .err()
+                .and_then(|_| Self::read_info_queue(&queue));
+            // SAFETY: `queue` is a live `ID3D12InfoQueue` on `self.device`.
+            unsafe { queue.ClearStoredMessages() };
+            return res.map_err(|e| Self::format_pipeline_error(reason, e));
+        }
+        op().map_err(err)
     }
 
     /// Whether this device fuses DXIL `FMad`, which the lowering emits for
