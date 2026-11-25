@@ -468,14 +468,26 @@ fn open_range(g: &mut Guards, first: usize, last: usize) -> usize {
     debug_assert_eq!(pages, last - first, "a partial run is not opened in one call");
     let mut old = 0;
     // SAFETY: a block we made read-only (failing harmlessly if it is gone).
-    unsafe {
+    let batch = unsafe {
         VirtualProtect(
             (first * PAGE) as *const _,
             (last - first) * PAGE,
             PAGE_READWRITE,
             &mut old,
         )
-    };
+    } != 0;
+    if !batch {
+        // Windows refuses one call across separate allocations or over an
+        // uncommitted page, even when every page is ours: restore the run a
+        // page at a time, as the old path did.
+        for page in first..last {
+            let mut old = 0;
+            // SAFETY: as above, one page.
+            unsafe {
+                VirtualProtect((page * PAGE) as *const _, PAGE, PAGE_READWRITE, &mut old)
+            };
+        }
+    }
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::OpenPages, pages as u64);
     #[cfg(test)]
@@ -1034,6 +1046,61 @@ pub(crate) mod tests {
     pub(crate) fn free(p: usize) {
         // SAFETY: an allocation of ours.
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+    }
+
+    /// Windows refuses one `VirtualProtect` across two separate
+    /// allocations, even when the pages are adjacent and both guarded: the
+    /// per-page fallback must still make them writable.
+    #[test]
+    fn open_runs_falls_back_across_separate_allocations() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READONLY, VirtualAlloc,
+            VirtualFree,
+        };
+        // Reserve room, give it back, then allocate each page on its own.
+        // SAFETY: fresh allocations, freed below.
+        let hint = unsafe { VirtualAlloc(std::ptr::null(), 2 * PAGE, MEM_RESERVE, PAGE_NOACCESS) } as usize;
+        if hint == 0 {
+            return;
+        }
+        // SAFETY: our reservation.
+        unsafe { VirtualFree(hint as *mut _, 0, MEM_RELEASE) };
+        // SAFETY: fresh allocations at the freed addresses.
+        let (a, b) = unsafe {
+            (
+                VirtualAlloc(hint as *const _, PAGE, MEM_RESERVE | MEM_COMMIT, PAGE_READONLY) as usize,
+                VirtualAlloc((hint + PAGE) as *const _, PAGE, MEM_RESERVE | MEM_COMMIT, PAGE_READONLY) as usize,
+            )
+        };
+        if a == 0 || b != a + PAGE {
+            // SAFETY: whichever allocations were made are ours.
+            unsafe {
+                if a != 0 {
+                    VirtualFree(a as *mut _, 0, MEM_RELEASE);
+                }
+                if b != 0 {
+                    VirtualFree(b as *mut _, 0, MEM_RELEASE);
+                }
+            }
+            eprintln!("two adjacent separate allocations unavailable; skipped");
+            return;
+        }
+        let pages = [a / PAGE, b / PAGE];
+        TEST_OPEN_ONE_BY_ONE.with(|c| c.set(false));
+        {
+            let mut g = guards();
+            for &page in &pages {
+                g.protected.insert(page);
+            }
+            open_pages(&mut g, &pages);
+            assert!(pages.iter().all(|p| !g.protected.contains(p)));
+        }
+        assert!(writable(a) && writable(b), "both pages read-write after the fallback");
+        // SAFETY: our allocations.
+        unsafe {
+            VirtualFree(a as *mut _, 0, MEM_RELEASE);
+            VirtualFree(b as *mut _, 0, MEM_RELEASE);
+        }
     }
 
     /// A write over a run of guarded pages opens them with one
