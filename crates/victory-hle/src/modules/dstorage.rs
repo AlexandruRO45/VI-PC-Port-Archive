@@ -509,7 +509,8 @@ impl Lanes {
 
     /// Starts the next read of the class with the least virtual time, from
     /// its lane that has started the fewest bytes, if the staging buffer
-    /// has room for it (or nothing else holds any).
+    /// has room for it (or nothing else holds any). A read that holds no
+    /// staging needs no room.
     fn start(&mut self) -> Option<Job> {
         let busy = || self.lanes.iter().filter(|(_, l)| !l.reads.is_empty());
         let (_, class) = busy().map(|(_, l)| (self.clock[l.class], l.class)).min()?;
@@ -520,7 +521,7 @@ impl Lanes {
         let lane = self.lanes.get_mut(&id)?;
         let &(seq, request) = lane.reads.front()?;
         let staging = staging_bytes(&request);
-        if self.staged > 0 && self.staged + staging > self.staging {
+        if staging > 0 && self.staged > 0 && self.staged + staging > self.staging {
             self.starved = true;
             self.refused += 1;
             return None;
@@ -1436,6 +1437,23 @@ mod tests {
         assert!(l.start().is_none());
         l.finish(&second, Ok(()));
         assert!(l.start().is_some());
+    }
+
+    #[test]
+    fn a_read_without_staging_is_in_turn_beside_a_read_larger_than_the_staging() {
+        let mut l = lanes(100);
+        l.lanes.insert(0, Lane::new(0, 64));
+        read(&mut l, 0, ZLIB, 500); // alone, it runs though it is larger
+        read(&mut l, 0, 0, 16);
+        l.submit(0);
+        let large = l.start().unwrap();
+        assert_eq!(large.staging, 500);
+
+        let raw = l.start().unwrap();
+
+        assert_eq!((raw.staging, l.starved, l.refused), (0, false, 0));
+        // The turn moved on to it: 500 bytes of a normal queue, at cost 10.
+        assert_eq!(l.now, 5000);
     }
 
     #[test]
