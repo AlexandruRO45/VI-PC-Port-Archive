@@ -1059,7 +1059,16 @@ impl Plan {
     /// is still there (not a constant branch's other edge, not from a block
     /// left out).
     fn edge(&self, m: &Module, b: usize, x: usize) -> bool {
-        self.seen[b] && successors(m.term(b)).iter().any(|&s| self.to(s) == x)
+        // A successor folded from `b` is the edge `b` leaves on (its entry
+        // moves to `b`'s predecessor): counting it here as well would give
+        // the phi two entries for one predecessor. A successor that is a
+        // loop's own header (or another unfolded block) is an edge of its
+        // own, even when it is `b` itself.
+        let from = self.src(b);
+        self.seen[b]
+            && successors(m.term(b))
+                .iter()
+                .any(|&s| self.to(s) == x && (self.src(s) == s || self.src(s) != from))
     }
 }
 
@@ -1508,6 +1517,67 @@ mod tests {
         assert_eq!((plan.src(f2), plan.to(f2)), (p2, t2));
         assert!(plan.edge(&m, f2, t2) && plan.edge(&m, q2, t2));
         assert!(!plan.layout.contains(&f2));
+        let _ = m.write();
+    }
+
+    /// A constant branch through a folded empty block: the phi keeps one
+    /// entry, for the block its edge now leaves from, not one for each of
+    /// the two blocks that used to reach it.
+    #[test]
+    fn a_constant_branch_through_a_folded_empty_block_keeps_one_phi_entry() {
+        let (mut m, b, sink) = module(3);
+        let [entry, empty, join] = b[..] else {
+            unreachable!()
+        };
+        let i32t = m.int(32);
+        let (one, two) = (m.i32(1), m.i32(2));
+        let t = m.bool(true);
+        // `entry` takes its one edge (through `empty`); the direct edge to
+        // `join` is gone.
+        m.terminate(entry, Term::CondBr(t, empty, join));
+        m.terminate(empty, Term::Br(join));
+        let phi = m.phi(join, i32t);
+        m.set_phi(phi, vec![(one, empty), (two, entry)]);
+        let _ = m.call(join, sink, vec![phi]);
+        m.terminate(join, Term::Ret);
+        let plan = m.plan();
+        assert_eq!(plan.fold[empty], Some((entry, join)));
+        // The folded block's entry moves to its predecessor; the untaken
+        // direct edge's entry goes.
+        assert!(
+            plan.edge(&m, empty, join),
+            "the folded block's entry stays, from entry"
+        );
+        assert!(
+            !plan.edge(&m, entry, join),
+            "the untaken direct edge's entry goes"
+        );
+        let _ = m.write();
+    }
+
+    /// A loop's header is its own back edge: its phi keeps the entry from
+    /// the header as well as the one from before the loop.
+    #[test]
+    fn a_self_looping_header_keeps_its_back_edge() {
+        let (mut m, b, sink) = module(3);
+        let [entry, head, exit] = b[..] else {
+            unreachable!()
+        };
+        let i32t = m.int(32);
+        let (zero, one, ten) = (m.i32(0), m.i32(1), m.i32(10));
+        m.terminate(entry, Term::Br(head));
+        let i = m.phi(head, i32t);
+        let next = m.bin(head, Bin::Add, i, one);
+        let more = m.cmp(head, pred::SLT, next, ten);
+        m.terminate(head, Term::CondBr(more, head, exit));
+        m.set_phi(i, vec![(zero, entry), (next, head)]);
+        let _ = m.call(exit, sink, vec![i]);
+        m.terminate(exit, Term::Ret);
+        let plan = m.plan();
+        assert!(
+            plan.edge(&m, entry, head) && plan.edge(&m, head, head),
+            "both the entry and the header's own back edge stay"
+        );
         let _ = m.write();
     }
 
