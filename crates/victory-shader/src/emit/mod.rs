@@ -525,7 +525,10 @@ pub fn emit(
     let original = original.map(|(shader, _)| shader);
     // Retry unsupported programs only. Threading can separate an unknown
     // register value from its apparent use on a mutually exclusive path.
-    if !matches!(original, Err(ShaderError::Unsupported { .. })) {
+    if !matches!(
+        original,
+        Err(ShaderError::Unsupported { .. } | ShaderError::UnsupportedHardwareSgprInput { .. })
+    ) {
         return original;
     }
     let edges = threading::constant_edges(p, st);
@@ -1585,6 +1588,41 @@ mod barycentric_tests {
         let io = io::raise(&p, &native)?;
         let st = structure::structure(&p)?;
         emit(&c, &native, &p, &st, &io, &res)
+    }
+
+    #[test]
+    fn hardware_sgpr_refusal_names_the_input_at_the_export() {
+        let [exp, src] = exp_mrt0(0);
+        let mut refusals = Vec::new();
+        for sgpr in [7, 19] {
+            // v_mov_b32 v0, sN; exp mrt0, v0, v0, v0, v0 done vm.
+            let words = [0x7E00_0200 | sgpr, exp, src, 0xBF81_0000];
+            match pixel(&words, 0) {
+                Ok(_) => panic!("s{sgpr} unexpectedly translated"),
+                Err(error) => refusals.push(error.to_string()),
+            }
+        }
+        assert_eq!(
+            refusals,
+            [7, 19].map(|sgpr| format!(
+                "GFX10 code at 0x4: a hardware SGPR input is not supported (s{sgpr})"
+            )),
+        );
+    }
+
+    #[test]
+    fn hardware_sgpr_read_without_a_consumer_still_translates() {
+        use std::hash::{DefaultHasher, Hash, Hasher};
+
+        let [exp, src] = exp_mrt0(0);
+        // v_mov_b32 v1, s7 (dead); v_mov_b32 v0, 1.0; exp mrt0, v0...
+        let mut words = [0x7E02_0207, 0x7E00_02F2, exp, src, 0xBF81_0000];
+        let dxil = pixel(&words, 0).unwrap().dxil;
+        words[0] = 0x7E02_0280; // v_mov_b32 v1, 0 (dead)
+        assert_eq!(dxil, pixel(&words, 0).unwrap().dxil);
+        let mut hasher = DefaultHasher::new();
+        dxil.hash(&mut hasher);
+        println!("control DXIL: {} bytes, {:016x}", dxil.len(), hasher.finish());
     }
 
     /// The translation's `SFI0` features and `ISG1` rows.
