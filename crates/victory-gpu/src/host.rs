@@ -770,6 +770,31 @@ mod tests {
         }
     }
 
+    #[test]
+    fn read_guard_page_returns_false_without_crashing() {
+        use windows_sys::Win32::System::Memory::*;
+        // SAFETY: a private synthetic page used only by this test.
+        unsafe {
+            let page = VirtualAlloc(std::ptr::null(), 4096, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE).cast::<u8>();
+            assert!(!page.is_null());
+            page.write(0x5a);
+            let mut old = 0;
+            assert_ne!(VirtualProtect(page.cast(), 4096, PAGE_READWRITE | PAGE_GUARD, &mut old), 0);
+            let mut out = 0u8;
+            assert!(!super::read(page, &mut out, 1));
+            assert_eq!(out, 0, "a fault before the first byte must not write");
+            assert_ne!(VirtualProtect(page.cast(), 4096, PAGE_READWRITE, &mut old), 0);
+            assert!(super::read(page, &mut out, 1), "the probe must recover after a fault");
+            assert_eq!(out, 0x5a);
+            assert_ne!(VirtualProtect(page.cast(), 4096, PAGE_READWRITE | PAGE_GUARD, &mut old), 0);
+            let value = 0xa5u8;
+            assert!(!super::read(&value, page, 1), "guarded destinations must also fail cleanly");
+            assert_ne!(VirtualProtect(page.cast(), 4096, PAGE_READWRITE, &mut old), 0);
+            assert_eq!(page.read(), 0x5a);
+            assert_ne!(VirtualFree(page.cast(), 0, MEM_RELEASE), 0);
+        }
+    }
+
     use super::*;
 
     #[test]
@@ -1810,7 +1835,7 @@ void main(uint3 group : SV_GroupID, uint t : SV_GroupIndex) {
 
 /// Whether the pieces hashed again after ranges were sent up to a copy in
 /// the card's memory are hashed in runs of pieces that touch, each piece
-/// once (`VICTORY_CARD_REHASH_RUNS=0` disables; on by default), and not in
+/// once (`VICTORY_CARD_REHASH_RUNS=1`; off by default), and not in
 /// a pass per range sent up.
 ///
 /// Run 102 sent up 514 ranges a frame: 514 passes without coalescing.
@@ -1819,7 +1844,7 @@ void main(uint3 group : SV_GroupID, uint t : SV_GroupIndex) {
 /// nothing and loses no shader write.
 fn rehash_runs() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_REHASH_RUNS").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_REHASH_RUNS").is_some_and(|v| v == "1"))
 }
 
 /// Since the last frame-rate line, of our own passes over copies in the
@@ -1828,13 +1853,13 @@ fn rehash_runs() -> bool {
 static CARD_PASSES: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
 /// Whether what shaders wrote to copies in the card's memory is merged
-/// into title memory on several threads (`VICTORY_WIDE_MERGE=0` disables;
-/// on by default). The pieces the card's compare found differing come down
+/// into title memory on several threads (`VICTORY_WIDE_MERGE=1`;
+/// off by default). The pieces the card's compare found differing come down
 /// in one fetch (~630 pieces and 40 MB a frame in run 104), and eight
 /// threads merge disjoint slices into title memory concurrently.
 fn wide_merge() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_MERGE").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_MERGE").is_some_and(|v| v == "1"))
 }
 
 /// One declared range of a copy in the card's memory, in a submission.
@@ -4153,7 +4178,7 @@ impl Host {
                     // Where the next range lies in the landing buffer.
                     let mut at = 0u64;
                     let mut barriers: Vec<D3D12_RESOURCE_BARRIER> = Vec::new();
-                    let mut rehash: Vec<(&crate::shadow::Shadow, &[(usize, usize)], ID3D12Resource, u64)> = Vec::new();
+                    let mut rehash: Vec<(&Arc<crate::shadow::Shadow>, &[(usize, usize)], ID3D12Resource, u64)> = Vec::new();
                     for (shadow, ranges) in &dirty {
                         let Some((staging, before, size)) = shadow.card_sides() else {
                             continue;
@@ -6836,7 +6861,7 @@ impl HostList {
 /// own copy while the write-watch journal and guards synchronize per lock.
 fn wide_refresh() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_REFRESH").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_REFRESH").is_some_and(|v| v == "1"))
 }
 
 /// A submission's refreshes not done yet, merged per buffer copy into the
@@ -7076,8 +7101,10 @@ fn read_pieces(src: *const u8, dst: *mut u8, len: usize) {
 #[cfg(target_arch = "x86_64")]
 mod fast_copy_impl {
     use std::cell::Cell;
-    use std::sync::{Once, OnceLock};
-    use windows_sys::Win32::Foundation::{EXCEPTION_ACCESS_VIOLATION, NTSTATUS};
+    use std::sync::OnceLock;
+    use windows_sys::Win32::Foundation::{
+        EXCEPTION_ACCESS_VIOLATION, EXCEPTION_GUARD_PAGE, EXCEPTION_IN_PAGE_ERROR, NTSTATUS,
+    };
     use windows_sys::Win32::System::Diagnostics::Debug::{
         AddVectoredExceptionHandler, EXCEPTION_CONTINUE_EXECUTION, EXCEPTION_CONTINUE_SEARCH,
         EXCEPTION_POINTERS,
@@ -7090,20 +7117,25 @@ mod fast_copy_impl {
     }
 
     unsafe extern "system" fn on_fault(info: *mut EXCEPTION_POINTERS) -> i32 {
-        let [start, end, fail] = TRAP.with(Cell::get);
+        let [start, end, fail] = TRAP.try_with(Cell::get).unwrap_or([0; 3]);
         if start == 0 {
             return EXCEPTION_CONTINUE_SEARCH;
         }
         // SAFETY: the OS passes valid exception and context records.
         unsafe {
             let record = &*(*info).ExceptionRecord;
-            if record.ExceptionCode != EXCEPTION_ACCESS_VIOLATION as NTSTATUS {
+            if ![
+                EXCEPTION_ACCESS_VIOLATION as NTSTATUS,
+                EXCEPTION_GUARD_PAGE,
+                EXCEPTION_IN_PAGE_ERROR,
+            ].contains(&record.ExceptionCode) {
                 return EXCEPTION_CONTINUE_SEARCH;
             }
             let context = &mut *(*info).ContextRecord;
             let rip = context.Rip;
             if rip >= start && rip < end {
-                if record.NumberParameters >= 2
+                if record.ExceptionCode == EXCEPTION_ACCESS_VIOLATION as NTSTATUS
+                    && record.NumberParameters >= 2
                     && record.ExceptionInformation[0] == 1
                     && crate::watch::open_guarded(record.ExceptionInformation[1])
                 {
@@ -7118,20 +7150,23 @@ mod fast_copy_impl {
 
     pub(super) fn enabled() -> bool {
         static ON: OnceLock<bool> = OnceLock::new();
-        *ON.get_or_init(|| std::env::var_os("VICTORY_FAST_COPY").is_none_or(|v| v != "0"))
+        *ON.get_or_init(|| std::env::var_os("VICTORY_FAST_COPY").is_some_and(|v| v == "1"))
+    }
+
+    pub(super) fn ready() -> bool {
+        static INSTALLED: OnceLock<bool> = OnceLock::new();
+        // SAFETY: the handler checks this thread's active probe instruction range.
+        *INSTALLED.get_or_init(|| unsafe {
+            !AddVectoredExceptionHandler(1, Some(on_fault)).is_null()
+        })
     }
 
     /// Copies `len` bytes from `src` to `dst` in process memory (`dst` must not
     /// overlap forward within `(src, src + len)`). Access violations inside the
-    /// copy loop are caught cleanly via a priority-1 VEH and return `false`.
+    /// copy loop, guard-page faults and in-page errors return `false`.
+    /// The caller must have installed the handler with `ready`.
     #[inline(never)]
     pub(super) unsafe fn copy(src: *const u8, dst: *mut u8, len: usize) -> bool {
-        static HANDLER: Once = Once::new();
-        // SAFETY: `on_fault` only inspects thread-local probe RIP bounds and
-        // opens write guards or jumps to `4:` on an AV inside this probe.
-        HANDLER.call_once(|| unsafe {
-            AddVectoredExceptionHandler(1, Some(on_fault));
-        });
         TRAP.with(|trap| {
             let slot = trap.as_ptr();
             let ok: usize;
@@ -7178,7 +7213,7 @@ pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
 
 /// Copies `len` bytes from `src` to `dst` unless a source or destination page
 /// is not accessible. Uses an in-process fault-guarded copy when safe
-/// (`VICTORY_FAST_COPY=0` forces `ReadProcessMemory` always).
+/// (`VICTORY_FAST_COPY=1` opts in; `ReadProcessMemory` is the default).
 fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
     if len == 0 {
         return true;
@@ -7194,6 +7229,7 @@ fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
             && d.checked_add(len).is_some()
             && non_overlapping_forward
             && fast_copy_impl::enabled()
+            && fast_copy_impl::ready()
             && let Some(_reading) = crate::watch::title_memory_reading_now()
         {
             // SAFETY: non-overlapping forward ranges held stable under `_reading`,

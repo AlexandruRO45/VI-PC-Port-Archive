@@ -189,6 +189,10 @@ by default (`VICTORY_LATE_WAIT`, `VICTORY_RELAY`, `VICTORY_WIDE_BACK`,
 `VICTORY_CARD_BUFFERS_MIN_MB`, `VICTORY_INPLACE`, `VICTORY_BVH_BUILDER`, ...).
 Each is described in a comment where it is read.
 
+`VICTORY_FAST_COPY=1` opts into fault-guarded in-process reads on x64.
+Unreadable memory, guard-page faults and in-page errors return failure;
+forward-overlapping ranges use the kernel copy. It is off by default.
+
 ### Known problems
 
 - Everything in shadow is black (see above).

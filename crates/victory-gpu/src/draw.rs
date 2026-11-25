@@ -142,8 +142,8 @@ struct Window {
 const WINDOW_MOST: u64 = 128;
 
 /// Whether indirect draws that read record after record of one argument
-/// buffer are clamped a window at a time (on by default; set
-/// `VICTORY_INDIRECT_WINDOW=0` to disable).
+/// buffer are clamped a window at a time (`VICTORY_INDIRECT_WINDOW=1`;
+/// off by default).
 ///
 /// The title issues its mesh draws one record per call, each from the next
 /// slot of the same argument buffer: 3,460 a frame in gameplay, and before
@@ -163,7 +163,27 @@ const WINDOW_MOST: u64 = 128;
 /// list / reset.
 fn windows() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_WINDOW").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_WINDOW").is_some_and(|v| v == "1"))
+}
+
+/// Only widen to a window if two full padded records fit. The clamp copies
+/// the padding too, so a final record shorter than `step` uses its original
+/// command-signature stride instead.
+fn window_records(left: u64, step: u64, previous: u32) -> Option<u32> {
+    let fit = (left / step).min(WINDOW_MOST) as u32;
+    (fit >= 2).then(|| (if previous == 1 { 16 } else { previous * 2 }).min(fit))
+}
+
+#[cfg(test)]
+mod window_tests {
+    #[test]
+    fn padded_windows_stop_before_a_short_buffer_tail() {
+        assert_eq!(super::window_records(12, 32, 1), None);
+        assert_eq!(super::window_records(32, 32, 1), None);
+        assert_eq!(super::window_records(63, 32, 1), None);
+        assert_eq!(super::window_records(64, 32, 1), Some(2));
+        assert_eq!(super::window_records(4096, 32, 64), Some(128));
+    }
 }
 
 /// Stack-backed list of freshly created descriptor-table `(slot, byte_offset)`
@@ -2429,7 +2449,7 @@ impl State {
             let draws: u32 = census.1.values().sum();
             if draws > 0 {
                 let mut rects: Vec<([i32; 4], u32)> = census.1.iter().map(|(r, n)| (*r, *n)).collect();
-                rects.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+                rects.sort_unstable_by_key(|a| std::cmp::Reverse(a.1));
                 let scissors: Vec<String> = rects
                     .iter()
                     .take(5)
@@ -3070,14 +3090,10 @@ impl State {
                             && step <= 256
                             && step.is_multiple_of(4)
                             && (w.records == 1 || step == u64::from(w.step));
-                        if walks {
-                            let fit = (args.left(arguments) / step).min(WINDOW_MOST) as u32;
-                            (
-                                step as u32,
-                                (if w.records == 1 { 16 } else { w.records * 2 })
-                                    .min(fit)
-                                    .max(1),
-                            )
+                        if walks
+                            && let Some(records) = window_records(args.left(arguments), step, w.records)
+                        {
+                            (step as u32, records)
                         } else {
                             (stride, max)
                         }
