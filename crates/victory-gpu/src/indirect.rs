@@ -1727,3 +1727,7 @@ void main() {
 /// The benchmark of the clamp and its barriers (ignored by default).
 #[cfg(test)]
 mod bench;
+
+/// The draw and state-change benchmark (ignored by default).
+#[cfg(test)]
+mod bare_cost;
