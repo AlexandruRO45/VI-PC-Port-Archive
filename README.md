@@ -226,8 +226,11 @@ the Windows paging file size, then retry.
 
 On Wine, `VICTORY_PHYSICAL_BACKING_DIR` can point to an existing, writable local
 directory outside the checkout. Physical-page sections then use temporary
-files that are deleted when released. This gives the host filesystem a
-chance to reclaim file-backed pages at the cost of extra disk I/O.
+files that are deleted on normal release. This gives the host filesystem a
+chance to reclaim file-backed pages at the cost of extra disk I/O. Use a
+dedicated directory for each run. If Wine is terminated before it can release
+the mappings, files can remain on disk. Remove those files after the run and
+its Wine processes have exited.
 
 ```powershell
 cargo xtask install-hooks                # asset-policy check on every commit
