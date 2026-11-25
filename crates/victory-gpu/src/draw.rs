@@ -1036,13 +1036,14 @@ impl State {
             once!("an unordered access clear of a slot without a view");
             return;
         };
-        self.clear_view(list, &view, values, float, rects);
+        self.clear_view(list, &view, values, float, rects, false);
     }
 
-    /// The clear of [`Self::clear_unordered`] of `view`. Whether it was
-    /// recorded. Its shader-visible slot is a dynamic one the list holds
-    /// until reset, one per view however often the list clears it
-    /// (`clear_slots`).
+    /// The clear of [`Self::clear_unordered`] of `view`; `written`: a
+    /// dispatch just wrote it, so unordered access barriers go before and
+    /// after the clear. Whether it was recorded. Its shader-visible slot is
+    /// a dynamic one the list holds until reset, one per view however often
+    /// the list clears it (`clear_slots`).
     fn clear_view(
         &mut self,
         list: &HostList,
@@ -1050,6 +1051,7 @@ impl State {
         values: [u32; 4],
         float: bool,
         rects: &[RECT],
+        written: bool,
     ) -> bool {
         let heap = (self.heaps[0] != 0).then(|| crate::descriptor::heap(self.heaps[0] as This));
         let (Some(heap), Some(host)) = (heap, crate::host::host()) else {
@@ -1075,7 +1077,7 @@ impl State {
                 slot
             }
         };
-        let written = UsedResource {
+        let uav = UsedResource {
             kind: ResourceType::Uav,
             root: RootType::Table,
             table_offset_dwords: 0,
@@ -1085,12 +1087,26 @@ impl State {
             user_data: 0,
             slot: 0,
         };
-        readable(list, &written, view, false);
+        readable(list, &uav, view, false);
         self.bind_heaps(list, false);
         list.keep(&resource);
         let gpu = visible.gpu(slot);
+        let barrier = || D3D12_RESOURCE_BARRIER {
+            Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+            Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                    // SAFETY: borrowed without a reference of its own,
+                    // never released (ManuallyDrop); the list keeps it.
+                    pResource: unsafe { std::mem::transmute_copy(&resource) },
+                }),
+            },
+        };
         // SAFETY: an open list; both slots view the live resource.
         unsafe {
+            if written {
+                list.list.ResourceBarrier(&[barrier()]);
+            }
             if float {
                 let values = values.map(f32::from_bits);
                 list.list
@@ -1099,8 +1115,110 @@ impl State {
                 list.list
                     .ClearUnorderedAccessViewUint(gpu, at, &resource, &values, rects);
             }
+            if written {
+                list.list.ResourceBarrier(&[barrier()]);
+            }
         }
         true
+    }
+
+    /// After a dispatch of `p`: the stand-ins `VICTORY_AMBIENT` sets for
+    /// its program (`crate::ambient`).
+    fn stand_ins(&mut self, list: &HostList, p: &HostPipeline) {
+        let rules = crate::ambient::rules();
+        if rules.is_empty() {
+            return;
+        }
+        if let Some(stage) = p.stages.first() {
+            self.stand_in(list, &stage.shader.hash, &stage.translated().used, rules);
+        }
+    }
+
+    /// The views of `rules` for `program`, whose code uses `used`, cleared
+    /// to their values: how many were.
+    fn stand_in(
+        &mut self,
+        list: &HostList,
+        program: &str,
+        used: &[UsedResource],
+        rules: &[crate::ambient::Rule],
+    ) -> usize {
+        let mut filled = 0;
+        for rule in rules.iter().filter(|r| r.program == program) {
+            let uavs = || -> Vec<String> {
+                used.iter()
+                    .filter(|u| u.kind == ResourceType::Uav && u.root == RootType::Table)
+                    .map(|u| format!("s{}+{}", u.slot, u.table_offset_dwords))
+                    .collect()
+            };
+            let first = !rule.seen.swap(true, Ordering::Relaxed);
+            let named = used.iter().any(|u| {
+                u.kind == ResourceType::Uav
+                    && u.root == RootType::Table
+                    && (u.slot, u.table_offset_dwords) == (rule.slot, rule.offset)
+            });
+            if !named {
+                if first {
+                    tracing::warn!(program, view = %rule.view(), views = ?uavs(), "ambient stand-in: the program has no such unordered view in a table");
+                }
+                crate::ambient::note(false);
+                continue;
+            }
+            let view = match self.roots_ref(true).get(usize::from(rule.slot)) {
+                Some(&Root::Table(table)) => crate::descriptor::view(table + u64::from(rule.offset) * 4),
+                _ => None,
+            };
+            // The formats of the view and of the texture it views, the
+            // title's; the size, for the log.
+            let formats = |view: &View| match view {
+                View::Unordered(r, _, words) => crate::resource::title_format(*r as This).map(|own| {
+                    // SAFETY: a live resource.
+                    let size = crate::resource::host_resource(*r as This).map(|t| unsafe { t.GetDesc() }).map(|d| (d.Width, d.Height));
+                    (words.map_or(0, |w| w[0]), own, size)
+                }),
+                View::Placed(true, texture, words) => Some((words[0], texture[8], None)),
+                _ => None,
+            };
+            let Some((view, (format, own, size))) = view.and_then(|v| formats(&v).map(|f| (v, f))) else {
+                if first {
+                    tracing::warn!(program, view = %rule.view(), "ambient stand-in: no unordered view of a texture there");
+                }
+                crate::ambient::note(false);
+                continue;
+            };
+            let format = if format == 0 { own } else { format };
+            let fill = crate::ambient::fill(rule.value, format, own);
+            if first {
+                tracing::info!(
+                    program,
+                    view = %rule.view(),
+                    views = ?uavs(),
+                    format,
+                    texture_format = own,
+                    ?size,
+                    value = ?rule.value,
+                    ?fill,
+                    "ambient stand-in: first dispatch of the program"
+                );
+            }
+            let recorded = match fill {
+                Ok(crate::ambient::Fill::Float(rgba)) => {
+                    self.clear_view(list, &view, rgba.map(f32::to_bits), true, &[], true)
+                }
+                Ok(crate::ambient::Fill::Uint(words)) => {
+                    self.clear_view(list, &view, words, false, &[], true)
+                }
+                Err(why) => {
+                    if first {
+                        tracing::warn!(program, view = %rule.view(), format, texture_format = own, "ambient stand-in: {why}");
+                    }
+                    false
+                }
+            };
+            crate::ambient::note(recorded);
+            filled += usize::from(recorded);
+        }
+        filled
     }
 
     /// Runs a dispatch on the host.
@@ -1140,6 +1258,7 @@ impl State {
         #[cfg(feature = "diagnostics")]
         self.probe_written(list);
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+        self.stand_ins(list, p);
     }
 
     /// What a draw or dispatch runs, for the device-removed report
@@ -1843,6 +1962,9 @@ impl State {
         crate::indirect::done(list, &clamped);
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
+            if let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) {
+                self.stand_ins(list, p);
+            }
         } else {
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
@@ -3156,8 +3278,125 @@ void main(uint3 id : SV_DispatchThreadID) {
         assert!((x - 64.0 / 255.0).abs() < 1e-6, "mip 0 kept: {x}");
     }
 
-    /// Clears of one view in one list share one dynamic slot (a title
-    /// that clears one view in many passes): eight clears of a
+    /// The ambient stand-in (`crate::ambient`): a program writes three
+    /// unordered views of a title table; after it, the views the rules name
+    /// for its hash hold their values (an R32_UINT texture the R9G9B9E5
+    /// packing, an RGBA16F one the colour as halves), the view no rule of
+    /// its names keeps what it wrote, and a program no rule names changes
+    /// nothing.
+    #[test]
+    fn the_ambient_stand_in_fills_the_named_views_after_the_named_program() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        const N: u32 = 16;
+        let null = std::ptr::null();
+        let heap_desc: [u32; 8] = [0, 8, 1, 0, 0, 0, 0, 0];
+        let mut heap = null;
+        let iid = crate::object::guid(0x8efb471d, 0x616c, 0x4f49, [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51]);
+        assert_eq!(crate::descriptor::create_heap(null, heap_desc.as_ptr().cast(), &iid, &mut heap), S_OK);
+        let title_heap = crate::descriptor::heap(heap);
+        // R32_UINT, RGBA16F, R32_UINT.
+        let formats = [42u32, 10, 42];
+        let textures: Vec<This> = formats
+            .iter()
+            .map(|&f| texture_at_address(title_memory(1 << 20), &texture_words(N, N, f, 0x105, 4)))
+            .collect();
+        let uavs: Vec<View> = textures
+            .iter()
+            .zip(formats)
+            .map(|(&t, f)| View::Unordered(t as usize, 0, Some([f, 4, 0, 0, 0, 0, 0, 0, 0, 0])))
+            .collect();
+        for (i, (&t, f)) in textures.iter().zip(formats).enumerate() {
+            let desc = [f, 4, 0, 0, 0, 0, 0, 0, 0, 0];
+            crate::descriptor::create_uav(null, t, null, &desc, title_heap.start + 32 * i as u64);
+        }
+        let slots = Slots::new(6);
+        for (i, v) in uavs.iter().enumerate() {
+            slots.make(i as u32, v);
+        }
+        let reads: Vec<View> = textures
+            .iter()
+            .zip(formats)
+            .map(|(&t, f)| View::Shader(t as usize, Some([f, 4, 0x1688, 0, 0, 1, 0, 0, 0, 0])))
+            .collect();
+        for (i, v) in reads.iter().enumerate() {
+            slots.make(3 + i as u32, v);
+        }
+        let write = compile_cs(
+            r#"
+#define RS "DescriptorTable(UAV(u0, numDescriptors=3))"
+RWTexture2D<uint> a : register(u0);
+RWTexture2D<float4> b : register(u1);
+RWTexture2D<uint> c : register(u2);
+[RootSignature(RS)]
+[numthreads(8, 8, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    a[id.xy] = 0xdeadbeef;
+    b[id.xy] = float4(9, 9, 9, 9);
+    c[id.xy] = 0xdeadbeef;
+}
+"#,
+        );
+        let read = compile_cs(
+            r#"
+#define RS "DescriptorTable(SRV(t0, numDescriptors=3)), UAV(u1)"
+Texture2D<uint> a : register(t0);
+Texture2D<float4> b : register(t1);
+Texture2D<uint> c : register(t2);
+RWByteAddressBuffer o : register(u1);
+[RootSignature(RS)]
+[numthreads(8, 8, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    int3 at = int3(id.xy, 0);
+    uint i = (id.y * 16 + id.x) * 32;
+    o.Store2(i, uint2(a.Load(at), c.Load(at)));
+    o.Store4(i + 16, asuint(b.Load(at)));
+}
+"#,
+        );
+        let (out, data) = host.shared_buffer(u64::from(N * N) * 32).unwrap();
+        let rules = crate::ambient::parse(
+            "aaaaaaaaaaaaaaaa:s1+0:rgb9e5=0.6,0.588,0.564; AAAAAAAAAAAAAAAA:1+8:0.25,0.5,1; bbbbbbbbbbbbbbbb:s1+16:0x12345678",
+        )
+        .unwrap();
+        let program_uses: Vec<UsedResource> = (0..3)
+            .map(|i| UsedResource { slot: 1, table_offset_dwords: 8 * i, ..used(ResourceType::Uav) })
+            .collect();
+        let list = host.new_list().unwrap();
+        let mut state = State::default();
+        state.set_heaps(&[heap]);
+        state.set_table(true, 1, title_heap.start);
+        for v in &uavs {
+            readable(&list, &used(ResourceType::Uav), v, false);
+        }
+        run(&list, &slots, &write, 0, None, (N / 8, N / 8));
+        let before = crate::ambient::filled();
+        assert_eq!(state.stand_in(&list, "aaaaaaaaaaaaaaaa", &program_uses, &rules), 2, "the two views of its rules");
+        assert_eq!(state.stand_in(&list, "cccccccccccccccc", &program_uses, &rules), 0, "a program no rule names");
+        assert_eq!(crate::ambient::filled() - before, 2);
+        for v in &reads {
+            readable(&list, &used(ResourceType::Srv), v, false);
+        }
+        run(&list, &slots, &read, 3, Some(&out), (N / 8, N / 8));
+        list.close();
+        host.execute(&[&list]);
+        let grey = crate::ambient::rgb9e5([0.6, 0.588, 0.564]);
+        for i in [0usize, 5, 7 * 16 + 9, 255] {
+            // SAFETY: inside the mapped output.
+            let (words, colour) = unsafe {
+                (
+                    (data.add(i * 32) as *const [u32; 2]).read(),
+                    (data.add(i * 32 + 16) as *const [f32; 4]).read(),
+                )
+            };
+            assert_eq!(words, [grey, 0xdeadbeef], "texel {i}: the packed grey, and the unnamed view as written");
+            assert_eq!(colour, [0.25, 0.5, 1.0, 1.0], "texel {i}: the colour as halves");
+        }
+    }
+
+    /// Clears of one view in one list share one dynamic slot (a stand-in
+    /// clears its view at each dispatch of its program): eight clears of a
     /// view take one, a clear of another view one more, and the views hold
     /// their last clears; the slots come back when the list is reset.
     #[test]
@@ -3204,12 +3443,12 @@ void main(uint3 id : SV_DispatchThreadID) {
         let mut state = State::default();
         state.set_heaps(&[heap]);
         for k in 1..=8 {
-            assert!(state.clear_view(&list, &uavs[0], [k, 0, 0, 0], false, &[]), "clear {k}");
+            assert!(state.clear_view(&list, &uavs[0], [k, 0, 0, 0], false, &[], true), "clear {k}");
         }
         assert_eq!(heap_host.dynamic_free(), free - 1, "eight clears of one view, one slot");
-        assert!(state.clear_view(&list, &uavs[1], [0x77, 0, 0, 0], false, &[]));
+        assert!(state.clear_view(&list, &uavs[1], [0x77, 0, 0, 0], false, &[], true));
         assert_eq!(heap_host.dynamic_free(), free - 2, "another view, another slot");
-        assert!(state.clear_view(&list, &uavs[0], [0x55, 0, 0, 0], false, &[]));
+        assert!(state.clear_view(&list, &uavs[0], [0x55, 0, 0, 0], false, &[], true));
         assert_eq!(heap_host.dynamic_free(), free - 2, "the first view's slot again");
         for t in &textures {
             let srv = View::Shader(*t as usize, Some([42, 4, 0x1688, 0, 0, 1, 0, 0, 0, 0]));
@@ -3228,7 +3467,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         assert_eq!(heap_host.dynamic_free(), free, "the slots come back at reset");
         // A new recording takes a slot afresh.
         state.set_heaps(&[heap]);
-        assert!(state.clear_view(&list, &uavs[0], [1, 0, 0, 0], false, &[]));
+        assert!(state.clear_view(&list, &uavs[0], [1, 0, 0, 0], false, &[], true));
         assert_eq!(heap_host.dynamic_free(), free - 1);
         list.close();
         host.execute(&[&list]);
@@ -3288,17 +3527,17 @@ void main(uint3 id : SV_DispatchThreadID) {
         let (first, second) = (host.new_list().unwrap(), host.new_list().unwrap());
         let mut state = State::default();
         state.set_heaps(&[heap]);
-        assert!(state.clear_view(&first, &uav, [0x11, 0, 0, 0], false, &[]));
-        assert!(state.clear_view(&first, &uav, [0x33, 0, 0, 0], false, &[]));
+        assert!(state.clear_view(&first, &uav, [0x11, 0, 0, 0], false, &[], true));
+        assert!(state.clear_view(&first, &uav, [0x33, 0, 0, 0], false, &[], true));
         assert_eq!(heap_host.dynamic_free(), free - 1, "one slot before the cut");
         srv(&first);
         run(&first, &slots, &read, 0, Some(&outs[0].0), (N / 8, N / 8));
         first.close();
         state.cut(&second);
         assert_eq!(heap_host.dynamic_free(), free - 1, "the cut gives no slot back");
-        assert!(state.clear_view(&second, &uav, [0x22, 0, 0, 0], false, &[]));
+        assert!(state.clear_view(&second, &uav, [0x22, 0, 0, 0], false, &[], true));
         assert_eq!(heap_host.dynamic_free(), free - 2, "the new segment's own slot; the old one held");
-        assert!(state.clear_view(&second, &uav, [0x44, 0, 0, 0], false, &[]));
+        assert!(state.clear_view(&second, &uav, [0x44, 0, 0, 0], false, &[], true));
         assert_eq!(heap_host.dynamic_free(), free - 2, "shared again within the new segment");
         srv(&second);
         run(&second, &slots, &read, 0, Some(&outs[1].0), (N / 8, N / 8));
