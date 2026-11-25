@@ -1245,6 +1245,8 @@ fn unsupported(offset: usize, what: Why) -> Stop {
     Stop::Fail(ShaderError::Unsupported { offset, what })
 }
 
+mod mask_scc;
+
 impl<'a> Lower<'a> {
     fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>) -> Self {
         let p = x.p;
@@ -1721,6 +1723,12 @@ impl<'a> Lower<'a> {
                 }
             }
         };
+        if let (None, Some(h), true) = (sub, h, n > 1 && Self::wide_loads()) {
+            for (k, x) in self.raw_dwords(h, off, n).into_iter().enumerate() {
+                self.write(inst, Reg::V(reg + k as u8), x, guard);
+            }
+            return Ok(());
+        }
         for k in 0..n {
             let x = match sub {
                 None => {
@@ -3180,49 +3188,6 @@ impl<'a> Lower<'a> {
             }
         };
         Ok(if high { y } else { x })
-    }
-
-    /// SCC of a lane-mask operation read as data (`s_cselect` on it, say):
-    /// whether the mask has a lane set, from its ballot where it is written.
-    fn mask_scc(&mut self, scc: Value) -> Result<V, Why> {
-        let p = self.x.p;
-        let &b = self.def_block.get(&scc).ok_or(LANE_MASK)?;
-        let inst: &Inst = p.blocks[b]
-            .insts
-            .iter()
-            .find(|i| i.write(Reg::Scc) == Some(scc))
-            .ok_or(LANE_MASK)?;
-        let Fields::Sop {
-            dst: Some(Operand::Scalar { code, .. }),
-            ..
-        } = inst.fields
-        else {
-            return Err(LANE_MASK);
-        };
-        if inst.write(Reg::S(EXEC)).is_some() {
-            return Err(LANE_MASK);
-        }
-        let lo = inst.write(Reg::S(code)).ok_or(LANE_MASK)?;
-        let x = self.mask_dword(lo)?;
-        let any = match inst.write(Reg::S(code + 1)) {
-            Some(hi) if self.wave() == 64 => {
-                let y = self.mask_dword(hi)?;
-                let at = if b == self.cur_ir {
-                    self.cur
-                } else {
-                    self.tail[b].ok_or("a lane mask written after its use")?
-                };
-                self.s.m.bin(at, Bin::Or, x, y)
-            }
-            _ => x,
-        };
-        let at = if b == self.cur_ir {
-            self.cur
-        } else {
-            self.tail[b].ok_or("a lane mask written after its use")?
-        };
-        let zero = self.s.m.i32(0);
-        Ok(self.s.m.cmp(at, pred::NE, any, zero))
     }
 
     // ---- operands ----
@@ -5510,6 +5475,47 @@ impl<'a> Lower<'a> {
         }
     }
 
+    /// Whether the dwords of one console load are read by one call for up
+    /// to four of them (`bitcode::opt::WIDE` of `VICTORY_SHADER_OPT`), not
+    /// by a call each.
+    fn wide_loads() -> bool {
+        super::shader_opt() & super::bitcode::opt::WIDE != 0
+    }
+
+    /// `count` dwords from byte `addr` on of the raw view `h`, as integers,
+    /// read in the current block by one call for every four of them
+    /// ([`Self::wide_loads`]). They are the dwords of ONE console load,
+    /// which the console reads as one (address plus 4, 8, ... without
+    /// wrapping at 32 bits): the same bytes as a call a dword reads. Loads
+    /// of different console instructions are never joined: the program
+    /// computes their offsets in 32-bit registers, and `x - 4` and `x` at
+    /// `x = 0` are one dword out of the view and its first one, where one
+    /// call from `x - 4` on would read both out of it.
+    fn raw_dwords(&mut self, h: V, addr: V, count: u32) -> Vec<V> {
+        let c = self.cur;
+        let (u, al) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
+        let mut out = Vec::with_capacity(count as usize);
+        for first in (0..count).step_by(4) {
+            let n = (count - first).min(4);
+            let off = self.s.m.i32(4 * first);
+            let a = self.s.m.bin(c, Bin::Add, addr, off);
+            let mask = self.s.m.i8((1u8 << n) - 1);
+            let r = self.s.op(
+                c,
+                "rawBufferLoad.f32",
+                Attr::ReadOnly,
+                self.s.t.res_ret,
+                139,
+                &[h, a, u, mask, al],
+            );
+            for k in 0..n {
+                let x = self.s.m.extract(c, r, k);
+                out.push(self.as_int(x));
+            }
+        }
+        out
+    }
+
     fn smem(&mut self, inst: &Inst, site: Site) -> Result<(), Why> {
         let Fields::Smem {
             data,
@@ -5591,7 +5597,12 @@ impl<'a> Lower<'a> {
             let at = self.begin_guarded(Some(is_buffer));
             let h = self.handle(site, src, false, (11, 0))?;
             let mut raw = Vec::new();
-            for k in 0..count {
+            let wide = Self::wide_loads();
+            if wide {
+                let dwords = self.raw_dwords(h, addr, count);
+                raw.extend(dwords.into_iter().map(|x| (x, zero)));
+            }
+            for k in 0..if wide { 0 } else { count } {
                 let b = self.cur;
                 let off = self.s.m.i32(4 * k);
                 let a = self.s.m.bin(b, Bin::Add, addr, off);
@@ -5629,6 +5640,12 @@ impl<'a> Lower<'a> {
         }
         if matches!(kind, Some(u) if u.kind == ResourceType::Srv) {
             let h = self.handle(site, src, false, (11, 0))?;
+            if Self::wide_loads() {
+                for (k, x) in self.raw_dwords(h, addr, count).into_iter().enumerate() {
+                    self.write(inst, Reg::S(code + k as u8), x, None);
+                }
+                return Ok(());
+            }
             for k in 0..count {
                 let off = self.s.m.i32(4 * k);
                 let a = self.s.m.bin(c, Bin::Add, addr, off);
