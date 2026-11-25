@@ -7,8 +7,25 @@
 
 use std::collections::HashMap;
 
+pub mod census;
+pub mod opt;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct Ty(u32);
+
+/// What the lowering made an instruction for, where it says so (counted by
+/// [`census`], nothing else reads it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Tag {
+    /// The select that keeps a register's old value in lanes a guard masks.
+    #[allow(dead_code)]
+    Guard,
+    /// An index clamp the translation adds (the console has none).
+    Clamp,
+    /// The iteration counter and limit test the translation adds to a loop.
+    #[allow(dead_code)]
+    Counter,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum TypeDef {
@@ -214,6 +231,8 @@ pub(crate) struct Module {
     blocks: Vec<Block>,
     mds: Vec<MdDef>,
     named: Vec<(String, Vec<Md>)>,
+    /// See [`Tag`]: by instruction.
+    tags: HashMap<u32, Tag>,
 }
 
 impl Module {
@@ -358,7 +377,21 @@ impl Module {
     /// Gives constant `old` the content of `new` (both stay valid).
     pub fn replace_const(&mut self, old: V, new: V) {
         if let (V::Const(o), V::Const(n)) = (old, new) {
+            if self.const_ids.get(&self.consts[o as usize]) == Some(&o) {
+                let prev = self.consts[o as usize].clone();
+                self.const_ids.remove(&prev);
+            }
             self.consts[o as usize] = self.consts[n as usize].clone();
+        }
+    }
+
+    /// Notes what instruction `v` is for (see [`Tag`]); only when modules
+    /// are counted.
+    pub fn tag(&mut self, v: V, tag: Tag) {
+        if let V::Inst(i) = v
+            && census::enabled()
+        {
+            self.tags.insert(i, tag);
         }
     }
 
@@ -561,12 +594,202 @@ impl Module {
         self.named.push((name.into(), nodes));
     }
 
+    /// Blocks reachable from entry (index 0) and their reverse postorder.
+    pub(super) fn reachable(&self) -> (Vec<bool>, Vec<usize>) {
+        if self.blocks.is_empty() {
+            return (Vec::new(), Vec::new());
+        }
+        let succs = |b: usize| successors(self.blocks[b].term);
+        let mut seen = vec![false; self.blocks.len()];
+        let mut post = Vec::new();
+        let mut stack = vec![(0usize, 0usize)];
+        seen[0] = true;
+        while let Some(top) = stack.last_mut() {
+            let (b, k) = *top;
+            top.1 += 1;
+            match succs(b).get(k) {
+                Some(&s) if !seen[s] => {
+                    seen[s] = true;
+                    stack.push((s, 0));
+                }
+                Some(_) => {}
+                None => {
+                    post.push(b);
+                    stack.pop();
+                }
+            }
+        }
+        post.reverse();
+        (seen, post)
+    }
+
+    /// The blocks in the order `write` gives them, and per block the
+    /// (predecessor, loop header) of an empty latch folded into its
+    /// predecessor.
+    ///
+    /// Blocks are laid out in reverse postorder, so every block follows its
+    /// forward predecessors (drivers take a branch to an earlier block for a
+    /// loop's back edge). An empty latch (only a branch back to its loop
+    /// header) is folded into its one predecessor, so the exiting block is
+    /// the latch as in DXC's loops; the AMD driver hangs on divergent loops
+    /// otherwise. A fold never gives a block a second branch back, nor a
+    /// header a second block that branches back to it (see
+    /// [`Module::one_back_edge_each`]).
+    pub(super) fn layout(&self, post: Vec<usize>) -> (Vec<usize>, Vec<Option<(usize, usize)>>) {
+        let succs = |b: usize| successors(self.blocks[b].term);
+        let mut pos = vec![u64::MAX; self.blocks.len()];
+        for (n, &b) in post.iter().enumerate() {
+            pos[b] = n as u64;
+        }
+        let mut preds = vec![Vec::new(); self.blocks.len()];
+        // Per header: the blocks that branch back to it (once per edge).
+        let mut latches = vec![0u32; self.blocks.len()];
+        for &b in &post {
+            for &s in succs(b).iter() {
+                preds[s].push(b);
+                if pos[s] <= pos[b] {
+                    latches[s] += 1;
+                }
+            }
+        }
+        let goes_back = |b: usize| succs(b).iter().any(|&s| pos[s] <= pos[b]);
+        let mut fold: Vec<Option<(usize, usize)>> = vec![None; self.blocks.len()];
+        // Per predecessor: the latch folded into it.
+        let mut into: Vec<Option<usize>> = vec![None; self.blocks.len()];
+        for &b in &post {
+            let blk = &self.blocks[b];
+            if let (Some(Term::Br(h)), true, [p]) = (
+                blk.term,
+                blk.phis.is_empty() && blk.body.is_empty(),
+                &preds[b][..],
+            ) && fold[*p].is_none()
+                && fold[h].is_none()
+                && pos[h] < pos[b]
+                && !succs(*p).contains(&h)
+                && latches[h] == 1
+                && !goes_back(*p)
+            {
+                // Of two latches below one block, the inner loop's (the
+                // later header) is folded.
+                match into[*p] {
+                    Some(other) if fold[other].is_some_and(|(_, oh)| pos[oh] >= pos[h]) => continue,
+                    Some(other) => fold[other] = None,
+                    None => {}
+                }
+                into[*p] = Some(b);
+                fold[b] = Some((*p, h));
+            }
+        }
+        let layout: Vec<usize> = post.into_iter().filter(|&b| fold[b].is_none()).collect();
+        (layout, fold)
+    }
+
+    /// Gives every loop header one block that branches back to it, and every
+    /// block at most one branch back to a loop header, as DXC's loops have
+    /// them: a block that branches back to several headers (a latch of an
+    /// inner and an outer loop at once) keeps the branch to the innermost
+    /// header and reaches each other one through a new block, and the
+    /// latches of a header with several branch to one new latch, which
+    /// takes the header's joins from them. The program does the same.
+    pub(crate) fn one_back_edge_each(&mut self) {
+        // A branch to `from` goes to `to` instead.
+        fn retarget(m: &mut Module, b: usize, from: usize, to: usize) {
+            let swap = |t: usize| if t == from { to } else { t };
+            m.blocks[b].term = match m.blocks[b].term {
+                Some(Term::Br(t)) => Some(Term::Br(swap(t))),
+                Some(Term::CondBr(c, t, f)) => Some(Term::CondBr(c, swap(t), swap(f))),
+                t => t,
+            };
+        }
+        let back = |m: &Module, pos: &[usize], b: usize| -> Vec<usize> {
+            let mut hs: Vec<usize> = successors(m.blocks[b].term)
+                .iter()
+                .copied()
+                .filter(|&s| pos[s] <= pos[b])
+                .collect();
+            hs.dedup();
+            hs
+        };
+        let positions = |m: &Module| {
+            let (_, order) = m.reachable();
+            let mut pos = vec![usize::MAX; m.blocks.len()];
+            for (k, &b) in order.iter().enumerate() {
+                pos[b] = k;
+            }
+            (order, pos)
+        };
+        // A block with several branches back.
+        let (order, pos) = positions(self);
+        for &b in &order {
+            let mut hs = back(self, &pos, b);
+            if hs.len() < 2 {
+                continue;
+            }
+            hs.sort_by_key(|&h| pos[h]);
+            hs.pop();
+            for h in hs {
+                let c = self.new_block();
+                self.terminate(c, Term::Br(h));
+                retarget(self, b, h, c);
+                for k in 0..self.blocks[h].phis.len() {
+                    let p = self.blocks[h].phis[k] as usize;
+                    if let Op::Phi(incoming) = &mut self.insts[p].op {
+                        for x in incoming.iter_mut().filter(|x| x.1 == b) {
+                            x.1 = c;
+                        }
+                    }
+                }
+            }
+        }
+        // A header with several latches.
+        let (order, pos) = positions(self);
+        let mut latches: Vec<Vec<usize>> = vec![Vec::new(); self.blocks.len()];
+        for &b in &order {
+            for h in back(self, &pos, b) {
+                latches[h].push(b);
+            }
+        }
+        for (h, ls) in latches.into_iter().enumerate() {
+            if ls.len() < 2 {
+                continue;
+            }
+            let c = self.new_block();
+            self.terminate(c, Term::Br(h));
+            for &l in &ls {
+                retarget(self, l, h, c);
+            }
+            for k in 0..self.blocks[h].phis.len() {
+                let p = self.blocks[h].phis[k];
+                let Op::Phi(incoming) =
+                    std::mem::replace(&mut self.insts[p as usize].op, Op::Phi(Vec::new()))
+                else {
+                    unreachable!("a join")
+                };
+                let (round, rest): (Vec<_>, Vec<_>) =
+                    incoming.into_iter().partition(|x| ls.contains(&x.1));
+                let v = match round.first() {
+                    Some(&(v, _)) if round.iter().all(|x| x.0 == v) => v,
+                    _ => {
+                        let ty = self.insts[p as usize].ty;
+                        let q = self.phi(c, ty);
+                        self.set_phi(q, round);
+                        q
+                    }
+                };
+                let mut incoming = rest;
+                incoming.push((v, c));
+                self.insts[p as usize].op = Op::Phi(incoming);
+            }
+        }
+    }
+
     /// The module as bitcode.
-    /// Which instructions are written: every body instruction, the branch
-    /// conditions, and whatever they read, transitively (a phi nothing reads
+    /// Which instructions are written: every body instruction in reachable
+    /// blocks, the branch conditions, and whatever they read, transitively
+    /// (a phi nothing reads, or an incoming edge from an unreachable block,
     /// is dropped). A worklist visits each instruction once, so a long chain
     /// of merges costs one pass, not one pass per merge.
-    fn live(&self) -> Vec<bool> {
+    pub(super) fn live(&self, reachable: &[bool]) -> Vec<bool> {
         let mut live = vec![false; self.insts.len()];
         let mut work: Vec<u32> = Vec::new();
         let mark = |live: &mut [bool], work: &mut Vec<u32>, v: V| {
@@ -577,7 +800,10 @@ impl Module {
                 work.push(i);
             }
         };
-        for b in &self.blocks {
+        for (b_idx, b) in self.blocks.iter().enumerate() {
+            if !reachable[b_idx] {
+                continue;
+            }
             for &i in &b.body {
                 mark(&mut live, &mut work, V::Inst(i));
             }
@@ -586,9 +812,16 @@ impl Module {
             }
         }
         while let Some(i) = work.pop() {
-            for_each_operand(&self.insts[i as usize].op, |v| {
-                mark(&mut live, &mut work, v)
-            });
+            match &self.insts[i as usize].op {
+                Op::Phi(inc) => {
+                    for &(v, pred) in inc {
+                        if reachable[pred] {
+                            mark(&mut live, &mut work, v);
+                        }
+                    }
+                }
+                op => for_each_operand(op, |v| mark(&mut live, &mut work, v)),
+            }
         }
         live
     }
@@ -726,60 +959,13 @@ impl Module {
         }
         w.exit();
 
-        // Phis nothing reads are left out (one register per phi makes many).
-        let live = self.live();
-
         // Blocks are laid out in reverse postorder, so every block follows
         // its forward predecessors (drivers take a branch to an earlier
         // block for a loop's back edge).
-        let succs = |b: usize| successors(self.blocks[b].term);
-        let mut seen = vec![false; self.blocks.len()];
-        let mut post = Vec::new();
-        let mut stack = vec![(0usize, 0usize)];
-        seen[0] = true;
-        while let Some(top) = stack.last_mut() {
-            let (b, k) = *top;
-            top.1 += 1;
-            match succs(b).get(k) {
-                Some(&s) if !seen[s] => {
-                    seen[s] = true;
-                    stack.push((s, 0));
-                }
-                Some(_) => {}
-                None => {
-                    post.push(b);
-                    stack.pop();
-                }
-            }
-        }
-        post.reverse();
-        let mut pos = vec![u64::MAX; self.blocks.len()];
-        for (n, &b) in post.iter().enumerate() {
-            pos[b] = n as u64;
-        }
-        // An empty latch (only a branch back to its loop header) is folded
-        // into its one predecessor, so the exiting block is the latch as in
-        // DXC's loops; the AMD driver hangs on divergent loops otherwise.
-        let mut preds = vec![Vec::new(); self.blocks.len()];
-        for &b in &post {
-            for &s in succs(b).iter() {
-                preds[s].push(b);
-            }
-        }
-        let mut fold = vec![None; self.blocks.len()];
-        for &b in &post {
-            let blk = &self.blocks[b];
-            if let (Some(Term::Br(h)), true, [p]) = (
-                blk.term,
-                blk.phis.is_empty() && blk.body.is_empty(),
-                &preds[b][..],
-            ) && pos[h] < pos[b]
-                && !succs(*p).contains(&h)
-            {
-                fold[b] = Some((*p, h));
-            }
-        }
-        let layout: Vec<usize> = post.into_iter().filter(|&b| fold[b].is_none()).collect();
+        let (seen, post) = self.reachable();
+        // Phis nothing reads (and operands from unreachable edges) are left out.
+        let live = self.live(&seen);
+        let (layout, fold) = self.layout(post);
         let mut pos = vec![u64::MAX; self.blocks.len()];
         for (n, &b) in layout.iter().enumerate() {
             pos[b] = n as u64;
@@ -899,6 +1085,9 @@ impl Module {
                         r.clear();
                         r.push(u64::from(inst.ty.0));
                         for &(v, b) in incoming {
+                            if !seen[b] {
+                                continue;
+                            }
                             r.push(signed(i64::from(inst_id) - i64::from(abs(v))));
                             r.push(from(b));
                         }
@@ -1215,7 +1404,8 @@ mod tests {
     fn worklist_liveness_matches_passes() {
         for (regs, stages, read) in [(1, 0, 1), (1, 1, 1), (4, 3, 1), (8, 17, 3), (16, 40, 16)] {
             let m = synthetic(regs, stages, read);
-            let live = m.live();
+            let (reach, _) = m.reachable();
+            let live = m.live(&reach);
             assert_eq!(live, live_by_passes(&m), "{regs} regs x {stages} stages");
         }
     }
@@ -1242,10 +1432,23 @@ mod tests {
             V::Inst(i) => i as usize,
             _ => unreachable!(),
         };
-        let live = m.live();
+        let (reach, _) = m.reachable();
+        let live = m.live(&reach);
         assert!(live[ids(read)] && live[ids(sum)]);
         assert!(!live[ids(unread)] && !live[ids(cyc_a)] && !live[ids(cyc_b)]);
         assert_eq!(live, live_by_passes(&m));
+    }
+
+    #[test]
+    fn replace_const_evicts_old_cache_key() {
+        let mut m = Module::default();
+        let c42 = m.i32(42);
+        let c99 = m.i32(99);
+        m.replace_const(c42, c99);
+        let fresh_42 = m.i32(42);
+        assert_ne!(fresh_42, c42);
+        assert_eq!(m.int_value(c42), Some(99));
+        assert_eq!(m.int_value(fresh_42), Some(42));
     }
 
     #[test]

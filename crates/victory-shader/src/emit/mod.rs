@@ -115,9 +115,35 @@ use crate::dxbc::{Container, FourCC};
 use crate::native::{HwStage, NativeProgram, RootType};
 use crate::{ShaderError, io, ir, resource, structure};
 
+pub use bitcode::census;
 pub use rectangle::rectangle_geometry;
 pub use sampler::StaticSampler;
 pub use shader::{ROOT_CBV_SPACE, SAMPLER_SPACE, STRIDE_SPACE, USER_DATA_SPACE};
+
+/// Which clean-up passes run over each translated DXIL module: every pass
+/// unless `VICTORY_SHADER_OPT` says otherwise (`0` turns them all off;
+/// bits: `1` dead code, `2` constants and identities, `4` one instruction
+/// for one value, `8` what a branch taken says about its condition, `16`
+/// one read for one place within a block).
+///
+/// Part of the translation: the shader cache keys on it (`victory-gpu`'s
+/// does).
+pub fn shader_opt() -> u32 {
+    static PASSES: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *PASSES.get_or_init(|| parse_shader_opt(std::env::var("VICTORY_SHADER_OPT").ok().as_deref()))
+}
+
+/// `VICTORY_SHADER_OPT`'s value; every pass when it is unset or
+/// unreadable. Pure, for testing.
+fn parse_shader_opt(value: Option<&str>) -> u32 {
+    let parsed = value
+        .map(str::trim)
+        .and_then(|v| match v.strip_prefix("0x") {
+            Some(hex) => u32::from_str_radix(hex, 16).ok(),
+            None => v.parse().ok(),
+        });
+    parsed.map_or(bitcode::opt::ALL, |n| n & bitcode::opt::ALL)
+}
 
 /// The loop limit without an override: 2^20.
 pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
@@ -688,7 +714,18 @@ mod tests {
     use super::Target;
     use super::bitcode::Attr;
     use super::lower::LOOP_LIMIT;
-    use super::parse_loop_limit;
+    use super::{parse_loop_limit, parse_shader_opt};
+
+    #[test]
+    fn the_clean_up_switch_parses_or_runs_every_pass() {
+        let all = super::bitcode::opt::ALL;
+        assert_eq!(parse_shader_opt(None), all);
+        assert_eq!(parse_shader_opt(Some("0")), 0);
+        assert_eq!(parse_shader_opt(Some(" 1 ")), 1);
+        assert_eq!(parse_shader_opt(Some("0x1")), 1);
+        assert_eq!(parse_shader_opt(Some("0xffffffff")), all);
+        assert_eq!(parse_shader_opt(Some("on")), all);
+    }
 
     #[test]
     fn the_loop_limit_switch_parses_or_falls_back() {
