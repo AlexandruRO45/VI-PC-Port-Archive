@@ -62,8 +62,9 @@ pub fn ensure_outside_repo(path: &Path) -> Result<(), PolicyError> {
     Ok(())
 }
 
-/// Canonicalizes the longest existing prefix of `path` and re-appends the
-/// rest, so that paths which do not exist yet can still be compared.
+/// Resolves `path` component by component, canonicalizing each existing prefix
+/// before applying `..` so symlinks exposed by or followed by `..` are
+/// resolved against their real target rather than collapsed lexically.
 fn resolve(path: &Path) -> Result<PathBuf, PolicyError> {
     let absolute = if path.is_absolute() {
         path.to_path_buf()
@@ -76,25 +77,40 @@ fn resolve(path: &Path) -> Result<PathBuf, PolicyError> {
             .join(path)
     };
 
-    let mut existing = absolute.as_path();
+    let mut out = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::Prefix(prefix) => out.push(prefix.as_os_str()),
+            Component::RootDir => out.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if let Ok(canon) = std::fs::canonicalize(&out) {
+                    out = canon;
+                }
+                out.pop();
+            }
+            Component::Normal(part) => {
+                out.push(part);
+                if let Ok(canon) = std::fs::canonicalize(&out) {
+                    out = canon;
+                }
+            }
+        }
+    }
+
+    let mut existing = out.as_path();
     let mut rest = Vec::new();
     loop {
         match std::fs::canonicalize(existing) {
-            Ok(canon) => {
-                let mut out = canon;
+            Ok(mut canon) => {
                 for component in rest.iter().rev() {
-                    out.push(component);
+                    canon.push(component);
                 }
-                return Ok(normalize(&out));
+                return Ok(canon);
             }
             Err(source) => match (existing.parent(), existing.file_name()) {
                 (Some(parent), Some(name)) => {
                     rest.push(name.to_os_string());
-                    existing = parent;
-                }
-                // `file_name()` is None for a trailing `..`; keep it so `normalize` resolves it.
-                (Some(parent), None) if existing.ends_with("..") => {
-                    rest.push("..".into());
                     existing = parent;
                 }
                 _ => {
@@ -106,21 +122,6 @@ fn resolve(path: &Path) -> Result<PathBuf, PolicyError> {
             },
         }
     }
-}
-
-/// Removes `.` and resolves `..` lexically (only used on the non-existing tail).
-fn normalize(path: &Path) -> PathBuf {
-    let mut out = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                out.pop();
-            }
-            c => out.push(c),
-        }
-    }
-    out
 }
 
 #[cfg(test)]
@@ -168,5 +169,54 @@ mod tests {
         let path = base.join("a").join("..").join("b");
         let resolved = resolve(&path).expect("a `..` in the missing tail must resolve lexically");
         assert_eq!(resolved, resolve(&base.join("b")).unwrap());
+    }
+
+    #[test]
+    fn rejects_symlink_into_repo_across_dotdot_components() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fake_repo = tmp.path().join("repo");
+        let repo_sub = fake_repo.join("sub");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&repo_sub).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(fake_repo.join(ROOT_MARKER), "").unwrap();
+
+        let link_root = tmp.path().join("link-root");
+        let link_sub = tmp.path().join("link-sub");
+        #[cfg(unix)]
+        let linked = std::os::unix::fs::symlink(&fake_repo, &link_root)
+            .and_then(|()| std::os::unix::fs::symlink(&repo_sub, &link_sub));
+        #[cfg(windows)]
+        let linked = std::os::windows::fs::symlink_dir(&fake_repo, &link_root)
+            .and_then(|()| std::os::windows::fs::symlink_dir(&repo_sub, &link_sub));
+        if linked.is_err() {
+            return; // environment lacks symlink creation privilege
+        }
+
+        // Case 1: `<outside>/missing/../../<link-root>/out` enters `<repo>/out`.
+        let into_root = outside
+            .join("missing")
+            .join("..")
+            .join("..")
+            .join("link-root")
+            .join("out");
+        assert!(matches!(
+            ensure_outside_repo(&into_root),
+            Err(PolicyError::InsideRepo { .. })
+        ));
+
+        // Case 2: `<outside>/missing/../../<link-sub>/../out` steps out of
+        // `<repo>/sub` into `<repo>/out` rather than lexically cancelling `link-sub`.
+        let via_sub_parent = outside
+            .join("missing")
+            .join("..")
+            .join("..")
+            .join("link-sub")
+            .join("..")
+            .join("out");
+        assert!(matches!(
+            ensure_outside_repo(&via_sub_parent),
+            Err(PolicyError::InsideRepo { .. })
+        ));
     }
 }
