@@ -13,6 +13,7 @@
 //! after; work runs with no lock held.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
 use crate::fence::Held;
@@ -30,6 +31,11 @@ pub(crate) struct Timeline {
     state: Mutex<State>,
     /// Signalled whenever work is done or the queue stops running it.
     moved: Condvar,
+    /// The latest of this queue's waits (by ticket) a fence released, set
+    /// under that fence's lock. A released wait holds even if the value goes
+    /// back down before the queue resumes (D3D12: a wait a signal satisfied
+    /// stays satisfied); a later wait has a later ticket.
+    released: AtomicU64,
 }
 
 #[derive(Default)]
@@ -74,6 +80,17 @@ impl Timeline {
         self.run(s);
     }
 
+    /// A fence's value reached the wait with ticket `wait`. Called under the
+    /// fence's lock; [`Self::wake`] follows once it is dropped.
+    pub(crate) fn release(&self, wait: u64) {
+        self.released.fetch_max(wait, Ordering::AcqRel);
+    }
+
+    /// Whether a fence released the wait with ticket `wait`.
+    pub(crate) fn is_released(&self, wait: u64) -> bool {
+        self.released.load(Ordering::Acquire) >= wait
+    }
+
     /// The fence this queue waits for moved: runs what it held back.
     pub(crate) fn wake(self: &Arc<Self>) {
         let s = self.lock();
@@ -89,8 +106,9 @@ impl Timeline {
             match op {
                 Op::Wait(fence, value) => {
                     // Checked and registered under the fence's lock, so a
-                    // signal after this check wakes us.
-                    if !fence.wait_on_gpu(value, self) {
+                    // signal after this check wakes us. The ticket is the
+                    // op's place in submission order (as in `submit`).
+                    if !fence.wait_on_gpu(value, s.done + 1, self) {
                         s.ops.push_front(Op::Wait(fence, value));
                         s.held = true;
                         break;

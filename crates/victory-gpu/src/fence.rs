@@ -49,8 +49,9 @@ struct Fence {
     /// whenever the value moves.
     moved: Condvar,
     /// Queues holding work back until the value reaches theirs
-    /// (`ID3D12CommandQueue::Wait`). Locked after `waiters`, never before.
-    queues: Mutex<Vec<(u64, Weak<Timeline>)>>,
+    /// (`ID3D12CommandQueue::Wait`), with the wait's ticket in its queue.
+    /// Locked after `waiters`, never before.
+    queues: Mutex<Vec<(u64, u64, Weak<Timeline>)>>,
 }
 
 impl Drop for Fence {
@@ -259,7 +260,7 @@ pub(crate) extern "system" fn signal(this: This, value: u64) -> HRESULT {
 fn wake_locked(
     fence: &Fence,
     waiters: &mut Vec<(u64, usize)>,
-    queues: &mut Vec<(u64, Weak<Timeline>)>,
+    queues: &mut Vec<(u64, u64, Weak<Timeline>)>,
 ) -> (Vec<Arc<Timeline>>, bool) {
     let value = fence.value.load(Ordering::Acquire);
     let mut moved = false;
@@ -272,9 +273,14 @@ fn wake_locked(
         !reached
     });
     let mut woken = Vec::new();
-    queues.retain(|(wanted, queue)| {
+    queues.retain(|(wanted, wait, queue)| {
         if *wanted <= value {
-            woken.extend(queue.upgrade());
+            // Released here, under our lock: the queue resumes later, when
+            // the value may have gone back down.
+            if let Some(queue) = queue.upgrade() {
+                queue.release(*wait);
+                woken.push(queue);
+            }
             moved = true;
             false
         } else {
@@ -335,17 +341,21 @@ impl Held {
         signal(self.0.get(), value);
     }
 
-    /// Whether the value is reached; if not, `queue` is woken once it is.
-    /// Checked under the lock a signal takes, so no signal is missed.
-    pub(crate) fn wait_on_gpu(&self, value: u64, queue: &Arc<Timeline>) -> bool {
+    /// Whether the value is reached, or was for this wait (`wait`, its
+    /// ticket in `queue`); if not, `queue` is woken once it is. Checked
+    /// under the lock a signal takes, so no signal is missed.
+    pub(crate) fn wait_on_gpu(&self, value: u64, wait: u64, queue: &Arc<Timeline>) -> bool {
         let fence = fence(self.0.get());
         let mut queues = fence.queues.lock().unwrap_or_else(|e| e.into_inner());
-        if fence.value.load(Ordering::Acquire) >= value {
+        if queue.is_released(wait) || fence.value.load(Ordering::Acquire) >= value {
             return true;
         }
         let queue = Arc::downgrade(queue);
-        if !queues.iter().any(|(v, q)| *v == value && q.ptr_eq(&queue)) {
-            queues.push((value, queue));
+        if !queues
+            .iter()
+            .any(|(_, w, q)| *w == wait && q.ptr_eq(&queue))
+        {
+            queues.push((value, wait, queue));
         }
         drop(queues);
         watch_notify();
@@ -605,6 +615,38 @@ mod tests {
         woken.run();
         assert_eq!(ran.load(Ordering::SeqCst), 1);
         release_fence(f);
+    }
+
+    /// A queue wait a signal satisfied stays satisfied when the fence is set
+    /// back below its value before the queue resumes (test by
+    /// contatopablow-spec, PR #32).
+    #[test]
+    fn queue_wait_survives_rewind_before_deferred_wake() {
+        use crate::timeline::{Op, Timeline};
+        let f = new_fence(0);
+        let queue = Arc::new(Timeline::default());
+        let ran = Arc::new(AtomicU64::new(0));
+        queue.submit(Op::Wait(Held::new(f), 1));
+        let seen = ran.clone();
+        queue.submit(Op::Run(Box::new(move || {
+            seen.fetch_add(1, Ordering::SeqCst);
+        })));
+        assert_eq!(ran.load(Ordering::SeqCst), 0);
+        let woken = {
+            let obj = fence(f);
+            let waiters = obj.waiters.lock().unwrap();
+            obj.value.store(1, Ordering::Release);
+            wake(obj, waiters)
+        };
+        assert_eq!(woken.len(), 1);
+        assert_eq!(signal(f, 0), S_OK);
+        run_held(woken);
+        let observed = ran.load(Ordering::SeqCst);
+        // Drain even on the buggy path before asserting.
+        assert_eq!(signal(f, 1), S_OK);
+        drop(queue);
+        release_fence(f);
+        assert_eq!(observed, 1, "satisfied wait was lost on rewind");
     }
 
     #[test]
