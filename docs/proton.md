@@ -167,6 +167,29 @@ Win10-era native `d3dcompiler_47` as above:
 
 Known gaps and unverified areas (file an issue if you hit one):
 
+- **World entry is a mesh-shader gap under Wine.** Past the loading screen
+  the title draws the world with mesh shaders, without querying support
+  (the hooked `CheckFeatureSupport` answers features 0–4 only, and no
+  query beyond them is logged). On GE-Proton11-11 and plain Proton 11.0
+  the process exits with code 3 at the first mesh pipeline bind, before
+  the translated mesh shader reaches the cache — no fault line, no
+  detach line; reverting `main`'s queue-wait rework (`cf57ca3`) changes
+  nothing, so it is not this fork's newer code. Proton Hotfix
+  (Experimental-line vkd3d) creates the same pipelines and runs the world
+  — dialogue audio plays and cutscene subtitles render, while the
+  mesh-drawn world behind them presents black: the non-mesh UI layer
+  draws, the mesh layer does not. The `victory-gpu` suite
+  has no mesh test, so this path had no Wine coverage; the world-streaming
+  numbers quoted below were measured on the Proton Experimental of their
+  day (#41). Menus, intro and loading are verified here; treat world
+  visuals as unverified under current Protons, and file an issue with
+  your Proton build if you get further.
+- **On-access antivirus eats the prefix.** ClamAV's `clamonacc` flags
+  Wine's .NET `ngen.exe` stubs under `drive_c/windows/Microsoft.NET` as
+  malware and deletes them mid-run (observed 2026-11-25). It was not the
+  cause of the mesh exit above — no detection at those moments — but
+  exclude the prefix and the game directory from on-access scanning to
+  keep the prefix whole.
 - **Black frames under Wine (#19).** This fork's in-place title memory
   (`440589e`, "GPU: title memory used in place by the host GPU") makes its
   windows without an error, but under Wine the GPU never sees what the
