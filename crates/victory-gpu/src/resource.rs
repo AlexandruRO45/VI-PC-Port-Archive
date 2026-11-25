@@ -1302,8 +1302,7 @@ fn takes(t: &HostTexture, d: &ResourceDesc) -> bool {
     let td = unsafe { t.texture.GetDesc() };
     let (flags, own) = (td.Flags.0 as u32, td.Format.0 as u32);
     d.flags & USES & !flags == 0
-        && (family(d.format) == family(own)
-            || t.castable.iter().any(|&c| family(c) == family(d.format)))
+        && (family(d.format) == family(own) || t.castable.contains(&d.format))
 }
 
 /// Whether `this`'s host texture is still its memory's (not replaced by one
