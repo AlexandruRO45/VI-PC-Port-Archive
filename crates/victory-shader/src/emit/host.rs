@@ -1294,14 +1294,14 @@ impl Host {
     pub fn takes_null_view_heap(&self) -> bool {
         // SAFETY: plain heap creation, dropped at once.
         unsafe {
-            self.device
-                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+            let heap: windows::core::Result<ID3D12DescriptorHeap> =
+                self.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
                     Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
                     NumDescriptors: super::HEAP_VIEWS,
                     Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
                     ..Default::default()
-                })
-                .is_ok()
+                });
+            heap.is_ok()
         }
     }
 
