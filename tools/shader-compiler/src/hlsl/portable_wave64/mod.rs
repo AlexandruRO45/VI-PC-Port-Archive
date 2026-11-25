@@ -16,7 +16,7 @@ mod emit;
 mod masks;
 mod uniformity;
 
-use super::Opnd;
+use super::{Enc, Insn, Opnd};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
@@ -24,6 +24,24 @@ pub(super) use emit::{
     emit, emit_post_votes, hoist_after, hoist_before, lockstep_branch_condition,
 };
 pub(super) use uniformity::analyze;
+
+/// Resolve the scalar destination of `v_readfirstlane_b32` across both VOP1 and VOP3 encodings.
+/// In VOP3 (`op == 386`), `tuxbox_dxbc` decodes `dst` as `Opnd::Vgpr(code)` while hardware writes
+/// the scalar register encoded in `raw[0] & 127`.
+pub(super) fn readfirstlane_dst(ins: &Insn) -> Option<Opnd> {
+    if ins.enc == Enc::Vop3 {
+        match (*ins.raw.first()? & 127) as u8 {
+            d @ 0..=105 => Some(Opnd::Sgpr(d)),
+            125 => Some(Opnd::Null),
+            _ => None,
+        }
+    } else {
+        match ins.dst.first().copied() {
+            Some(d @ (Opnd::Sgpr(0..=105) | Opnd::Null)) => Some(d),
+            _ => None,
+        }
+    }
+}
 
 /// A 64-lane collective vote/count/scan emitted for per-lane 1-bit mask operand(s).
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -66,10 +84,12 @@ pub(super) struct Plan {
     pub(super) ballot_mask_copies: BTreeSet<usize>,
     /// `v_mov_b32` / `s_mov_b32` directly reading `exec_lo|exec_hi|vcc_lo|vcc_hi` as ballot word.
     pub(super) ballot_word_reads: BTreeSet<usize>,
-    /// 64-bit logic ops combining a `Ballot64` SGPR pair with `exec` or `vcc`.
+    /// 64-bit logic ops producing a `Ballot64` result (combining with `exec`/`vcc`, or writing `exec`/`vcc`).
     pub(super) ballot_logic_mask: BTreeSet<usize>,
     /// Instructions consuming a 64-bit ballot SGPR pair as a per-lane mask.
     pub(super) ballot_mask_reads: BTreeSet<usize>,
+    /// `s_cselect_b64` / `s_cmov_b64` writing `exec`/`vcc` where `[src0, src1]` need lane-bit extraction.
+    pub(super) ballot_exec_select: BTreeMap<usize, [bool; 2]>,
     /// Instructions performing a 64-lane collective over per-lane mask bit(s).
     pub(super) mask_votes: BTreeMap<usize, MaskOp>,
     /// Barrier-bearing sites enclosed by wave-uniform (not group-uniform) forward skips

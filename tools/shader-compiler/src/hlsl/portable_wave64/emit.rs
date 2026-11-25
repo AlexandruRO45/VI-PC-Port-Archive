@@ -44,6 +44,22 @@ fn bit_combine(m: &str, a: &str, b: &str) -> Result<String, String> {
     })
 }
 
+fn exec_combine(m: &str, src_bit: &str) -> Result<String, String> {
+    Ok(match m.split('_').nth(1) {
+        Some("and") => format!("({src_bit} & exec_lo)"),
+        Some("or") => format!("({src_bit} | exec_lo)"),
+        Some("xor") => format!("({src_bit} ^ exec_lo)"),
+        Some("nand") => format!("(~({src_bit} & exec_lo))"),
+        Some("nor") => format!("(~({src_bit} | exec_lo))"),
+        Some("xnor") => format!("(~({src_bit} ^ exec_lo))"),
+        Some("andn2") => format!("({src_bit} & ~exec_lo)"),
+        Some("orn2") => format!("({src_bit} | ~exec_lo)"),
+        Some("andn1") => format!("(~{src_bit} & exec_lo)"),
+        Some("orn1") => format!("(~{src_bit} | exec_lo)"),
+        _ => return Err("unsupported saveexec/wrexec in portable wave64".into()),
+    })
+}
+
 /// Emit hoisted barrier-bearing portable Wave64 computation BEFORE an enclosing forward skip guard.
 pub(in crate::hlsl) fn hoist_before(
     em: &mut Emitter<'_>,
@@ -68,6 +84,19 @@ pub(in crate::hlsl) fn hoist_before(
         let c = em.compare_cond(ins)?;
         return Ok(Some(format!(
             "uint2 w64_b{idx} = tb_w64_ballot({lane}, ((exec_lo & 1u) != 0u) && ({c}));"
+        )));
+    }
+    if plan.ballot_mask_copies.contains(&idx) && m.contains("_wrexec_") {
+        em.touch(&s[0]);
+        let src_bit = if plan.ballot_mask_reads.contains(&idx) {
+            em.touch(&hi(&s[0]));
+            format!("({} & 1u)", lane_bit_extract(lane, &r(&s[0])?, &r(&hi(&s[0]))?))
+        } else {
+            r(&s[0])?
+        };
+        let new_exec = exec_combine(m, &src_bit)?;
+        return Ok(Some(format!(
+            "uint2 w64_b{idx} = tb_w64_ballot({lane}, ({new_exec} & 1u) != 0u);"
         )));
     }
     if plan.ballot_mask_copies.contains(&idx)
@@ -267,7 +296,7 @@ pub(in crate::hlsl) fn hoist_after(
         barriers.push(format!("bool w64_lv{idx} = tb_w64_any({lane}, ({mask} & 1u) != 0u);"));
         applies.push(format!("scc = uint({not}w64_lv{idx});"));
     } else if let Some(MaskOp::PostAnyTrue(mask)) = plan.mask_votes.get(&idx).copied() {
-        let m = r(&mask)?;
+        let m = if mask == Opnd::Null { format!("w64_null{idx}") } else { r(&mask)? };
         barriers.push(format!("bool w64_pv{idx} = tb_w64_any({lane}, ({m} & 1u) != 0u);"));
         applies.push(format!("scc = uint(w64_pv{idx});"));
     }
@@ -371,47 +400,80 @@ pub(in crate::hlsl) fn emit(
         } else {
             em.line(&format!("uint t{t}l = (~{al}); uint t{t}h = (~{ah});"));
         }
-        em.ws(&dst, &format!("t{t}l"))?;
-        let dh = hi(&dst);
-        em.touch(&dh);
-        em.ws(&dh, &format!("t{t}h"))?;
+        if matches!(dst, Opnd::ExecLo | Opnd::VccLo) {
+            let bit = lane_bit_extract(lane, &format!("t{t}l"), &format!("t{t}h"));
+            let (lo_name, hi_name) = if dst == Opnd::ExecLo {
+                ("exec_lo", "exec_hi")
+            } else {
+                ("vcc_lo", "vcc_hi")
+            };
+            em.line(&format!("{lo_name} = ({bit} & 1u); {hi_name} = 0u;"));
+        } else if dst != Opnd::Null {
+            em.ws(&dst, &format!("t{t}l"))?;
+            let dh = hi(&dst);
+            em.touch(&dh);
+            em.ws(&dh, &format!("t{t}h"))?;
+        }
         em.line(&format!("scc = ((t{t}l | t{t}h) != 0u) ? 1u : 0u;"));
         return Ok(true);
     }
 
-    // 4. EXEC/VCC ballot capture (`tb_capture_allocation_mask`, `s_mov_b64`, `saveexec_b64`).
+    // 3b. 64-bit logic with `null` dst feeding `PostAnyTrue(Null)`: avoid `nul` clobber by `hi(Null)`.
+    if matches!(plan.mask_votes.get(&idx), Some(MaskOp::PostAnyTrue(Opnd::Null)))
+        && super::masks::is_64bit_logic(m)
+    {
+        let var = format!("w64_null{idx}");
+        em.regs.insert(var.clone());
+        let lo = if m == "s_not_b64" {
+            format!("(~{})", r(&s[0])?)
+        } else {
+            bit_combine(m, &r(&s[0])?, &r(&s[1])?)?
+        };
+        em.line(&format!("{var} = {lo};"));
+        return Ok(true);
+    }
+
+    // 4. EXEC/VCC ballot capture (`tb_capture_allocation_mask`, `s_mov_b64`, `saveexec_b64`, `wrexec_b64`).
     if m == "tb_capture_allocation_mask" || plan.ballot_mask_copies.contains(&idx) {
         let dst = d.ok_or("missing mask register")?;
         let upper = hi(&dst);
         em.touch(&upper);
-        let reg = if m == "s_mov_b64" { mask_reg_name(&s[0]) } else { "exec_lo" };
-        if !hoisted {
-            em.line(&format!(
-                "uint2 w64_b{idx} = tb_w64_ballot({lane}, ({reg} & 1u) != 0u);"
-            ));
-        }
-        if m.contains("_saveexec_") {
+        if m.contains("_saveexec_") || m.contains("_wrexec_") {
             let src_bit = if plan.ballot_mask_reads.contains(&idx) {
                 em.touch(&hi(&s[0]));
                 format!("({} & 1u)", lane_bit_extract(lane, &r(&s[0])?, &r(&hi(&s[0]))?))
             } else {
                 r(&s[0])?
             };
-            let new_exec = match m.split('_').nth(1) {
-                Some("and") => format!("{src_bit} & exec_lo"),
-                Some("or") => format!("{src_bit} | exec_lo"),
-                Some("xor") => format!("{src_bit} ^ exec_lo"),
-                Some("nand") => format!("~({src_bit} & exec_lo)"),
-                Some("andn2") => format!("{src_bit} & ~exec_lo"),
-                Some("orn2") => format!("{src_bit} | ~exec_lo"),
-                Some("andn1") => format!("~{src_bit} & exec_lo"),
-                _ => return Err("unsupported saveexec in portable wave64".into()),
-            };
-            em.line(&format!("uint w64_e{idx} = {new_exec};"));
-            em.ws(&dst, &format!("w64_b{idx}.x"))?;
-            em.ws(&upper, &format!("w64_b{idx}.y"))?;
-            em.line(&format!("exec_lo = w64_e{idx}; exec_hi = 0u; scc = (exec_lo != 0u);"));
+            let new_exec = exec_combine(m, &src_bit)?;
+            if m.contains("_wrexec_") {
+                if !hoisted {
+                    em.line(&format!(
+                        "uint2 w64_b{idx} = tb_w64_ballot({lane}, ({new_exec} & 1u) != 0u);"
+                    ));
+                }
+                em.line(&format!("exec_lo = ({new_exec}) & 1u; exec_hi = 0u;"));
+                em.ws(&dst, &format!("w64_b{idx}.x"))?;
+                em.ws(&upper, &format!("w64_b{idx}.y"))?;
+                em.line(&format!("scc = uint((w64_b{idx}.x | w64_b{idx}.y) != 0u);"));
+            } else {
+                if !hoisted {
+                    em.line(&format!(
+                        "uint2 w64_b{idx} = tb_w64_ballot({lane}, (exec_lo & 1u) != 0u);"
+                    ));
+                }
+                em.line(&format!("uint w64_e{idx} = {new_exec};"));
+                em.ws(&dst, &format!("w64_b{idx}.x"))?;
+                em.ws(&upper, &format!("w64_b{idx}.y"))?;
+                em.line(&format!("exec_lo = w64_e{idx}; exec_hi = 0u; scc = (exec_lo != 0u);"));
+            }
         } else {
+            let reg = if m == "s_mov_b64" { mask_reg_name(&s[0]) } else { "exec_lo" };
+            if !hoisted {
+                em.line(&format!(
+                    "uint2 w64_b{idx} = tb_w64_ballot({lane}, ({reg} & 1u) != 0u);"
+                ));
+            }
             em.ws(&dst, &format!("w64_b{idx}.x"))?;
             em.ws(&upper, &format!("w64_b{idx}.y"))?;
         }
@@ -473,33 +535,66 @@ pub(in crate::hlsl) fn emit(
         return Ok(true);
     }
 
-    // 7. Ballot-mask consumers (`s_mov_b64 exec, s[lo:hi]` and `s_*_saveexec_b64 dst, s[lo:hi]`).
-    if plan.ballot_mask_reads.contains(&idx) && m != "v_cndmask_b32" {
-        em.touch(&hi(&s[0]));
-        let src_bit = format!("({} & 1u)", lane_bit_extract(lane, &r(&s[0])?, &r(&hi(&s[0]))?));
-        if m == "s_mov_b64" && ins.dst == [Opnd::ExecLo] {
-            em.line(&format!("exec_lo = {src_bit}; exec_hi = 0u;"));
+    // 7. Ballot-mask consumers (`s_mov_b64`/`s_cmov_b64`/`s_cselect_b64` -> `exec|vcc`, `saveexec`/`wrexec`).
+    if let Some(&[s0_bal, s1_bal]) = plan.ballot_exec_select.get(&idx) {
+        let dst = d.ok_or("missing exec/vcc select dst")?;
+        let (lo_name, hi_name) = if dst == Opnd::ExecLo {
+            ("exec_lo", "exec_hi")
+        } else {
+            ("vcc_lo", "vcc_hi")
+        };
+        let mut bit_of = |op: &Opnd, is_bal: bool| -> Result<String, String> {
+            if is_bal {
+                em.touch(&hi(op));
+                Ok(format!("({} & 1u)", lane_bit_extract(lane, &r(op)?, &r(&hi(op))?)))
+            } else {
+                Ok(format!("({} & 1u)", r(op)?))
+            }
+        };
+        let a_bit = bit_of(&s[0], s0_bal)?;
+        let b_bit = if m == "s_cmov_b64" {
+            format!("({lo_name} & 1u)")
+        } else {
+            bit_of(&s[1], s1_bal)?
+        };
+        em.line(&format!("{lo_name} = (scc != 0u) ? {a_bit} : {b_bit}; {hi_name} = 0u;"));
+        return Ok(true);
+    }
+    if (plan.ballot_mask_reads.contains(&idx) && m != "v_cndmask_b32")
+        || matches!(m, "s_nor_saveexec_b64" | "s_xnor_saveexec_b64" | "s_orn1_saveexec_b64")
+    {
+        let src_bit = if plan.ballot_mask_reads.contains(&idx) {
+            em.touch(&hi(&s[0]));
+            format!("({} & 1u)", lane_bit_extract(lane, &r(&s[0])?, &r(&hi(&s[0]))?))
+        } else {
+            r(&s[0])?
+        };
+        if m == "s_mov_b64" && matches!(ins.dst.as_slice(), [Opnd::ExecLo | Opnd::VccLo]) {
+            let (lo_name, hi_name) = if ins.dst[0] == Opnd::ExecLo {
+                ("exec_lo", "exec_hi")
+            } else {
+                ("vcc_lo", "vcc_hi")
+            };
+            em.line(&format!("{lo_name} = {src_bit}; {hi_name} = 0u;"));
             return Ok(true);
         }
-        if m.contains("_saveexec_") {
-            let dst = d.ok_or("missing saveexec dst")?;
-            let new_exec = match m.split('_').nth(1) {
-                Some("and") => format!("{src_bit} & exec_lo"),
-                Some("or") => format!("{src_bit} | exec_lo"),
-                Some("xor") => format!("{src_bit} ^ exec_lo"),
-                Some("nand") => format!("~({src_bit} & exec_lo)"),
-                Some("andn2") => format!("{src_bit} & ~exec_lo"),
-                Some("orn2") => format!("{src_bit} | ~exec_lo"),
-                Some("andn1") => format!("~{src_bit} & exec_lo"),
-                _ => return Err("unsupported saveexec in portable wave64".into()),
-            };
+        if m.contains("_saveexec_") || m.contains("_wrexec_") {
+            let dst = d.ok_or("missing saveexec/wrexec dst")?;
+            let new_exec = exec_combine(m, &src_bit)?;
             let t = em.tmp;
             em.tmp += 1;
             em.line(&format!("uint t{t}l = {new_exec};"));
-            em.ws(&dst, "exec_lo")?;
-            let dh = hi(&dst);
-            em.touch(&dh);
-            em.ws(&dh, "exec_hi")?;
+            let (dlo, dhi) = if m.contains("_wrexec_") {
+                (format!("(t{t}l & 1u)"), "0u".to_string())
+            } else {
+                ("exec_lo".to_string(), "exec_hi".to_string())
+            };
+            if dst != Opnd::Null {
+                em.ws(&dst, &dlo)?;
+                let dh = hi(&dst);
+                em.touch(&dh);
+                em.ws(&dh, &dhi)?;
+            }
             em.line(&format!("exec_lo = t{t}l; exec_hi = 0u; scc = (exec_lo != 0u);"));
             return Ok(true);
         }
@@ -612,7 +707,9 @@ pub(in crate::hlsl) fn emit(
         return Ok(true);
     }
     if m == "v_readfirstlane_b32" {
-        let dst = d.ok_or("missing readfirstlane destination")?;
+        let dst = super::readfirstlane_dst(ins)
+            .ok_or("unsupported v_readfirstlane_b32 destination")?;
+        em.touch(&dst);
         let val = if hoisted {
             format!("w64_r{idx}")
         } else {
@@ -738,7 +835,7 @@ pub(in crate::hlsl) fn emit_post_votes(em: &mut Emitter<'_>, idx: usize, ins: &I
             let not = if vote.none { "!" } else { "" };
             em.line(&format!("scc = uint({not}tb_w64_any({lane}, ({mask} & 1u) != 0u));"));
         } else if let Some(MaskOp::PostAnyTrue(mask)) = plan.mask_votes.get(&idx).copied() {
-            let m = r(&mask)?;
+            let m = if mask == Opnd::Null { format!("w64_null{idx}") } else { r(&mask)? };
             em.line(&format!("scc = uint(tb_w64_any({lane}, ({m} & 1u) != 0u));"));
         }
         if em.vote_defs.contains(&idx) {

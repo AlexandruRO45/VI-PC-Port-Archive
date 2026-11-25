@@ -123,16 +123,25 @@ pub(super) fn is_64bit_logic(m: &str) -> bool {
 }
 
 fn is_mask_const(o: &Opnd) -> bool {
-    matches!(*o, Opnd::ConstInt(0 | -1) | Opnd::Literal(0 | u32::MAX))
+    // Only inline 0, literal 0, and inline -1 (sign-extended to all 64 ones) are full-wave mask
+    // constants. 32-bit `Literal(u32::MAX)` zero-extends to 0x0000_0000_ffff_ffff (low 32 lanes).
+    matches!(*o, Opnd::ConstInt(0 | -1) | Opnd::Literal(0))
+}
+
+fn is_exec_vcc(op: &Opnd) -> bool {
+    matches!(*op, Opnd::ExecLo | Opnd::ExecHi | Opnd::VccLo | Opnd::VccHi)
+}
+
+fn is_exec_write_op(m: &str) -> bool {
+    m.contains("saveexec_b64") || m.contains("wrexec_b64")
 }
 
 fn is_ballot_word_mov(ins: &Insn) -> bool {
     matches!(ins.mnemonic.as_str(), "v_mov_b32" | "s_mov_b32")
+        && ins.aux.sdwa.is_none()
+        && ins.aux.mask == 0
         && matches!(ins.dst.first(), Some(Opnd::Sgpr(_) | Opnd::Vgpr(_)))
-        && matches!(
-            ins.src.first(),
-            Some(Opnd::ExecLo | Opnd::ExecHi | Opnd::VccLo | Opnd::VccHi)
-        )
+        && ins.src.first().is_some_and(is_exec_vcc)
 }
 
 fn scc_read_after(insns: &[Insn], cfg: &Cfg, start: usize) -> bool {
@@ -195,6 +204,7 @@ pub(super) struct MaskPlan {
     pub(super) ballot_word_reads: BTreeSet<usize>,
     pub(super) ballot_logic_mask: BTreeSet<usize>,
     pub(super) ballot_mask_reads: BTreeSet<usize>,
+    pub(super) ballot_exec_select: BTreeMap<usize, [bool; 2]>,
     pub(super) mask_votes: BTreeMap<usize, MaskOp>,
     pub(super) needs_ballot: bool,
     pub(super) has_general_ops: bool,
@@ -252,7 +262,19 @@ pub(super) fn analyze_masks(em: &Emitter<'_>, cfg: &Cfg) -> MaskPlan {
             let is_ballot_logic = promoted_logic.contains(&i);
 
             let mut handled = false;
-            if is_ballot_cmp || is_ballot_copy || is_ballot_logic {
+            if em.exec_snapshots.sites.contains_key(&i) {
+                if let [Opnd::Sgpr(lo @ 0..=104)] = ins.dst.as_slice() {
+                    if lo % 2 == 0 {
+                        let o = RegOrigin::Mask {
+                            roots: BTreeSet::new(),
+                            promotable: false,
+                        };
+                        out[*lo as usize] = o.clone();
+                        out[*lo as usize + 1] = o;
+                        handled = true;
+                    }
+                }
+            } else if is_ballot_cmp || is_ballot_copy || is_ballot_logic {
                 if let [Opnd::Sgpr(lo @ 0..=104)] = ins.dst.as_slice() {
                     if lo % 2 == 0 {
                         out[*lo as usize] = RegOrigin::Ballot64;
@@ -260,23 +282,40 @@ pub(super) fn analyze_masks(em: &Emitter<'_>, cfg: &Cfg) -> MaskPlan {
                         handled = true;
                     }
                 }
-            } else if m.starts_with("v_cmp_") && !m.starts_with("v_cmpx_") && ins.aux.sdwa.is_none()
-            {
+            } else if m.starts_with("v_cmp_") && !m.starts_with("v_cmpx_") {
                 if let [Opnd::Sgpr(lo @ 0..=104)] = ins.dst.as_slice() {
                     if lo % 2 == 0 {
-                        let o = RegOrigin::Mask {
-                            roots: BTreeSet::from([i]),
-                            promotable: true,
+                        let o = if ins.aux.sdwa.is_none() {
+                            RegOrigin::Mask {
+                                roots: BTreeSet::from([i]),
+                                promotable: true,
+                            }
+                        } else {
+                            RegOrigin::Mask {
+                                roots: BTreeSet::new(),
+                                promotable: false,
+                            }
                         };
                         out[*lo as usize] = o.clone();
                         out[*lo as usize + 1] = o;
                         handled = true;
                     }
                 }
-            } else if ((m == "s_mov_b64"
+            } else if m == "s_wqm_b64" && ins.src == [Opnd::ExecLo] {
+                if let [Opnd::Sgpr(lo @ 0..=104)] = ins.dst.as_slice() {
+                    if lo % 2 == 0 {
+                        let o = RegOrigin::Mask {
+                            roots: BTreeSet::new(),
+                            promotable: false,
+                        };
+                        out[*lo as usize] = o.clone();
+                        out[*lo as usize + 1] = o;
+                        handled = true;
+                    }
+                }
+            } else if (m == "s_mov_b64"
                 && matches!(ins.src.as_slice(), [Opnd::ExecLo | Opnd::VccLo]))
-                || m.contains("saveexec_b64"))
-                && !em.exec_snapshots.sites.contains_key(&i)
+                || is_exec_write_op(m)
             {
                 if let [Opnd::Sgpr(lo @ 0..=104)] = ins.dst.as_slice() {
                     if lo % 2 == 0 {
@@ -289,15 +328,35 @@ pub(super) fn analyze_masks(em: &Emitter<'_>, cfg: &Cfg) -> MaskPlan {
                         handled = true;
                     }
                 }
-            } else if m == "s_mov_b64" || m == "s_cselect_b64" || is_64bit_logic(m) {
+            } else if m == "s_mov_b32"
+                && !em.exec_snapshots.sites.is_empty()
+                && matches!(
+                    (ins.dst.as_slice(), ins.src.as_slice()),
+                    ([Opnd::Sgpr(0..=105)], [Opnd::Sgpr(0..=105)])
+                )
+            {
+                if let ([Opnd::Sgpr(d)], [Opnd::Sgpr(s)]) = (ins.dst.as_slice(), ins.src.as_slice())
+                {
+                    out[*d as usize] = incoming[*s as usize].clone();
+                    handled = true;
+                }
+            } else if m == "s_mov_b64"
+                || m == "s_cselect_b64"
+                || m == "s_cmov_b64"
+                || is_64bit_logic(m)
+            {
                 if let [Opnd::Sgpr(lo @ 0..=104)] = ins.dst.as_slice() {
                     if lo % 2 == 0 {
-                        let any_ballot = ins
-                            .src
+                        let srcs: Vec<Opnd> = if m == "s_cmov_b64" {
+                            ins.src.iter().chain(ins.dst.iter()).copied().collect()
+                        } else {
+                            ins.src.clone()
+                        };
+                        let any_ballot = srcs
                             .iter()
                             .any(|o| matches!(pair_origin(o), RegOrigin::Ballot64));
                         let mut combined: Option<RegOrigin> = None;
-                        for src in &ins.src {
+                        for src in &srcs {
                             if is_mask_const(src) {
                                 continue;
                             }
@@ -420,13 +479,24 @@ pub(super) fn analyze_masks(em: &Emitter<'_>, cfg: &Cfg) -> MaskPlan {
                     }
                 }
                 _ if is_64bit_logic(m) => {
-                    // If this op is promoted or combines with Ballot64/Scalar, promote SGPR Mask siblings.
+                    // If this op is promoted or combines with Ballot64/Scalar/non-mask-const,
+                    // promote SGPR Mask siblings and promote any ExecLo/VccLo logic op itself.
                     let force = promoted_logic.contains(&i)
                         || ins.src.iter().any(|o| {
                             !is_mask_const(o)
-                                && matches!(*o, Opnd::Sgpr(lo @ 0..=104) if lo % 2 == 0
-                                    && matches!(st[lo as usize], RegOrigin::Ballot64 | RegOrigin::Scalar)
-                                    && matches!(st[lo as usize + 1], RegOrigin::Ballot64 | RegOrigin::Scalar))
+                                && match *o {
+                                    Opnd::Sgpr(lo @ 0..=104) if lo % 2 == 0 => {
+                                        matches!(
+                                            st[lo as usize],
+                                            RegOrigin::Ballot64 | RegOrigin::Scalar
+                                        ) && matches!(
+                                            st[lo as usize + 1],
+                                            RegOrigin::Ballot64 | RegOrigin::Scalar
+                                        )
+                                    }
+                                    Opnd::ConstInt(_) | Opnd::Literal(_) => true,
+                                    _ => false,
+                                }
                         });
                     if force {
                         for src in &ins.src {
@@ -436,12 +506,51 @@ pub(super) fn analyze_masks(em: &Emitter<'_>, cfg: &Cfg) -> MaskPlan {
                                 }
                             }
                         }
+                        if ins.src.iter().any(|o| matches!(*o, Opnd::ExecLo | Opnd::VccLo)) {
+                            new_logic.insert(i);
+                        }
+                    }
+                }
+                "s_cselect_b64" | "s_cmov_b64" => {
+                    let srcs: Vec<Opnd> = if m == "s_cmov_b64" {
+                        ins.src.iter().chain(ins.dst.iter()).copied().collect()
+                    } else {
+                        ins.src.clone()
+                    };
+                    let has_ballot_or_scalar = srcs.iter().any(|o| {
+                        !is_mask_const(o)
+                            && match *o {
+                                Opnd::Sgpr(lo @ 0..=104) if lo % 2 == 0 => {
+                                    matches!(
+                                        st[lo as usize],
+                                        RegOrigin::Ballot64 | RegOrigin::Scalar
+                                    ) && matches!(
+                                        st[lo as usize + 1],
+                                        RegOrigin::Ballot64 | RegOrigin::Scalar
+                                    )
+                                }
+                                Opnd::ConstInt(_) | Opnd::Literal(_) => true,
+                                _ => false,
+                            }
+                    });
+                    if has_ballot_or_scalar && !matches!(ins.dst.as_slice(), [Opnd::ExecLo | Opnd::VccLo]) {
+                        for src in &srcs {
+                            if let Opnd::Sgpr(lo @ 0..=104) = *src {
+                                if matches!(st[lo as usize], RegOrigin::Mask { .. }) {
+                                    data_reads.extend([lo, lo + 1]);
+                                }
+                            }
+                        }
                     }
                 }
                 _ if m == "s_mov_b64"
-                    || m == "s_cselect_b64"
-                    || m.contains("saveexec_b64")
-                    || m.contains("wrexec_b64") => {}
+                    || is_exec_write_op(m)
+                    || (m == "s_mov_b32"
+                        && !em.exec_snapshots.sites.is_empty()
+                        && matches!(
+                            (ins.dst.as_slice(), ins.src.as_slice()),
+                            ([Opnd::Sgpr(0..=105)], [Opnd::Sgpr(0..=105)])
+                        )) => {}
                 "v_cndmask_b32" => {
                     for src in ins.src.iter().take(2) {
                         if let Opnd::Sgpr(r @ 0..=105) = *src {
@@ -458,6 +567,9 @@ pub(super) fn analyze_masks(em: &Emitter<'_>, cfg: &Cfg) -> MaskPlan {
                 }
             }
             for reg in data_reads {
+                if em.exec_snapshots.word(i, &Opnd::Sgpr(reg)).is_some() {
+                    continue;
+                }
                 match &st[reg as usize] {
                     RegOrigin::Mask { roots, promotable } => {
                         if !promotable || roots.is_empty() {
@@ -499,14 +611,19 @@ pub(super) fn analyze_masks(em: &Emitter<'_>, cfg: &Cfg) -> MaskPlan {
     let mut ballot_word_reads = BTreeSet::new();
     let mut ballot_logic_mask = BTreeSet::new();
     let mut ballot_mask_reads = BTreeSet::new();
+    let mut ballot_exec_select = BTreeMap::new();
     let mut mask_votes = BTreeMap::new();
     let mut needs_ballot = !promoted_compares.is_empty()
         || !promoted_copies.is_empty()
+        || !promoted_logic.is_empty()
         || packed_ballots.is_some_and(|b| !b.is_empty())
         || !em.vote_uses.is_empty()
         || !em.reduction_execz_guards.is_empty()
         || em.lockstep.is_some();
-    let mut has_general_ops = !promoted_compares.is_empty() || !promoted_copies.is_empty();
+    let mut has_general_ops = !promoted_compares.is_empty()
+        || !promoted_copies.is_empty()
+        || !promoted_logic.is_empty()
+        || conflict;
 
     if !conflict {
         for (i, ins) in insns.iter().enumerate() {
@@ -543,31 +660,83 @@ pub(super) fn analyze_masks(em: &Emitter<'_>, cfg: &Cfg) -> MaskPlan {
                 ballot_word_reads.insert(i);
                 needs_ballot = true;
                 has_general_ops = true;
-            } else if m == "v_cndmask_b32" && ins.enc == Enc::Vop3 {
-                if let Some(src2) = ins.src.get(2) {
-                    if has_conflict(src2, true) {
-                        conflict = true;
-                    } else if is_ballot_pair(src2) {
-                        ballot_mask_reads.insert(i);
+            } else if m == "v_cndmask_b32" {
+                if ins.src.iter().take(2).any(is_exec_vcc) {
+                    conflict = true;
+                    has_general_ops = true;
+                } else if ins.enc == Enc::Vop3 {
+                    if let Some(src2) = ins.src.get(2) {
+                        if has_conflict(src2, true) || matches!(src2, Opnd::ExecHi | Opnd::VccHi) {
+                            conflict = true;
+                            has_general_ops = true;
+                        } else if is_ballot_pair(src2) {
+                            ballot_mask_reads.insert(i);
+                        }
                     }
                 }
-            } else if m == "s_mov_b64" && ins.dst == [Opnd::ExecLo] {
-                if let Some(src0) = ins.src.first() {
+            } else if matches!(
+                m,
+                "v_addc_co_u32"
+                    | "v_subb_co_u32"
+                    | "v_subbrev_co_u32"
+                    | "v_add_co_ci_u32"
+                    | "v_sub_co_ci_u32"
+                    | "v_subrev_co_ci_u32"
+            ) {
+                if ins.src.iter().take(2).any(is_exec_vcc)
+                    || ins.src.get(2).is_some_and(|o| matches!(o, Opnd::ExecHi | Opnd::VccHi))
+                {
+                    conflict = true;
+                    has_general_ops = true;
+                }
+            } else if m == "s_mov_b64" {
+                if ins.src.iter().any(|o| matches!(o, Opnd::ExecHi | Opnd::VccHi)) {
+                    conflict = true;
+                    has_general_ops = true;
+                } else if matches!(ins.dst.as_slice(), [Opnd::ExecLo | Opnd::VccLo]) {
+                    if let Some(src0) = ins.src.first() {
+                        if has_conflict(src0, true) {
+                            conflict = true;
+                            has_general_ops = true;
+                        } else if is_ballot_pair(src0) {
+                            ballot_mask_reads.insert(i);
+                        }
+                    }
+                }
+            } else if matches!(m, "s_cselect_b64" | "s_cmov_b64") {
+                if ins.src.iter().any(|o| matches!(o, Opnd::ExecHi | Opnd::VccHi))
+                    || ins.src.iter().any(|o| has_conflict(o, true))
+                {
+                    conflict = true;
+                    has_general_ops = true;
+                } else if matches!(ins.dst.as_slice(), [Opnd::ExecLo | Opnd::VccLo]) {
+                    let s0_bal = ins.src.first().is_some_and(is_ballot_pair);
+                    let s1_bal = ins.src.get(1).is_some_and(is_ballot_pair);
+                    if s0_bal || s1_bal {
+                        ballot_exec_select.insert(i, [s0_bal, s1_bal]);
+                    }
+                } else if ins.src.iter().any(|o| matches!(o, Opnd::ExecLo | Opnd::VccLo))
+                    && ins.src.iter().any(is_ballot_pair)
+                {
+                    conflict = true;
+                    has_general_ops = true;
+                }
+            } else if is_exec_write_op(m) {
+                if ins.src.iter().any(|o| matches!(o, Opnd::ExecHi | Opnd::VccHi)) {
+                    conflict = true;
+                    has_general_ops = true;
+                } else if let Some(src0) = ins.src.first() {
                     if has_conflict(src0, true) {
                         conflict = true;
+                        has_general_ops = true;
                     } else if is_ballot_pair(src0) {
                         ballot_mask_reads.insert(i);
                     }
                 }
-            } else if m.contains("saveexec_b64") {
-                if let Some(src0) = ins.src.first() {
-                    if has_conflict(src0, true) {
-                        conflict = true;
-                    } else if is_ballot_pair(src0) {
-                        ballot_mask_reads.insert(i);
-                    }
-                }
-                if em.lockstep.is_none() && scc_read_after(insns, cfg, i) {
+                let already_ballot_wrexec =
+                    m.contains("wrexec_b64") && promoted_copies.contains(&i);
+                if !already_ballot_wrexec && em.lockstep.is_none() && scc_read_after(insns, cfg, i)
+                {
                     mask_votes.insert(i, MaskOp::PostAnyTrue(Opnd::ExecLo));
                     needs_ballot = true;
                     has_general_ops = true;
@@ -582,11 +751,20 @@ pub(super) fn analyze_masks(em: &Emitter<'_>, cfg: &Cfg) -> MaskPlan {
                     matches!(*o, Opnd::Sgpr(lo @ 0..=104) if lo % 2 == 0
                         && matches!(st[lo as usize], RegOrigin::Mask { .. }))
                 });
-                if any_ballot && any_sgpr_mask {
+                let writes_exec_vcc = matches!(ins.dst.as_slice(), [Opnd::ExecLo | Opnd::VccLo]);
+                if ins.src.iter().any(|o| matches!(o, Opnd::ExecHi | Opnd::VccHi))
+                    || ins.src.iter().any(|o| has_conflict(o, true))
+                    || (any_ballot && any_sgpr_mask)
+                {
                     conflict = true;
-                } else if (any_ballot || promoted_logic.contains(&i)) && any_exec_vcc {
+                    has_general_ops = true;
+                } else if (any_ballot || promoted_logic.contains(&i))
+                    && (any_exec_vcc || writes_exec_vcc)
+                {
                     ballot_logic_mask.insert(i);
-                    needs_ballot = true;
+                    if any_exec_vcc {
+                        needs_ballot = true;
+                    }
                     has_general_ops = true;
                 } else if (any_exec_vcc || any_sgpr_mask)
                     && em.lockstep.is_none()
@@ -603,8 +781,12 @@ pub(super) fn analyze_masks(em: &Emitter<'_>, cfg: &Cfg) -> MaskPlan {
                 let (a, b) = (ins.src[0], ins.src[1]);
                 let (am, bm) = (is_mask_opnd(&a), is_mask_opnd(&b));
                 let (ab, bb) = (is_ballot_pair(&a), is_ballot_pair(&b));
-                if has_conflict(&a, true) || has_conflict(&b, true) {
+                if ins.src.iter().any(|o| matches!(o, Opnd::ExecHi | Opnd::VccHi))
+                    || has_conflict(&a, true)
+                    || has_conflict(&b, true)
+                {
                     conflict = true;
+                    has_general_ops = true;
                 } else if am && bm {
                     let op = if eq { MaskOp::AllEqual(a, b) } else { MaskOp::AnyDiff(a, b) };
                     mask_votes.insert(i, op);
@@ -625,8 +807,8 @@ pub(super) fn analyze_masks(em: &Emitter<'_>, cfg: &Cfg) -> MaskPlan {
                     let op = match (eq, other) {
                         (true, Opnd::ConstInt(0) | Opnd::Literal(0)) => Some(MaskOp::NoneTrue(mask)),
                         (false, Opnd::ConstInt(0) | Opnd::Literal(0)) => Some(MaskOp::AnyTrue(mask)),
-                        (true, Opnd::ConstInt(-1) | Opnd::Literal(u32::MAX)) => Some(MaskOp::AllTrue(mask)),
-                        (false, Opnd::ConstInt(-1) | Opnd::Literal(u32::MAX)) => Some(MaskOp::NotAllTrue(mask)),
+                        (true, Opnd::ConstInt(-1)) => Some(MaskOp::AllTrue(mask)),
+                        (false, Opnd::ConstInt(-1)) => Some(MaskOp::NotAllTrue(mask)),
                         _ => None,
                     };
                     if let Some(op) = op {
@@ -635,6 +817,7 @@ pub(super) fn analyze_masks(em: &Emitter<'_>, cfg: &Cfg) -> MaskPlan {
                         has_general_ops = true;
                     } else {
                         conflict = true;
+                        has_general_ops = true;
                     }
                 }
             } else if m == "s_bcnt1_i32_b64" {
@@ -642,31 +825,60 @@ pub(super) fn analyze_masks(em: &Emitter<'_>, cfg: &Cfg) -> MaskPlan {
                     mask_votes.insert(i, MaskOp::CountBits(src0));
                     needs_ballot = true;
                     has_general_ops = true;
+                } else if ins.src.iter().any(is_exec_vcc) {
+                    conflict = true;
+                    has_general_ops = true;
                 }
             } else if m == "s_ff1_i32_b64" {
                 if let Some(&src0 @ (Opnd::ExecLo | Opnd::VccLo)) = ins.src.first() {
                     mask_votes.insert(i, MaskOp::FirstActive(src0));
                     needs_ballot = true;
                     has_general_ops = true;
+                } else if ins.src.iter().any(is_exec_vcc) {
+                    conflict = true;
+                    has_general_ops = true;
                 }
             } else if matches!(m, "v_mbcnt_lo_u32_b32" | "v_mbcnt_hi_u32_b32") {
-                if let Some(Opnd::ExecLo | Opnd::ExecHi | Opnd::VccLo | Opnd::VccHi) =
-                    ins.src.first()
-                {
+                if ins.src.get(1).is_some_and(is_exec_vcc) {
+                    conflict = true;
+                    has_general_ops = true;
+                } else if ins.src.first().is_some_and(is_exec_vcc) {
                     needs_ballot = true;
                     has_general_ops = true;
                 }
             } else if matches!(
                 m,
-                "tb_capture_allocation_mask" | "tb_allocation_prefix_lo" | "tb_allocation_prefix_hi"
+                "tb_capture_allocation_mask"
+                    | "tb_allocation_prefix_lo"
+                    | "tb_allocation_prefix_hi"
             ) {
                 needs_ballot = true;
                 has_general_ops = true;
             } else if m == "s_wqm_b64" && ins.src == [Opnd::ExecLo] {
                 needs_ballot = true;
                 has_general_ops = true;
-            } else if matches!(m, "v_readfirstlane_b32" | "v_permlanex16_b32") {
-                needs_ballot = true;
+            } else if m == "v_readfirstlane_b32" {
+                if super::readfirstlane_dst(ins).is_none() || ins.src.iter().any(is_exec_vcc) {
+                    conflict = true;
+                    has_general_ops = true;
+                } else {
+                    needs_ballot = true;
+                }
+            } else if m == "v_permlanex16_b32" {
+                if ins.src.iter().any(is_exec_vcc) {
+                    conflict = true;
+                    has_general_ops = true;
+                } else {
+                    needs_ballot = true;
+                }
+            } else if !matches!(m, "tb_first_exec_lane" | "tb_first_active_lane" | COUNT_LANES)
+                && ins.src.iter().any(is_exec_vcc)
+            {
+                // Unhandled 32-bit or non-lowered read of EXEC/VCC (e.g. `s_wqm_b32`,
+                // `s_bcnt1_i32_b32`, `s_and_saveexec_b32`): refuse rather than falling through
+                // to per-lane 1-bit flags or native `WaveActiveBallot`.
+                conflict = true;
+                has_general_ops = true;
             }
         }
     }
@@ -677,6 +889,7 @@ pub(super) fn analyze_masks(em: &Emitter<'_>, cfg: &Cfg) -> MaskPlan {
         ballot_word_reads,
         ballot_logic_mask,
         ballot_mask_reads,
+        ballot_exec_select,
         mask_votes,
         needs_ballot,
         has_general_ops,

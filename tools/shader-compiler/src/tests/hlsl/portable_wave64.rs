@@ -357,3 +357,193 @@ fn saveexec_scc_and_andn2_all_true_idiom_lower_portably() {
     assert_eq!(translated.required_wave_size, None);
     assert!(translated.hlsl.contains("tb_w64_any(tb_lane, (s6 & 1u) != 0u)"));
 }
+
+#[test]
+fn f1_null_dst_64bit_logic_vote_does_not_clobber_nul() {
+    // s_andn2_b64 null (125), exec, s[4:5]; s_cbranch_scc1 +1
+    let cmp = v_cmp_u32_e64(197, 4, 256, 0x80);
+    let words = [
+        cmp[0], cmp[1],
+        s_sop2(21, 125, 0x7e, 4), // s_andn2_b64 null, exec, s[4:5]
+        s_branch(5, 1),           // s_cbranch_scc1 +1
+        S_NOP,
+        S_ENDPGM,
+    ];
+    let translated = translate(&make_compute([64, 1, 1], &words)).expect("null dst andn2 vote");
+    assert_eq!(translated.required_wave_size, None);
+    assert!(translated.hlsl.contains("w64_null1 = (exec_lo & ~s4);"), "{}", translated.hlsl);
+    assert!(translated.hlsl.contains("tb_w64_any(gtid.x, (w64_null1 & 1u) != 0u)"), "{}", translated.hlsl);
+    assert!(!translated.hlsl.contains("tb_w64_any(gtid.x, (nul"), "{}", translated.hlsl);
+}
+
+#[test]
+fn f2_ballot64_written_to_exec_or_vcc_extracts_lane_bit() {
+    // s[4:5] = ballot(v0 != 0); s_bcnt1 s6, s[4:5] (forces Ballot64);
+    // s_and_b64 exec, s[4:5], exec; s_and_b64 exec, s[4:5], s[4:5]; s_mov_b64 vcc, s[4:5];
+    // s_cmov_b64 exec, s[4:5]; s_cselect_b64 vcc, s[4:5], 0; s_endpgm
+    let cmp = v_cmp_u32_e64(197, 4, 256, 0x80);
+    let words = [
+        cmp[0], cmp[1],
+        s_sop1(16, 6, 4),           // s_bcnt1_i32_b64 s6, s[4:5]
+        s_sop2(15, 0x7e, 4, 0x7e),  // s_and_b64 exec, s[4:5], exec
+        s_sop2(15, 0x7e, 4, 4),     // s_and_b64 exec, s[4:5], s[4:5]
+        s_sop1(4, 0x6a, 4),         // s_mov_b64 vcc, s[4:5]
+        s_sop1(6, 0x7e, 4),         // s_cmov_b64 exec, s[4:5]
+        s_sop2(11, 0x6a, 4, 0x80),  // s_cselect_b64 vcc, s[4:5], 0
+        S_ENDPGM,
+    ];
+    let translated = translate(&make_compute([64, 1, 1], &words)).expect("ballot64 to exec/vcc");
+    assert_eq!(translated.required_wave_size, None);
+    assert!(!translated.hlsl.contains("exec_hi = t"), "{}", translated.hlsl);
+    assert!(!translated.hlsl.contains("vcc_hi = s5"), "{}", translated.hlsl);
+    assert!(translated.hlsl.contains("exec_lo = (((((gtid.x & 63u) < 32u)"), "{}", translated.hlsl);
+    assert!(translated.hlsl.contains("vcc_lo = (((((gtid.x & 63u) < 32u)"), "{}", translated.hlsl);
+}
+
+#[test]
+fn f3_wrexec_b64_and_orn1_saveexec_lower_portably() {
+    // s[4:5] = ballot(v0 != 0); s_bcnt1 s6, s[4:5]; s_andn2_wrexec_b64 s[8:9], s[4:5];
+    // s_cbranch_scc1 +1; s_orn1_saveexec_b64 s[10:11], s[4:5]; s_endpgm
+    let cmp = v_cmp_u32_e64(197, 4, 256, 0x80);
+    let words = [
+        cmp[0], cmp[1],
+        s_sop1(16, 6, 4),          // s_bcnt1_i32_b64 s6, s[4:5] (Ballot64 on s[4:5])
+        s_sop1(58, 8, 4),          // s_andn2_wrexec_b64 s[8:9], s[4:5]
+        s_branch(5, 1),            // s_cbranch_scc1 +1
+        s_sop1(56, 10, 4),         // s_orn1_saveexec_b64 s[10:11], s[4:5]
+        S_ENDPGM,
+    ];
+    let translated = translate(&make_compute([64, 1, 1], &words)).expect("wrexec + orn1");
+    assert_eq!(translated.required_wave_size, None);
+    assert!(translated.hlsl.contains("tb_w64_any(gtid.x, (exec_lo & 1u) != 0u)"), "{}", translated.hlsl);
+    assert!(translated.hlsl.contains("& ~exec_lo"), "{}", translated.hlsl);
+    assert!(translated.hlsl.contains("| exec_lo"), "{}", translated.hlsl);
+    assert!(!translated.hlsl.contains("s4 & ~exec_lo"), "{}", translated.hlsl);
+}
+
+#[test]
+fn f4_literal_u32_max_is_low32_mask_not_all64_ones() {
+    // s_cmp_eq_u64 s[4:5], Literal(0xffffffff) must promote s[4:5] to Ballot64 and compare
+    // against (0xffffffffu, 0x0u), NOT emit tb_w64_all!
+    let cmp = v_cmp_u32_e64(197, 4, 256, 0x80);
+    let words = [
+        cmp[0], cmp[1],
+        s_sopc(18, 4, 0xff), 0xffff_ffff, // s_cmp_eq_u64 s[4:5], Literal(0xffffffff)
+        S_ENDPGM,
+    ];
+    let translated = translate(&make_compute([64, 1, 1], &words)).expect("literal u32::MAX compare");
+    assert_eq!(translated.required_wave_size, None);
+    let main_body = &translated.hlsl[translated.hlsl.find("void main(").unwrap()..];
+    assert!(main_body.contains("tb_w64_ballot("), "{main_body}");
+    assert!(main_body.contains("s4 == 0xffffffffu && s5 == 0x0u"), "{main_body}");
+    assert!(!main_body.contains("tb_w64_all("), "{main_body}");
+}
+
+#[test]
+fn f5_logic_b64_combining_exec_with_scalar_pair_ballots_exec() {
+    // s_mov_b32 s4, 2; s_mov_b32 s5, 0; s_and_b64 s[6:7], exec, s[4:5]; s_cbranch_scc1 +1; s_nop; s_endpgm
+    let words = [
+        s_sop1(3, 4, 0x82),        // s_mov_b32 s4, 2
+        s_sop1(3, 5, 0x80),        // s_mov_b32 s5, 0
+        s_sop2(15, 6, 0x7e, 4),    // s_and_b64 s[6:7], exec, s[4:5]
+        s_branch(5, 1),            // s_cbranch_scc1 +1
+        S_NOP,
+        S_ENDPGM,
+    ];
+    let translated = translate(&make_compute([64, 1, 1], &words)).expect("exec & scalar pair");
+    assert_eq!(translated.required_wave_size, None);
+    assert!(translated.hlsl.contains("tb_w64_ballot(gtid.x, (exec_lo & 1u) != 0u)"), "{}", translated.hlsl);
+    assert!(translated.hlsl.contains("(w64_b2_0.x & s4)"), "{}", translated.hlsl);
+    assert!(!translated.hlsl.contains("(exec_lo & s4)"), "{}", translated.hlsl);
+}
+
+#[test]
+fn f6_cmov_b64_preserves_ballot_provenance_and_wqm_sdwa_stay_refused() {
+    // F6a: s_cmov_b64 s[6:7], s[4:5] -> v_cndmask_b32 v1, 0, 1, s[6:7] extracts lane bit!
+    let cmp = v_cmp_u32_e64(197, 4, 256, 0x80);
+    // v_cndmask_b32_e64 v1, 0, 1, s[6:7] (VOP3 op 0x101)
+    let cnd: [u32; 2] = [0xd501_0001, (6u32 << 18) | (0x81u32 << 9) | 0x80];
+    let cmov_words = [
+        cmp[0], cmp[1],
+        s_sop1(16, 8, 4),     // s_bcnt1_i32_b64 s8, s[4:5] (forces Ballot64 on s[4:5])
+        s_sop1(6, 6, 4),      // s_cmov_b64 s[6:7], s[4:5]
+        cnd[0], cnd[1],       // v_cndmask_b32 v1, 0, 1, s[6:7]
+        S_ENDPGM,
+    ];
+    let translated = translate(&make_compute([64, 1, 1], &cmov_words)).expect("cmov ballot provenance");
+    assert_eq!(translated.required_wave_size, None);
+    assert!(translated.hlsl.contains("(((gtid.x & 63u) < 32u) ? s6 : s7)"), "{}", translated.hlsl);
+
+    // F6b: s_wqm_b64 s[4:5], exec followed by s_bcnt1_i32_b64 s6, s[4:5] must refuse (unpromotable Mask)!
+    let wqm_bcnt_words = [
+        s_sop1(0x1c, 4, 0x7e), // s_wqm_b64 s[4:5], exec
+        s_sop1(16, 6, 4),      // s_bcnt1_i32_b64 s6, s[4:5]
+        S_ENDPGM,
+    ];
+    assert!(
+        translate(&make_compute([64, 1, 1], &wqm_bcnt_words)).is_err(),
+        "s_wqm_b64 followed by s_bcnt1 must be refused"
+    );
+
+    // F6c: SDWA v_mov_b32 v1, vcc_lo (src0 = 0xf9 SDWA, bit 23 scalar flag + 0x6a vcc_lo) is refused by F7!
+    let sdwa_mov = [v_vop1(1, 1, 0xf9), 0x0086_006a, S_ENDPGM];
+    assert!(
+        translate(&make_compute([64, 1, 1], &sdwa_mov)).is_err(),
+        "SDWA v_mov_b32 reading vcc_lo must be refused"
+    );
+
+    // F6d: exec_snapshots Site::Capture(Shared64) followed by s_bcnt1_i32_b64 must refuse
+    // instead of misreading per-lane 1-bit `s20` as a 64-bit ballot!
+    let snap_bcnt = [
+        0x7d86_00a3,      // v_cmp_gt_u32 vcc, 35, v0
+        0xbe94_246a,      // s_and_saveexec_b64 s[20:21], vcc
+        0xbe98_147e,      // s_ff1_i32_b64 s24, exec (triggers Shared64 exec_snapshots)
+        0xbefe_0414,      // s_mov_b64 exec, s[20:21]
+        0x7e08_0214,      // v_mov_b32 v4, s20 (forces Site::Capture(Shared64) on s[20:21])
+        s_sop1(16, 6, 20), // s_bcnt1_i32_b64 s6, s[20:21] (not handled by exec_snapshots!)
+        S_ENDPGM,
+    ];
+    assert!(
+        translate(&make_compute([64, 1, 1], &snap_bcnt)).is_err(),
+        "s_bcnt1_i32_b64 on exec_snapshots Site::Capture must be refused"
+    );
+}
+
+#[test]
+fn f7_unhandled_32bit_exec_vcc_reads_and_s_wqm_b32_are_refused() {
+    // s_wqm_b32 s8, exec_lo (SOP1 op 0x1b) must NEVER fall through to native WaveActiveBallot!
+    let wqm32 = [s_sop1(0x1b, 8, 0x7e), S_ENDPGM];
+    assert!(
+        translate(&make_compute([64, 1, 1], &wqm32)).is_err(),
+        "s_wqm_b32 s8, exec_lo must be refused"
+    );
+    // s_bcnt1_i32_b32 s8, exec_lo (SOP1 op 15) must NOT read per-lane 1-bit exec_lo!
+    let bcnt32 = [s_sop1(15, 8, 0x7e), S_ENDPGM];
+    assert!(
+        translate(&make_compute([64, 1, 1], &bcnt32)).is_err(),
+        "s_bcnt1_i32_b32 s8, exec_lo must be refused"
+    );
+}
+
+#[test]
+fn f8_vop3_readfirstlane_writes_sgpr_and_hoists_multiwave_dependent_ballot() {
+    // VOP3 v_readfirstlane_b32 (op 386 = 0x182) s6, v0 -> s_cmp_eq_i32 s6, 0 -> s_cbranch_scc1 -> ballot
+    // On [128,1,1], s6 MUST be treated as Wave-uniform so the following ballot is hoisted outside `if (!(j...))`!
+    let rfl_vop3: [u32; 2] = [0xd400_0000 | (386u32 << 16) | 6, 256];
+    let cmp = v_cmp_u32_e64(197, 4, 256, 0x80);
+    let words = [
+        rfl_vop3[0], rfl_vop3[1],
+        s_sopc(0, 6, 0x80), // s_cmp_eq_i32 s6, 0
+        s_branch(5, 3),     // s_cbranch_scc1 +3
+        cmp[0], cmp[1],
+        s_sop1(16, 8, 4),   // s_bcnt1_i32_b64 s8, s[4:5]
+        S_ENDPGM,
+    ];
+    let translated = translate(&make_compute([128, 1, 1], &words)).expect("VOP3 readfirstlane");
+    assert_eq!(translated.required_wave_size, None);
+    assert!(translated.hlsl.contains("s6 = tb_w64_read_first_lane("), "{}", translated.hlsl);
+    assert!(!translated.hlsl.contains("v6 = tb_w64_read_first_lane("), "{}", translated.hlsl);
+    let guard_pos = translated.hlsl.find("if (!(j").expect("forward skip guard");
+    let ballot_pos = translated.hlsl.find("tb_w64_ballot(tb_lane,").expect("hoisted ballot");
+    assert!(ballot_pos < guard_pos, "ballot must be hoisted before guard:\n{}", translated.hlsl);
+}

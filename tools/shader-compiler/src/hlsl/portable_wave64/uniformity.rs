@@ -318,8 +318,11 @@ fn analyze_uniformity(
                 if let Some(Opnd::Sgpr(d @ 0..=105)) = ins.dst.first() {
                     out.sgpr[*d as usize] = res_u;
                 }
-            } else if m == "v_readfirstlane_b32"
-                || (ins.enc == Enc::Vop3 && ins.op == OP_WAVE_REDUCE)
+            } else if m == "v_readfirstlane_b32" {
+                if let Some(Opnd::Sgpr(d)) = super::readfirstlane_dst(ins) {
+                    out.sgpr[d as usize] = wave_res;
+                }
+            } else if (ins.enc == Enc::Vop3 && ins.op == OP_WAVE_REDUCE)
                 || m == "tb_first_exec_lane"
                 || matches!(masks.mask_votes.get(&i), Some(MaskOp::FirstActive(_)))
             {
@@ -576,7 +579,8 @@ pub(in crate::hlsl) fn analyze(
             || packed_ballots.is_some_and(|b| b.contains(&i));
         let is_ballot_exec = masks.ballot_mask_copies.contains(&i)
             || masks.ballot_word_reads.contains(&i)
-            || masks.ballot_logic_mask.contains(&i)
+            || (masks.ballot_logic_mask.contains(&i)
+                && ins.src.iter().any(|o| matches!(o, Opnd::ExecLo | Opnd::VccLo)))
             || matches!(
                 m,
                 "tb_capture_allocation_mask" | "tb_allocation_prefix_lo" | "tb_allocation_prefix_hi"
@@ -732,6 +736,7 @@ pub(in crate::hlsl) fn analyze(
         ballot_word_reads: masks.ballot_word_reads,
         ballot_logic_mask: masks.ballot_logic_mask,
         ballot_mask_reads: masks.ballot_mask_reads,
+        ballot_exec_select: masks.ballot_exec_select,
         mask_votes: masks.mask_votes,
         hoisted_ops,
         reduction_permlane,
