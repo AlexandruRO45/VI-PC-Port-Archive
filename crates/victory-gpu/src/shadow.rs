@@ -1068,6 +1068,7 @@ mod tests {
             merge_touching_ranges(&[(100, 200), (50, 120), (60, 80), (200, 250), (300, 320), (300, 320)]),
             vec![(50, 250), (300, 320)]
         );
+    }
 
     /// The title writes a constant under a range an earlier list of the
     /// submission declared as written by shaders: the refresh before the

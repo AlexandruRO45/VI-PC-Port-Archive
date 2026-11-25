@@ -1573,7 +1573,9 @@ mod tests {
             capped_layout(1_245_184),
             (PORTABLE_VIEWS - MIN_DYNAMIC, MIN_DYNAMIC)
         );
+    }
 
+    #[test]
     fn dynamic_search_can_find_a_run_across_the_cursor() {
         let Some(heap) = HostHeap::new(false, 4) else {
             eprintln!("no host descriptor heap; skipped");

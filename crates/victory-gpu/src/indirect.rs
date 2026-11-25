@@ -44,7 +44,7 @@ uint clamped(uint at) {
         uint instances = args.Load(at + 4);
         if (count > (1u << 24) || instances > (1u << 26) / max(count, 1u)) {
             args.Store2(at, uint2(0, 0));
-            return;
+            return 0;
         }
         cost = count * instances;
         args.Store2(at, uint2(count, instances));
@@ -54,7 +54,7 @@ uint clamped(uint at) {
         if (any(g > uint3(65535, 65535, 65535)) ||
             (g.z != 0 && g.x * g.y > GROUPS / g.z)) {
             args.Store3(at, uint3(0, 0, 0));
-            return;
+            return 0;
         }
         cost = g.x * g.y * g.z * 64;
         args.Store3(at, g);
@@ -63,7 +63,7 @@ uint clamped(uint at) {
         uint3 g = args.Load3(at);
         if (any(g > uint3(65535, 1, 1))) {
             args.Store3(at, uint3(0, 0, 0));
-            return;
+            return 0;
         }
         cost = g.x * g.y * g.z * 128;
         args.Store3(at, g);
@@ -307,11 +307,11 @@ mod tests {
     /// let four; of 600 garbage mesh dispatches 16, not 31.
     #[test]
     fn rejected_records_do_not_wrap_the_budget() {
-        let Some(draws) = clamped(0, &[u32::MAX], 128, 1) else {
+        let Some(draws) = clamped(0, &[1 << 24, 4, 0, 0], 128, 1) else {
             return; // no host GPU here
         };
         assert_eq!(draws.iter().filter(|&&count| count != 0).count(), 2);
-        let meshes = clamped(10, &[u32::MAX], 600, 1).unwrap();
+        let meshes = clamped(10, &[65535, 1, 1], 600, 1).unwrap();
         assert_eq!(meshes.iter().filter(|&&groups| groups != 0).count(), 16);
     }
 

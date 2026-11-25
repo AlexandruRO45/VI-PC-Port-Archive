@@ -1833,6 +1833,7 @@ fn lower_synthetic_cs(
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        view_marks: false,
     })
     .expect("lower");
     let shader = HostShader {
@@ -1849,6 +1850,7 @@ fn lower_synthetic_cs(
         view_addresses: lowered.view_addresses,
         heap: lowered.heap,
         heap_writes: lowered.heap_writes,
+        view_marks: lowered.view_marks,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         let mut copy = shader.dxil.clone();
@@ -2255,6 +2257,7 @@ fn v_cndmask_b32_with_untracked_mask_selects_per_lane() {
             outputs: Vec::new(),
             prims: Vec::new(),
             mesh_stride: 0,
+            view_marks: false,
         })
         .expect("lower");
         let shader = HostShader {
@@ -2271,6 +2274,7 @@ fn v_cndmask_b32_with_untracked_mask_selects_per_lane() {
             view_addresses: lowered.view_addresses,
             heap: lowered.heap,
             heap_writes: lowered.heap_writes,
+            view_marks: lowered.view_marks,
         };
         if let Ok(mut v) =
             validator::Validator::load(validator::Validator::default_path().as_deref())
@@ -2413,6 +2417,7 @@ fn compute_spilled_user_data_table_resolves_constants_table_and_root_srv() {
                 (RootType::Constants, 0, 0) => 0x0000_0100,
                 (RootType::Constants, 0, 1) => 0x0000_0020,
                 (RootType::Table, 1, _) => 0,
+                (RootType::Descriptor, 2, _) => 0,
                 other => panic!("unexpected user data {other:?}"),
             };
         }
@@ -2494,6 +2499,7 @@ fn run_64_thread_lds_cs(wave64: bool, _max_wave: u32, body: &[u32], taken: u32, 
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        view_marks: false,
     })
     .expect("lower");
     let mut shader = HostShader {
@@ -2510,6 +2516,7 @@ fn run_64_thread_lds_cs(wave64: bool, _max_wave: u32, body: &[u32], taken: u32, 
         view_addresses: lowered.view_addresses,
         heap: lowered.heap,
         heap_writes: lowered.heap_writes,
+        view_marks: lowered.view_marks,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         v.validate(&mut shader.dxil).expect("DXIL validation failed");
@@ -2692,6 +2699,7 @@ fn mesh_per_wave_s_barrier_runs_on_hardware_and_clamps_out_of_bounds_prim() {
         }],
         prims: Vec::new(),
         mesh_stride: 128,
+        view_marks: false,
     })
     .expect("lower");
     let ms = HostShader {
@@ -2708,6 +2716,7 @@ fn mesh_per_wave_s_barrier_runs_on_hardware_and_clamps_out_of_bounds_prim() {
         view_addresses: lowered.view_addresses,
         heap: lowered.heap,
         heap_writes: lowered.heap_writes,
+        view_marks: lowered.view_marks,
     };
     let ps = HostShader {
         stage: HwStage::Ps,
@@ -2723,6 +2732,7 @@ fn mesh_per_wave_s_barrier_runs_on_hardware_and_clamps_out_of_bounds_prim() {
         view_addresses: false,
         heap: false,
         heap_writes: false,
+        view_marks: false,
     };
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let Ok(host) = Host::new(false) else {
