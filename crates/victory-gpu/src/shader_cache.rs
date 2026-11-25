@@ -65,10 +65,14 @@ fn build() -> &'static [u8; 32] {
                     "VICTORY_WAVE_DEEP_SKIPS",
                     "VICTORY_WAVE_OWN_BITS",
                     "VICTORY_F16_NEAREST",
+                    "VICTORY_WAVE_LOCAL",
+                    "VICTORY_STRICT_JOINS",
+                    "VICTORY_MESH_OUTPUT_STRICT",
                 ] {
                     bytes.extend_from_slice(name.as_bytes());
-                    bytes.push(b'=');
                     if let Some(value) = std::env::var_os(name) {
+                        // NAME= is set even when empty; NAME alone is unset.
+                        bytes.push(b'=');
                         bytes.extend_from_slice(value.as_encoded_bytes());
                     }
                     bytes.push(0);
@@ -417,6 +421,50 @@ mod tests {
             assert_eq!(result, Ok(expected));
         }
         assert_eq!(runs.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn translation_switches_partition_the_cache_across_runs() {
+        const CHILD: &str = "VICTORY_TEST_PRINT_SHADER_KEY";
+        if std::env::var_os(CHILD).is_some() {
+            println!("\nkey={}", blake3::Hash::from(*build()).to_hex());
+            return;
+        }
+
+        // The translator and cache read their options once per process.
+        let read_key = |setting: Option<(&str, &str)>| {
+            let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+            cmd.args([
+                "--exact",
+                "shader_cache::tests::translation_switches_partition_the_cache_across_runs",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env_remove("VICTORY_WAVE_LOCAL")
+            .env_remove("VICTORY_STRICT_JOINS")
+            .env_remove("VICTORY_MESH_OUTPUT_STRICT");
+            if let Some((name, value)) = setting {
+                cmd.env(name, value);
+            }
+            let out = cmd.output().unwrap();
+            assert!(out.status.success());
+            String::from_utf8(out.stdout)
+                .unwrap()
+                .lines()
+                .find_map(|line| line.strip_prefix("key="))
+                .expect("child printed cache key")
+                .to_owned()
+        };
+        let default = read_key(None);
+        let off = read_key(Some(("VICTORY_WAVE_LOCAL", "0")));
+        let idiom = read_key(Some(("VICTORY_WAVE_LOCAL", "idiom")));
+        assert_ne!(off, default);
+        assert_ne!(idiom, default);
+        assert_ne!(off, idiom);
+        // Both strict options check presence, including an empty value.
+        for name in ["VICTORY_STRICT_JOINS", "VICTORY_MESH_OUTPUT_STRICT"] {
+            assert_ne!(read_key(Some((name, ""))), default, "{name}");
+        }
     }
 
     fn walk(dir: &std::path::Path) -> Vec<PathBuf> {
