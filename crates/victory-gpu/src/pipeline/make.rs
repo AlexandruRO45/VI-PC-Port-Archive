@@ -68,9 +68,8 @@ impl Pending {
     }
 }
 
-/// Why a pipeline has no host pipeline (diagnostics): its shaders that do
+/// Why a pipeline has no host pipeline: its shaders that do
 /// not translate, else "refused" or "being made"; `None` if it has one.
-#[cfg(feature = "diagnostics")]
 pub(crate) fn missing(p: &Pending) -> Option<String> {
     match p.made.get() {
         Some(Some(_)) => None,
@@ -136,6 +135,7 @@ pub(crate) fn now(p: &Arc<Pending>) -> bool {
     p.make();
     p.made.get().is_some_and(|made| made.is_some())
 }
+
 
 /// At the title's creation of a pipeline: starts it at once if an earlier
 /// run drew with it (during loading, so the world's first frames find it).

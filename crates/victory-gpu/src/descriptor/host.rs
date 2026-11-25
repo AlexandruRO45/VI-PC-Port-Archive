@@ -1356,6 +1356,32 @@ macro_rules! once {
     }};
 }
 
+/// SRV of a packed colour stand-in: resource format, whole 2D (or array), A=1.
+fn opaque_stand_in_srv(texture: &ID3D12Resource) -> D3D12_SHADER_RESOURCE_VIEW_DESC {
+    // SAFETY: a live resource.
+    let d = unsafe { texture.GetDesc() };
+    let mut desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+        Format: d.Format,
+        ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+        Shader4ComponentMapping: crate::resource::OPAQUE_SRV_MAPPING,
+        ..Default::default()
+    };
+    if d.DepthOrArraySize > 1 && d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D {
+        desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+        desc.Anonymous.Texture2DArray = D3D12_TEX2D_ARRAY_SRV {
+            MipLevels: u32::from(d.MipLevels).max(1),
+            ArraySize: u32::from(d.DepthOrArraySize),
+            ..Default::default()
+        };
+    } else {
+        desc.Anonymous.Texture2D = D3D12_TEX2D_SRV {
+            MipLevels: u32::from(d.MipLevels).max(1),
+            ..Default::default()
+        };
+    }
+    desc
+}
+
 /// A view description from its words, with the format as the host has it.
 fn srv_desc(words: &[u32; 10]) -> D3D12_SHADER_RESOURCE_VIEW_DESC {
     let mut words = *words;
@@ -1887,6 +1913,15 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 let mut desc = desc.as_ref().map(srv_desc);
                 if !fits(texture, desc.as_mut().map(|d| &mut d.Format), false) {
                     return None;
+                }
+                // Packed colour stand-in is RGBA8: force A=1 or sampled walls
+                // are discarded. Mapping is the 3-bit D3D12 encode (0,1,2,5).
+                if crate::resource::stand_in_opaque_alpha(resource) {
+                    if let Some(d) = desc.as_mut() {
+                        d.Shader4ComponentMapping = crate::resource::OPAQUE_SRV_MAPPING;
+                    } else {
+                        desc = Some(opaque_stand_in_srv(texture));
+                    }
                 }
                 // SAFETY: a live texture and a slot of our heap.
                 unsafe {

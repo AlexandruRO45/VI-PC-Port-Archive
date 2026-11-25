@@ -262,6 +262,9 @@ struct Lower<'a> {
     clane: Option<V>,
     /// The first exchange dword of this thread's console wave ([`Self::exchange_pair`]).
     pair: Option<V>,
+    /// With `exchange` and a `ds_bpermute` that names the other half: 64 LDS
+    /// dwords per console wave, lanes store then load by console lane.
+    permute_lds: Option<u32>,
     /// A console wave64 program in host waves of 32: the LDS dword counting the console threads
     /// handed to host waves (`wave_base`), and the base made in the entry block.
     halves: Option<u32>,
@@ -1016,7 +1019,7 @@ fn own_bits_on() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_WAVE_OWN_BITS").is_none_or(|v| v != "0"))
 }
 
-pub(super) fn host_max_wave() -> u32 {
+pub fn host_max_wave() -> u32 {
     #[cfg(test)]
     if let Some(lanes) = TEST_HOST_WAVE.get() {
         return lanes;
@@ -1250,6 +1253,7 @@ impl<'a> Lower<'a> {
         let mut lds_meet: Option<(Vec<bool>, Vec<(bool, bool)>)> = None;
         // a console wave64 program in two host waves of 32 (`exchange`)
         let mut exchange: Option<(u32, bool, Vec<bool>)> = None;
+        let mut permute_lds: Option<u32> = None;
         // a console wave64 program in host waves of 32: the LDS dword of `wave_base`'s counter
         let mut halves: Option<u32> = None;
         if let StageIo::Cs(cs) = x.native.io {
@@ -1331,6 +1335,13 @@ impl<'a> Lower<'a> {
                                 // numbers go through two exchange dwords past the program's LDS
                                 exchange = Some((s.lds_dwords, group <= 32, all));
                                 s.lds_dwords += 2 * group.div_ceil(64);
+                                if insts().any(|i| {
+                                    let n = i.name();
+                                    n.starts_with("ds_permute") || n.starts_with("ds_bpermute")
+                                }) {
+                                    permute_lds = Some(s.lds_dwords);
+                                    s.lds_dwords += 64 * group.div_ceil(64);
+                                }
                             }
                         }
                     }
@@ -1519,6 +1530,7 @@ impl<'a> Lower<'a> {
             exchange,
             clane: None,
             pair: None,
+            permute_lds,
             halves,
             wave_base: None,
             flat: None,
@@ -3606,6 +3618,17 @@ impl<'a> Lower<'a> {
         v
     }
 
+    /// The first of the 64 permute dwords of this thread's console wave.
+    fn permute_wave_base(&mut self, slot: u32) -> V {
+        let e = self.s.entry;
+        let thread = self.console_thread();
+        let six = self.s.m.i32(6);
+        let wave = self.s.m.bin(e, Bin::LShr, thread, six);
+        let off = self.s.m.bin(e, Bin::Shl, wave, six);
+        let base = self.s.m.i32(slot);
+        self.s.m.bin(e, Bin::Add, base, off)
+    }
+
     /// The console's decision of the branch closing IR block `b`, which the wave takes
     /// together ([`Structured::wide`]): `when` is the lane's own bit, and the branch is taken
     /// when some lane's `when` holds (`execnz`, `vccnz`, SCC of a mask operation set) or
@@ -4268,11 +4291,6 @@ impl<'a> Lower<'a> {
             // host (it left through a branch, not a guard) is read as the
             // host gives it; the console reads 0.
             self.cross_lane(false)?;
-            if self.exchange.as_ref().is_some_and(|e| !e.1) {
-                // a console wave of 64 run as two host waves: the lane named
-                // may be in the other one
-                return Err("a lane permute across two host waves");
-            }
             let at = self.vgprs(inst, addr.as_ref().ok_or("a permute address")?, 1)?[0];
             let x = self.vgprs(inst, data.first().ok_or("a permute source")?, 1)?[0];
             let o = self.s.m.i32(offset);
@@ -4288,7 +4306,30 @@ impl<'a> Lower<'a> {
                 }
                 None => x,
             };
-            let r = self.read_lane(x, src);
+            let r = if self.exchange.as_ref().is_some_and(|e| !e.1) {
+                // two host waves of 32: the named lane may be in the other
+                // half, so the 64 lanes meet in LDS (one dword per lane)
+                let slot = self.permute_lds.ok_or("a lane permute across two host waves")?;
+                if !self.all_lanes(self.cur_ir) {
+                    need(self.cur_ir);
+                    return Err("a lane permute where not every lane runs");
+                }
+                let cl = self.console_lane();
+                let base = self.permute_wave_base(slot);
+                let c = self.cur;
+                let index = self.s.m.bin(c, Bin::Add, base, cl);
+                let lds = self.s.lds();
+                let ptr = self.s.m.element(c, lds, index);
+                self.s.m.store(c, ptr, x);
+                self.group_sync(c);
+                let src_idx = self.s.m.bin(c, Bin::Add, base, src);
+                let src_ptr = self.s.m.element(c, lds, src_idx);
+                let r = self.s.m.load(c, src_ptr);
+                self.group_sync(c);
+                r
+            } else {
+                self.read_lane(x, src)
+            };
             let reg = dst_reg.ok_or("a permute result")?;
             self.write(inst, Reg::V(reg), r, guard);
             return Ok(());

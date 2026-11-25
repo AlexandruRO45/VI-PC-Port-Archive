@@ -284,7 +284,18 @@ pub(crate) fn builder_off(why: &'static str) {
 #[cfg(windows)]
 pub(crate) fn builder_runs() -> bool {
     static ALLOWED: OnceLock<bool> = OnceLock::new();
-    if !*ALLOWED.get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1")) {
+    if !*ALLOWED.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1");
+        if on {
+            let quarantine =
+                std::env::var_os("VICTORY_BVH_QUARANTINE").is_some_and(|v| v == "1");
+            tracing::info!(
+                quarantine,
+                "VICTORY_BVH_BUILDER=1: the ray-tracing structure builder is asked for (quarantine keeps its stores out of title memory)"
+            );
+        }
+        on
+    }) {
         return false;
     }
     let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
@@ -294,12 +305,18 @@ pub(crate) fn builder_runs() -> bool {
     if b.whole {
         return true;
     }
-    let missing = b.pipelines.iter().filter(|p| !make::now(p)).count();
-    if missing > 0 {
+    let mut failed: Vec<String> = Vec::new();
+    for p in &b.pipelines {
+        if !make::now(p) {
+            failed.push(make::missing(p).unwrap_or_else(|| "unknown".into()));
+        }
+    }
+    if !failed.is_empty() {
         b.off = true;
         tracing::warn!(
-            missing,
+            missing = failed.len(),
             of = b.pipelines.len(),
+            failed = %failed.join("; "),
             "the ray-tracing structure builder stays off: not all of its programs have a host pipeline, and its stages run all or none"
         );
         return false;

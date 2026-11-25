@@ -30,6 +30,21 @@ const EXCEPTION_CONTINUE_SEARCH: i32 = 0;
 /// Frames listed per report.
 pub(crate) const MAX_FRAMES: usize = 40;
 
+/// Extra lines a host component wants on the next crash (the GPU commands
+/// in flight). Set from the runtime; read only while reporting.
+static CRASH_DETAIL: std::sync::Mutex<Option<fn() -> String>> = std::sync::Mutex::new(None);
+
+/// `detail` is appended to later crash reports. One setter; the GPU uses it
+/// for the command list that was running.
+pub fn set_crash_detail(detail: fn() -> String) {
+    *CRASH_DETAIL.lock().unwrap_or_else(|e| e.into_inner()) = Some(detail);
+}
+
+fn crash_detail() -> Option<String> {
+    let detail = (*CRASH_DETAIL.lock().unwrap_or_else(|e| e.into_inner()))?;
+    Some(detail())
+}
+
 /// Memory saved to files when a crash is reported: (address, length, file).
 #[cfg(feature = "diagnostics")]
 static SAVE: std::sync::OnceLock<Vec<(usize, usize, std::path::PathBuf)>> =
@@ -508,6 +523,9 @@ unsafe fn report(what: &str, info: *const EXCEPTION_POINTERS, to_file: bool) {
     ));
     for (i, pc) in unwind(*context).into_iter().enumerate() {
         line(format!("  #{i:<2} {}", locate(pc as usize)));
+    }
+    if let Some(detail) = crash_detail() {
+        line(detail);
     }
     if to_file {
         let said = title_output();

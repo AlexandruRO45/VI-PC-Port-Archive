@@ -221,7 +221,14 @@ impl Memory {
             }
         }
         for page in pages {
-            self.map(u64::from(page) * PAGE);
+            let a = u64::from(page) * PAGE;
+            self.map(a);
+            // A BVH node or instance record often sits on the next page;
+            // one fault then still left the neighbour as zeros for a frame.
+            if a >= PAGE {
+                self.map(a - PAGE);
+            }
+            self.map(a + PAGE);
         }
     }
 

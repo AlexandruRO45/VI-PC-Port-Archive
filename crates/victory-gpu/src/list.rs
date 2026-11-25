@@ -825,18 +825,86 @@ extern "system" fn copy_buffer_region(
     let _ = (this, dst, dst_offset, src, src_offset, len);
 }
 
+/// Packed 16-bit ↔ RGBA8 stand-in: CopyResource cannot convert. Snapshot
+/// GPU RGBA into an RGBA twin of the packed texture, or expand packed
+/// title texels into the stand-in, so tiles are not left black.
+#[cfg(windows)]
+fn copy_unlike(
+    list: &crate::host::HostList,
+    dst: This,
+    src: This,
+    to: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    from: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+) {
+    use std::sync::atomic::Ordering::Relaxed;
+    use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATES as State;
+    const COPY_SOURCE: u32 = 0x800;
+    const COPY_DEST: u32 = 0x400;
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        tracing::info!(?dst, ?src, "copy between a stand-in target and title-format texels: converting");
+    });
+    if crate::resource::stands_in(src) && !crate::resource::stands_in(dst) {
+        let Some(twin) = crate::resource::rgba_twin(dst) else {
+            return;
+        };
+        ensure_state(list, src, COPY_SOURCE);
+        let before = twin.state.swap(COPY_DEST, Relaxed);
+        // SAFETY: open list; both textures live; twin is ours.
+        unsafe {
+            if before != COPY_DEST {
+                list.list.ResourceBarrier(&[crate::host::transition(
+                    &twin.texture,
+                    State(before as i32),
+                    State(COPY_DEST as i32),
+                )]);
+            }
+            list.list.CopyResource(&twin.texture, from);
+            list.list.ResourceBarrier(&[crate::host::transition(
+                &twin.texture,
+                State(COPY_DEST as i32),
+                State(COPY_SOURCE as i32),
+            )]);
+        }
+        twin.state.store(COPY_SOURCE, Relaxed);
+        // The packed texture is still filled from title memory; only the
+        // twin holds the GPU copy. Marking it host-written stopped skin
+        // and other streamed atlases from uploading.
+        return;
+    }
+    if !crate::resource::stands_in(src) && crate::resource::stands_in(dst) {
+        if let Some(twin) = crate::resource::rgba_twin_of(src) {
+            ensure_state(list, dst, COPY_DEST);
+            let before = twin.state.swap(COPY_SOURCE, Relaxed);
+            unsafe {
+                if before != COPY_SOURCE {
+                    list.list.ResourceBarrier(&[crate::host::transition(
+                        &twin.texture,
+                        State(before as i32),
+                        State(COPY_SOURCE as i32),
+                    )]);
+                }
+                list.list.CopyResource(to, &twin.texture);
+            }
+            twin.state.store(COPY_SOURCE, Relaxed);
+            crate::texture::host_written(dst);
+            return;
+        }
+        if crate::texture::title_written(from)
+            && crate::texture::expand_packed_to_rgba(list, src, dst, from, to)
+        {
+            crate::texture::host_written(dst);
+        }
+    }
+}
+
 /// Whether one of two resources is a target in a stand-in format and the
 /// other is not ([`crate::resource::target_format`]): their texels differ
 /// in size, so the host cannot copy between them (logged once).
 #[cfg(windows)]
 fn unlike(dst: This, src: This) -> bool {
     let unlike = crate::resource::stands_in(dst) != crate::resource::stands_in(src);
-    if unlike {
-        static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| {
-            tracing::warn!(?dst, ?src, "copy between a stand-in target and title-format texels skipped")
-        });
-    }
+    let _ = (dst, src);
     unlike
 }
 
@@ -851,6 +919,7 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             crate::resource::host_resource(src),
         ) {
             if unlike(dst, src) {
+                copy_unlike(list, dst, src, to, from);
                 return;
             }
             // A source the title fills itself is uploaded first (upstream
@@ -953,6 +1022,9 @@ extern "system" fn copy_texture_region(
             return;
         };
         if unlike(dst.resource, src.resource) {
+            if let Some(from) = crate::resource::host_resource(src.resource) {
+                copy_unlike(list, dst.resource, src.resource, to, from);
+            }
             return;
         }
         let mut from = src;
@@ -1216,6 +1288,13 @@ extern "system" fn clear_rtv(
         let Some(color) = (unsafe { color.as_ref() }) else {
             return;
         };
+        // B5G6R5 / B5G5R5A1 stand-ins: the title's clear A is 0 (no channel
+        // on console). Left as 0, later samples and dest-alpha punch walls.
+        let mut opaque = *color;
+        if crate::resource::stand_in_opaque_alpha(record.resource) {
+            opaque[3] = 1.0;
+        }
+        let color = &opaque;
         let rects = (count > 0 && !rects.is_null()).then(|| {
             // SAFETY: the title passes `count` rectangles, laid out as the host's.
             unsafe { std::slice::from_raw_parts(rects.cast(), count as usize) }

@@ -239,8 +239,8 @@ pub(crate) fn pc_format(format: u32) -> u32 {
 
 /// The format of a texture the host GPU renders to or writes as unordered
 /// access, for the title's `format`. The console's GPU does both with the
-/// 16-bit colour formats B5G5R5A1 (86) and B4G4R4A4 (115), and
-/// the title has full-screen targets in both; a host that refuses either use
+/// 16-bit colour formats B5G6R5 (85), B5G5R5A1 (86) and B4G4R4A4 (115), and
+/// the title has full-screen targets in them; a host that refuses either use
 /// (NVIDIA) refused the whole texture, so every pass that wrote it drew
 /// nothing. There 8-bit RGBA stands in: the same channels in the same
 /// order, every 4-bit level exact and every 5-bit level within 1/510.
@@ -250,14 +250,14 @@ pub(crate) fn pc_format(format: u32) -> u32 {
 /// itself in the 16-bit format are skipped ([`stands_in`]); convert them
 /// if a pass turns out to need one.
 pub(crate) fn target_format(format: u32) -> u32 {
-    const STAND_INS: [(u32, u32); 2] = [(86, 28), (115, 28)];
+    const STAND_INS: [(u32, u32); 3] = [(85, 28), (86, 28), (115, 28)];
     let Some(i) = STAND_INS.iter().position(|&(f, _)| f == format) else {
         return format;
     };
     #[cfg(windows)]
     {
         use windows::Win32::Graphics::Direct3D12::*;
-        static REFUSED: std::sync::OnceLock<[bool; 2]> = std::sync::OnceLock::new();
+        static REFUSED: std::sync::OnceLock<[bool; 3]> = std::sync::OnceLock::new();
         let refused = REFUSED.get_or_init(|| {
             STAND_INS.map(|(f, _)| {
                 let Some(host) = crate::host::host() else {
@@ -303,6 +303,128 @@ pub(crate) fn stands_in(this: This) -> bool {
         && host_resource(this)
             // SAFETY: a live resource.
             .is_some_and(|host| unsafe { host.GetDesc() }.Format.0 as u32 == target_format(own))
+}
+
+/// An 8-bit RGBA copy of a packed title texture the host cannot CopyResource
+/// into: NVIDIA paints those targets as RGBA8, and a copy to the 16-bit
+/// texture was skipped, so tiles stayed black until the next upload.
+#[cfg(windows)]
+pub(crate) struct RgbaTwin {
+    pub texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    pub state: std::sync::atomic::AtomicU32,
+}
+
+#[cfg(windows)]
+static RGBA_TWIN: std::sync::Mutex<Option<std::collections::HashMap<usize, std::sync::Arc<RgbaTwin>>>> =
+    std::sync::Mutex::new(None);
+
+/// The RGBA twin of `this` if an unlike copy has already made one.
+#[cfg(windows)]
+pub(crate) fn rgba_twin_of(this: This) -> Option<std::sync::Arc<RgbaTwin>> {
+    RGBA_TWIN
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .and_then(|m| m.get(&(this as usize)).cloned())
+}
+
+/// RGBA8 host texture to present or copy when `this` is packed. Made on
+/// the first unlike copy into it.
+#[cfg(windows)]
+pub(crate) fn rgba_twin(
+    this: This,
+) -> Option<std::sync::Arc<RgbaTwin>> {
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::*;
+    if this.is_null() {
+        return None;
+    }
+    let mut map = RGBA_TWIN.lock().unwrap_or_else(|e| e.into_inner());
+    let map = map.get_or_insert_with(std::collections::HashMap::new);
+    if let Some(t) = map.get(&(this as usize)) {
+        return Some(t.clone());
+    }
+    let src = host_resource(this)?;
+    // SAFETY: a live resource.
+    let d = unsafe { src.GetDesc() };
+    let host = crate::host::host()?;
+    let desc = D3D12_RESOURCE_DESC {
+        Dimension: d.Dimension,
+        Width: d.Width,
+        Height: d.Height,
+        DepthOrArraySize: d.DepthOrArraySize,
+        MipLevels: d.MipLevels,
+        Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
+        Flags: D3D12_RESOURCE_FLAG_NONE,
+        ..Default::default()
+    };
+    let heap = D3D12_HEAP_PROPERTIES {
+        Type: D3D12_HEAP_TYPE_DEFAULT,
+        ..Default::default()
+    };
+    let mut texture = None;
+    // SAFETY: our description and out pointer.
+    unsafe {
+        host.device
+            .CreateCommittedResource(
+                &heap,
+                D3D12_HEAP_FLAG_NONE,
+                &desc,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                None,
+                &mut texture,
+            )
+            .ok()?;
+    }
+    let texture = texture?;
+    crate::host::name(&texture, || format!("rgba twin of {this:?}"));
+    let twin = std::sync::Arc::new(RgbaTwin {
+        texture,
+        state: std::sync::atomic::AtomicU32::new(D3D12_RESOURCE_STATE_COPY_DEST.0 as u32),
+    });
+    map.insert(this as usize, twin.clone());
+    Some(twin)
+}
+
+/// D3D12_ENCODE_SHADER_4_COMPONENT_MAPPING(0, 1, 2, 5): RGB from memory,
+/// alpha FORCE_VALUE_1. (3 bits per component, plus bit 12 always set.)
+#[cfg(windows)]
+pub(crate) const OPAQUE_SRV_MAPPING: u32 = (1 << 3) | (2 << 6) | (5 << 9) | (1 << 12);
+
+/// Title packed colour with no usable alpha, hosted as RGBA8: 85 B5G6R5
+/// (no A) and 86 B5G5R5A1 (1-bit, unused on the title's colour RTs). A
+/// shader that never writes `.a` leaves 0; samples and clears must treat
+/// the texel as opaque or walls vanish in gameplay.
+#[cfg(windows)]
+pub(crate) fn stand_in_opaque_alpha(this: This) -> bool {
+    !this.is_null()
+        && matches!(pc_format(resource(this).desc.format), 85 | 86)
+        && stands_in(this)
+}
+
+/// What present should copy: the live host texture when it is already the
+/// RGBA8 stand-in (that is what the GPU drew). The twin is only for a
+/// packed title-format dest the host cannot present, filled by an unlike
+/// copy; presenting it in place of a stand-in showed holes (unwritten
+/// alpha-0 tiles) where walls should be.
+#[cfg(windows)]
+pub(crate) fn present_texture(
+    this: This,
+) -> Option<(windows::Win32::Graphics::Direct3D12::ID3D12Resource, u32)> {
+    use std::sync::atomic::Ordering::Relaxed;
+    const COPY_SOURCE: u32 = 0x800;
+    if !stands_in(this)
+        && let Some(twin) = rgba_twin_of(this)
+    {
+        return Some((twin.texture.clone(), twin.state.load(Relaxed)));
+    }
+    let texture = host_resource(this)?.clone();
+    let state = host_transition(this, COPY_SOURCE).map_or(COPY_SOURCE, |(_, before)| before);
+    Some((texture, state))
 }
 
 /// Depth textures the title also asks unordered access for (the console
@@ -1645,6 +1767,7 @@ fn host_texture(
         d.flags &= !UNORDERED;
     }
     d.format = pc_format(d.format);
+    let packed_no_alpha = matches!(d.format, 85 | 86);
     const TARGET: u32 = 1;
     if d.flags & (TARGET | UNORDERED) != 0 {
         d.format = target_format(d.format);
@@ -1668,6 +1791,11 @@ fn host_texture(
         value[0] = pc_format(value[0]);
         if d.flags & (TARGET | UNORDERED) != 0 {
             value[0] = target_format(value[0]);
+        }
+        // B5G6R5 has no alpha; the RGBA8 stand-in must clear A to 1 or
+        // later samples and the swap chain see through the colour.
+        if packed_no_alpha {
+            value[4] = 1.0f32.to_bits();
         }
         value
     });

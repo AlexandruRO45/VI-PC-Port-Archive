@@ -591,6 +591,164 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     list.defer_texture(staging);
 }
 
+/// Packed title texels (B5G6R5 / B5G5R5A1 / B4G4R4A4) expanded into an
+/// 8-bit RGBA host texture. The host cannot CopyResource between those
+/// sizes; skipping the copy left dark tiles that popped in later.
+pub(crate) fn expand_packed_to_rgba(
+    list: &HostList,
+    src: This,
+    dst: This,
+    from: &ID3D12Resource,
+    dest: &ID3D12Resource,
+) -> bool {
+    let Some(staging) = staging(src, from) else {
+        return false;
+    };
+    let Some(host) = host() else {
+        return false;
+    };
+    // SAFETY: live resources.
+    let (src_desc, dest_desc) = unsafe { (from.GetDesc(), dest.GetDesc()) };
+    let packed = src_desc.Format.0;
+    if !matches!(packed, 85 | 86 | 115) {
+        return false;
+    }
+    let count = if dest_desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
+        u32::from(dest_desc.MipLevels)
+    } else {
+        u32::from(dest_desc.MipLevels) * u32::from(dest_desc.DepthOrArraySize)
+    };
+    let mut dest_fp = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); count as usize];
+    let mut dest_rows = vec![0u32; count as usize];
+    let mut total = 0;
+    // SAFETY: outputs for `count` subresources.
+    unsafe {
+        host.device.GetCopyableFootprints(
+            &dest_desc,
+            0,
+            count,
+            0,
+            Some(dest_fp.as_mut_ptr()),
+            Some(dest_rows.as_mut_ptr()),
+            None,
+            Some(&mut total),
+        );
+    }
+    let Some((buffer, data)) = list.upload(host, total) else {
+        return false;
+    };
+    let staging_for_expand = staging.clone();
+    let dest_fp_cpu = dest_fp.clone();
+    let dest_rows_cpu = dest_rows.clone();
+    let dest_ptr = data as usize;
+    list.defer_texture(staging.clone());
+    list.defer_host(move || {
+        staging_for_expand.refresh();
+        // SAFETY: mapped upload buffer of `total` bytes; staging mapping is
+        // the packed layout, written by refresh.
+        unsafe {
+            expand_packed(
+                packed,
+                staging_for_expand.data,
+                &staging_for_expand.footprints,
+                &staging_for_expand.rows,
+                dest_ptr as *mut u8,
+                &dest_fp_cpu,
+                &dest_rows_cpu,
+            );
+        }
+    });
+    const COPY_DEST: u32 = 0x400;
+    crate::list::ensure_state(list, dst, COPY_DEST);
+    let _ = src;
+    for (i, footprint) in dest_fp.iter().enumerate() {
+        let to = D3D12_TEXTURE_COPY_LOCATION {
+            pResource: unsafe { std::mem::transmute_copy(dest) },
+            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                SubresourceIndex: i as u32,
+            },
+        };
+        let from_loc = D3D12_TEXTURE_COPY_LOCATION {
+            pResource: unsafe { std::mem::transmute_copy(&buffer) },
+            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                PlacedFootprint: *footprint,
+            },
+        };
+        // SAFETY: open list; dest RGBA8, upload holds expanded texels.
+        unsafe { list.list.CopyTextureRegion(&to, 0, 0, 0, &from_loc, None) };
+    }
+    let _ = buffer;
+    true
+}
+
+/// `src` packed 16-bit rows into `dst` RGBA8 rows, matching the footprints.
+unsafe fn expand_packed(
+    packed: i32,
+    src: *const u8,
+    src_fp: &[D3D12_PLACED_SUBRESOURCE_FOOTPRINT],
+    src_rows: &[u32],
+    dst: *mut u8,
+    dst_fp: &[D3D12_PLACED_SUBRESOURCE_FOOTPRINT],
+    dst_rows: &[u32],
+) {
+    // SAFETY: caller holds mapped staging and upload buffers for every
+    // footprint; each row stays inside those mappings.
+    unsafe {
+    let n = src_fp.len().min(dst_fp.len()).min(src_rows.len()).min(dst_rows.len());
+    for i in 0..n {
+        let (sf, df) = (src_fp[i].Footprint, dst_fp[i].Footprint);
+        let rows = src_rows[i].min(dst_rows[i]).min(sf.Height).min(df.Height);
+        let width = sf.Width.min(df.Width);
+        for z in 0..sf.Depth.min(df.Depth) {
+            for y in 0..rows {
+                let s = src.add(
+                    (src_fp[i].Offset + u64::from(sf.RowPitch) * u64::from(y)
+                        + u64::from(sf.RowPitch) * u64::from(rows) * u64::from(z))
+                        as usize,
+                );
+                let d = dst.add(
+                    (dst_fp[i].Offset + u64::from(df.RowPitch) * u64::from(y)
+                        + u64::from(df.RowPitch) * u64::from(rows) * u64::from(z))
+                        as usize,
+                );
+                for x in 0..width {
+                    let p = u16::from_le_bytes([*s.add(x as usize * 2), *s.add(x as usize * 2 + 1)]);
+                    let (r, g, b, a) = match packed {
+                        85 => {
+                            let r = ((p >> 11) & 31) as u8;
+                            let g = ((p >> 5) & 63) as u8;
+                            let b = (p & 31) as u8;
+                            ((r << 3) | (r >> 2), (g << 2) | (g >> 4), (b << 3) | (b >> 2), 255)
+                        }
+                        86 => {
+                            let a = if p & 0x8000 != 0 { 255 } else { 0 };
+                            let r = ((p >> 10) & 31) as u8;
+                            let g = ((p >> 5) & 31) as u8;
+                            let b = (p & 31) as u8;
+                            ((r << 3) | (r >> 2), (g << 3) | (g >> 2), (b << 3) | (b >> 2), a)
+                        }
+                        _ => {
+                            let a = ((p >> 12) & 15) as u8;
+                            let r = ((p >> 8) & 15) as u8;
+                            let g = ((p >> 4) & 15) as u8;
+                            let b = (p & 15) as u8;
+                            (r * 17, g * 17, b * 17, a * 17)
+                        }
+                    };
+                    let o = d.add(x as usize * 4);
+                    *o = r;
+                    *o.add(1) = g;
+                    *o.add(2) = b;
+                    *o.add(3) = a;
+                }
+            }
+        }
+    }
+    }
+}
+
 impl Staging {
     /// The title memory the texture is read from: address and bytes.
     pub(crate) fn memory(&self) -> (usize, usize) {

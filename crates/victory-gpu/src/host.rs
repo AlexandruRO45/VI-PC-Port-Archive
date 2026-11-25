@@ -447,6 +447,38 @@ fn private_bytes() -> u64 {
 /// draws nothing at seconds per frame.
 static ON_FAILURE: OnceLock<fn(&str) -> !> = OnceLock::new();
 
+/// The lists last submitted, for a crash inside the driver (the software
+/// adapter writes past a buffer as an access violation, before the
+/// device-removed report).
+static IN_FLIGHT: Mutex<String> = Mutex::new(String::new());
+
+/// What [`remember_inflight`] stored. The crash report prints it.
+pub fn crash_detail() -> String {
+    IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+fn remember_inflight(runs: &[&HostList]) {
+    let mut text = String::from("gpu in flight:");
+    for (i, list) in runs.iter().enumerate() {
+        let pipelines = list.pipelines.lock().unwrap_or_else(|e| e.into_inner());
+        text.push_str(&format!(
+            " list {i} {:?}",
+            pipelines.iter().take(8).collect::<Vec<_>>()
+        ));
+        #[cfg(feature = "diagnostics")]
+        {
+            let notes = list.notes.lock().unwrap_or_else(|e| e.into_inner());
+            let n = notes.len();
+            let start = n.saturating_sub(4);
+            for (k, (note, _)) in notes.iter().enumerate().skip(start) {
+                let shown: String = note.chars().take(180).collect();
+                text.push_str(&format!("\n  [{k}/{n}] {shown}"));
+            }
+        }
+    }
+    *IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner()) = text;
+}
+
 /// Sets what a host GPU failure does (the runtime's crash report).
 pub fn on_failure(report: fn(&str) -> !) {
     let _ = ON_FAILURE.set(report);
@@ -3978,6 +4010,7 @@ impl Host {
         if let Some(check) = card.as_ref().and_then(|c| c.check.clone()) {
             lists.push(Some(check));
         }
+        remember_inflight(runs);
         let prepared = std::time::Instant::now();
         if late {
             *submitted += 1;
@@ -6005,6 +6038,9 @@ impl Host {
                 BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
                 BufferCount: BUFFERS,
                 SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
+                // Packed 565 stand-ins are RGBA8 with leftover alpha 0.
+                // IGNORE stops DWM punching through the window (walls as glass).
+                AlphaMode: DXGI_ALPHA_MODE_IGNORE,
                 ..Default::default()
             };
             let swap_chain = factory

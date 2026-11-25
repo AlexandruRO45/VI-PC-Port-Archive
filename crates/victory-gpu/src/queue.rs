@@ -822,14 +822,17 @@ extern "system" fn present(
         && !plane.resources.is_null()
         // SAFETY: the plane lists `count` resources.
         && let resource = unsafe { *plane.resources }
-        && let Some(texture) = crate::resource::host_resource(resource)
+        && let Some((texture, state)) = crate::resource::present_texture(resource)
         && let Some(host) = crate::host::host()
     {
-        const COPY_SOURCE: u32 = 0x800;
-        let state = crate::resource::host_transition(resource, COPY_SOURCE)
-            .map_or(COPY_SOURCE, |(_, before)| before);
-        let shown = host.present(texture, state, frame);
-        crate::resource::host_transition(resource, state);
+        let shown = host.present(&texture, state, frame);
+        // Twin present: the title resource's state is untouched. Stand-in
+        // present (even if a twin exists for unlike copies) is the live RT.
+        if crate::resource::rgba_twin_of(resource).is_none()
+            || crate::resource::stands_in(resource)
+        {
+            crate::resource::host_transition(resource, state);
+        }
         #[cfg(feature = "diagnostics")]
         blinks(frame, resource, state, shown);
         #[cfg(not(feature = "diagnostics"))]

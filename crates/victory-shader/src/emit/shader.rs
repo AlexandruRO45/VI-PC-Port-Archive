@@ -727,9 +727,16 @@ impl Shader {
             }
         }
         if let Some(n) = self.wave_size {
-            props.push(i32c(&mut self, 11));
-            let n = Some(i32c(&mut self, n));
-            props.push(self.m.md_node(vec![n]));
+            // NVIDIA (wave 32) refuses WaveSize(64). Omit it: the program
+            // runs in host waves of 32. Console wave64 lighting and
+            // skinning that still asked for 64 never got a host pipeline,
+            // so lit skin stayed black.
+            let host = super::lower::host_max_wave();
+            if host == 0 || n <= host {
+                props.push(i32c(&mut self, 11));
+                let n = Some(i32c(&mut self, n));
+                props.push(self.m.md_node(vec![n]));
+            }
         }
         let props =
             (!props.is_empty()).then(|| self.m.md_node(props.into_iter().map(Some).collect()));
