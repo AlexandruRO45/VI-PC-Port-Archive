@@ -280,8 +280,8 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
 }
 
 /// Whether a texture refresh that finds the runtime remapping title memory
-/// goes on without waiting for it (`VICTORY_TEXTURE_NO_WAIT=1`; off by
-/// default).
+/// goes on without waiting for it (on by default; `VICTORY_TEXTURE_NO_WAIT=0`
+/// waits, as before).
 ///
 /// A texture whose memory is all mapped is read in place, under a lock
 /// the runtime takes alone while it changes a mapping
@@ -301,9 +301,38 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
 ///
 /// What changes for the picture: a texture that arrives while the runtime
 /// is remapping may show a frame later. It never shows partly read.
+///
+/// On by default since the stop at world entry: in about one run of three
+/// a title job looked up an entity whose pool slot had been freed and taken
+/// again since the title last rebuilt its map of them (the map is rebuilt
+/// once a frame, right after that job), and the lookup, which has no way
+/// out for a missing key, spun for good until the title's watchdog ended
+/// the run. The window is one frame of wall-clock time: seconds at world
+/// entry here against 33 ms on the console, and 1.0-1.9 s of those entry
+/// frames were refreshes waiting here for the runtime's remapping. Not
+/// waiting shortens the frame and with it the window; it does not close
+/// the race (a mitigation).
 fn no_wait() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_NO_WAIT").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| no_wait_from(std::env::var_os("VICTORY_TEXTURE_NO_WAIT").as_deref()))
+}
+
+/// [`no_wait`] from the switch's value: on unless it is `0`.
+fn no_wait_from(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_none_or(|v| v != "0")
+}
+
+#[cfg(test)]
+mod no_wait_tests {
+    use super::no_wait_from;
+    use std::ffi::OsStr;
+
+    #[test]
+    fn refreshes_do_not_wait_unless_told_to() {
+        assert!(no_wait_from(None));
+        assert!(no_wait_from(Some(OsStr::new("1"))));
+        assert!(!no_wait_from(Some(OsStr::new("0"))));
+    }
 }
 
 /// Since the last frame-rate line, with [`no_wait`]: refreshes that read
