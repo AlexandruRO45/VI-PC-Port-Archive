@@ -1,4 +1,12 @@
-# DexNom Runtime
+# VIctory (DexNom-based fork)
+
+This fork is based on [DexNom's VIctory](https://github.com/DexNom/VIctory), which builds on [Marvisak's VIctory](https://github.com/Marvisak/VIctory). DexNom's renderer made the first recognizable world images possible in our RX 6600 tests. This fork adds the `--capture-world` launcher option to record that transition.
+
+## RX 6600 test result
+
+On a Ryzen 5 5600X and Radeon RX 6600 (8 GB), the standard renderer in [DexNom revision `921d8d3`](https://github.com/DexNom/VIctory/commit/921d8d3b43b44f3a6ca4b44095edd3c4baf10a87) showed terrain and several shots of the GTA VI opening cutscene in Series X mode on a second launch with a warm cache. Shadows remained very dark, the world often ran below 1 FPS, and player control was unverified. [Run notes](https://github.com/anrq0/SeriesX-Emulator/issues/1#issuecomment-7168908492)
+
+## Runtime overview
 
 DexNom Runtime is a community fork of Marvisak's VIctory for Windows x64. It runs an Xbox Series executable from your own game installation and translates its GPU work for Direct3D 12. It builds on the Radeon runtime tested at `e061c69032b84ec6e2ec17340469cd689500dafd` and adds fixes for static sampler selection, wave64 lane masks and integer render targets. Game files, executables, saves and generated shader caches stay on your own computer.
 
@@ -6,7 +14,7 @@ DexNom Runtime is a community fork of Marvisak's VIctory for Windows x64. It run
 
 1. Use 64-bit Windows and a current Direct3D 12 driver. The game uses mesh shaders and Shader Model 6.6. The Radeon gameplay results and known issues are listed below.
 2. Install Rust for Windows and Visual Studio Build Tools. In the Visual Studio installer, select **Desktop development with C++**, including the x64 MSVC toolset and a Windows 10 or 11 SDK. [Rust installer](https://rustup.rs/) · [Microsoft C++ Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/)
-3. Download this repository using **Code → Download ZIP**, extract the ZIP to a writable folder, and double-click **Setup.cmd**. Select the Series X game executable inside your own extracted game installation. Keep its accompanying files together. Setup downloads the pinned build dependencies, verifies the BCPack format tables, and compiles the three Windows programs locally. [Download source ZIP](https://github.com/DexNom/VIctory/archive/refs/heads/main.zip)
+3. Download this repository using **Code → Download ZIP**, extract the ZIP to a writable folder, and double-click **Setup.cmd**. Select the Series X game executable inside your own extracted game installation. Keep its accompanying files together. Setup downloads the pinned build dependencies, verifies the BCPack format tables, and compiles the three Windows programs locally. [Download source ZIP](https://github.com/anrq0/VIctory/archive/refs/heads/main.zip)
 4. Open **DexNom Runtime** from the Windows Start menu. Use a controller for the game's first-time setup. The launcher and your local data are in `%LOCALAPPDATA%\DexNom Runtime`. Saves are in `state`, shader caches in `cache`, and per-run diagnostics in `logs`. The file `logs\latest.txt` points to the latest game log.
 
 To update, close the runtime, extract the new source ZIP, and run **Setup.cmd** again. It reuses the saved game path and the same save directory. To select a different installation, pass its executable path to Setup from PowerShell:
@@ -22,8 +30,6 @@ For a manual build, run `.\Initialize-FormatTables.ps1`, then `cargo build --loc
 ## Capture the start of a 3D scene
 
 Run `victory-play.exe --capture-world` with a diagnostics build. The launcher saves PNGs in a per-run directory inside `logs` and records its path in the run log. It captures frames after the first heavy draw workload so changes in loading time do not move the scene outside the capture window. This mode uses the normal renderer and skips the per-operation text trace. The PNGs use the runtime's existing half-resolution capture format.
-
-On a Ryzen 5 5600X and Radeon RX 6600 (8 GB), a second launch at [DexNom revision `921d8d3`](https://github.com/DexNom/VIctory/commit/921d8d3b43b44f3a6ca4b44095edd3c4baf10a87) with a warm cache showed terrain and several shots of the opening cutscene in Series X mode. The world often ran below 1 FPS, shadows remained very dark, and player control was unverified. [Run notes](https://github.com/anrq0/SeriesX-Emulator/issues/1#issuecomment-7168908492)
 
 ## Try experimental ray tracing on Radeon
 
