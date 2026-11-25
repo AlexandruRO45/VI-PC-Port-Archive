@@ -15,6 +15,10 @@ use crate::dxbc::{Container, FourCC};
 
 pub struct Host {
     pub device: ID3D12Device,
+    /// DXGI `EnumAdapters1` index of the adapter this device was created on.
+    pub adapter_index: u32,
+    /// That adapter's description (UTF-8), for pipeline verdicts and logs.
+    pub adapter_name: String,
 }
 
 /// What the stage declares that a pipeline must match.
@@ -71,7 +75,7 @@ fn err(e: windows::core::Error) -> String {
 /// (`permutes_read_the_lane_named_and_zero_from_lanes_left_out`). WARP and the
 /// basic render driver report no dedicated video memory, which is what this
 /// asks for as well.
-fn hardware_adapter(factory: &IDXGIFactory4) -> windows::core::Result<IDXGIAdapter1> {
+fn hardware_adapter(factory: &IDXGIFactory4) -> windows::core::Result<(u32, IDXGIAdapter1)> {
     // SAFETY: plain DXGI adapter enumeration.
     unsafe {
         for index in 0.. {
@@ -81,7 +85,7 @@ fn hardware_adapter(factory: &IDXGIFactory4) -> windows::core::Result<IDXGIAdapt
             let desc = adapter.GetDesc1()?;
             let software = desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0;
             if !software && desc.DedicatedVideoMemory > 0 {
-                return Ok(adapter);
+                return Ok((index, adapter));
             }
         }
     }
@@ -91,9 +95,89 @@ fn hardware_adapter(factory: &IDXGIFactory4) -> windows::core::Result<IDXGIAdapt
     ))
 }
 
+/// UTF-8 form of a DXGI adapter description (NUL-terminated UTF-16).
+fn adapter_description(desc: &DXGI_ADAPTER_DESC1) -> String {
+    let len = desc
+        .Description
+        .iter()
+        .position(|&c| c == 0)
+        .unwrap_or(desc.Description.len());
+    String::from_utf16_lossy(&desc.Description[..len])
+}
+
+/// Whether `want` (from `VICTORY_D3D12_ADAPTER`) names this adapter: a
+/// decimal index, or a case-insensitive substring of its description.
+pub(crate) fn adapter_selector_matches(index: u32, name: &str, want: &str) -> bool {
+    let want = want.trim();
+    if want.is_empty() {
+        return false;
+    }
+    if let Ok(n) = want.parse::<u32>() {
+        return index == n;
+    }
+    name.to_ascii_lowercase()
+        .contains(&want.to_ascii_lowercase())
+}
+
+/// The `EnumAdapters1` index of the WARP adapter, matched by LUID.
+fn warp_adapter_index(factory: &IDXGIFactory4, warp: &DXGI_ADAPTER_DESC1) -> Option<u32> {
+    // SAFETY: plain DXGI adapter enumeration.
+    unsafe {
+        for index in 0.. {
+            let Ok(adapter) = factory.EnumAdapters1(index) else {
+                break;
+            };
+            let desc = adapter.GetDesc1().ok()?;
+            if desc.AdapterLuid.LowPart == warp.AdapterLuid.LowPart
+                && desc.AdapterLuid.HighPart == warp.AdapterLuid.HighPart
+            {
+                return Some(index);
+            }
+        }
+    }
+    None
+}
+
+/// Adapter chosen by `VICTORY_D3D12_ADAPTER` (index or description substring).
+fn selected_adapter(
+    factory: &IDXGIFactory4,
+    want: &str,
+) -> windows::core::Result<(u32, IDXGIAdapter1)> {
+    // SAFETY: plain DXGI adapter enumeration.
+    unsafe {
+        if let Ok(n) = want.trim().parse::<u32>() {
+            let adapter = factory.EnumAdapters1(n).map_err(|e| {
+                windows::core::Error::new(e.code(), format!("no DXGI adapter at index {n}"))
+            })?;
+            return Ok((n, adapter));
+        }
+        for index in 0.. {
+            let Ok(adapter) = factory.EnumAdapters1(index) else {
+                break;
+            };
+            let desc = adapter.GetDesc1()?;
+            let name = adapter_description(&desc);
+            if adapter_selector_matches(index, &name, want) {
+                return Ok((index, adapter));
+            }
+        }
+    }
+    Err(windows::core::Error::new(
+        windows::Win32::Foundation::E_FAIL,
+        format!("no DXGI adapter matching {want:?}"),
+    ))
+}
+
 impl Host {
+    /// A short label for pipeline verdicts: `index "Description"`.
+    pub fn adapter_label(&self) -> String {
+        format!("{} \"{}\"", self.adapter_index, self.adapter_name)
+    }
+
     /// The default adapter, or WARP with `warp` (or `VICTORY_WARP=1`).
-    /// A software default adapter (a machine without a GPU, as CI) is
+    /// `VICTORY_D3D12_ADAPTER` (a decimal index or a case-insensitive
+    /// substring of the description) picks another adapter when set; a
+    /// software default adapter (a machine without a GPU, as CI) is
     /// refused, so hardware-only checks never run on WARP.
     pub fn new(warp: bool) -> Result<Self, String> {
         let warp = warp || std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1");
@@ -102,11 +186,18 @@ impl Host {
             let mut device: Option<ID3D12Device> = None;
             let factory: IDXGIFactory4 =
                 CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(err)?;
-            let adapter: IDXGIAdapter1 = if warp {
-                factory.EnumWarpAdapter().map_err(err)?
+            let (adapter_index, adapter): (u32, IDXGIAdapter1) = if warp {
+                let warp_adapter = factory.EnumWarpAdapter().map_err(err)?;
+                let adapter: IDXGIAdapter1 = warp_adapter.cast().map_err(err)?;
+                let desc = adapter.GetDesc1().map_err(err)?;
+                (warp_adapter_index(&factory, &desc).unwrap_or(0), adapter)
+            } else if let Ok(want) = std::env::var("VICTORY_D3D12_ADAPTER") {
+                selected_adapter(&factory, &want).map_err(err)?
             } else {
                 hardware_adapter(&factory).map_err(err)?
             };
+            let desc = adapter.GetDesc1().map_err(err)?;
+            let adapter_name = adapter_description(&desc);
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
             let device = device.ok_or("no device")?;
             let mut sm = D3D12_FEATURE_DATA_SHADER_MODEL {
@@ -125,7 +216,11 @@ impl Host {
                     sm.HighestShaderModel.0
                 ));
             }
-            Ok(Host { device })
+            Ok(Host {
+                device,
+                adapter_index,
+                adapter_name,
+            })
         }
     }
 
@@ -1874,5 +1969,53 @@ impl Host {
             drop(keep);
             Ok(out)
         }
+    }
+}
+
+#[cfg(test)]
+mod adapter_selector_tests {
+    use super::adapter_selector_matches;
+
+    #[test]
+    fn a_decimal_index_matches_only_that_adapter() {
+        assert!(adapter_selector_matches(1, "NVIDIA GeForce RTX 4090", "1"));
+        assert!(!adapter_selector_matches(0, "AMD Radeon(TM) Graphics", "1"));
+        assert!(adapter_selector_matches(0, "anything", "0"));
+    }
+
+    #[test]
+    fn a_description_substring_matches_case_insensitively() {
+        assert!(adapter_selector_matches(
+            1,
+            "NVIDIA GeForce RTX 4090",
+            "rtx 4090"
+        ));
+        assert!(adapter_selector_matches(
+            0,
+            "AMD Radeon(TM) Graphics",
+            "radeon"
+        ));
+        assert!(!adapter_selector_matches(
+            0,
+            "AMD Radeon(TM) Graphics",
+            "nvidia"
+        ));
+    }
+
+    #[test]
+    fn an_empty_or_whitespace_selector_matches_nothing() {
+        assert!(!adapter_selector_matches(0, "AMD Radeon(TM) Graphics", ""));
+        assert!(!adapter_selector_matches(
+            0,
+            "AMD Radeon(TM) Graphics",
+            "  "
+        ));
+    }
+
+    #[test]
+    fn an_index_string_is_not_treated_as_a_substring() {
+        // "0" is an index, not a description that happens to contain "0".
+        assert!(!adapter_selector_matches(1, "adapter 0 spare", "0"));
+        assert!(adapter_selector_matches(0, "adapter 0 spare", "0"));
     }
 }
