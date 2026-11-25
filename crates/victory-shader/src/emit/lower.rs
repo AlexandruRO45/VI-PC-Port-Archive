@@ -467,6 +467,75 @@ fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
     })
 }
 
+/// The per-lane lowering can replace a proven restore with its original SGPR.
+fn restored_lane_read(st: &Structured, inst: &Inst) -> bool {
+    inst.writes
+        .first()
+        .is_some_and(|&(_, result)| st.restored.contains_key(&result))
+}
+
+/// Constant-lane SGPR writes whose VGPR is used only by other such writes
+/// and by proven restores. A VGPR use elsewhere, even through a phi, needs
+/// the original lane write to be carried out.
+fn spill_writes(
+    p: &Program,
+    st: &Structured,
+    phi_at: &HashMap<Value, Site>,
+) -> HashMap<Value, Option<Value>> {
+    let insts = || p.blocks.iter().flat_map(|b| &b.insts);
+    let mut spills = HashMap::new();
+    for inst in insts().filter(|i| i.name() == "v_writelane_b32") {
+        if let Fields::Valu(w) = &inst.fields
+            && let (Some(Operand::Vector { reg, .. }), [Operand::Scalar { code, .. }, lane]) =
+                (w.dst, w.src.as_slice())
+            && *code != NULL
+            && crate::resource::lane_of(*lane).is_some()
+            && let Some(result) = inst.write(Reg::V(reg))
+        {
+            spills.insert(result, inst.read(Reg::V(reg)));
+        }
+    }
+    if spills.is_empty() {
+        return spills;
+    }
+
+    let mut used: Vec<_> = insts()
+        .filter(|inst| !is_sgpr_spill(st, inst, &spills))
+        .flat_map(|inst| &inst.reads)
+        .filter_map(|&(reg, value)| matches!(reg, Reg::V(_)).then_some(value))
+        .collect();
+    let mut seen_phis = HashSet::new();
+    while let Some(value) = used.pop() {
+        if let Some(previous) = spills.remove(&value) {
+            used.extend(previous);
+        } else if let Some(&(b, i)) = phi_at.get(&value)
+            && seen_phis.insert(value)
+        {
+            used.extend(&p.blocks[b].phis[i].args);
+        }
+    }
+    spills
+}
+
+fn is_named_lane(inst: &Inst) -> bool {
+    matches!(inst.name(), "v_readlane_b32" | "v_writelane_b32")
+}
+
+fn is_sgpr_spill(
+    st: &Structured,
+    inst: &Inst,
+    spill_writes: &HashMap<Value, Option<Value>>,
+) -> bool {
+    match inst.name() {
+        "v_readlane_b32" => restored_lane_read(st, inst),
+        "v_writelane_b32" => inst
+            .writes
+            .first()
+            .is_some_and(|&(_, result)| spill_writes.contains_key(&result)),
+        _ => false,
+    }
+}
+
 /// Where half `h` (dword h / 2, the high half when odd) of the parameter
 /// whose first element is in row `a` comes from, when the console packs
 /// 16-bit values two per dword: a row and channel of `elements`, none for
@@ -581,11 +650,15 @@ impl<'a> Lower<'a> {
                     || i.name() == "ds_bpermute_b32"
                     || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
             };
+            let spills = spill_writes(p, x.st, &phi_at);
+            let named_lane = |i: &Inst| is_named_lane(i) && !is_sgpr_spill(x.st, i, &spills);
             let whole = |i: &Inst| {
                 let n = i.name();
+                if is_named_lane(i) {
+                    return named_lane(i);
+                }
                 (n.contains("permute") && n != "ds_bpermute_b32")
                     || n.starts_with("v_mbcnt")
-                    || matches!(n, "v_readlane_b32" | "v_writelane_b32")
                     || reads_mask_as_data(x.st, i)
             };
             let reads_whole = insts().any(whole);
@@ -635,8 +708,15 @@ impl<'a> Lower<'a> {
                 all.dedup();
                 constant || all.into_iter().any(|g| numeric(&x.st.bools, g))
             };
-            console_lanes = reads_whole || masks_held || insts().any(in_half);
+            // SGPR spills keep main's per-lane form: on a host that runs the
+            // console's wave size, with that wave size and the lane writes
+            // emulated; elsewhere, with no wave size (each restore is its
+            // SGPR).
             let wave = if x.native.wave64 { 64 } else { 32 };
+            console_lanes = reads_whole
+                || masks_held
+                || insts().any(in_half)
+                || x.target.runs(wave) && insts().any(is_named_lane);
             let one_wave = cs.threads.iter().product::<u32>() <= wave;
             // On a host without 64-lane waves, a wave64 program whose lanes
             // read only their own half runs as two 32-lane waves: what each
@@ -682,7 +762,7 @@ impl<'a> Lower<'a> {
                 wants_console_flow = no_console_flow.is_none() && x.target.runs(32);
             }
             // On a host that runs the console's wave size: lane reads and
-            // writes in a program whose lanes branch differently (see
+            // writes other than SGPR spills in a divergent program (see
             // [`CONSOLE_FLOW`]).
             let uniform = |when: Bool| {
                 x.st.bools
@@ -696,7 +776,7 @@ impl<'a> Lower<'a> {
             let lane_access_outside_sections = p.blocks.iter().enumerate().any(|(b, block)| {
                 let sections = super::wave::sections(p, b);
                 block.insts.iter().enumerate().any(|(i, inst)| {
-                    matches!(inst.name(), "v_readlane_b32" | "v_writelane_b32")
+                    named_lane(inst)
                         && !sections
                             .iter()
                             .any(|(&start, s)| (start..=s.end).contains(&i))
@@ -6447,12 +6527,7 @@ impl<'a> Lower<'a> {
             // An SGPR spilled to a VGPR lane and read back is the SGPR, in
             // every stage (in compute the VGPR's other lanes may hold what has
             // no host value, a descriptor's address say).
-            "v_readlane_b32"
-                if inst
-                    .writes
-                    .first()
-                    .is_some_and(|w| self.x.st.restored.contains_key(&w.1)) =>
-            {
+            "v_readlane_b32" if restored_lane_read(self.x.st, inst) => {
                 let a = self.i32_of(self.x.st.restored[&inst.writes[0].1])?;
                 int(self, a)
             }
