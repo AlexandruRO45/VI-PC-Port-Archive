@@ -333,6 +333,15 @@ Check **Committed** under **Task Manager → Performance → Memory**. If
 `crashes.log` reports Windows error 1455, close other applications or increase
 the Windows paging file size, then retry.
 
+On native Windows, `VICTORY_PHYSICAL_BACKING_DIR` enables an experimental
+backing store for the title's shared physical page pool. Set it to an existing
+directory on a local volume that supports sparse files, outside the checkout.
+The runtime checks free space when it creates each file. Sparse files allocate
+space as pages are written, so leave enough free space for the whole pool.
+Disk exhaustion or I/O errors can interrupt a run. The temporary files are
+removed when the sections and their views are released. The system paging file
+remains the default backing store.
+
 ```powershell
 cargo xtask install-hooks                # asset-policy check on every commit
 copy victory.example.toml victory.toml   # then set your paths (outside the repo)

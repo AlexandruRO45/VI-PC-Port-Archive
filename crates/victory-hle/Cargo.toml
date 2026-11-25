@@ -17,6 +17,8 @@ zlib-rs.workspace = true
 tracing.workspace = true
 
 [target.'cfg(windows)'.dependencies]
+tempfile.workspace = true
+victory-core.workspace = true
 windows-sys = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_Globalization",
@@ -24,6 +26,8 @@ windows-sys = { workspace = true, features = [
     "Win32_Security",
     "Win32_Storage_FileSystem",
     "Win32_System_Diagnostics_Debug",
+    "Win32_System_IO",
+    "Win32_System_Ioctl",
     "Win32_System_LibraryLoader",
     "Win32_System_Memory",
     "Win32_System_Power",

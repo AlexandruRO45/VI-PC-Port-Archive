@@ -272,8 +272,15 @@ struct Views {
     /// page is a write of the bytes every other view shows
     /// (`crate::watch` guards them all).
     pages: BTreeMap<(usize, u64), Vec<usize>>,
-    /// Sections by handle: bytes, and whether made committed.
-    sections: Vec<(usize, u64, bool)>,
+    /// Physical section properties by handle.
+    sections: Vec<SectionInfo>,
+}
+
+struct SectionInfo {
+    handle: usize,
+    bytes: u64,
+    committed: bool,
+    file_backed: bool,
 }
 
 static VIEWS: Mutex<Views> =
@@ -285,10 +292,10 @@ fn views() -> std::sync::MutexGuard<'static, Views> {
 
 /// The runtime made a section of `bytes` for physical pages; `committed`
 /// if with `SEC_COMMIT` (only such a section can be opened as a heap).
-pub fn title_memory_section(section: usize, bytes: u64, committed: bool) {
+pub fn title_memory_section(handle: usize, bytes: u64, committed: bool, file_backed: bool) {
     let mut v = views();
-    v.sections.retain(|s| s.0 != section);
-    v.sections.push((section, bytes, committed));
+    v.sections.retain(|s| s.handle != handle);
+    v.sections.push(SectionInfo { handle, bytes, committed, file_backed });
 }
 
 /// The runtime mapped `[at, at + len)` as a view of `section` from
@@ -460,7 +467,12 @@ pub(crate) fn write_own(at: usize, bytes: &[u8]) -> Option<Vec<usize>> {
         if shown.len() > crate::watch::MANY_VIEWS {
             return None;
         }
-        let section_bytes = v.sections.iter().find(|s| s.0 == section)?.1;
+        let info = v.sections.iter().find(|s| s.handle == section)?;
+        // A cached whole-section view would keep the temporary file open.
+        if info.file_backed {
+            return None;
+        }
+        let section_bytes = info.bytes;
         (section, offset, shown, section_bytes)
     };
     if offset + bytes.len() as u64 > section_bytes {
@@ -1104,11 +1116,17 @@ fn census_of(spans: &[(u64, u64, bool)]) -> Vec<String> {
         bytes >> 20,
         big >> 20
     ));
-    for &(_, bytes, committed) in &v.sections {
+    for &SectionInfo { bytes, committed, file_backed, .. } in &v.sections {
+        let backing = if file_backed {
+            "temporary sparse file"
+        } else if committed {
+            "committed: it can be opened as one heap"
+        } else {
+            "reserved: refused as a heap until it is made with SEC_COMMIT"
+        };
         lines.push(format!(
-            "census, a section of {} MB, {}",
+            "census, a section of {} MB, {backing}",
             bytes >> 20,
-            if committed { "committed: it can be opened as one heap" } else { "reserved: refused as a heap until it is made with SEC_COMMIT" }
         ));
     }
     lines
