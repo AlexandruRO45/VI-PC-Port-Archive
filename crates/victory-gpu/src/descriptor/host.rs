@@ -11,6 +11,29 @@ use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
 use super::{VIEW_TAG, View, view_at};
+    id: u64,
+                let bytes = u64::from(victory_shader::emit::SLOT_STRIDES_COUNT) * 4;
+                let bytes = u64::from(victory_shader::emit::SLOT_STRIDES_DWORDS) * 4;
+        static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+            id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+    /// Monotonic unique identifier for this host heap, used to key per-heap
+    /// caches without pointer-reuse aliasing.
+    pub(crate) fn id(&self) -> u64 {
+        self.id
+    }
+
+            // The title address of the buffer view, after the strides
+            // (`victory_shader::emit::SLOT_ADDRESSES`): low dword, then high.
+            let address = view
+                .and_then(buffer_range)
+                .map_or(0, |range| range.0);
+            // SAFETY: as above, two dwords inside the mapping.
+            unsafe {
+                let at = (*data as *mut u32).add((victory_shader::emit::SLOT_ADDRESSES + 2 * index) as usize);
+                at.write_volatile(address as u32);
+                at.add(1).write_volatile((address >> 32) as u32);
+            }
+
 use crate::host::host;
 
 pub(crate) struct HostHeap {
