@@ -1337,6 +1337,12 @@ impl<'a> Lower<'a> {
             let picked = self.quad_pick(active_i32, src);
             return Some(self.s.m.cmp(c, pred::NE, picked, zero));
         }
+        if self.emulating_wave64() && !mesh_quad {
+            let g = guard?;
+            let uniform_here = self.uniform.get(self.cur_ir).copied().unwrap_or(false);
+            let (lo, hi) = self.compute_ballot_bit(g, uniform_here).ok()?;
+            return Some(self.lane_bit_of(c, src, lo, hi));
+        }
         let bit = guard.unwrap_or_else(|| self.s.m.bool(true));
         let i32t = self.s.t.i32;
         let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
