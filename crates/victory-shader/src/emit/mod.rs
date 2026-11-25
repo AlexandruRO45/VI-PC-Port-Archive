@@ -284,6 +284,12 @@ pub(crate) fn wave_wide_named() -> bool {
     std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1") || WIDE_HERE.with(|w| w.get())
 }
 
+/// Whether the caller named the program being translated for the wave-wide form
+/// ([`with_wave_wide`]); `VICTORY_WAVE_WIDE=1` alone does not count.
+pub(crate) fn wave_wide_here() -> bool {
+    WIDE_HERE.with(|w| w.get())
+}
+
 /// Runs `f` with the wave-wide form allowed for the programs it translates
 /// on this thread, as `VICTORY_WAVE_WIDE=1` allows it for all: for the
 /// programs a caller names (`VICTORY_WAVE_WIDE_ONLY` in `victory-gpu`).

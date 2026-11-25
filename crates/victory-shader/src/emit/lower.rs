@@ -1658,11 +1658,15 @@ impl<'a> Lower<'a> {
                     s.lds_dwords += group.div_ceil(64);
                 }
                 // The program's own LDS fills the host's 32 KiB: the dwords added above go over
-                // its last ones. shortcut: taken to be unused, and only for programs named for
-                // the wave-wide form (6b82bc7d: a 32 KiB bitset over triangles, read at its
-                // start).
+                // its last ones. shortcut: taken to be unused, and only in the wave-wide form of
+                // a program the caller names (6b82bc7d: a 32 KiB bitset over triangles, read at
+                // its start), whose own LDS fits the host's, so its accesses stay in bounds.
                 const HOST_LDS_DWORDS: u32 = 32 * 1024 / 4;
-                if s.lds_dwords > HOST_LDS_DWORDS && super::wave_wide_named() {
+                if s.lds_dwords > HOST_LDS_DWORDS
+                    && cs.lds_bytes() / 4 <= HOST_LDS_DWORDS
+                    && pair_meet.is_some()
+                    && super::wave_wide_here()
+                {
                     let over = s.lds_dwords - HOST_LDS_DWORDS;
                     for slot in [halves.as_mut(), exchange.as_mut().map(|e| &mut e.0), pair_meet.as_mut()].into_iter().flatten() {
                         *slot -= over;
