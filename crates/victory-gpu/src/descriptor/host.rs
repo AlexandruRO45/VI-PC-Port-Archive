@@ -5503,8 +5503,21 @@ void main(uint3 id : SV_DispatchThreadID) {
         assert_ne!(h_inc.made.lock().unwrap()[0], 0, "live slot 0 kept");
 
         // Phase 4: Evicted placed texture invalidation.
-        let placed_victim_before = h_inc.bindless.lock().unwrap().uses.get(&10).unwrap().placed;
-        let placed_survivor_before = h_inc.bindless.lock().unwrap().uses.get(&11).unwrap().placed;
+        // Hold live COM references to the pre-eviction host `ID3D12Resource`s so
+        // D3D12 cannot reuse the COM pointer address (avoiding allocator ABA on
+        // the re-allocated `Box<Resource>` pointer).
+        use windows::core::Interface;
+        let (placed_victim_before, placed_victim_host_before, placed_survivor_before, placed_survivor_host_before) = {
+            let b = h_inc.bindless.lock().unwrap();
+            let u10 = b.uses.get(&10).unwrap();
+            let u11 = b.uses.get(&11).unwrap();
+            (
+                u10.placed,
+                u10.retained.clone().unwrap(),
+                u11.placed,
+                u11.retained.clone().unwrap(),
+            )
+        };
         assert!(placed_victim_before.is_some_and(|t| t != 0));
         assert!(placed_survivor_before.is_some_and(|t| t != 0));
         crate::queue::pass_frame();
@@ -5513,16 +5526,27 @@ void main(uint3 id : SV_DispatchThreadID) {
         let p_full = drain_bindless(&h_full, false);
         assert_heap_invariants_and_oracle(&h_inc, &p_inc, "evicted_placed");
         assert_plans_cross_heap_equal(&p_inc, &p_full, "evicted_placed");
-        assert_eq!(
-            h_inc.bindless.lock().unwrap().uses.get(&11).unwrap().placed,
-            placed_survivor_before,
-            "non-evicted placed texture must remain cached"
-        );
-        assert_ne!(
-            h_inc.bindless.lock().unwrap().uses.get(&10).unwrap().placed,
-            placed_victim_before,
-            "evicted placed texture slot must be re-resolved"
-        );
+        {
+            let b = h_inc.bindless.lock().unwrap();
+            let u10 = b.uses.get(&10).unwrap();
+            let u11 = b.uses.get(&11).unwrap();
+            assert_eq!(
+                u11.placed, placed_survivor_before,
+                "non-evicted placed texture must remain cached"
+            );
+            assert_eq!(
+                u11.retained.as_ref().unwrap().as_raw(),
+                placed_survivor_host_before.as_raw(),
+                "non-evicted placed texture host resource must remain unchanged"
+            );
+            assert_ne!(
+                u10.retained.as_ref().unwrap().as_raw(),
+                placed_victim_host_before.as_raw(),
+                "evicted placed texture slot must be re-resolved to a fresh host resource"
+            );
+        }
+        drop(placed_victim_host_before);
+        drop(placed_survivor_host_before);
 
         // Pure write-only mutation: keep read/retained refcounts on both UAV buffers
         // via SRV slots 17/18 so switching UAV slot 15 from `buf_uav_b` to `buf_uav_a`
@@ -5596,7 +5620,14 @@ void main(uint3 id : SV_DispatchThreadID) {
 
         let plan = drain_bindless(&h, true);
         assert_heap_invariants_and_oracle(&h, &plan, "overflow_initial");
-        let placed_before = h.bindless.lock().unwrap().uses.get(&2).unwrap().placed;
+        // Hold a live COM ref to the pre-eviction host `ID3D12Resource` so its
+        // pointer cannot be reused via allocator ABA after eviction.
+        use windows::core::Interface;
+        let (placed_before, placed_host_before) = {
+            let b = h.bindless.lock().unwrap();
+            let u2 = b.uses.get(&2).unwrap();
+            (u2.placed, u2.retained.clone().unwrap())
+        };
         assert!(placed_before.is_some_and(|t| t != 0));
         assert!(h.bindless.lock().unwrap().direct_slots.contains(&1));
 
@@ -5635,10 +5666,20 @@ void main(uint3 id : SV_DispatchThreadID) {
         let plan = drain_bindless(&h, true);
         assert_heap_invariants_and_oracle(&h, &plan, "placed_ring_overflow");
         assert_ne!(
-            h.bindless.lock().unwrap().uses.get(&2).unwrap().placed,
-            placed_before,
+            h.bindless
+                .lock()
+                .unwrap()
+                .uses
+                .get(&2)
+                .unwrap()
+                .retained
+                .as_ref()
+                .unwrap()
+                .as_raw(),
+            placed_host_before.as_raw(),
             "evicted placed texture caught via placed_live fallback after ring wrap"
         );
+        drop(placed_host_before);
 
         crate::watch::title_memory_remapped(placed_addr as usize, 64 << 10);
         assert_eq!(release(h_this), 0);
