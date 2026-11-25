@@ -795,7 +795,10 @@ fn join_placeholders(base: usize, len: usize) {
         };
         (n != 0).then_some(info)
     };
-    if len == 0 {
+    // (placeholders are cut at the 64 KiB allocation granularity: a range
+    // inside one granule crosses no cut, and the single-page maps of the
+    // page-mapping copies skip the two queries)
+    if len == 0 || base / PAGE == (base + len - 1) / PAGE {
         return;
     }
     let (Some(first), Some(last)) = (query(base), query(base + len - 1)) else {

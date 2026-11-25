@@ -582,6 +582,14 @@ pub fn XAsyncSchedule(block: *mut AsyncBlock, delay_ms: u32) -> HRESULT {
 /// Records the result (the first one wins), wakes waiters and queues the
 /// completion routine on the block's completion port.
 pub fn XAsyncComplete(block: *mut AsyncBlock, result: HRESULT, required_size: usize) {
+    complete_call(block, None, result, required_size);
+}
+
+/// [`XAsyncComplete`]; with `only`, for that call alone: one that ended
+/// meanwhile (cancelled) is not completed in the place of the call the
+/// title began on the block after it. (Its own `done` decides: a cancel
+/// sets it, under its lock, before the block is free for another call.)
+fn complete_call(block: *mut AsyncBlock, only: Option<&Arc<Call>>, result: HRESULT, required_size: usize) {
     extern "system" fn complete(block: *mut c_void, _canceled: bool) {
         let block = block.cast::<AsyncBlock>();
         // SAFETY: read before the status was published; see below.
@@ -590,6 +598,9 @@ pub fn XAsyncComplete(block: *mut AsyncBlock, result: HRESULT, required_size: us
         }
     }
     let Some(call) = call(block) else { return };
+    if only.is_some_and(|own| !Arc::ptr_eq(&call, own)) {
+        return;
+    }
     if result == E_PENDING {
         return;
     }
@@ -785,16 +796,14 @@ pub fn pending_with(
                 let own = call(data.block);
                 std::thread::spawn(move || {
                     let result = work.map_or(Err(E_ABORT), |work| work());
-                    // Cancelled meanwhile: the call ended with `E_ABORT`
-                    // and is gone, and the title may have begun another on
-                    // the block, which this result is not for.
+                    // Cancelled meanwhile, the call ended with `E_ABORT` and
+                    // is gone, and the title may have begun another on the
+                    // block, which this result is not for: it completes
+                    // this call alone (a check here and then a completion by
+                    // the block's address would leave a gap for a cancel
+                    // and a new call between the two).
                     let block = block as *mut AsyncBlock;
-                    let still = call(block)
-                        .zip(own)
-                        .is_some_and(|(now, own)| Arc::ptr_eq(&now, &own));
-                    if !still {
-                        return;
-                    }
+                    let Some(own) = own else { return };
                     let (hr, len) = match &result {
                         Ok(bytes) => (S_OK, bytes.len()),
                         Err(hr) => (*hr, 0),
@@ -802,7 +811,7 @@ pub fn pending_with(
                     if let Ok(bytes) = result {
                         state.lock().unwrap_or_else(|e| e.into_inner()).1 = bytes;
                     }
-                    XAsyncComplete(block, hr, len);
+                    complete_call(block, Some(&own), hr, len);
                 });
             }
             // SAFETY: before cleanup, as above; the runtime checked the
