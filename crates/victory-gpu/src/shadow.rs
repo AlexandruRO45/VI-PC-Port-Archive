@@ -3320,3 +3320,11 @@ pub(crate) fn near(va: u64) -> String {
     }
     text
 }
+
+#[cfg(test)]
+impl Shadow {
+    /// A copy over `buffer`, for tests of the host's plans.
+    pub(crate) fn for_test(buffer: ID3D12Resource, data: *mut u8, start: u64, len: u64) -> Shadow {
+        Shadow::new(buffer, data, 0, start, len)
+    }
+}

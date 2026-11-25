@@ -2563,6 +2563,39 @@ mod card_work_tests {
         }
     }
 
+    /// `CardPlan::take_run` over ranges: each compared range gets its first
+    /// dword in the plan's run, in order; one not compared keeps its own;
+    /// without room none is compared and the plan has no run.
+    #[test]
+    fn take_run_lays_out_each_compared_range() {
+        let Some(host) = super::host() else {
+            return;
+        };
+        let (buffer, data) = host.shared_buffer(65536).expect("a buffer");
+        let shadow = std::sync::Arc::new(crate::shadow::Shadow::for_test(buffer, data, 0x10000, 0x10000));
+        let range = |pieces: u32, compared: bool| super::CardRange {
+            shadow: shadow.clone(),
+            declared: (0, 0),
+            span: crate::shadow::CardSpan { from: 0, to: 0, first: 0, pieces, skew: 0 },
+            at: 7777,
+            compared,
+        };
+        let mut areas = super::CardAreas::new(64, Some(16));
+        // A run out first, so that the plan's does not start at dword 0.
+        let _first = areas.take(5, false).unwrap();
+        let mut p = plan(true);
+        p.ranges = vec![range(3, true), range(4, false), range(2, true)];
+        assert!(p.take_run(&mut areas, &[3, 2]));
+        let ats: Vec<(bool, u32)> = p.ranges.iter().map(|r| (r.compared, r.at)).collect();
+        assert_eq!(ats, [(true, 5), (false, 7777), (true, 8)]);
+        assert_eq!(p.count_at, Some(10));
+        let mut q = plan(true);
+        q.ranges = vec![range(60, true), range(1, true)];
+        assert!(!q.take_run(&mut areas, &[60, 1]), "no room");
+        assert!(q.ranges.iter().all(|r| !r.compared));
+        assert_eq!((q.run, q.count_at), (None, None));
+    }
+
     /// The wait of a submission that found the compare's results low
     /// (`VICTORY_RELAY=2`) looks at the host's own results: it goes on
     /// while they are low with flights in the air, and is over with room
