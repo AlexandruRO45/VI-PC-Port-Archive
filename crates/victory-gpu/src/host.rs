@@ -736,6 +736,40 @@ mod tests {
         }
     }
 
+    #[test]
+    fn fast_copy_handles_faults_and_overlap_cleanly() {
+        use windows_sys::Win32::System::Memory::*;
+        const N: usize = 3 << 12;
+        // SAFETY: private allocation for fault and overlap tests, freed at the end.
+        unsafe {
+            let base = VirtualAlloc(std::ptr::null(), N, MEM_RESERVE, PAGE_NOACCESS).cast::<u8>();
+            assert!(!base.is_null());
+            assert_eq!(VirtualAlloc(base.cast(), 4096, MEM_COMMIT, PAGE_READWRITE), base.cast());
+            base.write_bytes(0x5a, 4096);
+
+            let mut dst = vec![0u8; N];
+            // Unmapped middle page must fail cleanly and return false without faulting.
+            assert!(!super::read(base, dst.as_mut_ptr(), N));
+            // Fully mapped first page succeeds via fast copy.
+            assert!(super::read(base, dst.as_mut_ptr(), 4096));
+            assert!(dst[..4096].iter().all(|&b| b == 0x5a));
+
+            // Read-only destination must fail cleanly without modifying or crashing.
+            let mut old = 0;
+            assert_ne!(VirtualProtect(base.cast(), 4096, PAGE_READONLY, &mut old), 0);
+            assert!(!super::read(dst.as_ptr(), base, 4096));
+
+            // Forward-overlapping range falls back cleanly without tearing bytes.
+            let mut overlap: Vec<u8> = (0..128u8).collect();
+            let ptr = overlap.as_mut_ptr();
+            assert!(super::read(ptr, ptr.add(16), 96));
+            let expected: Vec<u8> = (0..96u8).collect();
+            assert_eq!(&overlap[16..112], &expected[..]);
+
+            assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
+        }
+    }
+
     use super::*;
 
     #[test]
@@ -1541,11 +1575,11 @@ unsafe impl Send for CardWork {}
 static CARD_WORK: Mutex<Option<CardWork>> = Mutex::new(None);
 
 /// The compare of a declared range of a copy in the card's memory with
-/// its bytes from before, one thread per 64 KiB piece (cut at multiples of
-/// 64 KiB of title memory, as `Shadow::card_piece` cuts them): `differs`
-/// gets a dword per piece, 1 where a byte differs. The offsets are widened
-/// to 16 bytes; buffers are multiples of 64 KiB, and a piece flagged for a
-/// byte just outside the range costs a fetch that finds nothing.
+/// its bytes from before, one 64-lane threadgroup per 64 KiB piece (cut at
+/// multiples of 64 KiB of title memory, as `Shadow::card_piece` cuts them):
+/// lanes coalesce 16-byte loads across the piece (`1024u` stride) and fold
+/// into a 128-bit hash in groupshared memory; `differs` gets a dword per
+/// piece, 1 where a byte differs.
 pub(crate) const CARD_COMPARE: &str = r#"
 #define RS "RootConstants(num32BitConstants=6, b0), SRV(t0), UAV(u0), UAV(u1)"
 cbuffer Span : register(b0) {
@@ -1561,32 +1595,77 @@ ByteAddressBuffer now : register(t0);
 // last sent up (or hashed whole, the first time).
 RWByteAddressBuffer hashes : register(u0);
 RWByteAddressBuffer differs : register(u1);
+groupshared uint4 accum[64];
 [RootSignature(RS)]
 [numthreads(64, 1, 1)]
-void main(uint3 id : SV_DispatchThreadID) {
-    if (id.x >= pieces) return;
-    uint piece = first + id.x;
+void main(uint3 group : SV_GroupID, uint t : SV_GroupIndex) {
+    if (group.x >= pieces) return;
+    uint piece = first + group.x;
     uint lo = piece * 65536u;
     lo = lo > skew ? lo - skew : 0u;
     uint hi = min((piece + 1u) * 65536u - skew, size);
     lo = lo & ~15u;
     hi = (hi + 15u) & ~15u;
-    uint4 h = uint4(0x9E3779B9u, 0x85EBCA6Bu, 0xC2B2AE35u, 0x27D4EB2Fu);
+    uint4 h = uint4(0x9E3779B9u, 0x85EBCA6Bu, 0xC2B2AE35u, 0x27D4EB2Fu)
+        ^ (t * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du));
     [loop]
-    for (uint at = lo; at < hi; at += 16u) {
+    for (uint at = lo + t * 16u; at < hi; at += 1024u) {
         h = (h ^ now.Load4(at)) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
         h = h.yzwx ^ (h >> 15);
     }
-    if (compare != 0u) {
-        differs.Store(out_at + id.x * 4u, any(h != hashes.Load4(piece * 16u)) ? 1u : 0u);
-        // With the copy-back on its own thread: the next compare of the
-        // piece finds what is written from here on.
-        if (compare == 2u) hashes.Store4(piece * 16u, h);
-    } else {
-        hashes.Store4(piece * 16u, h);
+    accum[t] = h;
+    GroupMemoryBarrierWithGroupSync();
+    [unroll]
+    for (uint stride = 32u; stride > 0u; stride >>= 1u) {
+        if (t < stride) {
+            uint4 b = accum[t + stride];
+            uint4 a = (accum[t] ^ (b + uint4(0x9E3779B9u, 0x85EBCA6Bu, 0xC2B2AE35u, 0x27D4EB2Fu)))
+                * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
+            accum[t] = a.yzwx ^ (a >> 15);
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+    if (t == 0u) {
+        uint4 res = accum[0];
+        if (compare != 0u) {
+            differs.Store(out_at + group.x * 4u, any(res != hashes.Load4(piece * 16u)) ? 1u : 0u);
+            // With the copy-back on its own thread: the next compare of the
+            // piece finds what is written from here on.
+            if (compare == 2u) hashes.Store4(piece * 16u, res);
+        } else {
+            hashes.Store4(piece * 16u, res);
+        }
     }
 }
 "#;
+
+/// Dispatches `CARD_COMPARE` for `pieces` 64 KiB pieces starting at `first`,
+/// chunking to D3D12's 65,535-group-per-dimension limit.
+///
+/// # Safety
+/// The caller must ensure `list` is open with `CARD_COMPARE`'s root signature,
+/// pipeline, SRV, and UAVs bound for the covered `first..first + pieces` range.
+unsafe fn dispatch_card_compare(
+    list: &ID3D12GraphicsCommandList,
+    first: u32,
+    skew: u32,
+    size: u32,
+    pieces: u32,
+    out_at: u32,
+    compare: u32,
+) {
+    let mut done = 0u32;
+    while done < pieces {
+        let batch = (pieces - done).min(65535);
+        let constants = [first + done, skew, size, batch, out_at + done * 4, compare];
+        // SAFETY: caller guarantees bound pipeline/resources cover this range.
+        unsafe {
+            list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+            list.Dispatch(batch, 1, 1);
+        }
+        done += batch;
+    }
+}
 
 /// Whether the pieces a flight's compare flags come down to the PC inside
 /// the flight itself (`VICTORY_CARD_FETCH_INFLIGHT=1`; off by default, and
@@ -1731,19 +1810,16 @@ void main(uint3 group : SV_GroupID, uint t : SV_GroupIndex) {
 
 /// Whether the pieces hashed again after ranges were sent up to a copy in
 /// the card's memory are hashed in runs of pieces that touch, each piece
-/// once (`VICTORY_CARD_REHASH_RUNS=1`; off by default), and not in a pass
-/// per range sent up.
+/// once (`VICTORY_CARD_REHASH_RUNS=0` disables; on by default), and not in
+/// a pass per range sent up.
 ///
-/// These passes are ours, they run on the card before every submission's
-/// lists, and no timing so far names them: each walks its 64 KiB pieces
-/// 16 bytes at a time, 4,096 steps one after the other, so a pass takes
-/// the time of one piece however few its pieces are. Run 102 sent up 514
-/// ranges a frame: 514 such passes. The same pieces are hashed either way;
-/// a piece hashed when it need not be, or not hashed when it should, costs
-/// a fetch that finds nothing and loses no shader write.
+/// Run 102 sent up 514 ranges a frame: 514 passes without coalescing.
+/// The same pieces are hashed either way; a piece hashed when it need
+/// not be, or not hashed when it should, costs a fetch that finds
+/// nothing and loses no shader write.
 fn rehash_runs() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_REHASH_RUNS").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_REHASH_RUNS").is_none_or(|v| v != "0"))
 }
 
 /// Since the last frame-rate line, of our own passes over copies in the
@@ -1752,16 +1828,13 @@ fn rehash_runs() -> bool {
 static CARD_PASSES: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
 /// Whether what shaders wrote to copies in the card's memory is merged
-/// into title memory on several threads (`VICTORY_WIDE_MERGE=1`; off by
-/// default). The pieces the card's compare found differing come down in
-/// one fetch and were then merged one after the other on the thread that
-/// settles: about 630 pieces and 40 MB a frame (run 104), each compared
-/// with the copy's CPU side byte by byte and put into title memory through
-/// the kernel. A piece is its own bytes of its copy and of title memory,
-/// so eight threads take an eighth of them each.
+/// into title memory on several threads (`VICTORY_WIDE_MERGE=0` disables;
+/// on by default). The pieces the card's compare found differing come down
+/// in one fetch (~630 pieces and 40 MB a frame in run 104), and eight
+/// threads merge disjoint slices into title memory concurrently.
 fn wide_merge() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_MERGE").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_MERGE").is_none_or(|v| v != "0"))
 }
 
 /// One declared range of a copy in the card's memory, in a submission.
@@ -1855,6 +1928,11 @@ struct Deferred {
     /// indirect arguments; 0 if none. It stays readable until the next
     /// clamp into it ([`HostList::indirect_state`]).
     indirect_readable: usize,
+    /// Bytes used so far in the indirect scratch buffer during this recording.
+    indirect_used: u64,
+    /// Generation counter incremented whenever `indirect_alloc` resets to
+    /// offset 0 mid-recording (on buffer growth or wrap).
+    indirect_epoch: u64,
 }
 
 impl Deferred {
@@ -4074,6 +4152,8 @@ impl Host {
                     list.Reset(allocator, None)?;
                     // Where the next range lies in the landing buffer.
                     let mut at = 0u64;
+                    let mut barriers: Vec<D3D12_RESOURCE_BARRIER> = Vec::new();
+                    let mut rehash: Vec<(&crate::shadow::Shadow, &[(usize, usize)], ID3D12Resource, u64)> = Vec::new();
                     for (shadow, ranges) in &dirty {
                         let Some((staging, before, size)) = shadow.card_sides() else {
                             continue;
@@ -4090,37 +4170,40 @@ impl Host {
                         let Some(before) = before else {
                             continue;
                         };
-                        // No twin (it cost the card the copy's size again,
-                        // 399 MB in run 75): `before` holds a 128-bit hash
-                        // of each 64 KiB piece. The pieces just sent up are
-                        // hashed again, all of them the first time; the
-                        // compare after the lists hashes the declared
-                        // pieces and flags those whose hash is another.
                         if !ranges.is_empty() {
-                            list.ResourceBarrier(&[transition(
+                            barriers.push(transition(
                                 &shadow.buffer,
                                 D3D12_RESOURCE_STATE_COPY_DEST,
                                 D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
-                            )]);
+                            ));
                         }
+                        rehash.push((shadow, ranges, before, size));
+                    }
+                    if !barriers.is_empty() {
+                        list.ResourceBarrier(&barriers);
+                    }
+                    if !rehash.is_empty() {
+                        // No twin (it cost the card the copy's size again,
+                        // 399 MB in run 75): `before` holds a 128-bit hash
+                        // of each 64 KiB piece.
                         list.SetComputeRootSignature(&work.root);
                         list.SetPipelineState(&work.pso);
-                        list.SetComputeRootShaderResourceView(1, shadow.buffer.GetGPUVirtualAddress());
-                        list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
                         list.SetComputeRootUnorderedAccessView(3, work.differs.0.GetGPUVirtualAddress());
-                        let runs: Vec<crate::shadow::CardSpan> = if whole.iter().any(|s| Arc::ptr_eq(s, shadow)) {
-                            vec![shadow.card_run(0, usize::MAX)]
-                        } else {
-                            ranges.iter().map(|&(a, b)| shadow.card_run(a, b)).collect()
-                        };
-                        // The same pieces in fewer passes (`rehash_runs`).
-                        let runs = if rehash_runs() { crate::shadow::joined_piece_runs(runs) } else { runs };
-                        CARD_PASSES[0].fetch_add(runs.len() as u64, Ordering::Relaxed);
-                        CARD_PASSES[1].fetch_add(runs.iter().map(|r| u64::from(r.pieces)).sum::<u64>(), Ordering::Relaxed);
-                        for run in runs {
-                            let constants = [run.first, run.skew, size as u32, run.pieces, 0, 0];
-                            list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
-                            list.Dispatch(run.pieces.div_ceil(64), 1, 1);
+                        for (shadow, ranges, before, size) in rehash {
+                            list.SetComputeRootShaderResourceView(1, shadow.buffer.GetGPUVirtualAddress());
+                            list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
+                            let runs: Vec<crate::shadow::CardSpan> = if whole.iter().any(|s| Arc::ptr_eq(s, shadow)) {
+                                vec![shadow.card_run(0, usize::MAX)]
+                            } else {
+                                ranges.iter().map(|&(a, b)| shadow.card_run(a, b)).collect()
+                            };
+                            // The same pieces in fewer passes (`rehash_runs`).
+                            let runs = if rehash_runs() { crate::shadow::joined_piece_runs(runs) } else { runs };
+                            CARD_PASSES[0].fetch_add(runs.len() as u64, Ordering::Relaxed);
+                            CARD_PASSES[1].fetch_add(runs.iter().map(|r| u64::from(r.pieces)).sum::<u64>(), Ordering::Relaxed);
+                            for run in runs {
+                                dispatch_card_compare(list, run.first, run.skew, size as u32, run.pieces, 0, 0);
+                            }
                         }
                     }
                     list.Close()?;
@@ -4201,15 +4284,26 @@ impl Host {
                     list.SetComputeRootSignature(&work.root);
                     list.SetPipelineState(&work.pso);
                     list.SetComputeRootUnorderedAccessView(3, work.differs.0.GetGPUVirtualAddress());
+                    let mut last_shadow = 0usize;
                     for r in plan.ranges.iter().filter(|r| r.compared) {
                         let Some((_, Some(before), size)) = r.shadow.card_sides() else {
                             continue;
                         };
-                        let constants = [r.span.first, r.span.skew, size as u32, r.span.pieces, r.at * 4, if flown { 2 } else { 1 }];
-                        list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
-                        list.SetComputeRootShaderResourceView(1, r.shadow.buffer.GetGPUVirtualAddress());
-                        list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
-                        list.Dispatch(r.span.pieces.div_ceil(64), 1, 1);
+                        let key = Arc::as_ptr(&r.shadow) as usize;
+                        if key != last_shadow {
+                            list.SetComputeRootShaderResourceView(1, r.shadow.buffer.GetGPUVirtualAddress());
+                            list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
+                            last_shadow = key;
+                        }
+                        dispatch_card_compare(
+                            list,
+                            r.span.first,
+                            r.span.skew,
+                            size as u32,
+                            r.span.pieces,
+                            r.at * 4,
+                            if flown { 2 } else { 1 },
+                        );
                         CARD_PASSES[2].fetch_add(1, Ordering::Relaxed);
                     }
                     // The fetch inside the flight (`inflight_fetch`): behind
@@ -4231,6 +4325,7 @@ impl Host {
                         list.SetComputeRootUnorderedAccessView(3, inflight.table.0.GetGPUVirtualAddress());
                         list.SetComputeRootUnorderedAccessView(4, inflight.fetched.0.GetGPUVirtualAddress());
                         let mut every = true;
+                        let mut last_fetch_shadow = 0usize;
                         for r in plan.ranges.iter().filter(|r| r.compared) {
                             let Some((_, Some(_), size)) = r.shadow.card_sides() else {
                                 every = false;
@@ -4240,7 +4335,11 @@ impl Host {
                             let constants =
                                 [r.span.first, r.span.skew, size as u32, r.span.pieces, r.at * 4, inflight.landed, inflight.fetched.2, groups];
                             list.SetComputeRoot32BitConstants(0, 8, constants.as_ptr().cast(), 0);
-                            list.SetComputeRootShaderResourceView(1, r.shadow.buffer.GetGPUVirtualAddress());
+                            let key = Arc::as_ptr(&r.shadow) as usize;
+                            if key != last_fetch_shadow {
+                                list.SetComputeRootShaderResourceView(1, r.shadow.buffer.GetGPUVirtualAddress());
+                                last_fetch_shadow = key;
+                            }
                             list.Dispatch(groups, 1, 1);
                         }
                         plan.inflight = every;
@@ -6470,15 +6569,20 @@ impl HostList {
 
     /// A device-local unordered-access buffer of at least `size` bytes for
     /// clamped indirect arguments, reused across executions and resets of the
-    /// list. Smaller buffers replaced mid-list stay alive until
+    /// list at offset 0. Smaller buffers replaced mid-list stay alive until
     /// [`HostList::reset`].
     pub(crate) fn indirect_scratch(&self, size: u64) -> Option<ID3D12Resource> {
         let needed = size.max(64 << 10);
+        let aligned = needed.next_multiple_of(16);
         let mut slot = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner());
         if let Some((buffer, cap)) = &*slot
             && *cap >= needed
         {
-            return Some(buffer.clone());
+            let buffer = buffer.clone();
+            drop(slot);
+            let mut d = self.deferred();
+            d.indirect_used = d.indirect_used.max(aligned);
+            return Some(buffer);
         }
         let prev = slot.as_ref().map_or(0, |(_, cap)| *cap);
         let alloc = prev
@@ -6494,7 +6598,65 @@ impl HostList {
             self.indirect_common(&old_buf);
             self.keep(&old_buf);
         }
+        {
+            let mut d = self.deferred();
+            d.indirect_used = aligned;
+            d.indirect_epoch += 1;
+        }
         Some(buffer)
+    }
+
+    /// Epoch incremented whenever [`HostList::indirect_alloc`] wraps or replaces
+    /// the scratch buffer, letting callers detect invalidated prior slices.
+    pub(crate) fn indirect_epoch(&self) -> u64 {
+        self.deferred().indirect_epoch
+    }
+
+    /// Bump-allocates a 16-byte-aligned non-overlapping `(buffer, dst_offset)`
+    /// slice of at least `size` bytes inside the list's scratch buffer so
+    /// multiple clamped indirect windows stay intact without barriers between.
+    pub(crate) fn indirect_alloc(&self, size: u64) -> Option<(ID3D12Resource, u64)> {
+        const INITIAL_CAP: u64 = 256 << 10;
+        const MAX_BUMP_CAP: u64 = 16 << 20;
+        let aligned = size.max(4).next_multiple_of(16);
+        let at = self.deferred().indirect_used;
+        let mut slot = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((buffer, cap)) = &*slot {
+            if at.saturating_add(aligned) <= *cap {
+                let buffer = buffer.clone();
+                drop(slot);
+                self.deferred().indirect_used = at + aligned;
+                return Some((buffer, at));
+            }
+            if *cap >= MAX_BUMP_CAP && aligned <= *cap {
+                let buffer = buffer.clone();
+                drop(slot);
+                let mut d = self.deferred();
+                d.indirect_used = aligned;
+                d.indirect_epoch += 1;
+                return Some((buffer, 0));
+            }
+        }
+        let prev = slot.as_ref().map_or(0, |(_, cap)| *cap);
+        let alloc = prev
+            .saturating_mul(2)
+            .max(aligned)
+            .max(INITIAL_CAP)
+            .next_multiple_of(64 << 10);
+        let buffer = host()?.uav_buffer(alloc)?;
+        name(&buffer, || format!("indirect arguments {alloc:#x}"));
+        let old = slot.replace((buffer.clone(), alloc));
+        drop(slot);
+        if let Some((old_buf, _)) = old {
+            self.indirect_common(&old_buf);
+            self.keep(&old_buf);
+        }
+        {
+            let mut d = self.deferred();
+            d.indirect_used = aligned;
+            d.indirect_epoch += 1;
+        }
+        Some((buffer, 0))
     }
 
     /// Moves `scratch` back to the common state if a clamp left it readable
@@ -6667,20 +6829,14 @@ impl HostList {
 }
 
 /// Whether a submission's refreshes of host copies run on several threads,
-/// a copy to a thread (`VICTORY_WIDE_REFRESH=1`; off by default).
+/// a copy to a thread (`VICTORY_WIDE_REFRESH=0` disables; on by default).
 ///
-/// A submission brings some sixty copies up to date, one after the other
-/// on the submitting thread: for each, the pages the title wrote are asked
-/// for and read through the kernel into the copy. That is the frame line's
-/// "copies", 45-50 ms a frame, and the copies have nothing to do with one
-/// another: each refresh writes its own copy and its own notes, and reads
-/// title memory. With the switch the copies of a flush (four or more) are
-/// spread over the threads kept for the snapshots (`crate::shadow::wide`).
-/// The write-watch journal and the guards are behind their own locks, as
-/// they are for the title's threads.
+/// A submission brings some sixty copies up to date across worker threads
+/// (`crate::shadow::wide`): each refresh reads title memory and updates its
+/// own copy while the write-watch journal and guards synchronize per lock.
 fn wide_refresh() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_REFRESH").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_REFRESH").is_none_or(|v| v != "0"))
 }
 
 /// A submission's refreshes not done yet, merged per buffer copy into the
@@ -6917,15 +7073,134 @@ fn read_pieces(src: *const u8, dst: *mut u8, len: usize) {
     });
 }
 
+#[cfg(target_arch = "x86_64")]
+mod fast_copy_impl {
+    use std::cell::Cell;
+    use std::sync::{Once, OnceLock};
+    use windows_sys::Win32::Foundation::{EXCEPTION_ACCESS_VIOLATION, NTSTATUS};
+    use windows_sys::Win32::System::Diagnostics::Debug::{
+        AddVectoredExceptionHandler, EXCEPTION_CONTINUE_EXECUTION, EXCEPTION_CONTINUE_SEARCH,
+        EXCEPTION_POINTERS,
+    };
+
+    // `[start_rip, end_rip, fail_rip]` while a probe is executing on this thread;
+    // `start_rip == 0` outside `copy`.
+    std::thread_local! {
+        static TRAP: Cell<[u64; 3]> = const { Cell::new([0; 3]) };
+    }
+
+    unsafe extern "system" fn on_fault(info: *mut EXCEPTION_POINTERS) -> i32 {
+        let [start, end, fail] = TRAP.with(Cell::get);
+        if start == 0 {
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+        // SAFETY: the OS passes valid exception and context records.
+        unsafe {
+            let record = &*(*info).ExceptionRecord;
+            if record.ExceptionCode != EXCEPTION_ACCESS_VIOLATION as NTSTATUS {
+                return EXCEPTION_CONTINUE_SEARCH;
+            }
+            let context = &mut *(*info).ContextRecord;
+            let rip = context.Rip;
+            if rip >= start && rip < end {
+                if record.NumberParameters >= 2
+                    && record.ExceptionInformation[0] == 1
+                    && crate::watch::open_guarded(record.ExceptionInformation[1])
+                {
+                    return EXCEPTION_CONTINUE_EXECUTION;
+                }
+                context.Rip = fail;
+                return EXCEPTION_CONTINUE_EXECUTION;
+            }
+        }
+        EXCEPTION_CONTINUE_SEARCH
+    }
+
+    pub(super) fn enabled() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("VICTORY_FAST_COPY").is_none_or(|v| v != "0"))
+    }
+
+    /// Copies `len` bytes from `src` to `dst` in process memory (`dst` must not
+    /// overlap forward within `(src, src + len)`). Access violations inside the
+    /// copy loop are caught cleanly via a priority-1 VEH and return `false`.
+    #[inline(never)]
+    pub(super) unsafe fn copy(src: *const u8, dst: *mut u8, len: usize) -> bool {
+        static HANDLER: Once = Once::new();
+        // SAFETY: `on_fault` only inspects thread-local probe RIP bounds and
+        // opens write guards or jumps to `4:` on an AV inside this probe.
+        HANDLER.call_once(|| unsafe {
+            AddVectoredExceptionHandler(1, Some(on_fault));
+        });
+        TRAP.with(|trap| {
+            let slot = trap.as_ptr();
+            let ok: usize;
+            // SAFETY: `slot` is this thread's live `[u64; 3]`; `start` (`[slot]`)
+            // is zeroed before exiting the asm block on both success and fault.
+            unsafe {
+                std::arch::asm!(
+                    "lea {tmp}, [rip + 2f]",
+                    "mov qword ptr [{slot}], {tmp}",
+                    "lea {tmp}, [rip + 3f]",
+                    "mov qword ptr [{slot} + 8], {tmp}",
+                    "lea {tmp}, [rip + 4f]",
+                    "mov qword ptr [{slot} + 16], {tmp}",
+                    "cld",
+                    "2:",
+                    "rep movsb",
+                    "3:",
+                    "mov {ok:e}, 1",
+                    "jmp 5f",
+                    "4:",
+                    "xor {ok:e}, {ok:e}",
+                    "5:",
+                    "xor {tmp:e}, {tmp:e}",
+                    "mov qword ptr [{slot}], {tmp}",
+                    slot = in(reg) slot,
+                    tmp = out(reg) _,
+                    ok = out(reg) ok,
+                    inout("rsi") src => _,
+                    inout("rdi") dst => _,
+                    inout("rcx") len => _,
+                    options(nostack),
+                );
+            }
+            ok != 0
+        })
+    }
+}
+
 /// Reads title memory at `src` into `dst`; false if a page of it is not
 /// readable.
 pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
     read(src, dst.as_mut_ptr(), dst.len())
 }
 
-/// Copies `len` bytes from `src` to `dst` unless a source page is not
-/// readable.
+/// Copies `len` bytes from `src` to `dst` unless a source or destination page
+/// is not accessible. Uses an in-process fault-guarded copy when safe
+/// (`VICTORY_FAST_COPY=0` forces `ReadProcessMemory` always).
 fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
+    if len == 0 {
+        return true;
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        let s = src as usize;
+        let d = dst as usize;
+        let non_overlapping_forward = d <= s || d >= s.saturating_add(len);
+        if !src.is_null()
+            && !dst.is_null()
+            && s.checked_add(len).is_some()
+            && d.checked_add(len).is_some()
+            && non_overlapping_forward
+            && fast_copy_impl::enabled()
+            && let Some(_reading) = crate::watch::title_memory_reading_now()
+        {
+            // SAFETY: non-overlapping forward ranges held stable under `_reading`,
+            // with page-fault fallback in `fast_copy_impl::copy`.
+            return unsafe { fast_copy_impl::copy(src, dst, len) };
+        }
+    }
     use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let mut done = 0;

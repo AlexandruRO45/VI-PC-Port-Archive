@@ -998,6 +998,19 @@ fn install() {
     });
 }
 
+/// Opens a write-guarded block at `at` (or returns true if `at` is already
+/// committed read-write) when an in-process copy hits a write fault.
+pub(crate) fn open_guarded(at: usize) -> bool {
+    let mut g = guards();
+    if open(&mut g, at, at + 1) {
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::GuardFaults, 1);
+        true
+    } else {
+        writable(at)
+    }
+}
+
 /// Whether `at` is committed read-write memory now.
 fn writable(at: usize) -> bool {
     use windows_sys::Win32::System::Memory::{
