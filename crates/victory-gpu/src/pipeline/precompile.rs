@@ -309,7 +309,7 @@ fn replay(line: &str, shaders: &Path, report: &mut Report) {
 }
 
 /// The stage names a host pipeline is made from, as the statics `Shader` holds.
-fn static_stage(stage: &str) -> Option<&'static str> {
+pub(crate) fn static_stage(stage: &str) -> Option<&'static str> {
     match stage {
         "vertex" => Some("vertex"),
         "pixel" => Some("pixel"),
@@ -324,7 +324,7 @@ fn static_stage(stage: &str) -> Option<&'static str> {
 /// The state is everything after `state=`, not one whitespace-separated field:
 /// it is a list of numbers with spaces between them, so a line cannot be read by
 /// splitting the whole of it on spaces.
-fn parse(line: &str) -> Option<(&str, Option<Vec<(&str, String)>>, Option<&str>)> {
+pub(crate) fn parse(line: &str) -> Option<(&str, Option<Vec<(&str, String)>>, Option<&str>)> {
     let (head, state) = line.split_once(" state=")?;
     let state = (state != "-").then_some(state);
     let mut kind = None;
