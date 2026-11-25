@@ -1094,21 +1094,59 @@ const LATE_LIST_TRIES: u32 = 8;
 /// Page lists filled after their request started (written late).
 static LATE_LISTS: AtomicU32 = AtomicU32::new(0);
 
+const COMMAND_NONE: i32 = -1;
+
+/// Header of the queue error record (`failure_count` plus the first-failure
+/// status and `COMMAND_NONE` tag).
+#[repr(C)]
+struct EmptyErrorRecord {
+    failure_count: u32,
+    _pad: u32,
+    hresult: HRESULT,
+    command_type: i32,
+}
+
+extern "system" fn get_error_event(_this: QueueRef) -> *mut c_void {
+    // shortcut: no queue failure event is allocated; a caller checking for one
+    // receives null.
+    static LOGGED: AtomicBool = AtomicBool::new(false);
+    if !LOGGED.swap(true, Ordering::Relaxed) {
+        tracing::debug!("dstorage: GetErrorEvent returned null (stub)");
+    }
+    std::ptr::null_mut()
+}
+
+extern "system" fn retrieve_error_record(_this: QueueRef, record: *mut EmptyErrorRecord) {
+    if record.is_null() {
+        return;
+    }
+    // SAFETY: caller passes writable storage for the record header; the union
+    // payload stays ignored while `failure_count == 0` and `command_type == COMMAND_NONE`.
+    unsafe {
+        record.write(EmptyErrorRecord {
+            failure_count: 0,
+            _pad: 0,
+            hresult: S_OK,
+            command_type: COMMAND_NONE,
+        });
+    }
+}
+
 /// Slots by the 2020 order, which the argument shapes at Grand Theft Auto
 /// VI's call sites match (0x18, 0x20, 0x30 and 0x40 are called).
 static QUEUE_VTABLE: Methods<12> = Methods([
     missing::<0> as *const (),
     add_ref_instance::<Queue> as *const (),
     release::<Queue> as *const (),
-    enqueue_request as *const (), // 0x18
-    enqueue_status as *const (),  // 0x20
-    missing::<5> as *const (),    // 0x28 (2020: fence signal)
-    submit as *const (),          // 0x30
-    missing::<7> as *const (),    // 0x38 (2020: cancel by tag)
-    close as *const (),           // 0x40
-    missing::<9> as *const (),    // 0x48 (2020: error event)
-    missing::<10> as *const (),   // 0x50 (2020: error record)
-    missing::<11> as *const (),   // 0x58 (2020: queue info)
+    enqueue_request as *const (),       // 0x18
+    enqueue_status as *const (),        // 0x20
+    missing::<5> as *const (),          // 0x28 (2020: fence signal)
+    submit as *const (),                // 0x30
+    missing::<7> as *const (),          // 0x38 (2020: cancel by tag)
+    close as *const (),                 // 0x40
+    get_error_event as *const (),       // 0x48
+    retrieve_error_record as *const (), // 0x50
+    missing::<11> as *const (),         // 0x58 (2020: queue info)
 ]);
 
 pub(crate) fn module() -> HleModule {
@@ -1791,5 +1829,35 @@ mod tests {
         }
         assert_eq!(xmem::XMemFreePhysicalPages(3, a.as_ptr()), 1);
         assert_eq!(xmem::XMemFreePhysicalPages(1, b.as_ptr()), 1);
+    }
+
+    #[test]
+    fn error_slots_return_null_event_and_empty_record() {
+        let queue = new_queue(0);
+        let get_event: extern "system" fn(*mut c_void) -> *mut c_void = call(queue, 0x48);
+        let retrieve: extern "system" fn(*mut c_void, *mut EmptyErrorRecord) = call(queue, 0x50);
+
+        assert!(get_event(queue).is_null());
+        retrieve(queue, std::ptr::null_mut());
+
+        const SIZE: usize = size_of::<EmptyErrorRecord>();
+        #[repr(C, align(8))]
+        struct Guarded {
+            bytes: [u8; SIZE + 16],
+        }
+        let mut buf = Guarded {
+            bytes: [0xCC; SIZE + 16],
+        };
+        let ptr = buf.bytes.as_mut_ptr().cast::<EmptyErrorRecord>();
+        retrieve(queue, ptr);
+        // SAFETY: `ptr` points to the initialized `EmptyErrorRecord` prefix of `buf`.
+        let rec = unsafe { &*ptr };
+        assert_eq!(rec.failure_count, 0);
+        assert_eq!(rec.hresult, S_OK);
+        assert_eq!(rec.command_type, COMMAND_NONE);
+        assert!(buf.bytes[SIZE..].iter().all(|&b| b == 0xCC));
+
+        let rel: extern "system" fn(*mut c_void) -> u32 = call(queue, 0x10);
+        assert_eq!(rel(queue), 0);
     }
 }
