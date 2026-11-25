@@ -7357,6 +7357,52 @@ fn swap_format(format: DXGI_FORMAT) -> Option<DXGI_FORMAT> {
 
 const BUFFERS: u32 = 2;
 
+#[derive(Default)]
+struct PresentTimes {
+    path: std::ffi::OsString,
+    last: Option<std::time::Instant>,
+    intervals: Vec<u64>,
+}
+
+impl PresentTimes {
+    fn frame(&mut self) -> std::io::Result<()> {
+        let now = std::time::Instant::now();
+        if let Some(last) = self.last.replace(now) {
+            self.intervals.push(now.duration_since(last).as_micros() as u64);
+        }
+        if (self.intervals.len() + 1) % 300 != 0 {
+            return Ok(());
+        }
+        self.write()
+    }
+
+    fn write(&self) -> std::io::Result<()> {
+        use std::io::Write;
+        let mut sorted = self.intervals.clone();
+        sorted.sort_unstable();
+        // Nearest-rank cumulative percentiles; the first frame has no interval.
+        let percentile = |p: usize| {
+            sorted.get((sorted.len() * p).div_ceil(100).saturating_sub(1)).copied().unwrap_or(0)
+        };
+        let (p50, p95, p99, max) = (percentile(50), percentile(95), percentile(99), percentile(100));
+        let mut out = std::io::BufWriter::new(std::fs::File::create(&self.path)?);
+        writeln!(out, "frame,interval_us,p50_us,p95_us,p99_us,max_us,dropped_estimate")?;
+        writeln!(out, "1,,{p50},{p95},{p99},{max},0")?;
+        let (mut total, mut dropped) = (0u64, 0u64);
+        for (i, &us) in self.intervals.iter().enumerate() {
+            // Missing median-sized slots, rounded to nearest; not DXGI drop telemetry.
+            let missed = ((us as f64 / p50.max(1) as f64).round() as u64).saturating_sub(1);
+            total = total.saturating_add(us);
+            dropped = dropped.saturating_add(missed);
+            writeln!(out, "{},{us},{p50},{p95},{p99},{max},{missed}", i + 2)?;
+        }
+        // Summary: frame = total:N, interval_us = first-to-last Present span.
+        writeln!(out, "total:{},{total},{p50},{p95},{p99},{max},{dropped}",
+            self.intervals.len() + 1)?;
+        out.flush()
+    }
+}
+
 struct Presenter {
     swap_chain: IDXGISwapChain3,
     width: u32,
@@ -7369,6 +7415,8 @@ struct Presenter {
     ahead: Vec<(HostList, u64)>,
     hwnd: HWND,
     meter: Meter,
+    times: Option<PresentTimes>,
+    sync_interval: u32,
 }
 
 /// The frame rate, shown in the window's caption every second and logged
@@ -7800,7 +7848,15 @@ impl Host {
             if let Some((buffer, footprint)) = capture {
                 crate::capture::save_read_back(frame, &buffer, &footprint);
             }
-            let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            let presented = p.swap_chain.Present(p.sync_interval, DXGI_PRESENT(0));
+            if presented.is_ok() {
+                if let Some(times) = &mut p.times {
+                    if let Err(error) = times.frame() {
+                        tracing::warn!(%error, "VICTORY_PRESENT_TIMES disabled after write failure");
+                        p.times = None;
+                    }
+                }
+            }
             p.meter.frame(p.hwnd);
             #[cfg(feature = "diagnostics")]
             return Some(probe.is_some_and(|b| crate::capture::black(&b)));
@@ -7852,6 +7908,10 @@ impl Host {
                 ahead: Vec::new(),
                 hwnd,
                 meter: Meter::new(),
+                times: std::env::var_os("VICTORY_PRESENT_TIMES")
+                    .map(|path| PresentTimes { path, ..Default::default() }),
+                sync_interval: std::env::var("VICTORY_PRESENT_SYNC").ok()
+                    .and_then(|v| v.parse::<u32>().ok()).filter(|v| *v <= 4).unwrap_or(0),
             })
         }
     }
