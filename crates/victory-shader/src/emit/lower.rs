@@ -1088,6 +1088,20 @@ impl SubDword {
     }
 }
 
+/// Whether a program must ask the driver for the console's wave size:
+/// console lanes, one wave sharing LDS, or a wave64 program on a host that
+/// runs 64 lanes. Without the last case the driver may pick 32-lane waves
+/// and a scalar counted in a divergent loop differs between the halves.
+fn wants_wave_size(
+    console_lanes: bool,
+    one_wave: bool,
+    lds_dwords: u32,
+    native_wave64: bool,
+    runs64: bool,
+) -> bool {
+    console_lanes || one_wave && lds_dwords > 0 || native_wave64 && runs64
+}
+
 impl<'a> Lower<'a> {
     fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>, numeric_selects: bool) -> Self {
         let p = x.p;
@@ -1226,7 +1240,13 @@ impl<'a> Lower<'a> {
             }
             if split {
                 s.wave_size = Some(32);
-            } else if console_lanes || one_wave && s.lds_dwords > 0 {
+            } else if wants_wave_size(
+                console_lanes,
+                one_wave,
+                s.lds_dwords,
+                x.native.wave64,
+                x.target.runs(64),
+            ) {
                 s.wave_size = Some(wave);
             }
         }
@@ -13033,6 +13053,18 @@ mod tests {
     use crate::{ShaderError, io, ir, resource, structure};
 
     const S_ENDPGM: u32 = 0xBF81_0000;
+
+    /// A wave64 program keeps the console's wave on a host that runs 64
+    /// lanes; the existing reasons still ask for it.
+    #[test]
+    fn a_wave64_program_keeps_its_wave_on_a_64_lane_host() {
+        assert!(super::wants_wave_size(false, false, 0, true, true));
+        assert!(!super::wants_wave_size(false, false, 0, true, false));
+        assert!(!super::wants_wave_size(false, false, 0, false, true));
+        assert!(super::wants_wave_size(true, false, 0, false, false));
+        assert!(super::wants_wave_size(false, true, 1, false, false));
+        assert!(!super::wants_wave_size(false, true, 0, false, false));
+    }
 
     /// Mesh output size as the validator counts it (53 programs were over
     /// the limit; they now fail as unsupported).
