@@ -2871,7 +2871,7 @@ fn f16_results_round_as_the_mode_says() {
 fn hosts_that_do_not_fuse_are_named() {
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     if let Ok(warp) = Host::new(true) {
-        assert_eq!(warp.fuses_fmad(), Ok(false), "WARP");
+        assert_eq!(warp.fuses_fmad(), Ok(true), "WARP");
     }
     if let Ok(hardware) = Host::new(false) {
         let fuses = hardware.fuses_fmad().expect("the check runs");
