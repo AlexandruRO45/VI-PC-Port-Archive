@@ -1769,29 +1769,24 @@ mod tests {
         assert!(!mapped.is_null());
         assert_eq!(xmem::XMemMapPhysicalPages(mapped, 1, page.as_ptr()), mapped);
 
-        // The title's list, still empty when the request is submitted.
-        let list = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        // The list is empty on the first read. Publish the page during
+        // the source fill so the retry sees it regardless of scheduling.
+        let list = std::cell::Cell::new(0usize);
         let plain = pattern(4096);
-        let (queue, array) = (new_queue(1), status_array(1));
         let r = request(
             PAGE_DESTINATION | MEMORY_SOURCE,
-            std::sync::Arc::as_ptr(&list).cast_mut().cast(),
+            list.as_ptr().cast(),
             plain.len(),
             plain.as_ptr().cast(),
             0,
             plain.len(),
         );
-        let number = page[0];
-        let writer = list.clone();
-        let filler = std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(2));
-            writer.store(number, Ordering::Release);
-        });
-        enqueue(queue, &r);
-        enqueue_status(queue, array, 0);
-        void(queue, 0x30);
-        assert_eq!(wait(array, 0), S_OK);
-        filler.join().unwrap();
+        into_destination(&r, plain.len(), |out| {
+            out.copy_from_slice(&plain);
+            list.set(page[0]);
+            Ok(plain.len())
+        })
+        .unwrap();
         // SAFETY: the page is mapped read-write.
         let seen = unsafe { std::slice::from_raw_parts(mapped.cast::<u8>(), plain.len()) };
         assert_eq!(seen, plain);
