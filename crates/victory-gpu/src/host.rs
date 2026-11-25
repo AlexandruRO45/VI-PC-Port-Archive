@@ -1164,7 +1164,7 @@ fn more_line(frames: f64) -> String {
         n(STALE_COPIES),
         n(STALE_SPANS),
         crate::watch::asking_cost_line(frames),
-        crate::queue::join_line(frames),
+        String::new(),
         crate::draw::record_line(frames),
     )
 }
@@ -1335,6 +1335,7 @@ pub(crate) fn host() -> Option<&'static Host> {
 
 fn create() -> windows::core::Result<Host> {
     crate::drvwatch::start();
+    crate::spread::start();
     // SAFETY: plain D3D12 object creation with valid descriptions.
     unsafe {
         // The debug layer only in builds with diagnostics.
@@ -1605,6 +1606,9 @@ pub(crate) struct HostList {
     /// The pair of timestamps its run is timed with since its last reset
     /// (`crate::cardmeter`), or none.
     meter: AtomicU32,
+    /// With `crate::cardmeter::pipelines`: the pair of the pipeline bound
+    /// last, open until the next one is bound or the list closes.
+    pipeline_meter: AtomicU32,
     /// The texts of the markers `note_op` set, in order (for device-removed
     /// data without marker texts), with the host GPU range a copy reads.
     #[cfg(feature = "diagnostics")]
@@ -6143,18 +6147,10 @@ pub(crate) fn late_met(wait: &crate::list::ValueWait) -> bool {
     wait.met()
 }
 
-/// [`late_met`] without its settle, for the look ahead of a queue's line
-/// (`crate::queue`'s `VICTORY_JOIN_PARTS`): whether memory holds the value
-/// now, or a bottom-of-pipe write of a flight in the air (or being landed)
-/// writes exactly it. False wherever [`late_met`] would have to settle to
-/// know: the line then runs as it did, with the part before sent first.
+/// [`late_met`] without its settle: whether a bottom-of-pipe write of a
+/// flight in the air, or of one being landed, is known to meet `wait`.
+/// False says nothing about what else the flights may write there.
 pub(crate) fn late_met_known(wait: &crate::list::ValueWait) -> bool {
-    if wait.met() {
-        return true;
-    }
-    if !late() {
-        return false;
-    }
     let (address, bytes) = wait.place();
     let line = line();
     let writes = line.in_hand.iter().map(|(at, what, n)| (at, what, n)).chain(line.line.iter().filter_map(|item| match item {
@@ -6162,67 +6158,17 @@ pub(crate) fn late_met_known(wait: &crate::list::ValueWait) -> bool {
         _ => None,
     }));
     for (at, what, n) in writes {
-        if *at >= address + bytes || address >= *at + *n {
-            continue;
-        }
-        match what {
-            crate::queue::Written::Value(v) if *at == address && *n >= bytes && wait.holds_for(*v) => return true,
-            _ => return false,
+        if let crate::queue::Written::Value(v) = what
+            && *at == address
+            && *n >= bytes
+            && wait.holds_for(*v)
+        {
+            LATE_STATS[13].fetch_add(1, Ordering::Relaxed);
+            return true;
         }
     }
     false
 }
-
-/// Why a part of a queue's line is not joined to the parts before it in
-/// one submission (`crate::queue`'s `VICTORY_JOIN_PARTS`), if so:
-/// [`JOIN_AIR`] its preparing would wait for flights in the air (joined,
-/// the parts before would wait with it); [`JOIN_DECLARED`] it reads on the
-/// CPU, or runs a step of ours, where the parts before write on the card
-/// (their declared shader writes, bottom-of-pipe writes, read-backs):
-/// as a submission of its own it waits for them to land; [`JOIN_REFRESH`]
-/// (unless `refresh_ok`) it brings up to date a range the parts before
-/// declare their shaders write. `prev` are the runs joined so far.
-pub(crate) fn join_stop(prev: &[&HostList], next: &[&HostList], refresh_ok: bool) -> Option<usize> {
-    if late_blocked(next, false).is_some() {
-        return Some(JOIN_AIR);
-    }
-    let mut ours = Vec::new();
-    for list in prev {
-        let deferred = list.deferred();
-        for step in &deferred.copies {
-            if let Step::GpuWrite(_, at, n) = step {
-                ours.push((*at, *at + *n));
-            }
-        }
-        ours.extend(deferred.writes.iter().map(|&(at, _, n)| (at, at + n)));
-    }
-    ours.extend(read_back_spans(prev));
-    let mut written = Vec::new();
-    join_ranges(&mut written, ours);
-    if written.is_empty() {
-        return None;
-    }
-    if blocked_by(&written, next, false).is_some() {
-        return Some(JOIN_DECLARED);
-    }
-    if !refresh_ok {
-        for list in next {
-            for step in &list.deferred().copies {
-                if let Step::Refresh(_, at, n) = step
-                    && touches(&written, *at, *at + *n)
-                {
-                    return Some(JOIN_REFRESH);
-                }
-            }
-        }
-    }
-    None
-}
-
-/// The reasons of [`join_stop`].
-pub(crate) const JOIN_AIR: usize = 0;
-pub(crate) const JOIN_DECLARED: usize = 1;
-pub(crate) const JOIN_REFRESH: usize = 2;
 
 /// Settles the flights in the air, if any ([`Host::settle`]), for reason
 /// `why` (one of the `WHY_` places). Not from inside a submission.
@@ -7225,6 +7171,7 @@ impl Host {
                 prof: Mutex::default(),
                 bar: crate::barstat::Track::new(),
                 meter: AtomicU32::new(u32::MAX),
+                pipeline_meter: AtomicU32::new(u32::MAX),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
@@ -10750,7 +10697,12 @@ impl HostList {
             self.indirect_common(&scratch);
         }
         self.card_budget_out();
-        crate::cardmeter::end(&self.list, crate::cardmeter::Span::from_raw(self.meter.swap(u32::MAX, Ordering::Relaxed)));
+        crate::cardmeter::end(&self.list, crate::cardmeter::Span::from_raw(self.pipeline_meter.swap(u32::MAX, Ordering::Relaxed)));
+        crate::cardmeter::end_named(
+            &self.list,
+            crate::cardmeter::Span::from_raw(self.meter.swap(u32::MAX, Ordering::Relaxed)),
+            &self.pipelines.lock().unwrap_or_else(|e| e.into_inner()),
+        );
         #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
             let count = (self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32).min(STAMPS - 1);
@@ -11250,11 +11202,18 @@ impl HostList {
             && self.twins.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
     }
 
-    /// Notes a pipeline the list binds.
+    /// Notes a pipeline the list binds; called where it is bound.
     pub(crate) fn used_pipeline(&self, name: &str) {
-        let mut pipelines = self.pipelines.lock().unwrap_or_else(|e| e.into_inner());
-        if !pipelines.contains(name) {
-            pipelines.insert(name.to_owned());
+        {
+            let mut pipelines = self.pipelines.lock().unwrap_or_else(|e| e.into_inner());
+            if !pipelines.contains(name) {
+                pipelines.insert(name.to_owned());
+            }
+        }
+        if crate::cardmeter::pipelines() {
+            // The pipeline before it ends here on the card's clock.
+            crate::cardmeter::end(&self.list, crate::cardmeter::Span::from_raw(self.pipeline_meter.swap(u32::MAX, Ordering::Relaxed)));
+            self.pipeline_meter.store(crate::cardmeter::begin_named(&self.list, name).raw(), Ordering::Relaxed);
         }
     }
 
@@ -11790,6 +11749,16 @@ impl HostList {
         });
         let backs = deferred.backs.iter().map(|(_, at, _)| (*at, crate::results::READ_BACK));
         writes.chain(backs).collect()
+    }
+
+    /// Whether the list, once it has run, stores at `address` a value of
+    /// `bytes` bytes or more for which `holds` says yes (one of its
+    /// bottom-of-pipe writes, as [`late_met`] reads them of a flight).
+    pub(crate) fn will_write(&self, address: usize, bytes: usize, holds: impl Fn(u64) -> bool) -> bool {
+        self.deferred()
+            .writes
+            .iter()
+            .any(|(at, what, n)| *at == address && *n >= bytes && matches!(what, crate::queue::Written::Value(v) if holds(*v)))
     }
 
     /// A mapped upload buffer of `size` bytes, alive until the list is
@@ -12378,9 +12347,33 @@ fn wide_refresh() -> bool {
 /// before they were submitted. A title buffer copy of ours takes its
 /// bytes out of what counts as up to date ([`Batch::title_wrote`]); any
 /// other step that writes title memory takes everything out.
+///
+/// `VICTORY_REFRESH_ONCE=alt`: twenty seconds with, twenty without, in
+/// turn, each change said in the log, so that one run measures both in
+/// the same scene (two runs do not stand in the same scene at the same
+/// second: runs 228 and 229).
 fn refresh_once() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_REFRESH_ONCE").is_some_and(|v| v == "1"))
+    /// 0 off, 1 on, 2 in turn.
+    static MODE: OnceLock<u8> = OnceLock::new();
+    match *MODE.get_or_init(|| match std::env::var("VICTORY_REFRESH_ONCE").as_deref() {
+        Ok("1") => 1,
+        Ok("alt") => 2,
+        _ => 0,
+    }) {
+        0 => false,
+        1 => true,
+        _ => {
+            let on = (now_us() / 20_000_000) % 2 == 1;
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if LAST.swap(u8::from(on), Ordering::Relaxed) != u8::from(on) {
+                tracing::info!(
+                    "refreshes once a submission from now (VICTORY_REFRESH_ONCE=alt): {}",
+                    if on { "ON" } else { "off, as usual" }
+                );
+            }
+            on
+        }
+    }
 }
 
 /// A submission's refreshes not done yet, merged per buffer copy into the

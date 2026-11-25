@@ -38,6 +38,7 @@ mod bus;
 mod drvwatch;
 #[cfg(windows)]
 mod early;
+mod spread;
 #[cfg(windows)]
 mod draw;
 pub mod dxgi;
