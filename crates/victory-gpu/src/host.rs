@@ -8975,13 +8975,21 @@ impl Batch {
 
     /// Brings `[from, to)` of a copy up to date, timed.
     fn update(shadow: &crate::shadow::Shadow, from: usize, to: usize) {
+        let us = Self::update_counting_bytes(shadow, from, to);
+        PREPARING[0].fetch_add(us, Ordering::Relaxed);
+    }
+
+    /// [`Self::update`] without adding its time to the frame line (the
+    /// caller counts the time once, for refreshes run side by side); its
+    /// microseconds come back.
+    fn update_counting_bytes(shadow: &crate::shadow::Shadow, from: usize, to: usize) -> u64 {
         let started = std::time::Instant::now();
         let copied = shadow.update(from, to - from);
         let us = started.elapsed().as_micros() as u64;
         #[cfg(feature = "diagnostics")]
         crate::copystat::range(from, to - from, us, 0);
-        PREPARING[0].fetch_add(us, Ordering::Relaxed);
         PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+        us
     }
 
     /// Whether `staging` is still to be refreshed in this submission (and
@@ -9016,17 +9024,23 @@ impl Batch {
         if wide_refresh() && self.refreshes.len() >= 4 {
             // Each copy on its own, several at a time: a copy's refresh
             // writes that copy and reads title memory, nothing of another's.
-            // The time counted is the time it took, not the threads' sum.
+            // The time counted is the time it took, not the threads' sum:
+            // the jobs count bytes only, and the time is added once. (It
+            // was the threads' sum less the time taken, subtracted from the
+            // counter afterwards, which the frame line may have taken to 0
+            // meanwhile: the counter then wrapped.)
             let started = std::time::Instant::now();
-            let before = PREPARING[0].load(Ordering::Relaxed);
             let jobs: Vec<Box<dyn FnOnce() + Send>> = self
                 .refreshes
                 .drain(..)
-                .map(|(shadow, from, to)| Box::new(move || Self::update(&shadow, from, to)) as Box<dyn FnOnce() + Send>)
+                .map(|(shadow, from, to)| {
+                    Box::new(move || {
+                        Self::update_counting_bytes(&shadow, from, to);
+                    }) as Box<dyn FnOnce() + Send>
+                })
                 .collect();
             crate::shadow::wide_run(jobs);
-            let summed = PREPARING[0].load(Ordering::Relaxed).saturating_sub(before);
-            PREPARING[0].fetch_sub(summed.saturating_sub(started.elapsed().as_micros() as u64), Ordering::Relaxed);
+            PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
         } else {
             for (shadow, from, to) in self.refreshes.drain(..) {
                 Self::update(&shadow, from, to);
