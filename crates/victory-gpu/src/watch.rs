@@ -717,8 +717,9 @@ pub fn writing(at: usize, len: usize) -> Writing {
 /// necessarily described by a single VirtualQuery result.
 ///
 /// # Safety
-/// `address` must be the base of an allocation owned by the caller, with
-/// the same lifetime requirements as VirtualFree(MEM_RELEASE).
+/// `address` must point into a live private allocation owned by the caller,
+/// with the same lifetime requirements as VirtualFree(MEM_RELEASE). Only
+/// its base address is accepted for release; interior addresses are rejected.
 pub unsafe fn release_title_allocation(address: *mut std::ffi::c_void) -> bool {
     use windows_sys::Win32::System::Memory::{
         MEM_PRIVATE, MEM_RELEASE, MEMORY_BASIC_INFORMATION, VirtualFree, VirtualQuery,
@@ -726,6 +727,8 @@ pub unsafe fn release_title_allocation(address: *mut std::ffi::c_void) -> bool {
 
     let base = address as usize;
     let mut end = base;
+    // SAFETY: this C structure consists of integers and raw pointers;
+    // zero is valid for every field before VirtualQuery fills it.
     let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
     loop {
         // SAFETY: valid output buffer for the query.
@@ -1285,12 +1288,15 @@ pub(crate) mod tests {
         assert!(t.changed(p / PAGE + 1));
         assert!(!t.changed(p / PAGE));
         // A rejected interior release must not dirty page zero.
+        // SAFETY: the interior address belongs to our live allocation;
+        // the release helper rejects non-base addresses.
         assert!(!unsafe { release_title_allocation((p + PAGE) as *mut _) });
         assert!(!t.changed(p / PAGE));
         assert_eq!(t.take(p + PAGE, p + 2 * PAGE), [(p + PAGE, p + 2 * PAGE)]);
         // Open the second page, then take the first one again if necessary.
         drop(writing(p + PAGE, PAGE));
         assert!(!t.changed(p / PAGE));
+        // SAFETY: p is the base of our live allocation and we own its lifetime.
         assert!(unsafe { release_title_allocation(p as *mut _) });
         assert!(t.changed(p / PAGE) && t.changed(p / PAGE + 1));
         assert_eq!(t.take_split(p, p + 2 * PAGE), (vec![], vec![(p, p + 2 * PAGE)]));
