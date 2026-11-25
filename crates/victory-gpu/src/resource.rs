@@ -2374,7 +2374,6 @@ mod tests {
             let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", TEST, "--nocapture"])
                 .env(CHILD, "1")
-                .env("VICTORY_D3D12_WARP", "1")
                 .output()
                 .unwrap();
             let stdout = String::from_utf8_lossy(&output.stdout);
@@ -2387,8 +2386,8 @@ mod tests {
             return;
         }
 
-        #[cfg(all(windows, feature = "diagnostics"))]
-        if let Some(host) = crate::host::host() {
+        #[cfg(windows)]
+        if let Some(device) = crate::host::test_warp_device() {
             use windows::Win32::Graphics::Direct3D12::*;
             use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
             use windows::core::Interface;
@@ -2414,8 +2413,8 @@ mod tests {
             };
             // SAFETY: live device, valid descriptions and a null result pointer for validation.
             let hr = unsafe {
-                (host.device.vtable().CreateCommittedResource)(
-                    host.device.as_raw(),
+                (device.vtable().CreateCommittedResource)(
+                    device.as_raw(),
                     &heap,
                     D3D12_HEAP_FLAG_NONE,
                     &desc,
@@ -2427,6 +2426,8 @@ mod tests {
             };
             assert_eq!(hr.0, object::S_FALSE);
             println!("Native WARP returned S_FALSE for the buffer probe");
+        } else {
+            println!("Native WARP unavailable for the buffer probe");
         }
 
         static CALLS: AtomicUsize = AtomicUsize::new(0);
