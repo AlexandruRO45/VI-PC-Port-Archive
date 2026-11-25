@@ -1902,13 +1902,20 @@ static MADE: Mutex<Option<(u64, std::collections::HashMap<View, Made>)>> = Mutex
 /// Above this many entries the frame's map is dropped rather than grown.
 const MADE_MOST: usize = 1 << 16;
 
-/// `VICTORY_VIEW_CACHE=0`: make every descriptor with the driver, as before
-/// this cache existed.
+/// `VICTORY_VIEW_CACHE=1`: serve a descriptor the frame already made by
+/// copying its 32 bytes instead of asking the driver again.
+///
+/// Off by default, because on the person's own launcher path it is slower:
+/// the map's lock and lookup plus the copy cost 8.6-14.1 µs a descriptor
+/// against the driver's 2.5-7.4 µs for making it again (PR #72's acceptance,
+/// 2026-11-25), so a frame of 20,000-48,000 descriptors paid 100-400 ms more
+/// than it saved. The window that suggested the opposite compared two
+/// different windows, not two costs of the same work: making a descriptor is
+/// not the wall, the number of them is.
 fn view_cache() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        std::env::var_os("VICTORY_VIEW_CACHE")
-            .is_none_or(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
+        std::env::var_os("VICTORY_VIEW_CACHE").is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
     })
 }
 
