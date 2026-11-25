@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use victory_pipeline::{Cache, Converter};
 use victory_shader::emit::{HostShader, StaticSampler, UserData};
 use victory_shader::resource::RootIndexedView;
-use victory_shader::{HwStage, RootType};
+use victory_shader::{HwStage, RootType, ShaderError};
 
 static CACHE: OnceLock<Cache> = OnceLock::new();
 static HITS: AtomicU64 = AtomicU64::new(0);
@@ -92,7 +92,7 @@ fn build() -> &'static [u8; 32] {
 /// The translation of a console shader container, from the cache when
 /// there is one.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
-    let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
+    let translate = |c: &[u8]| translate_one(|| victory_shader::emit::translate(c));
     match CACHE.get() {
         Some(cache) => cached(
             cache,
@@ -102,6 +102,24 @@ pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
             translate,
         ),
         None => translate(container),
+    }
+}
+
+/// A translator assertion is a failure of this shader, like an unsupported instruction.
+/// Leave the panic hook active so that its diagnostic is still available.
+fn translate_one(
+    translate: impl FnOnce() -> Result<HostShader, ShaderError> + std::panic::UnwindSafe,
+) -> Result<HostShader, String> {
+    match std::panic::catch_unwind(translate) {
+        Ok(result) => result.map_err(|error| error.to_string()),
+        Err(panic) => {
+            let reason = panic
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| panic.downcast_ref::<&str>().copied())
+                .unwrap_or("unknown cause");
+            Err(format!("shader translator panicked: {reason}"))
+        }
     }
 }
 
@@ -364,6 +382,20 @@ mod tests {
                 shift: 5,
             }],
         }
+    }
+
+    #[test]
+    fn a_panicking_translation_is_not_cached_and_can_be_retried() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::open(dir.path()).unwrap();
+        let build = [7u8; 32];
+        let container = b"a shader that fails on first translation";
+        let failed = cached(&cache, &build, false, container, |_| {
+            translate_one(|| panic!("forward reference outside a phi"))
+        });
+        assert!(failed.unwrap_err().contains("shader translator panicked: forward reference outside a phi"));
+        let retried = cached(&cache, &build, false, container, |_| translate_one(|| Ok(shader())));
+        assert_eq!(retried, Ok(shader()));
     }
 
     #[test]

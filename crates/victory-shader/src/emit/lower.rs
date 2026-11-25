@@ -1074,10 +1074,7 @@ thread_local! {
 /// thread group gets per-half results. The last resort for programs that
 /// do not translate otherwise.
 pub(super) fn with_local_waves_any<R>(f: impl FnOnce() -> R) -> R {
-    let was = LOCAL_ANY.replace(true);
-    let r = with_local_waves(f);
-    LOCAL_ANY.set(was);
-    r
+    LOCAL_ANY.with(|flag| with_flag(flag, || with_local_waves(f)))
 }
 
 /// Runs `f` with console wave64 programs on 32-lane hosts lowered with each
@@ -1097,10 +1094,35 @@ pub(super) fn with_local_waves_any<R>(f: impl FnOnce() -> R) -> R {
 /// say, with one wave per thread group) gets its half's result. It is used
 /// only for programs that do not translate otherwise.
 pub(super) fn with_local_waves<R>(f: impl FnOnce() -> R) -> R {
-    let was = LOCAL_WAVES.replace(true);
-    let r = f();
-    LOCAL_WAVES.set(was);
-    r
+    LOCAL_WAVES.with(|flag| with_flag(flag, f))
+}
+
+fn with_flag<R>(flag: &std::cell::Cell<bool>, f: impl FnOnce() -> R) -> R {
+    struct Restore<'a> {
+        flag: &'a std::cell::Cell<bool>,
+        previous: bool,
+    }
+
+    impl Drop for Restore<'_> {
+        fn drop(&mut self) {
+            self.flag.set(self.previous);
+        }
+    }
+
+    let _restore = Restore { flag, previous: flag.replace(true) };
+    f()
+}
+
+#[test]
+fn a_failed_local_wave_translation_restores_the_thread_modes() {
+    let result = std::panic::catch_unwind(|| with_local_waves_any(|| {
+        assert!(LOCAL_WAVES.get());
+        assert!(LOCAL_ANY.get());
+        panic!("synthetic translation error");
+    }));
+    assert!(result.is_err());
+    assert!(!LOCAL_WAVES.get());
+    assert!(!LOCAL_ANY.get());
 }
 
 /// `VICTORY_F16_NEAREST=1`: the results of 16-bit float operations (`v_add_f16`,
