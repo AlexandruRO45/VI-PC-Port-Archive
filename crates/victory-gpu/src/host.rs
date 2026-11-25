@@ -3192,7 +3192,7 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
     }
 
     #[test]
-    fn disjoint_partial_refreshes_preserve_pending_gpu_writes() {
+    fn disjoint_partial_refreshes_update_declared_write_snapshots() {
         use crate::watch::{PAGE, tests::{free, pool}};
 
         let Some(host) = crate::host::host() else {
@@ -3204,31 +3204,39 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         let copy = crate::shadow::find(title as u64, PAGE as u64).unwrap();
         assert_eq!(copy.update(title, PAGE), PAGE);
         let busy = title + 32;
+        // The submission is still preparing. An earlier list declared this
+        // range writable, but no GPU work in this batch has run yet.
         copy.writing(busy, 4);
-        for (offset, value) in [(4, 11u8), (16, 22), (32, 33), (40, 44)] {
+        for (offset, value) in [(4, 11u8), (16, 22), (32, 33), (33, 66), (40, 44)] {
             // SAFETY: every marker belongs to the test's live title page.
             unsafe { ((title + offset) as *mut u8).write_volatile(value) };
         }
         let mut batch = Batch::default();
         batch.add(&copy, title + 4, 4);
         batch.add(&copy, busy, 12);
-        assert_eq!(batch.flush(), 12, "the pending dword and the gap stay untouched");
-        let markers = || [4, 16, 32, 40].map(|offset| copy.read_host((title + offset) as u64, 1)[0]);
-        assert_eq!(markers(), [11, 0, 0, 44]);
+        assert_eq!(batch.flush(), 16, "both requested ranges refresh without the gap");
+        let markers = || {
+            [4, 16, 32, 40].map(|offset| copy.read_host((title + offset) as u64, 1)[0].to_le_bytes()[0])
+        };
+        assert_eq!(markers(), [11, 0, 33, 44]);
+        assert_eq!(copy.read_host(busy as u64, 1)[0].to_le_bytes(), [33, 66, 0, 0]);
 
         let (upload, data) = host.upload_buffer(4).unwrap();
         let writer = host.new_list().unwrap();
-        // SAFETY: both buffers live through the synchronous submission; the
-        // copy targets the pending dword, outside the CPU refreshes above.
+        // SAFETY: both buffers live through the synchronous submission.
+        // The GPU changes only the first byte relative to the refreshed
+        // snapshot. The title also changes the second byte after refresh.
         unsafe {
-            data.cast::<u32>().write(55);
+            data.cast::<u32>().write(u32::from_le_bytes([55, 66, 0, 0]));
             writer.list.CopyBufferRegion(&copy.buffer, 32, &upload, 0, 4);
+            ((busy + 1) as *mut u8).write_volatile(77);
         }
         writer.close();
         host.execute(&[&writer]);
         assert_eq!(copy.copy_back(busy, 4), 4);
-        // SAFETY: the copy-back completed and the test owns this page.
-        assert_eq!(unsafe { (busy as *const u8).read_volatile() }, 55);
+        // SAFETY: the copy-back completed and the test owns these bytes.
+        let delivered = [busy, busy + 1].map(|address| unsafe { (address as *const u8).read_volatile() });
+        assert_eq!(delivered, [55, 77]);
 
         batch.add(&copy, title + 16, 4);
         assert_eq!(batch.flush(), 4, "the unobserved partial page stays dirty");
