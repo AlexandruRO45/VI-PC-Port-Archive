@@ -168,6 +168,7 @@ fn spare_most() -> u64 {
 /// (memory not watched), or the write-watch asking it was detiled after.
 #[derive(Default)]
 struct Last {
+    band: Option<(u32, u32)>,
     hash: Option<blake3::Hash>,
     asked: u64,
     /// The frame a partly mapped texture was last read in.
@@ -864,6 +865,45 @@ pub(crate) fn card_writes(list: &HostList, resource: This, texture: &ID3D12Resou
     });
 }
 
+/// Full-width GPU copy band, rounded to the console layout's tile rows.
+fn upload_band(
+    layout: &victory_formats::texture::Layout,
+    dirty: std::ops::Range<usize>,
+) -> Option<(u32, u32)> {
+    use victory_formats::texture::{Dimension, Swizzle};
+    let [mip] = layout.mips.as_slice() else { return None };
+    let desc = &layout.desc;
+    if !layout.addressable() || layout.slices != 1 || mip.depth != 1
+        || desc.dimension != Dimension::Tex2d || desc.samples != 1
+        || mip.tail.is_some() || dirty.is_empty()
+        || !desc.height.is_multiple_of(desc.block)
+        || !desc.width.is_multiple_of(desc.block)
+    {
+        return None;
+    }
+    let (group_rows, stride) = if desc.swizzle == Swizzle::LINEAR {
+        (1, u64::from(mip.pitch) * u64::from(desc.element_bytes))
+    } else {
+        let [width, height, _] = layout.block;
+        (height, u64::from(mip.pitch / width) * layout.alignment)
+    };
+    if stride == 0 { return None }
+    let first = (dirty.start as u64).checked_sub(mip.offset)? / stride;
+    let last = ((dirty.end - 1) as u64).checked_sub(mip.offset)? / stride;
+    let group = u64::from(group_rows) * u64::from(desc.block);
+    let top = u32::try_from(first * group).ok()?;
+    let bottom = ((last + 1) * group).min(u64::from(desc.height)) as u32;
+    (top < bottom && bottom - top <= desc.height / 2).then_some((top, bottom))
+}
+
+fn texture_bands() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_UPLOAD_BANDS").is_some_and(|v| v == "1"))
+}
+
+#[cfg(test)]
+static GPU_BAND_COPIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 impl Staging {
     /// Levels on demand: what says, beside the mapping, which levels of
     /// the texture are the title's now. First the lowest level a live view
@@ -948,7 +988,10 @@ impl Staging {
         &self,
         list: &ID3D12GraphicsCommandList,
         texture: &ID3D12Resource,
+        bands: bool,
     ) {
+        let band = self.last.lock().unwrap_or_else(|e| e.into_inner()).band.take();
+        let band = band.filter(|_| bands && self.footprints.len() == 1);
         for (i, footprint) in self.footprints.iter().enumerate() {
             let to = D3D12_TEXTURE_COPY_LOCATION {
                 // SAFETY: a borrowed pointer the location never releases.
@@ -967,40 +1010,83 @@ impl Staging {
                 },
             };
             // SAFETY: an open list; both locations name live resources.
-            unsafe { list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
+            let rect = band.map(|(top, bottom)| D3D12_BOX {
+                left: 0, top, front: 0, right: footprint.Footprint.Width, bottom, back: 1,
+            });
+            // SAFETY: the optional box is in the full staging footprint
+            // and the destination has identical dimensions and format.
+            unsafe {
+                list.CopyTextureRegion(
+                    &to, 0, rect.as_ref().map_or(0, |r| r.top), 0, &from,
+                    rect.as_ref().map(|r| r as *const _),
+                )
+            };
+            #[cfg(test)]
+            if rect.is_some() {
+                GPU_BAND_COPIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
         }
     }
 
     /// Detiles the texture memory into the staging buffer if it changed
     /// since the last time (and is mapped at all).
-    pub(crate) fn refresh(&self) {
+    pub(crate) fn refresh(&self, bands: bool) {
         use std::sync::atomic::Ordering::Relaxed;
         let started = std::time::Instant::now();
-        let read = self.refresh_now();
+        let read = self.refresh_now(bands);
         let preparing = &crate::host::PREPARING;
         preparing[2].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
         preparing[3].fetch_add(read as u64, Relaxed);
     }
 
     /// Returns the bytes of title memory read.
-    fn refresh_now(&self) -> usize {
+    fn refresh_now(&self, bands: bool) -> usize {
         let whole = std::time::Instant::now();
-        let read = self.refresh_timed();
+        let read = self.refresh_timed(bands);
         let us = whole.elapsed().as_micros() as u64;
         REFRESH_WAITS[3].fetch_add(us, std::sync::atomic::Ordering::Relaxed);
         crate::framelog::add(crate::framelog::T::RefreshUs, us);
         read
     }
 
-    fn refresh_timed(&self) -> usize {
+    fn refresh_timed(&self, bands: bool) -> usize {
         let size = self.layout.size as usize;
         let start = self.memory as usize;
         let mut last = waited(0, || self.last.lock().unwrap_or_else(|e| e.into_inner()));
         let last = &mut *last;
+        last.band = None;
+        let bands = bands && texture_bands();
         if let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, false)) {
             if last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
                 return 0;
             }
+            let previous = last.asked;
+            let candidate = if bands && previous != 0 && last.hash.is_none() && !self.on_demand
+                && self.uploaded.load(std::sync::atomic::Ordering::Acquire)
+                && !self.dirty.load(std::sync::atomic::Ordering::Acquire)
+            {
+                let start_page = start / crate::watch::PAGE;
+                let last_page = (start + size - 1) / crate::watch::PAGE;
+                let touched = written.iter().filter(|&&(p, w)| w > previous && p >= start_page && p <= last_page);
+                let mut min = usize::MAX;
+                let mut max = 0;
+                for &(page, _) in touched {
+                    min = min.min(page);
+                    max = max.max(page);
+                }
+                (min <= max).then(|| {
+                    let left = (min * crate::watch::PAGE).saturating_sub(start);
+                    let right = (((max + 1) * crate::watch::PAGE) - start).min(size);
+                    upload_band(&self.layout, left..right)
+                }).flatten()
+            } else {
+                None
+            };
+
+            // Only use a band on fully committed watched memory. Keep
+            // the default whole upload if commitment cannot be established.
+            let mapped = candidate.and_then(|_| crate::watch::title_memory_reading_now());
+            let candidate = candidate.filter(|_| mapped.is_some() && committed(self.memory, size));
             last.asked = now;
             // Read through the copy, which stands unmapped pages: memory of
             // big pools is too slow to ask page by page.
@@ -1010,6 +1096,7 @@ impl Staging {
             });
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexWatched, size as u64);
+            last.band = candidate;
             return size;
         }
         // View memory has no write-watch, and a texture there was hashed
@@ -1508,6 +1595,126 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
 
 #[cfg(test)]
 mod title_memory_tests {
+    #[test]
+    #[ignore = "native integration: set VICTORY_TEXTURE_UPLOAD_BANDS=1"]
+    fn boxed_upload_uses_only_a_watched_band_in_the_prelude() {
+        use super::{host, texture_bands};
+        assert!(texture_bands(), "set VICTORY_TEXTURE_UPLOAD_BANDS=1");
+        let h = host().expect("D3D12 required");
+        use victory_formats::texture::Swizzle;
+        for (format, swizzle) in [
+            (28, Swizzle::LINEAR), (28, Swizzle::SW_64KB_D), (77, Swizzle::SW_64KB_D),
+        ] {
+            check_watched_band(h, format, swizzle.0);
+        }
+    }
+
+    fn check_watched_band(h: &crate::host::Host, format: u32, swizzle: u32) {
+        use super::*;
+        use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::Relaxed};
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        let (resource, _, size, texture) = make_test_texture_of_size(256, 2048, format, swizzle);
+        let (_, desc) = crate::resource::texture_memory(resource).unwrap();
+        let layout = crate::resource::texture_layout(&desc).unwrap().planes[0].layout.clone();
+        let page = crate::watch::PAGE;
+        assert!(size >= 4 * page);
+        // SAFETY: private committed write-watched storage of the layout's size.
+        let memory = unsafe { VirtualAlloc(std::ptr::null(), size,
+            MEM_RESERVE | MEM_COMMIT | 0x0020_0000 /* MEM_WRITE_WATCH */, PAGE_READWRITE) }.cast::<u8>();
+        assert!(!memory.is_null());
+        struct Region(*mut u8);
+        impl Drop for Region {
+            fn drop(&mut self) {
+                // SAFETY: this guard owns the initial allocation address.
+                unsafe { VirtualFree(self.0.cast(), 0, MEM_RELEASE) };
+            }
+        }
+        let _region = Region(memory);
+        let mut footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+        let mut rows = 0;
+        let mut total = 0;
+        // SAFETY: texture is live, and the output slots each hold one subresource.
+        unsafe { h.device.GetCopyableFootprints(&texture.GetDesc(), 0, 1, 0,
+            Some(&mut footprint), Some(&mut rows), None, Some(&mut total)); }
+        let pitch = footprint.Footprint.RowPitch as usize;
+        let (buffer, data, pooled) = staging_buffer(h, total).unwrap();
+        STAGED[0].fetch_add(1, Relaxed);
+        STAGED[1].fetch_add(total, Relaxed);
+        let staging = Arc::new(Staging {
+            buffer, data, pooled, footprints: vec![footprint], rows: vec![rows],
+            layout, mips: 1, bytes: total, memory, last: Mutex::default(),
+            dirty: AtomicBool::new(true), uploaded: AtomicBool::new(false),
+            used: AtomicU64::new(0), on_demand: false,
+            detiled: AtomicU32::new(0), judged: [const { AtomicU64::new(0) }; 2],
+            waiting: AtomicU64::new(0),
+        });
+        let copy = crate::resource::host_copy(resource).unwrap();
+        let readback = h.read_back_buffer(total).expect("readback");
+        let run = |extra: bool| {
+            let list = h.new_list().unwrap();
+            list.defer_texture(staging.clone());
+            list.defer_texture_upload(copy.clone(), staging.clone());
+            crate::list::ensure_state(&list, resource, 0x800);
+            let dst = D3D12_TEXTURE_COPY_LOCATION {
+                // SAFETY: the readback lives through command execution.
+                pResource: unsafe { std::mem::transmute_copy(&readback) },
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: footprint },
+            };
+            let src = D3D12_TEXTURE_COPY_LOCATION {
+                // SAFETY: the console resource and its host copy are live.
+                pResource: unsafe { std::mem::transmute_copy(texture) },
+                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+            };
+            // SAFETY: the list prelude has arranged the source/destination states.
+            unsafe { list.list.CopyTextureRegion(&dst, 0, 0, 0, &src, None); }
+            list.close();
+            if extra {
+                let sampler = h.new_list().unwrap();
+                sampler.defer_texture(staging.clone());
+                sampler.defer_texture_upload(copy.clone(), staging.clone());
+                sampler.close();
+                h.execute(&[&list, &sampler]);
+            } else {
+                h.execute(&[&list]);
+            }
+            let mut ptr = std::ptr::null_mut();
+            let mut expected = vec![0; pitch * rows as usize];
+            // SAFETY: the fake title owns a full layout-sized allocation.
+            let tiled = unsafe { std::slice::from_raw_parts(memory, size) };
+            let expected_len = expected.len();
+            staging.layout.detile(tiled, 0, 0, &mut expected, pitch, expected_len).unwrap();
+            // SAFETY: synchronous execution completed and this allocation is live.
+            unsafe {
+                readback.Map(0, None, Some(&mut ptr)).unwrap();
+                let got = std::slice::from_raw_parts(ptr.cast::<u8>(), total as usize);
+                assert!(got == &expected[..total as usize], "GPU bytes differ from full detile");
+                readback.Unmap(0, None);
+            }
+        };
+        let before = GPU_BAND_COPIES.load(Relaxed);
+        // SAFETY: initialization and the later writes are within the allocation.
+        unsafe { memory.write_bytes(0x12, size); }
+        run(false);
+        assert_eq!(GPU_BAND_COPIES.load(Relaxed), before);
+        unsafe { memory.add(page).write_bytes(0xab, page); }
+        run(false);
+        assert_eq!(GPU_BAND_COPIES.load(Relaxed), before + 1);
+        unsafe { memory.add(2 * page).write_bytes(0x97, page); }
+        run(true);
+        assert_eq!(GPU_BAND_COPIES.load(Relaxed), before + 1);
+        unsafe { memory.write_bytes(0x26, size); }
+        run(false);
+        assert_eq!(GPU_BAND_COPIES.load(Relaxed), before + 1);
+        let release = crate::object::slot::<extern "system" fn(crate::object::This) -> u32>(
+            resource, 0x10);
+        assert_eq!(release(resource), 0);
+    }
+
+
     use super::with_title;
 
     /// Title memory whose tail is reserved and not committed reads through
@@ -1625,8 +1832,17 @@ mod title_memory_tests {
         usize,
         &'static windows::Win32::Graphics::Direct3D12::ID3D12Resource,
     ) {
+        make_test_texture_of_size(16, 4, 28, 0)
+    }
+
+    fn make_test_texture_of_size(width: u32, height: u32, format: u32, swizzle: u32) -> (
+        crate::object::This,
+        *mut u8,
+        usize,
+        &'static windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    ) {
         let heap_words: [u32; 5] = [1, 0, 0, 1, 1];
-        let desc_words: [u32; 14] = [3, 0, 0, 0, 16, 0, 4, 65537, 28, 1, 0, 256, 0, 0];
+        let desc_words: [u32; 14] = [3, 0, 0, 0, width, 0, height, 65537, format, 1, 0, 256 | swizzle, 0, 0];
         // SAFETY: plain structs with exact repr(C) layouts.
         let (heap, desc) = unsafe {
             (

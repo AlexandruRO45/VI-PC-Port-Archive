@@ -5493,10 +5493,14 @@ impl Host {
             self.settle(&mut submitted, WHY_STALE);
             settled += settling.elapsed();
         }
+        // The shared full staging buffer is only safe for a band when
+        // no earlier flight can still be reading it and this is the
+        // only list in the submission. Other paths preserve the full copy.
+        let bands = !late && runs.len() == 1;
         for list in runs {
-            list.run_deferred(&mut batch);
+            list.run_deferred(&mut batch, bands);
             firsts.push(lists.len());
-            if let Some(prelude) = list.prelude() {
+            if let Some(prelude) = list.prelude(bands) {
                 lists.push(Some(prelude));
             }
             lists.push(list.list.cast().ok());
@@ -6359,7 +6363,7 @@ impl HostList {
     /// title-written textures whose staging buffer was refreshed (or has
     /// not been uploaded yet) it copies the staging buffer into the host
     /// texture before the list uses it.
-    fn prelude(&self) -> Option<ID3D12CommandList> {
+    fn prelude(&self, bands: bool) -> Option<ID3D12CommandList> {
         const COPY_DEST: u32 = 0x400;
         const COPY_SOURCE: u32 = 0x800;
         let host_state = |state: u32| D3D12_RESOURCE_STATES(state as i32);
@@ -6504,7 +6508,7 @@ impl HostList {
                     record_twin_copy(list, &depth.texture, twin, *colour);
                 }
                 for (copy, staging) in &uploads {
-                    staging.record_copy(list, &copy.texture);
+                    staging.record_copy(list, &copy.texture, bands);
                 }
                 #[cfg(feature = "diagnostics")]
                 for (copy, real, first) in &leaving {
@@ -7067,7 +7071,7 @@ impl HostList {
     /// Runs the list's submission-time steps; refreshes go into `batch`
     /// (the title's big buffers, a 174 MB one among them, are read by most
     /// lists of a submission, through many ranges).
-    fn run_deferred(&self, batch: &mut Batch) {
+    fn run_deferred(&self, batch: &mut Batch, bands: bool) {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
         for step in &self.deferred().copies {
@@ -7142,7 +7146,7 @@ impl HostList {
                 }
                 Step::Texture(staging) => {
                     if batch.texture_due(staging) {
-                        staging.refresh();
+                        staging.refresh(bands);
                     }
                     continue;
                 }
