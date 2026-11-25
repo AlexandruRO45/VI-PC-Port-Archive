@@ -18,6 +18,8 @@ use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObj
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{Interface, PCWSTR, w};
 
+use crate::readback::{CopyRegion, coalesce};
+
 /// Resource states without the console's own bits (compression hints from
 /// bit 25 up), which the host rejects.
 pub(crate) fn pc_state(state: u32) -> u32 {
@@ -1510,6 +1512,38 @@ fn rehash_runs() -> bool {
 /// card's memory: hash passes after ranges were sent up, the pieces they
 /// hashed, and compare passes after the lists.
 static CARD_PASSES: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// Native readback copy commands since the last frame-rate line.
+static CARD_FETCH_COPIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Records the fetch without changing the piece boundaries used on the CPU.
+/// Pieces of the same shadow pass references to the same source buffer field.
+///
+/// # Safety
+/// The caller must have an open list, live source and destination resources
+/// in copy-compatible states, and non-empty piece ranges within both buffers.
+/// The destination must not alias any source. The resources must remain live
+/// until the GPU is done with the copies.
+pub(crate) unsafe fn record_card_readback<'a>(
+    list: &ID3D12GraphicsCommandList,
+    destination: &ID3D12Resource,
+    pieces: impl Iterator<Item = (&'a ID3D12Resource, usize, usize, u64)>,
+) -> u64 {
+    let pieces = pieces.map(|(source, lo, hi, destination_offset)| CopyRegion {
+        source,
+        source_offset: lo as u64,
+        destination_offset,
+        bytes: (hi - lo) as u64,
+    });
+    let mut copies = 0;
+    for copy in coalesce(pieces) {
+        // SAFETY: the caller ensures states and lifetimes, and coalescing
+        // preserves the exact source and destination bytes of the pieces.
+        unsafe { list.CopyBufferRegion(destination, copy.destination_offset, copy.source, copy.source_offset, copy.bytes) };
+        copies += 1;
+    }
+    copies
+}
 
 /// Whether what shaders wrote to copies in the card's memory is merged
 /// into title memory on several threads (`VICTORY_WIDE_MERGE=1`; off by
@@ -3303,12 +3337,14 @@ impl Host {
         // buffers (the copies are held by the plans); the fence and the
         // event are this thread's.
         let ran = unsafe {
-            (|| -> windows::core::Result<u64> {
+            (|| -> windows::core::Result<(u64, u64)> {
                 allocator.Reset()?;
                 list.Reset(&allocator, None)?;
-                for (shadow, lo, hi, at) in &pieces {
-                    list.CopyBufferRegion(&buffer, *at, &shadow.buffer, *lo as u64, (*hi - *lo) as u64);
-                }
+                let copies = record_card_readback(
+                    &list,
+                    &buffer,
+                    pieces.iter().map(|(shadow, lo, hi, at)| (&shadow.buffer, *lo, *hi, *at)),
+                );
                 list.Close()?;
                 let lists = [Some(list.cast::<ID3D12CommandList>()?)];
                 // In the order of the queue: the sends of title bytes so
@@ -3321,13 +3357,14 @@ impl Host {
                 self.queue.Signal(&fence, sent)?;
                 fence.SetEventOnCompletion(sent, event)?;
                 WaitForSingleObject(event, INFINITE);
-                Ok(after)
+                Ok((after, copies))
             })()
         };
-        let after = match ran {
-            Ok(after) => after,
+        let (after, copies) = match ran {
+            Ok(fetched) => fetched,
             Err(e) => fail(format_args!("what shaders wrote to the card's memory could not be fetched ({e}, VICTORY_RELAY=1)")),
         };
+        CARD_FETCH_COPIES.fetch_add(copies, Ordering::Relaxed);
         let us = waiting.elapsed().as_micros() as u64;
         RELAY_STATS[3].fetch_add(us, Ordering::Relaxed);
         {
@@ -3523,12 +3560,14 @@ impl Host {
             // SAFETY: the list's last run was waited for; live buffers; the
             // fence and event are ours, under the submission lock.
             let ran = unsafe {
-                (|| -> windows::core::Result<()> {
+                (|| -> windows::core::Result<u64> {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
-                    for &(i, lo, hi, at) in &pieces {
-                        list.CopyBufferRegion(fetched, at, &plan.ranges[i].shadow.buffer, lo as u64, (hi - lo) as u64);
-                    }
+                    let copies = record_card_readback(
+                        list,
+                        fetched,
+                        pieces.iter().map(|&(i, lo, hi, at)| (&plan.ranges[i].shadow.buffer, lo, hi, at)),
+                    );
                     list.Close()?;
                     self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
                     self.card_sent();
@@ -3539,12 +3578,14 @@ impl Host {
                     WaitForSingleObject(self.event, INFINITE);
                     stood(waiting);
                     working(was_working);
-                    Ok(())
+                    Ok(copies)
                 })()
             };
-            if let Err(e) = ran {
-                fail(format_args!("what shaders wrote to the card's memory could not be fetched ({e})"));
-            }
+            let copies = match ran {
+                Ok(copies) => copies,
+                Err(e) => fail(format_args!("what shaders wrote to the card's memory could not be fetched ({e})")),
+            };
+            CARD_FETCH_COPIES.fetch_add(copies, Ordering::Relaxed);
             {
                 use crate::shadow::CARD_STATS;
                 CARD_STATS[3].fetch_add(pieces.len() as u64, Ordering::Relaxed);
@@ -5730,6 +5771,7 @@ impl Meter {
         let planes = crate::resource::PLANES[0].swap(0, Ordering::Relaxed) as f64 / frames;
         // Copies in the card's memory (`crate::shadow::cards`).
         let card = crate::shadow::card_stats();
+        let fetch_copies = CARD_FETCH_COPIES.swap(0, Ordering::Relaxed) as f64 / frames;
         #[cfg(feature = "diagnostics")]
         let slow = crate::watch::slow_asks();
         // Over the same frames as the counts above.
@@ -5776,7 +5818,7 @@ impl Meter {
                 tracing::info!(
                     "host copies in the card's memory: {} copies {} MB, their bytes from before {} MB; per frame: \
                      {:.1} MB sent up in {:.0} ranges, {:.0} pieces compared on the card, {:.0} of them fetched \
-                     ({:.1} MB) with {:.1} more waits for the card ({:.1} ms)",
+                     ({:.1} MB) with {:.1} more waits for the card ({:.1} ms) and {fetch_copies:.0} CopyBufferRegion calls",
                     card[7],
                     card[8] >> 20,
                     card[9] >> 20,
