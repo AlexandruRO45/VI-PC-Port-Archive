@@ -99,6 +99,10 @@ trait Source: Send {
     }
     /// Motor speeds: low frequency (left), high frequency (right).
     fn rumble(&mut self, slot: usize, low: u16, high: u16);
+    /// Ignore host gamepads and use the keyboard stand-in instead.
+    fn keyboard_only(&self) -> bool {
+        false
+    }
 }
 
 fn fallback(keys: &[KeyState]) -> PadState {
@@ -418,7 +422,12 @@ impl Hub {
     fn poll(&self) {
         let (pads, keys, buttons) = {
             let mut source = lock(&self.source);
-            let pads: [_; PADS] = std::array::from_fn(|slot| source.pad(slot));
+            let keyboard_only = source.keyboard_only();
+            let pads: [Option<PadState>; PADS] = if keyboard_only {
+                std::array::from_fn(|_| None)
+            } else {
+                std::array::from_fn(|slot| source.pad(slot))
+            };
             (pads, source.keys(), source.mouse_buttons())
         };
         let events = {
@@ -693,7 +702,21 @@ fn host(counts: &Arc<Counts>, settings: &super::controls::Settings) -> Box<dyn S
     if settings.enabled {
         host::raw_mouse(counts.clone());
     }
-    Box::new(host::Host::new(counts.clone()))
+    Box::new(host::Host::new(
+        counts.clone(),
+        keyboard_only_requested(),
+    ))
+}
+
+/// Whether the launcher asked VIctory to ignore every host XInput pad.
+#[cfg(windows)]
+fn keyboard_only_requested() -> bool {
+    std::env::var("VICTORY_KEYBOARD_ONLY").is_ok_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
 }
 
 #[cfg(not(windows))]
@@ -1486,6 +1509,8 @@ mod host {
         /// Why focus was last judged lost (for the release log).
         lost: String,
         empty_until: [Option<Instant>; PADS],
+        /// Ignore host XInput pads and keep the keyboard stand-in.
+        keyboard_only: bool,
         /// Where scripted mouse motion goes (diagnostics).
         #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
         counts: Arc<Counts>,
@@ -1500,12 +1525,13 @@ mod host {
     }
 
     impl Host {
-        pub(super) fn new(counts: Arc<Counts>) -> Host {
+        pub(super) fn new(counts: Arc<Counts>, keyboard_only: bool) -> Host {
             Host {
                 caption: Caption::default(),
                 no_foreground: None,
                 lost: String::new(),
                 empty_until: [None; PADS],
+                keyboard_only,
                 counts,
                 was_focused: false,
                 was_captured: false,
@@ -1817,6 +1843,10 @@ mod host {
             // SAFETY: a valid vibration; an empty slot just fails.
             unsafe { XInputSetState(slot as u32, &speeds) };
         }
+
+        fn keyboard_only(&self) -> bool {
+            self.keyboard_only
+        }
     }
 
     /// Debugging aid: `VICTORY_KEYS=<seconds>:<key>,...` holds each key for
@@ -2012,6 +2042,7 @@ mod tests {
         keys: Vec<KeyState>,
         buttons: Vec<u8>,
         rumble: Vec<(usize, u16, u16)>,
+        keyboard_only: bool,
     }
 
     struct Fake(Arc<Mutex<FakeHost>>);
@@ -2028,6 +2059,9 @@ mod tests {
         }
         fn rumble(&mut self, slot: usize, low: u16, high: u16) {
             self.0.lock().unwrap().rumble.push((slot, low, high));
+        }
+        fn keyboard_only(&self) -> bool {
+            self.0.lock().unwrap().keyboard_only
         }
     }
 
@@ -2337,6 +2371,44 @@ mod tests {
         let r = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
         assert_eq!(pad(r).right_x, 0.0, "no motion, no turn");
         release(r);
+    }
+
+    #[test]
+    fn keyboard_only_mode_ignores_host_pads_and_keeps_the_keyboard_pad() {
+        let (hub, host) = fake();
+        {
+            let mut host = host.lock().unwrap();
+            host.pads[0] = Some(PadState {
+                buttons: B,
+                ..Default::default()
+            });
+        }
+        hub.poll();
+        let host_reading = current(hub, GAMEPAD_KIND, 0)
+            .expect("the host gamepad must connect before keyboard-only mode");
+        assert_eq!(pad(host_reading).buttons, B);
+        release(host_reading);
+
+        {
+            let mut host = host.lock().unwrap();
+            host.keys = vec![key(0x0D)];
+            host.keyboard_only = true;
+        }
+        hub.poll();
+
+        assert_eq!(
+            current(hub, GAMEPAD_KIND, 0),
+            Err(DEVICE_DISCONNECTED),
+            "the host gamepad must be ignored in keyboard-only mode"
+        );
+        let reading = current(hub, GAMEPAD_KIND, FALLBACK)
+            .expect("keyboard-only mode must keep the keyboard gamepad connected");
+        assert_eq!(
+            pad(reading).buttons,
+            A,
+            "Enter must drive the keyboard gamepad's A button"
+        );
+        release(reading);
     }
 
     #[test]

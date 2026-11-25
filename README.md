@@ -84,6 +84,10 @@ $env:VICTORY_RENDER_SCALE = "0.5"
 .\target\release\victory.exe run --console series-s --execute "<path-to-title-exe>"
 ```
 
+Set `VICTORY_KEYBOARD_ONLY=1` to ignore connected XInput pads and keep the
+keyboard stand-in gamepad connected. The separate keyboard device remains
+available as well; Enter drives the stand-in's A button.
+
 See `docs/architecture.md` and `docs/asset-policy.md` for architecture notes and contribution rules.
 
 ---
