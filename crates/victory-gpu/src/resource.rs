@@ -1212,10 +1212,12 @@ fn host_texture(
     let mut d = *desc;
     d.layout = 0;
     d.alignment = 0;
-    let skip = over_cap(&d).max(LARGEST.get().min(u32::from(d.mip_levels) - 1));
+    // No mip levels is the full chain: counted, so it can lose mips too.
+    let mips = mip_count(&d);
+    let skip = over_cap(&d).max(LARGEST.get().min(mips - 1));
     d.width >>= skip;
     d.height >>= skip;
-    d.mip_levels -= skip as u16;
+    d.mip_levels = (mips - skip) as u16;
     d.flags &= PC_FLAGS;
     // PC refuses depth targets that are also unordered-access (the console
     // allows both; Grand Theft Auto VI's shadow maps ask for it).
@@ -2349,6 +2351,41 @@ mod tests {
         assert_eq!(t, u64::MAX, "no second subresource");
     }
 
+
+    /// A texture with no mip levels (the full chain) gets that chain on the
+    /// host, less the largest mips the title's view goes without.
+    #[cfg(windows)]
+    #[test]
+    fn host_texture_of_a_full_chain_loses_its_largest_mips() {
+        if crate::host::host().is_none() {
+            return; // no host GPU here
+        }
+        let null = std::ptr::null();
+        let made = |largest| {
+            LARGEST.set(largest);
+            let mut image = null;
+            let hr = create_committed(
+                null,
+                &PROPERTIES,
+                0,
+                &texture(64, 64, 28, 0),
+                0,
+                null.cast(),
+                &RESOURCE_IIDS[0],
+                &mut image,
+            );
+            LARGEST.set(0);
+            assert_eq!(hr, S_OK);
+            // SAFETY: a live host texture.
+            let mips = unsafe { host_resource(image).unwrap().GetDesc() }.MipLevels;
+            let skipped = skipped_mips(image);
+            resource_release(image);
+            (mips, skipped)
+        };
+        assert_eq!(made(0), (7, 0));
+        assert_eq!(made(2), (5, 2));
+        assert_eq!(made(9), (1, 6), "the smallest mip stays");
+    }
 
     /// A 4x4 texture filled from a title buffer through our list and queue,
     /// then read back from the host GPU.
