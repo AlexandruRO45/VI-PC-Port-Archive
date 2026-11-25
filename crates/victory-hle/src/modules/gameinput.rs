@@ -157,15 +157,28 @@ fn merge_pad(base: PadState, extra: PadState) -> PadState {
 }
 
 /// Applies `scripted` keys to the first connected host pad, so `VICTORY_KEYS`
-/// works even when an XInput or virtual controller disables `FALLBACK`.
+/// works even when an XInput or virtual controller disables `FALLBACK`. With
+/// no host pad at all the keys go to `keys`, which is what the keyboard's
+/// stand-in pad is built from: a scripted run is usually a machine with no
+/// gamepad, and dropping them there made the switch do nothing.
 #[cfg(any(test, feature = "diagnostics"))]
-fn merge_scripted(pads: &mut [Option<PadState>; PADS], scripted: &[KeyState]) {
+fn apply_scripted(
+    pads: &mut [Option<PadState>; PADS],
+    keys: &mut Vec<KeyState>,
+    scripted: &[KeyState],
+) {
     if scripted.is_empty() {
         return;
     }
     let extra = fallback(scripted);
     if let Some(pad) = pads.iter_mut().flatten().next() {
         *pad = merge_pad(*pad, extra);
+        return;
+    }
+    for key in scripted {
+        if !keys.iter().any(|k| k.virtual_key == key.virtual_key) {
+            keys.push(*key);
+        }
     }
 }
 
@@ -437,13 +450,17 @@ impl Hub {
             let mut source = lock(&self.source);
             let mut pads: [_; PADS] = std::array::from_fn(|slot| source.pad(slot));
             #[cfg(any(test, feature = "diagnostics"))]
+            let mut keys = source.keys();
+            #[cfg(not(any(test, feature = "diagnostics")))]
+            let keys = source.keys();
+            #[cfg(any(test, feature = "diagnostics"))]
             {
                 let scripted = source.scripted_keys();
-                merge_scripted(&mut pads, &scripted);
+                apply_scripted(&mut pads, &mut keys, &scripted);
             }
             #[cfg(not(any(test, feature = "diagnostics")))]
             let _ = &mut pads;
-            (pads, source.keys())
+            (pads, keys)
         };
         let events = self.state().poll(&self.devices, pads, keys);
         self.deliver(events);
@@ -1366,6 +1383,38 @@ mod tests {
             virtual_key,
             ..Default::default()
         }
+    }
+
+    /// A scripted key reaches a connected host pad, and when there is none it
+    /// reaches the keyboard's stand-in instead: `VICTORY_KEYS` used to be
+    /// merged into a pad that did not exist and dropped, so the switch did
+    /// nothing on a machine without a gamepad.
+    #[test]
+    fn scripted_keys_reach_a_pad_or_the_stand_in() {
+        let mut pads: [Option<PadState>; PADS] = [None; PADS];
+        let mut keys = Vec::new();
+        apply_scripted(&mut pads, &mut keys, &[key(0x0D)]);
+        assert!(pads.iter().all(Option::is_none), "no pad is invented");
+        assert_eq!(
+            keys.iter().map(|k| k.virtual_key).collect::<Vec<_>>(),
+            [0x0D],
+            "no pad: the stand-in is driven by the keys"
+        );
+        assert_eq!(fallback(&keys).buttons & A, A, "and it presses A");
+
+        // With a pad, the key goes there and not into the keyboard's state,
+        // so a title reading either one sees it once.
+        let mut pads: [Option<PadState>; PADS] = [Some(PadState::default()); PADS];
+        let mut keys = Vec::new();
+        apply_scripted(&mut pads, &mut keys, &[key(0x0D)]);
+        assert_eq!(pads[0].unwrap().buttons & A, A, "the pad gets it");
+        assert!(keys.is_empty(), "the keyboard does not repeat it");
+
+        // The same key twice is not counted twice.
+        let mut pads: [Option<PadState>; PADS] = [None; PADS];
+        let mut keys = vec![key(0x0D)];
+        apply_scripted(&mut pads, &mut keys, &[key(0x0D)]);
+        assert_eq!(keys.len(), 1);
     }
 
     fn slot<F: Copy, T>(object: *const T, offset: usize) -> F {
