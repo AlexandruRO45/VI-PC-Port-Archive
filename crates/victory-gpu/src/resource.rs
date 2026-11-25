@@ -346,6 +346,20 @@ const NO_FOOTPRINT: PlacedFootprint = PlacedFootprint {
 /// One subresource's upload footprint (offset 0), row count and unpadded row size.
 fn subresource(desc: &ResourceDesc, index: u32) -> Option<(PlacedFootprint, u32, u64)> {
     const PITCH: u64 = 256;
+    // NV12 and P010 copy footprints require an even-sized 2D texture with one mip.
+    if matches!(desc.format, 103 | 104)
+        && (desc.dimension != TEXTURE_2D
+            || desc.mip_levels != 1
+            || desc.sample_count != 1
+            || !(1..=2048).contains(&desc.depth_or_array_size)
+            || desc.width < 2
+            || desc.width > u64::from(u32::MAX)
+            || desc.height < 2
+            || !desc.width.is_multiple_of(2)
+            || !desc.height.is_multiple_of(2))
+    {
+        return None;
+    }
     if desc.dimension == BUFFER {
         let footprint = PlacedFootprint {
             offset: 0,
@@ -365,33 +379,21 @@ fn subresource(desc: &ResourceDesc, index: u32) -> Option<(PlacedFootprint, u32,
     };
     let mip = index % mips;
     let plane = index / mips / slices;
-    if matches!(desc.format, 103 | 104)
-        && (desc.dimension != TEXTURE_2D
-            || mips != 1
-            || desc.sample_count != 1
-            || desc.depth_or_array_size == 0
-            || desc.width < 2
-            || desc.height < 2
-            || !desc.width.is_multiple_of(2)
-            || !desc.height.is_multiple_of(2))
-    {
-        return None;
-    }
-    // Each plane contains all array slices. NV12 and P010 chroma has half
-    // the extent of luma and two components per sample.
-    let (format, pitch_alignment, shift) = match (desc.format, plane) {
-        (19..=22 | 44..=47, 0) => (39, 512, mip), // depth: R32_TYPELESS
-        (19..=22 | 44..=47, 1) => (60, 512, mip), // stencil: R8_TYPELESS
-        (103, 0) => (60, 512, 0),                 // NV12 luma: R8_TYPELESS
-        (103, 1) => (48, 512, 1),                 // NV12 chroma: R8G8_TYPELESS
-        (104, 0) => (53, 512, 0),                 // P010 luma: R16_TYPELESS
-        (104, 1) => (33, 512, 1),                 // P010 chroma: R16G16_TYPELESS
+    // Each plane contains all mips and array slices. Video chroma samples
+    // contain two components and cover a 2x2 luma region.
+    let (format, pitch_alignment, extent_shift) = match (desc.format, plane) {
+        (19..=22 | 44..=47, 0) => (39, 512, mip), // R32_TYPELESS
+        (19..=22 | 44..=47, 1) => (60, 512, mip), // R8_TYPELESS
+        (103, 0) => (60, 512, 0),                  // NV12 Y: R8_TYPELESS
+        (103, 1) => (48, 512, 1),                  // NV12 UV: R8G8_TYPELESS
+        (104, 0) => (53, 512, 0),                  // P010 Y: R16_TYPELESS
+        (104, 1) => (33, 512, 1),                  // P010 UV: R16G16_TYPELESS
         (format, 0) => (format, PITCH, mip),
         _ => return None,
     };
     let (element, block) = element(format)?;
-    let width = (desc.width >> shift).max(1).next_multiple_of(block);
-    let height = (u64::from(desc.height) >> shift)
+    let width = (desc.width >> extent_shift).max(1).next_multiple_of(block);
+    let height = (u64::from(desc.height) >> extent_shift)
         .max(1)
         .next_multiple_of(block);
     let depth = if desc.dimension == TEXTURE_3D {
@@ -412,8 +414,8 @@ fn subresource(desc: &ResourceDesc, index: u32) -> Option<(PlacedFootprint, u32,
 }
 
 /// Places subresources at 512-byte boundaries in an upload buffer.
-/// Row pitch is aligned to 512 bytes for depth/stencil and NV12/P010 planes and 256 bytes
-/// otherwise. Unknown sizes give the documented all-ones values.
+/// Row pitch is aligned to 512 bytes for depth/stencil and planar video,
+/// and 256 bytes otherwise. An unknown size gives an all-ones total.
 pub(crate) extern "system" fn copyable_footprints(
     _: This,
     desc: *const ResourceDesc,
@@ -2127,36 +2129,6 @@ mod tests {
     }
 
     #[test]
-    fn planar_video_copy_footprints() {
-        for (format, y_format, uv_format, row_bytes, pitch) in
-            [(103, 60, 48, 514, 1024), (104, 53, 33, 1028, 1536)]
-        {
-            let mut desc = texture(514, 258, format, 1);
-            desc.depth_or_array_size = 3;
-            // All luma slices precede all chroma slices.
-            for index in 0..6 {
-                let (fp, rows, bytes) = subresource(&desc, index).unwrap();
-                let (plane_format, width, height) = if index < 3 {
-                    (y_format, 514, 258)
-                } else {
-                    (uv_format, 257, 129)
-                };
-                assert_eq!(
-                    (fp.format, fp.width, fp.height),
-                    (plane_format, width, height)
-                );
-                assert_eq!((rows, bytes, fp.row_pitch), (height, row_bytes, pitch));
-            }
-            assert!(subresource(&desc, 6).is_none());
-            desc.height = 257;
-            assert!(subresource(&desc, 0).is_none());
-            desc.height = 258;
-            desc.mip_levels = 2;
-            assert!(subresource(&desc, 0).is_none());
-        }
-    }
-
-    #[test]
     fn upload_footprints_follow_the_pc_rules() {
         let null = std::ptr::null();
         let mut layouts = [NO_FOOTPRINT; 2];
@@ -2179,6 +2151,88 @@ mod tests {
         assert_eq!((r[0], s[0]), (16, 128));
         let (_, _, _, t) = footprints(&texture(64, 64, 71, 1), 1, 1);
         assert_eq!(t, u64::MAX, "no second subresource");
+    }
+
+    #[test]
+    fn planar_video_copy_footprints() {
+        // Native D3D12 reports both Y slices first, then both interleaved UV slices.
+        for (format, y, uv, bytes, pitch) in [(103, 60, 48, 514, 1024), (104, 53, 33, 1028, 1536)] {
+            let desc = ResourceDesc {
+                depth_or_array_size: 2,
+                ..texture(514, 258, format, 1)
+            };
+            let mut layouts = [NO_FOOTPRINT; 4];
+            let (mut rows, mut sizes, mut total) = ([0; 4], [0; 4], 0);
+            copyable_footprints(
+                std::ptr::null(),
+                &desc,
+                0,
+                4,
+                512,
+                layouts.as_mut_ptr(),
+                rows.as_mut_ptr(),
+                sizes.as_mut_ptr(),
+                &mut total,
+            );
+            assert_eq!(
+                layouts.map(|l| (l.format, l.width, l.height)),
+                [(y, 514, 258), (y, 514, 258), (uv, 257, 129), (uv, 257, 129)]
+            );
+            assert_eq!(layouts.map(|l| l.row_pitch), [pitch; 4]);
+            assert_eq!(rows, [258, 258, 129, 129]);
+            assert_eq!(sizes, [bytes; 4]);
+            let stride = u64::from(pitch);
+            assert_eq!(
+                layouts.map(|l| l.offset),
+                [0, 258, 516, 645].map(|r| 512 + r * stride)
+            );
+            assert_eq!(total, 773 * stride + bytes);
+            // Starting at UV describes only the requested range in the upload buffer.
+            copyable_footprints(
+                std::ptr::null(),
+                &desc,
+                2,
+                1,
+                512,
+                layouts.as_mut_ptr(),
+                rows.as_mut_ptr(),
+                sizes.as_mut_ptr(),
+                &mut total,
+            );
+            assert_eq!(
+                (layouts[0].offset, layouts[0].format, rows[0], sizes[0]),
+                (512, uv, 129, bytes)
+            );
+            assert_eq!(total, 128 * stride + bytes);
+            assert!(subresource(&desc, 4).is_none());
+
+            for invalid in [
+                ResourceDesc {
+                    dimension: TEXTURE_3D,
+                    ..desc
+                },
+                ResourceDesc {
+                    mip_levels: 0,
+                    ..desc
+                },
+                ResourceDesc {
+                    mip_levels: 2,
+                    ..desc
+                },
+                ResourceDesc {
+                    sample_count: 4,
+                    ..desc
+                },
+                ResourceDesc { width: 513, ..desc },
+                ResourceDesc { height: 257, ..desc },
+                ResourceDesc {
+                    depth_or_array_size: 2049,
+                    ..desc
+                },
+            ] {
+                assert!(subresource(&invalid, 0).is_none());
+            }
+        }
     }
 
     #[test]
