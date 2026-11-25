@@ -541,7 +541,7 @@ extern "system" fn present(
         const COPY_SOURCE: u32 = 0x800;
         // SAFETY: the title passes the plane descriptions.
         let slice = unsafe { std::slice::from_raw_parts(plane_parameters, planes.min(8) as usize) };
-        let mut resources: Vec<(This, &ID3D12Resource, u32, bool)> =
+        let mut resources: Vec<(This, ID3D12Resource, u32, bool)> =
             Vec::with_capacity(slice.len());
         for plane in slice {
             if plane.count == 0 || plane.resources.is_null() {
