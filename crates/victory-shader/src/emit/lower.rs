@@ -10604,15 +10604,41 @@ impl<'a> Lower<'a> {
                 self.len += 1;
                 self
             }
+            /// The same conditions as a set: sorted, without repeats.
+            fn set(self) -> Known {
+                let mut sorted = self.conditions;
+                sorted[..self.len].sort_unstable();
+                sorted[..self.len].iter().fold(NONE, |s, &c| {
+                    if s.get().last() == Some(&c) {
+                        s
+                    } else {
+                        s.and(c)
+                    }
+                })
+            }
+            /// The subsets of a set, as sets.
+            fn subsets(self) -> impl Iterator<Item = Known> {
+                (0..1usize << self.len).map(move |m| {
+                    (0..self.len)
+                        .filter(|j| m >> j & 1 == 1)
+                        .fold(NONE, |s, j| s.and(self.conditions[j]))
+                })
+            }
         }
-        let none = Known {
+        const NONE: Known = Known {
             conditions: [(Bool::FALSE, false); MAX_KNOWN],
             len: 0,
         };
         let (p, st) = (self.x.p, &self.x.st);
-        let mut work: Vec<(Value, Known)> = self.read_phis.iter().map(|&v| (v, none)).collect();
+        let mut work: Vec<(Value, Known)> = self.read_phis.iter().map(|&v| (v, NONE)).collect();
         let mut live = HashSet::new();
-        let mut seen = HashMap::<Value, Vec<Known>>::new();
+        // The sets of conditions each phi was reached with. A set has at
+        // most `MAX_KNOWN` conditions, so once a phi has more earlier sets
+        // than a set has subsets, whether one of them is a subset of it is a
+        // lookup of each subset in an index of them, not a scan (a phi of
+        // some programs is reached with tens of thousands).
+        const INDEXED: usize = 1 << MAX_KNOWN;
+        let mut seen = HashMap::<Value, (Vec<Known>, HashSet<Known>)>::new();
         // Whether some lane meets each set of conditions: paths into a join
         // ask again for the same sets.
         let mut meets = HashMap::<Known, bool>::new();
@@ -10620,20 +10646,28 @@ impl<'a> Lower<'a> {
             let Some(&(b, i)) = self.phi_at.get(&v) else {
                 continue;
             };
-            let done = seen.entry(v).or_default();
+            let (done, index) = seen.entry(v).or_default();
             // Known of fewer lanes than before: nothing new is live.
-            if done
-                .iter()
-                .any(|d| d.get().iter().all(|c| known.get().contains(c)))
-            {
+            let covered = if done.len() < INDEXED {
+                done.iter()
+                    .any(|d| d.get().iter().all(|c| known.get().contains(c)))
+            } else {
+                known.set().subsets().any(|s| index.contains(&s))
+            };
+            if covered {
                 continue;
             }
-            done.push(known);
+            done.push(known.set());
+            if done.len() == INDEXED {
+                index.extend(done.iter().copied());
+            } else if done.len() > INDEXED {
+                index.extend(done.last().copied());
+            }
             for (n, &q) in p.blocks[b].preds.iter().enumerate() {
                 if self.tail[q].is_none() {
                     continue;
                 }
-                let mut k = none;
+                let mut k = NONE;
                 // Forward edges out of a block that is no loop's latch (a
                 // loop's exit is also taken at its iteration limit).
                 if let LaneExit::Branch {
