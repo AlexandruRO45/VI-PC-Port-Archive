@@ -45,7 +45,7 @@ uint clamped(uint at) {
         uint count = args.Load(at);
         uint instances = args.Load(at + 4);
         if (count > (1u << 24) || instances > (1u << 26) / max(count, 1u)) {
-            args.Store2(at, uint2(0, 0));
+            dest.Store2(at, uint2(0, 0));
             return 0;
         }
         cost = count * instances;
@@ -62,7 +62,7 @@ uint clamped(uint at) {
         // x * y fits 32 bits; the whole count may not.
         if (any(g > uint3(65535, 65535, 65535)) ||
             (g.z != 0 && g.x * g.y > GROUPS / g.z)) {
-            args.Store3(at, uint3(0, 0, 0));
+            dest.Store3(at, uint3(0, 0, 0));
             return 0;
         }
         cost = g.x * g.y * g.z * 64;
@@ -71,7 +71,7 @@ uint clamped(uint at) {
         // Mesh dispatches (kind 10): the console's are one-dimensional.
         uint3 g = args.Load3(at);
         if (any(g > uint3(65535, 1, 1))) {
-            args.Store3(at, uint3(0, 0, 0));
+            dest.Store3(at, uint3(0, 0, 0));
             return 0;
         }
         cost = g.x * g.y * g.z * 128;
@@ -412,7 +412,7 @@ mod tests {
                     out.Map(0, None, Some(&mut p)).unwrap();
                     p.cast::<[u32; 3]>().read_volatile()
                 };
-                assert_eq!(clamped, [65_535, 1, 1]);
+                assert_eq!(clamped, [0, 0, 0]);
             }
             // SAFETY: as above.
             assert_eq!(unsafe { data.cast::<[u32; 3]>().read_volatile() }, [70_000, 1, 1], "the title's copy as written");
