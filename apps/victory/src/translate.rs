@@ -430,9 +430,20 @@ pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result
     Ok(())
 }
 
+/// Whether the warm-up prints how far it is: the `translate` command does
+/// (its user waits for it); a run's does not (its lines would fill the
+/// console the title is already playing to), it waits it out quietly.
+static PROGRESS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Whether the warm-up prints its progress lines, from now on.
+pub fn use_progress(print: bool) {
+    PROGRESS.store(print, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Shows on stderr how far `workers` are through `file`'s `jobs` (`next`
 /// hands them out) until they finish: on a terminal one line rewritten
-/// every second, else a line every 10 s; then the file's last line.
+/// every second, else a line every 10 s; then the file's last line; or
+/// quietly when the progress is asked off.
 pub(crate) fn report<T>(
     file: &Path,
     jobs: usize,
@@ -444,6 +455,12 @@ pub(crate) fn report<T>(
 ) {
     use std::io::IsTerminal;
     if workers.is_empty() {
+        return;
+    }
+    if !PROGRESS.load(std::sync::atomic::Ordering::Relaxed) {
+        while !workers.iter().all(|w| w.is_finished()) {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
         return;
     }
     let terminal = std::io::stderr().is_terminal();
