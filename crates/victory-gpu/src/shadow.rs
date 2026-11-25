@@ -3925,11 +3925,14 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
     let mut gone: Vec<Arc<Shadow>> = Vec::new();
     {
         let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
-        // Every window that starts below the end: one may be longer than
-        // the 4 MiB grid (a sized ask that crosses a line), and so start
-        // further below `at` than that.
+        // Every window that starts below the end and as far below `at` as
+        // the longest there has been: one may be longer than the 4 MiB grid
+        // (a sized ask that crosses a line), and so start further below `at`
+        // than that. (All of them below the end were walked, under the lock
+        // the asks take, on every remap.)
+        let from = at.saturating_sub(LOOSE_LONGEST.load(Ordering::Relaxed));
         let keys: Vec<(u64, u64)> = map
-            .range(..(end, 0))
+            .range((from, 0)..(end, 0))
             .filter(|(key, shadow)| shadow.place.is_some() && key.0 + key.1 > at)
             .map(|(key, _)| *key)
             .collect();
@@ -4203,6 +4206,9 @@ fn longest_tail(windows: impl Iterator<Item = (u64, u64)>, address: u64, end: u6
 
 /// Copies of title memory outside buffers, by (start, length).
 static LOOSE: Mutex<BTreeMap<(u64, u64), Arc<Shadow>>> = Mutex::new(BTreeMap::new());
+/// The longest window [`LOOSE`] has held: none that reaches an address
+/// starts further below it ([`in_place_let_go`]).
+static LOOSE_LONGEST: AtomicU64 = AtomicU64::new(0);
 
 fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Shadow>> {
     let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
@@ -4238,6 +4244,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     if let Some(placed) = crate::inplace::place_for(start, len, true) {
         let shadow = Arc::new(Shadow::placed(placed, start, len, true));
         note(&shadow);
+        LOOSE_LONGEST.fetch_max(len, Ordering::Relaxed);
         map.insert((start, len), shadow.clone());
         return Some(shadow);
     }
@@ -4273,6 +4280,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
     }
     note(&shadow);
+    LOOSE_LONGEST.fetch_max(len, Ordering::Relaxed);
     map.insert((start, len), shadow.clone());
     Some(shadow)
 }
