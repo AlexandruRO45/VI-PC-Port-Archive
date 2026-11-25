@@ -72,7 +72,15 @@ fn hardware(d: &DXGI_ADAPTER_DESC1) -> bool {
 }
 
 /// The hardware adapters that run waves of 32 or 64 lanes, in DXGI's
-/// order: each one's description. An integrated GPU with narrower waves
+/// order: each one's description.
+///
+/// A run can be kept off a card: `VICTORY_TEST_ADAPTERS=<part of a
+/// name>[,<part>...]` lists only the adapters whose description holds one
+/// of the parts (ignoring case), and without it `VICTORY_ADAPTER=<part>`
+/// (which picks the device of [`Host::new`]) does the same, so
+/// `VICTORY_ADAPTER=radeon` keeps a whole test run on that adapter.
+/// `VICTORY_WARP=1` lists none: a software-renderer run touches no hardware
+/// adapter. An adapter that is left out is not opened at all. An integrated GPU with narrower waves
 /// (some Intel ones report 16-16) runs none of the console's programs
 /// that depend on the wave size: the translator refuses them for it by
 /// name, and what walks this list expects a pipeline. An adapter no SM 6.6
@@ -92,6 +100,23 @@ pub fn adapters() -> Result<Vec<String>, String> {
         }
         out
     };
+    if std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1") {
+        return Ok(Vec::new());
+    }
+    let only = std::env::var("VICTORY_TEST_ADAPTERS")
+        .or_else(|_| std::env::var("VICTORY_ADAPTER"))
+        .unwrap_or_default();
+    let only: Vec<String> = only
+        .split(',')
+        .map(|part| part.trim().to_lowercase())
+        .filter(|part| !part.is_empty())
+        .collect();
+    if !only.is_empty() {
+        out.retain(|name| {
+            let name = name.to_lowercase();
+            only.iter().any(|part| name.contains(part))
+        });
+    }
     out.retain(|name| {
         Host::on(name).map_or(true, |host| {
             let target = host.target();
