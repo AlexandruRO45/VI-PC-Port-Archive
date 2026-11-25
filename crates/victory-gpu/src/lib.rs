@@ -69,6 +69,8 @@ mod twin;
 #[cfg(windows)]
 mod texpool;
 #[cfg(windows)]
+mod texback;
+#[cfg(windows)]
 mod texture;
 #[cfg(windows)]
 mod watch;

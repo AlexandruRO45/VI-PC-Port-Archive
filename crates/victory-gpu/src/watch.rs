@@ -741,6 +741,7 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     if len == 0 {
         return;
     }
+    crate::texback::remapped(at, len);
     let end = at.saturating_add(len);
     {
         let mut g = guards();
