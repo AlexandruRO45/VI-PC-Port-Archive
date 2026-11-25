@@ -4299,13 +4299,6 @@ impl Host {
                     }
                 }
                 relay_hand_back(&back);
-                // Only now, and flight by flight: a range another flight
-                // in the air declared too stays closed to refreshes.
-                for flight in &flights {
-                    for (shadow, ranges) in &flight.back {
-                        shadow.copy_back_done(ranges);
-                    }
-                }
                 COPY_BACK[0].fetch_add(landing.elapsed().as_micros() as u64, Ordering::Relaxed);
                 RELAY_STATS[0].fetch_add(1, Ordering::Relaxed);
                 RELAY_STATS[1].fetch_add(flights.len() as u64, Ordering::Relaxed);
@@ -4314,6 +4307,9 @@ impl Host {
         // In the order given: what tells the title the card is done.
         let mut last = 0;
         let mut landed = Vec::new();
+        // Keep the declarations per flight, including ranges shared by
+        // flights. Each contributes one reference to the pending ranges.
+        let mut completed_back = Vec::new();
         for item in items {
             match item {
                 Late::Run(flight) => {
@@ -4325,6 +4321,7 @@ impl Host {
                         self.card_done(card);
                     }
                     landed.push((flight.lists, flight.order));
+                    completed_back.extend(flight.back);
                 }
                 Late::Write(at, what, bytes) => what.write(at as *mut u8, bytes),
                 Late::Signal(fence, value) => crate::fence::set(fence as crate::object::This, value),
@@ -4368,6 +4365,11 @@ impl Host {
         }
         LINE_MOVED.notify_all();
         LINE_LANDED.notify_all();
+        // Refreshes can see these ranges as free once the line and its
+        // waiters have been told about the completed writes.
+        for (shadow, ranges) in completed_back {
+            shadow.copy_back_done(&ranges);
+        }
     }
 
     /// After a submission ran, for copies in the card's memory: the pieces
