@@ -1206,6 +1206,22 @@ pub(crate) fn log(frames: f64) {
         c[C::GpuWritesLeftOut as usize],
         mb(c[C::GpuWritesLeftOutBytes as usize]),
     );
+    {
+        let keys = crate::draw::take_resolved_keys();
+        if keys.iter().any(|&k| k > 0) {
+            tracing::info!(
+                "a key resolved to what a shader sees would keep {} of a frame's fresh tables distinct ({} copied                  slots a frame); leaving one field out it would keep {} without the heap, {} without the slot                  order, {} without the view description, {} without the constant bytes (their address instead),                  {} without the table's extent, {} without the host identity",
+                keys[0],
+                c[C::TableCopied as usize],
+                keys[1],
+                keys[2],
+                keys[3],
+                keys[4],
+                keys[5],
+                keys[6]
+            );
+        }
+    }
     // Where the wall clock of a frame goes: the phases of a frame, the
     // processor time of the whole process, and what each submitting and
     // recording thread did.

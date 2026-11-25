@@ -2014,6 +2014,9 @@ impl State {
                     crate::copystat::C::TableHashNs,
                     hashing.elapsed().as_nanos() as u64,
                 );
+                if resolved_keys() {
+                    count_resolved(table, n);
+                }
             }
             if let Some(&first) = self.fresh_tables.get(&key) {
                 #[cfg(feature = "diagnostics")]
@@ -2119,8 +2122,8 @@ impl State {
         made
     }
 
-    /// The first draws, at debug level: what they bind and read
-    /// (diagnostics builds).
+/// The first draws, at debug level: what they bind and read
+/// (diagnostics builds).
     #[cfg(feature = "diagnostics")]
     fn trace(&self, kind: &str, count: u32, first: u32) {
         static TRACED: AtomicU64 = AtomicU64::new(0);
@@ -2826,3 +2829,137 @@ pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
     // SAFETY: an open list.
     unsafe { list.list.OMSetStencilRef(reference) };
 }
+
+/// `VICTORY_TABLE_KEY=1`: count what a table key resolved to what a shader
+/// sees would do - how many of the fresh tables in a frame it makes distinct,
+/// and how many more it would merge if it ignored one of its fields (which is
+/// the check that a field is not carrying weight it should not).
+#[cfg(feature = "diagnostics")]
+fn resolved_keys() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("VICTORY_TABLE_KEY")
+            .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+    })
+}
+
+/// The fields a resolved key is built from, and the varians that leave one
+/// out: 0 all seven, then without the heap, without the slot index, without
+/// the view description, without the constant buffer's bytes (its address
+/// instead), without the table's extent, and without the host identity.
+#[cfg(feature = "diagnostics")]
+const KEY_VARIANTS: usize = 7;
+
+#[cfg(feature = "diagnostics")]
+static KEY_DISTINCT: [std::sync::atomic::AtomicU64; KEY_VARIANTS] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; KEY_VARIANTS];
+
+/// Counts this table into each variant's set of distinct keys for the frame.
+#[cfg(feature = "diagnostics")]
+fn count_resolved(table: u64, n: u32) {
+    use std::hash::{Hash, Hasher};
+    let heap = table & !0xfff;
+    let mut guard = KEY_SETS.lock().unwrap_or_else(|e| e.into_inner());
+    let sets = guard.get_or_insert_with(|| KeySets {
+        frame: u64::MAX,
+        sets: (0..KEY_VARIANTS).map(|_| std::collections::HashSet::new()).collect(),
+    });
+    let frame = crate::frame::current();
+    if sets.frame != frame {
+        for set in sets.sets.iter_mut() {
+            set.clear();
+        }
+        sets.frame = frame;
+        for (i, count) in KEY_DISTINCT.iter().enumerate() {
+            let _ = i;
+            count.store(0, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    // One pass over the slots: the resolved thing each one holds, and the
+    // description and identity it holds it through.
+    let mut parts: Vec<[u64; 5]> = Vec::with_capacity(n as usize);
+    for k in 0..n {
+        let handle = table + u64::from(k) * 32;
+        let mut fields = [0u64; 5];
+        match crate::descriptor::view(handle) {
+            Some(crate::descriptor::View::Constant(address, size)) => {
+                // The bytes, which is what the shader reads.
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                if address != 0 && size > 0 {
+                    // SAFETY: a constant buffer the title wrote; read as the
+                    // bytes the shader would read.
+                    let bytes =
+                        unsafe { std::slice::from_raw_parts(address as *const u8, size as usize) };
+                    bytes.hash(&mut h);
+                }
+                fields[0] = h.finish();
+                fields[1] = address;
+                fields[2] = u64::from(size);
+            }
+            Some(view) => {
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                view.hash(&mut h);
+                fields[1] = h.finish();
+                fields[2] = match &view {
+                    crate::descriptor::View::Shader(resource, _)
+                    | crate::descriptor::View::Unordered(resource, _, _) => {
+                        crate::resource::host_resource(*resource as crate::object::This)
+                            .map_or(0, |r| r.as_raw() as u64)
+                    }
+                    _ => 0,
+                };
+            }
+            None => {}
+        }
+        fields[3] = u64::from(k);
+        parts.push(fields);
+    }
+    for variant in 0..KEY_VARIANTS {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        if variant != 1 {
+            heap.hash(&mut h);
+        }
+        if variant != 5 {
+            n.hash(&mut h);
+        }
+        for fields in &parts {
+            if variant != 2 {
+                fields[3].hash(&mut h);
+            }
+            match variant {
+                3 => fields[1].hash(&mut h),
+                4 => fields[0].hash(&mut h),
+                6 => {}
+                _ => {
+                    fields[0].hash(&mut h);
+                    fields[1].hash(&mut h);
+                }
+            }
+            fields[2].hash(&mut h);
+        }
+        let set = &mut sets.sets[variant];
+        if set.insert(h.finish()) {
+            KEY_DISTINCT[variant].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+#[cfg(feature = "diagnostics")]
+struct KeySets {
+    frame: u64,
+    sets: Vec<std::collections::HashSet<u64>>,
+}
+
+#[cfg(feature = "diagnostics")]
+static KEY_SETS: std::sync::Mutex<Option<KeySets>> = std::sync::Mutex::new(None);
+
+/// The counts for the frame, and how many fresh tables the frame made.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn take_resolved_keys() -> [u64; KEY_VARIANTS] {
+    let mut out = [0u64; KEY_VARIANTS];
+    for (i, count) in KEY_DISTINCT.iter().enumerate() {
+        out[i] = count.swap(0, std::sync::atomic::Ordering::Relaxed);
+    }
+    out
+}
+
