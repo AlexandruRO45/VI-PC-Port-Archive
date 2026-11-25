@@ -682,6 +682,9 @@ struct Deferred {
     /// Buffers shaders wrote, copied at the list's end into read-back
     /// buffers (from, to, bytes; [`HostList::read_back_at_close`]).
     read_backs: Vec<(ID3D12Resource, ID3D12Resource, u64)>,
+    /// Whether its shaders mark the pages they write through views
+    /// (`crate::shadow::copy_back_marks`).
+    marks_views: bool,
 }
 
 impl Host {
@@ -875,6 +878,16 @@ impl Host {
             }
             lists.push(list.list.cast().ok());
         }
+        // After lists whose shaders mark pages they write through views:
+        // the bitmap is read back and cleared.
+        let marks = runs
+            .iter()
+            .any(|l| l.deferred().marks_views)
+            .then(crate::shadow::marks_tail)
+            .flatten();
+        if let Some(tail) = marks {
+            lists.push(tail.list.cast().ok());
+        }
         batch.flush();
         let prepared = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
@@ -988,7 +1001,9 @@ impl Host {
             .filter(|b| !b.3)
             .map(|(s, a, n, _)| (s.clone(), *a, *n))
             .collect();
-        crate::shadow::copy_back_marks(&withheld);
+        if marks.is_some() {
+            crate::shadow::copy_back_marks(&withheld);
+        }
         for (shadow, address, len, goes_back) in &back {
             let (address, len) = (*address, *len);
             if *goes_back {
@@ -1783,6 +1798,12 @@ impl HostList {
         }
         // SAFETY: a live buffer.
         Some(unsafe { buffer.GetGPUVirtualAddress() })
+    }
+
+    /// The list's shaders mark the pages they write through views: the
+    /// submission reads the marks back after it (`crate::shadow::marks_tail`).
+    pub(crate) fn marks_views(&self) {
+        self.deferred().marks_views = true;
     }
 
     /// Keeps `object` alive until the list is reset.
