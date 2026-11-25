@@ -6,6 +6,9 @@
 //! queue back; else the submission returns, and the work runs on the thread
 //! that meets the wait. One title thread submits to all queues, waits before
 //! what they wait for, so a submission never blocks.
+// Without a Windows host nothing submits command lists, so that step of a
+// queue's work is never made.
+#![cfg_attr(not(windows), allow(dead_code))]
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};

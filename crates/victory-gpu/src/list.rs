@@ -2072,6 +2072,8 @@ mod tests {
         assert_eq!(release(allocator), 0);
     }
 
+    /// A host GPU runs the parts, so this needs Windows.
+    #[cfg(windows)]
     #[test]
     fn lists_are_cut_at_waits_that_follow_work() {
         if crate::host::host().is_none() {

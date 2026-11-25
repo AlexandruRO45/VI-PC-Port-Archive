@@ -347,6 +347,8 @@ impl Module {
     }
 
     /// The value of an integer constant; `None` for anything else.
+    // Asked for only by the translation paths a Windows host runs.
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub fn int_value(&self, v: V) -> Option<i64> {
         match v {
             V::Const(i) => match self.consts[i as usize].1 {

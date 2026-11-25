@@ -1371,6 +1371,9 @@ mod tests {
         })
         .unwrap();
         let mut dxil = l.dxil;
+        // On a host without the DXIL validator and D3D12, nothing consumes it.
+        #[cfg(not(windows))]
+        let _ = &mut dxil;
         #[cfg(windows)]
         if let Ok(mut v) = super::validator::Validator::load(
             super::validator::Validator::default_path().as_deref(),
@@ -1699,6 +1702,9 @@ mod tests {
         .unwrap();
         assert!(l.stride_table);
         let mut dxil = l.dxil;
+        // On a host without the DXIL validator and D3D12, nothing consumes it.
+        #[cfg(not(windows))]
+        let _ = &mut dxil;
         #[cfg(windows)]
         if let Ok(mut v) = super::validator::Validator::load(
             super::validator::Validator::default_path().as_deref(),
@@ -1857,6 +1863,9 @@ mod tests {
         })
         .unwrap();
         let mut dxil = l.dxil;
+        // On a host without the DXIL validator and D3D12, nothing consumes it.
+        #[cfg(not(windows))]
+        let _ = &mut dxil;
         #[cfg(windows)]
         if let Ok(mut v) = super::validator::Validator::load(
             super::validator::Validator::default_path().as_deref(),
@@ -2691,6 +2700,11 @@ mod pr306_tests {
         assert_eq!(copy[4..20], ours[..], "container hash disagrees");
     }
 
+    /// A host without a DXIL validator: the shader is still emitted, only
+    /// the validation is skipped.
+    #[cfg(not(windows))]
+    fn validate_if_available(_: &[u8]) {}
+
     fn emit_synthetic(
         parts: &[(FourCC, &[u8])],
         native: &NativeProgram,
@@ -2759,7 +2773,6 @@ mod pr306_tests {
                 container::signature(&[sig_elem(depth_name, 0, depth_kind, 9, None, 0, 1)], false);
             let host =
                 emit_synthetic(&[(FourCC::ISG1, &isg1), (FourCC::OSG1, &osg1)], &native).unwrap();
-            #[cfg(windows)]
             validate_if_available(&host.dxil);
         }
     }
@@ -2799,7 +2812,6 @@ mod pr306_tests {
         let osg1 = container::signature(&[sig_elem("SV_Target", 0, 16, 9, Some(0), 0, 4)], false);
         let ps =
             emit_synthetic(&[(FourCC::ISG1, &isg1), (FourCC::OSG1, &osg1)], &ps_native).unwrap();
-        #[cfg(windows)]
         validate_if_available(&ps.dxil);
 
         // Also validate a VS whose OSG1 has the same out-of-column row order.
@@ -2832,7 +2844,6 @@ mod pr306_tests {
         };
         let vs_osg1 = container::signature(&row1_elems, false);
         let vs = emit_synthetic(&[(FourCC::OSG1, &vs_osg1)], &vs_native).unwrap();
-        #[cfg(windows)]
         validate_if_available(&vs.dxil);
     }
 
@@ -2907,7 +2918,6 @@ mod pr306_tests {
         };
         let osg1 = container::signature(&[sig_elem("SV_Target", 0, 16, 9, Some(0), 0, 4)], false);
         let ps = emit_synthetic(&[(FourCC::OSG1, &osg1)], &native).unwrap();
-        #[cfg(windows)]
         validate_if_available(&ps.dxil);
     }
 }

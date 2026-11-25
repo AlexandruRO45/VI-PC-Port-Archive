@@ -177,6 +177,9 @@ pub(crate) extern "system" fn wait(
             unsafe { token.write(frame) };
         }
     }
+    // Only the diagnostics log below reads the tick's length.
+    #[cfg(not(feature = "diagnostics"))]
+    let _ = wait;
     #[cfg(feature = "diagnostics")]
     tracing::debug!(
         kind,
