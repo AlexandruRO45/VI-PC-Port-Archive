@@ -1393,6 +1393,21 @@ void main() {
 }
 "#;
 
+    /// The tests of this module that use a device take this for as long as
+    /// they do, so that one of them runs at a time whatever the test
+    /// threads. Side by side on the software adapter they brought the whole
+    /// suite down with an access violation inside the rasterizer
+    /// (d3d10warp.dll), at a different place each time: on a thread of its
+    /// own, or in a call of another module's test. With the host device on
+    /// the software adapter (`VICTORY_D3D12_WARP=1`) and 32 test threads,
+    /// `main`'s suite died so in 12 runs of 21, and in none of 10 without
+    /// this module's tests; with the seven tests added since, in 17 of 22;
+    /// with this, in 2 of 34.
+    fn one_at_a_time() -> std::sync::MutexGuard<'static, ()> {
+        static GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        GATE.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     struct WarpHarness {
         device: ID3D12Device,
         queue: ID3D12CommandQueue,
@@ -1403,10 +1418,13 @@ void main() {
         event: HANDLE,
         clamp: Clamp,
         worker: Clamp,
+        /// Held while the harness lives ([`one_at_a_time`]); dropped last.
+        _alone: std::sync::MutexGuard<'static, ()>,
     }
 
     impl WarpHarness {
         fn new() -> Option<Self> {
+            let alone = one_at_a_time();
             // SAFETY: plain DXGI WARP query and D3D12 test harness setup.
             unsafe {
                 let factory: IDXGIFactory4 =
@@ -1445,6 +1463,7 @@ void main() {
                     event,
                     clamp,
                     worker,
+                    _alone: alone,
                 })
             }
         }
@@ -1782,6 +1801,7 @@ void main() {
     /// The clamp compiles with the system's compiler and the host takes it.
     #[test]
     fn argument_clamp_builds() {
+        let _alone = one_at_a_time();
         if super::host().is_none() {
             return; // no host GPU here
         }
@@ -2530,6 +2550,7 @@ void main() {
     /// the host device.
     #[test]
     fn host_list_reuses_and_grows_scratch_across_submissions() {
+        let _alone = one_at_a_time();
         let Some(host) = super::host() else {
             return;
         };
@@ -2691,6 +2712,7 @@ void main() {
     /// small record still runs.
     #[test]
     fn host_list_budget_starts_empty_at_each_submission() {
+        let _alone = one_at_a_time();
         let Some(host) = super::host() else {
             return;
         };
@@ -2801,6 +2823,7 @@ void main() {
     /// as it is now.
     #[test]
     fn host_list_window_check_finds_a_record_written_under_its_window() {
+        let _alone = one_at_a_time();
         let Some(host) = super::host() else {
             return;
         };
@@ -2943,6 +2966,7 @@ void main() {
     /// diagnostics build) no barrier names a state the buffer is not in.
     #[test]
     fn host_list_window_executions_need_no_barrier_of_their_own() {
+        let _alone = one_at_a_time();
         let Some(host) = super::host() else {
             return;
         };
@@ -3040,6 +3064,7 @@ void main() {
     /// after its reset the room is taken from the start again.
     #[test]
     fn ring_gives_each_clamp_room_of_its_own() {
+        let _alone = one_at_a_time();
         let Some(host) = super::host() else {
             return;
         };
@@ -3090,6 +3115,7 @@ void main() {
     /// the list (records changed by the CPU in between) clamps them again.
     #[test]
     fn early_clamps_run_in_the_prelude_at_each_submission() {
+        let _alone = one_at_a_time();
         let Some(host) = super::host() else {
             return;
         };
@@ -3160,6 +3186,7 @@ void main() {
     /// spend leaves the list's own clamps their budget.
     #[test]
     fn early_clamps_charge_a_budget_of_their_own_at_each_submission() {
+        let _alone = one_at_a_time();
         let Some(host) = super::host() else {
             return;
         };
@@ -3255,6 +3282,7 @@ void main() {
     /// kind's records theirs.
     #[test]
     fn a_prelude_clamps_gathered_records_and_early_ones_side_by_side() {
+        let _alone = one_at_a_time();
         let Some(host) = super::host() else {
             return;
         };
