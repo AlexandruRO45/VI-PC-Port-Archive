@@ -63,6 +63,12 @@ Check **Committed** under **Task Manager → Performance → Memory**. If
 `crashes.log` reports Windows error 1455, close other applications or increase
 the Windows paging file size, then retry.
 
+If a dependency's build script fails from a deeply nested checkout on
+Windows (MASM `A1009: line too long`, or `LNK1104` while linking a
+build-script executable), build from a shorter path, or point
+`CARGO_TARGET_DIR` at a short absolute one: both keep the generated command
+lines under Windows' limits.
+
 ```powershell
 cargo xtask install-hooks                # asset-policy check on every commit
 copy victory.example.toml victory.toml   # then set your paths (outside the repo)
