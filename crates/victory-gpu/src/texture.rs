@@ -42,9 +42,11 @@ pub(crate) struct Staging {
     data: *mut u8,
     footprints: Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
     rows: Vec<u32>,
-    layout: victory_formats::texture::Layout,
+    layout: victory_formats::texture::Texture,
     /// Mips per array slice.
     mips: u32,
+    /// Subresources per plane: all mips of each array slice.
+    subresources_per_plane: u32,
     memory: *const u8,
     /// The memory's pages changed since detiled (none: not the runtime's
     /// memory, hashed instead).
@@ -320,7 +322,7 @@ impl Staging {
             tracing::debug!(
                 memory = ?self.memory,
                 size,
-                desc = ?self.layout.desc,
+                desc = ?self.layout.planes[0].layout.desc,
                 "a sampled texture's memory is not committed"
             );
             return (0, false);
@@ -346,12 +348,17 @@ impl Staging {
         if tiled.iter().all(|&b| b == 0) {
             tracing::debug!(
                 memory = ?self.memory,
-                desc = ?self.layout.desc,
+                desc = ?self.layout.planes[0].layout.desc,
                 "a sampled texture's memory is all zero (not streamed yet, or a failed BCPack read)"
             );
         }
         for (i, (footprint, &rows)) in self.footprints.iter().zip(&self.rows).enumerate() {
-            let (mip, slice) = (i as u32 % self.mips, i as u32 / self.mips);
+            // D3D12 orders mips first, then array slices, then planes.
+            let index = i as u32 % self.subresources_per_plane;
+            let (mip, slice) = (index % self.mips, index / self.mips);
+            let plane = &self.layout.planes[i / self.subresources_per_plane as usize];
+            let start = plane.offset as usize;
+            let tiled = &tiled[start..start + plane.layout.size as usize];
             let f = footprint.Footprint;
             let pitch = f.RowPitch as usize;
             let len = subresource_len(footprint.Offset, pitch, rows, f.Depth, self.size);
@@ -362,7 +369,7 @@ impl Staging {
                 std::slice::from_raw_parts_mut(self.data.add(footprint.Offset as usize), len)
             };
             if let Err(e) =
-                self.layout
+                plane.layout
                     .detile(tiled, mip, slice, linear, pitch, pitch * rows as usize)
             {
                 tracing::warn!(?e, mip, slice, "texture not detiled");
@@ -422,26 +429,26 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         return Some(s.clone());
     }
     let (memory, desc) = crate::resource::texture_memory(resource)?;
-    let Some(layout) = crate::resource::texture_layout(&desc).map(|t| t.planes[0].layout.clone())
-    else {
+    let Some(layout) = crate::resource::texture_layout(&desc) else {
         once!(
             ?desc,
             "texture contents without a console layout not uploaded"
         );
         return None;
     };
-    if layout.desc.swizzle.xor() {
+    if layout.planes.iter().any(|p| p.layout.desc.swizzle.xor()) {
         once!(?desc, "texture contents in an XOR mode not uploaded");
         return None;
     }
     let host = host()?;
     // SAFETY: a live resource.
     let d = unsafe { texture.GetDesc() };
-    let count = if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
+    let subresources_per_plane = if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
         u32::from(d.MipLevels)
     } else {
         u32::from(d.MipLevels) * u32::from(d.DepthOrArraySize)
     };
+    let count = subresources_per_plane * layout.planes.len() as u32;
     let mut footprints = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); count as usize];
     let mut rows = vec![0u32; count as usize];
     let mut total = 0;
@@ -475,6 +482,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         rows,
         layout,
         mips: u32::from(d.MipLevels),
+        subresources_per_plane,
         memory,
         tracked: crate::watch::track(memory as usize, layout_size, true),
         last: Mutex::default(),
