@@ -1103,10 +1103,9 @@ mod tests {
             D3D12_FEATURE_D3D12_OPTIONS7, D3D12_FEATURE_DATA_D3D12_OPTIONS7,
             D3D12_MESH_SHADER_TIER_NOT_SUPPORTED, D3D12_SHADER_VISIBILITY_MESH,
         };
-        // One GPU test at a time in this module (the fork keeps the VALU
-        // tests' lock local to their runner).
-        static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        let _one = super::valu_tests::ONE_AT_A_TIME
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let ps = constant_color();
         let mut ran = 0;
         for (label, warp) in [("hardware", false), ("warp", true)] {
