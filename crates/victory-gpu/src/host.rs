@@ -9858,6 +9858,19 @@ impl Meter {
             );
         }
         let dropped = crate::draw::take_dropped() as f64 / frames;
+        {
+            // The same drops by reason (the frame line's one number mixed them).
+            let why = crate::draw::take_dropped_why();
+            if why.iter().any(|&n| n > 0) {
+                let parts: Vec<String> = why
+                    .iter()
+                    .zip(crate::draw::DROP_REASONS)
+                    .filter(|(n, _)| **n > 0)
+                    .map(|(&n, what)| format!("{:.1} {what}", n as f64 / frames))
+                    .collect();
+                tracing::info!("draws and dispatches dropped per frame, by reason: {}", parts.join(", "));
+            }
+        }
         let indirect = crate::list::take_indirect() as f64 / frames;
         let mesh_largest = MESH_GROUPS[0].swap(0, Ordering::Relaxed);
         let mesh_groups = MESH_GROUPS[1].swap(0, Ordering::Relaxed) as f64 / frames;
