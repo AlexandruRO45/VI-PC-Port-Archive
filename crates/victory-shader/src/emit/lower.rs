@@ -10336,6 +10336,8 @@ impl<'a> Lower<'a> {
         } else {
             (0..4).filter(|ch| dmask >> ch & 1 != 0).collect()
         };
+        // Sampling each possible immediate sampler joins their results in a new block.
+        let c = self.cur;
         let mut xs = Vec::new();
         for ch in channels {
             let x = match gathered {

@@ -262,14 +262,24 @@ fn lanes_sample_their_own_texture_in_a_waterfall_narrowed_by_v_cmpx() {
 }
 #[test]
 fn immediate_sampler_chosen_by_control_flow() {
+    check_immediate_sampler_choice(false);
+}
+
+#[test]
+fn immediate_sampler_choice_packs_d16_after_the_join() {
+    check_immediate_sampler_choice(true);
+}
+
+fn check_immediate_sampler_choice(d16: bool) {
     let s_mov_lit = |dst: u8, lit: u32| [0xBE80_03FF | (dst as u32) << 16, lit];
     let s_mov_zero = |dst: u8| 0xBE80_0380 | (dst as u32) << 16;
     let s_load_x8 = |dst: u8, base: u8| [0x3D << 26 | 0x03 << 18 | (dst as u32) << 6 | (base as u32 >> 1), 125 << 25];
     let s_load_x4_off = |dst: u8, base: u8, off: u32| [0x3D << 26 | 0x02 << 18 | (dst as u32) << 6 | (base as u32 >> 1), 125 << 25 | off];
     // image_sample_lz v4, v[2:3], s[8:15], s[16:19] dmask:0x1 dim:SQ_RSRC_IMG_2D
+    let dmask = if d16 { 3 } else { 1 };
     let image_sample_lz: [u32; 2] = [
-        0x3C << 26 | 0x21 << 18 | 1 << 8 | 1 << 3, // dmask=1, dim=2D(1)
-        (16u32 >> 2) << 21 | (8u32 >> 2) << 16 | 4 << 8 | 2,
+        0x3C << 26 | 0x21 << 18 | dmask << 8 | 1 << 3,
+        u32::from(d16) << 31 | (16u32 >> 2) << 21 | (8u32 >> 2) << 16 | 4 << 8 | 2,
     ];
     // buffer_store_dword v4, off, s[20:23], 0
     let buf_store: [u32; 2] = [0x38 << 26 | 0x1C << 18, 0x80 << 24 | (20u32 >> 2) << 16 | 4 << 8];
@@ -420,7 +430,7 @@ fn immediate_sampler_chosen_by_control_flow() {
                         other => panic!("unexpected user data {other:?}"),
                     };
                 }
-                let texels = [[1.0f32, 0.0, 0.0, 1.0]];
+                let texels = [[1.0f32, 0.5, 0.0, 1.0]];
                 let out = host
                     .dispatch(
                         &root,
@@ -437,8 +447,8 @@ fn immediate_sampler_chosen_by_control_flow() {
                         },
                     )
                     .unwrap_or_else(|e| panic!("{case_name}/{label}: dispatch failed: {e}"));
-                let got = f32::from_bits(out[0][0]);
-                assert_eq!(got, 1.0, "{case_name}/{label} branch={branch}");
+                let expected = if d16 { 0x3800_3c00 } else { 1.0f32.to_bits() };
+                assert_eq!(out[0][0], expected, "{case_name}/{label} branch={branch}");
             }
         }
     }
