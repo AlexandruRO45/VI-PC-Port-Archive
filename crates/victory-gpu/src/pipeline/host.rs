@@ -6,7 +6,7 @@
 //! the immediate samplers, and directly indexed heaps.
 
 use std::ffi::{CStr, CString};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use victory_shader::emit::{
     MEMORY_SPACE, MESH_RECORD_SPACE, ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE,
@@ -94,6 +94,44 @@ impl Default for GraphicsState {
     }
 }
 
+#[derive(Clone, Copy)]
+enum DepthEqualRelax {
+    LessEqual,
+    GreaterEqual,
+}
+
+/// `VICTORY_DEPTH_EQUAL_RELAX=1` widens a depth-writing-off EQUAL test to
+/// LESS_EQUAL; `=reversed` selects GREATER_EQUAL for a reversed-Z title.
+fn depth_equal_relax() -> Option<DepthEqualRelax> {
+    static MODE: OnceLock<Option<DepthEqualRelax>> = OnceLock::new();
+    *MODE.get_or_init(|| {
+        match std::env::var("VICTORY_DEPTH_EQUAL_RELAX").ok()?.as_str() {
+            "1" | "less" | "less_equal" => Some(DepthEqualRelax::LessEqual),
+            "reversed" | "greater" | "greater_equal" => Some(DepthEqualRelax::GreaterEqual),
+            _ => None,
+        }
+    })
+}
+
+fn relax_depth_equal(depth: &mut D3D12_DEPTH_STENCIL_DESC, mode: Option<DepthEqualRelax>) -> bool {
+    if depth.DepthWriteMask != D3D12_DEPTH_WRITE_MASK_ZERO
+        || depth.DepthFunc != D3D12_COMPARISON_FUNC_EQUAL
+    {
+        return false;
+    }
+    let Some(mode) = mode else { return false };
+    depth.DepthFunc = match mode {
+        DepthEqualRelax::LessEqual => D3D12_COMPARISON_FUNC_LESS_EQUAL,
+        DepthEqualRelax::GreaterEqual => D3D12_COMPARISON_FUNC_GREATER_EQUAL,
+    };
+    tracing::info!(
+        from = D3D12_COMPARISON_FUNC_EQUAL.0,
+        to = depth.DepthFunc.0,
+        "VICTORY_DEPTH_EQUAL_RELAX: widened a depth-read-only EQUAL test"
+    );
+    true
+}
+
 impl GraphicsState {
     /// Takes in one subobject of a stream: its type, then its data at +4
     /// (+8 for those holding pointers).
@@ -108,7 +146,10 @@ impl GraphicsState {
                 8 => self.blend = data.cast::<D3D12_BLEND_DESC>().read_unaligned(),
                 9 => self.sample_mask = data.cast::<u32>().read_unaligned(),
                 10 => self.rasterizer = data.cast::<D3D12_RASTERIZER_DESC>().read_unaligned(),
-                11 => self.depth = data.cast::<D3D12_DEPTH_STENCIL_DESC>().read_unaligned(),
+                11 => {
+                    self.depth = data.cast::<D3D12_DEPTH_STENCIL_DESC>().read_unaligned();
+                    relax_depth_equal(&mut self.depth, depth_equal_relax());
+                }
                 21 => {
                     // shortcut: the depth bounds test is dropped (the host
                     // pipeline uses the plain description); bring it back
@@ -124,6 +165,7 @@ impl GraphicsState {
                         FrontFace: d.FrontFace,
                         BackFace: d.BackFace,
                     };
+                    relax_depth_equal(&mut self.depth, depth_equal_relax());
                 }
                 12 => {
                     let layout = at.add(8).cast::<D3D12_INPUT_LAYOUT_DESC>().read_unaligned();
@@ -352,6 +394,30 @@ fn native_barycentrics_need_the_device_feature() {
     ps.dxil[bit] |= 2;
     assert!(!pixel_features_supported(&ps.dxil, || false));
     assert!(pixel_features_supported(&ps.dxil, || true));
+}
+
+#[cfg(test)]
+#[test]
+fn depth_equal_relax_only_widens_read_only_tests() {
+    let mut depth = D3D12_DEPTH_STENCIL_DESC {
+        DepthEnable: true.into(),
+        DepthWriteMask: D3D12_DEPTH_WRITE_MASK_ZERO,
+        DepthFunc: D3D12_COMPARISON_FUNC_EQUAL,
+        ..Default::default()
+    };
+    assert!(!relax_depth_equal(&mut depth, None));
+    assert_eq!(depth.DepthFunc, D3D12_COMPARISON_FUNC_EQUAL);
+    assert!(relax_depth_equal(&mut depth, Some(DepthEqualRelax::LessEqual)));
+    assert_eq!(depth.DepthFunc, D3D12_COMPARISON_FUNC_LESS_EQUAL);
+
+    depth.DepthFunc = D3D12_COMPARISON_FUNC_EQUAL;
+    depth.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+    assert!(!relax_depth_equal(&mut depth, Some(DepthEqualRelax::LessEqual)));
+    assert_eq!(depth.DepthFunc, D3D12_COMPARISON_FUNC_EQUAL);
+
+    depth.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+    assert!(relax_depth_equal(&mut depth, Some(DepthEqualRelax::GreaterEqual)));
+    assert_eq!(depth.DepthFunc, D3D12_COMPARISON_FUNC_GREATER_EQUAL);
 }
 
 impl HostPipeline {
