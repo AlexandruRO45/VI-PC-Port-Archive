@@ -541,41 +541,36 @@ impl Module {
     }
 
     /// What the handle of a 64-bit atomic is: `(typed, from the heap)`, from
-    /// the annotation (kinds 1-10 are typed resources) and the handle's
-    /// source, looking through selects and phis.
-    fn atomic64_handle_kinds(&self, start: V) -> (bool, bool) {
-        let mut stack = vec![start];
-        let mut seen = Vec::new();
-        let (mut typed, mut heap) = (false, false);
-        while let Some(v) = stack.pop() {
-            let V::Inst(i) = v else { continue };
-            if seen.contains(&i) {
-                continue;
+    /// the annotation (kinds 1-10 are typed resources) and the call the
+    /// annotation is of. Handles are not joined: lowering joins the heap
+    /// index and makes the handle after it, and the validator refuses a phi
+    /// or a select of handles, so there is one annotation and one source.
+    fn atomic64_handle_kinds(&self, handle: V) -> (bool, bool) {
+        let name = |v: V| match v {
+            V::Inst(i) => match &self.insts[i as usize].op {
+                Op::Call(f, _) => self.funcs[*f as usize].name.as_str(),
+                _ => "",
+            },
+            _ => "",
+        };
+        let (mut typed, mut source) = (false, handle);
+        if name(handle) == "dx.op.annotateHandle"
+            && let V::Inst(i) = handle
+            && let Op::Call(_, args) = &self.insts[i as usize].op
+        {
+            // Arguments: opcode, handle, properties.
+            if let Some(&V::Const(props)) = args.get(2)
+                && let Const::Aggregate(fields) = &self.consts[props as usize].1
+                && let Some(&first) = fields.first()
+                && let Some(props0) = self.int_value(V::Const(first))
+            {
+                typed = (1..=10).contains(&(props0 & 0xFF));
             }
-            seen.push(i);
-            match &self.insts[i as usize].op {
-                Op::Call(f, args) if self.funcs[*f as usize].name == "dx.op.annotateHandle" => {
-                    // Arguments: opcode, handle, properties.
-                    if let Some(&V::Const(props)) = args.get(2)
-                        && let Const::Aggregate(fields) = &self.consts[props as usize].1
-                        && let Some(&first) = fields.first()
-                        && let Some(props0) = self.int_value(V::Const(first))
-                    {
-                        typed |= (1..=10).contains(&(props0 & 0xFF));
-                    }
-                    if let Some(&raw) = args.get(1) {
-                        stack.push(raw);
-                    }
-                }
-                Op::Call(f, _) if self.funcs[*f as usize].name.starts_with("dx.op.createHandleFromHeap") => {
-                    heap = true;
-                }
-                Op::Select(_, t, f) => stack.extend([*t, *f]),
-                Op::Phi(inc) => stack.extend(inc.iter().map(|x| x.0)),
-                _ => {}
+            if let Some(&raw) = args.get(1) {
+                source = raw;
             }
         }
-        (typed, heap)
+        (typed, name(source).starts_with("dx.op.createHandleFromHeap"))
     }
 
     /// Which instructions are written: those [`Module::rooted`], the
