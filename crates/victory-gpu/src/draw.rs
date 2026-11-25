@@ -9,6 +9,7 @@
 //! title sets it.
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use victory_shader::resource::RootIndexedView;
 use victory_shader::{ResourceType, RootType, UsedResource};
@@ -372,6 +373,61 @@ pub(crate) static HEAP_TEXTURES_FULL: AtomicU64 = AtomicU64::new(0);
 /// Content checks that found a texture unchanged, or queued a fresh upload.
 pub(crate) static HEAP_TEXTURES_RECHECKED: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 pub(crate) static HEAP_TEXTURE_RECHECK_US: AtomicU64 = AtomicU64::new(0);
+pub(crate) static EARLY_TEXTURE_PASSES: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+static EARLY_TEXTURE_FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// Pixel shaders that bake decoration textures once while the world loads.
+const BAKE_PIXEL_SHADERS: [&str; 4] =
+    ["c0a7fe77b1862e10", "0d1575a396dfe513", "b7cfd8dda91ebb6b", "280967ad158cee0b"];
+
+fn early_texture_limits() -> (Duration, Duration) {
+    static LIMITS: std::sync::OnceLock<(Duration, Duration)> = std::sync::OnceLock::new();
+    *LIMITS.get_or_init(|| {
+        let limit = |name| {
+            let ms = std::env::var(name).ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0);
+            Duration::from_millis(ms)
+        };
+        (limit("VICTORY_EARLY_TEXTURES_MS"), limit("VICTORY_BAKE_TEXTURES_MS"))
+    })
+}
+
+enum TexturePass {
+    Indexed,
+    Early { regular: Duration, bake: Duration },
+}
+
+struct TextureUploads {
+    frame: Option<u64>,
+    spent: u64,
+    early: bool,
+    bake_spent: u64,
+    bake_time: Duration,
+}
+
+impl TextureUploads {
+    const fn new(frame: Option<u64>) -> Self {
+        Self { frame, spent: 0, early: false, bake_spent: 0, bake_time: Duration::ZERO }
+    }
+
+    fn budget(&mut self, mode: TexturePass) -> Option<(Duration, u64, bool)> {
+        match mode {
+            TexturePass::Indexed => Some((Duration::from_millis(250), 192 << 20, false)),
+            TexturePass::Early { regular, bake } => {
+                let bake_time = bake.saturating_sub(self.bake_time);
+                let bake_bytes = (2u64 << 30).saturating_sub(self.bake_spent);
+                if !bake_time.is_zero() && bake_bytes > 0 {
+                    self.early = true;
+                    Some((bake_time, self.spent.saturating_add(bake_bytes), true))
+                } else if !self.early && !regular.is_zero() {
+                    self.early = true;
+                    Some((regular, self.spent.saturating_add(64 << 20), false))
+                } else {
+                    None
+                }
+            }
+        }
+    }
+}
 
 /// Whether textures picked by index are looked at again after their upload
 /// (`VICTORY_HEAP_RECHECK=0`: no).
@@ -903,6 +959,9 @@ impl State {
     /// could not be given a view.
     pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
         let l = &list.list;
+        if !compute {
+            self.early_textures(list, p);
+        }
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them.
         if self.host_heaps != self.heaps {
@@ -1314,6 +1373,38 @@ impl State {
         true
     }
 
+    fn view_heap(&self) -> Option<&crate::descriptor::Heap> {
+        self.heaps.iter()
+            .filter(|&&h| h != 0)
+            .map(|&h| crate::descriptor::heap(h as This))
+            .find(|h| !h.samplers())
+    }
+
+    fn early_textures(&self, list: &HostList, pipeline: &HostPipeline) {
+        let (regular, bake_limit) = early_texture_limits();
+        if regular.is_zero() && bake_limit.is_zero() {
+            return;
+        }
+        let regular = if EARLY_TEXTURE_FRAME.load(Ordering::Relaxed) == crate::frame::current() {
+            Duration::ZERO
+        } else {
+            regular
+        };
+        let bake = if !bake_limit.is_zero()
+            && pipeline.stages.iter().any(|stage| BAKE_PIXEL_SHADERS.contains(&stage.shader.hash.as_str()))
+        {
+            bake_limit
+        } else {
+            Duration::ZERO
+        };
+        if regular.is_zero() && bake.is_zero() {
+            return;
+        }
+        if let Some(heap) = self.view_heap() && let Some(host) = heap.host() {
+            self.heap_textures(list, heap, host, TexturePass::Early { regular, bake });
+        }
+    }
+
     /// For a shader that picks buffers from the view heap by an index it
     /// computes (SM 6.6 dynamic resources): the GPU address of the heap's
     /// table of element strides, with every buffer view of the heap given
@@ -1326,12 +1417,7 @@ impl State {
     /// copy. A list refreshes them where it first runs such a shader;
     /// title writes recorded later in the same list are not seen.
     fn heap_buffers(&self, list: &HostList) -> Option<u64> {
-        let heap = self
-            .heaps
-            .iter()
-            .filter(|&&h| h != 0)
-            .map(|&h| crate::descriptor::heap(h as This))
-            .find(|h| !h.samplers())?;
+        let heap = self.view_heap()?;
         let host = heap.host()?;
         let gpu = host.strides_gpu()?;
         // One key per list, as textures have: no title resource is there.
@@ -1447,7 +1533,7 @@ impl State {
             shadow.refresh(list, *from, to - from);
         }
         HEAP_PHASES[1].fetch_add(spans_started.elapsed().as_micros() as u64, Ordering::Relaxed);
-        self.heap_textures(list, heap, host);
+        self.heap_textures(list, heap, host, TexturePass::Indexed);
         HEAP_BUFFER_PASSES.fetch_add(1, Ordering::Relaxed);
         HEAP_BUFFER_MICROS.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
         static LOGGED: AtomicU64 = AtomicU64::new(0);
@@ -1484,18 +1570,30 @@ impl State {
         list: &HostList,
         heap: &crate::descriptor::Heap,
         host: &crate::descriptor::host::HostHeap,
+        mode: TexturePass,
     ) {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if !*ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_TEXTURES").is_none_or(|v| v != "0")) {
             return;
         }
-        /// Bytes of texture memory staged per frame.
-        const PER_FRAME: u64 = 192 << 20;
-        static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
-        static SPENT: AtomicU64 = AtomicU64::new(0);
+        // Both indexed and early passes record uploads and update the same
+        // queue. Serialize them even when the early draw does not use buffers.
+        static UPLOADS: std::sync::Mutex<TextureUploads> =
+            std::sync::Mutex::new(TextureUploads::new(None));
+        let mut uploads = UPLOADS.lock().unwrap_or_else(|e| e.into_inner());
         let frame = crate::frame::current();
-        if FRAME.swap(frame, Ordering::Relaxed) != frame {
-            SPENT.store(0, Ordering::Relaxed);
+        if uploads.frame != Some(frame) {
+            *uploads = TextureUploads::new(Some(frame));
+        }
+        let early = matches!(mode, TexturePass::Early { .. });
+        let Some((span, bytes_limit, bake)) = uploads.budget(mode) else {
+            return;
+        };
+        let pass_started = std::time::Instant::now();
+        let spent_before = uploads.spent;
+        if early {
+            EARLY_TEXTURE_FRAME.store(frame, Ordering::Relaxed);
+            EARLY_TEXTURE_PASSES[usize::from(bake)].fetch_add(1, Ordering::Relaxed);
         }
         // No more of them are made while the card has no room
         // (`resource::room`): by what is alive now, not by what was ever
@@ -1568,14 +1666,13 @@ impl State {
         // records the frame, and making and staging 192 MB of textures took
         // 1.6-2.2 s of each of the world's first twenty frames (run 20).
         // The rest waits for the next frames, as it does past the bytes.
-        const SPAN: std::time::Duration = std::time::Duration::from_millis(250);
-        let began = std::time::Instant::now();
+        let began = if early { pass_started } else { std::time::Instant::now() };
         for (index, write) in due {
-            if SPENT.load(Ordering::Relaxed) >= PER_FRAME {
+            if uploads.spent >= bytes_limit {
                 HEAP_PHASES[10].fetch_add(1, Ordering::Relaxed);
                 break;
             }
-            if began.elapsed() > SPAN {
+            if began.elapsed() > span {
                 HEAP_PHASES[9].fetch_add(1, Ordering::Relaxed);
                 break;
             }
@@ -1673,7 +1770,7 @@ impl State {
                 let text: String = format!("{view:?}").chars().take(300).collect();
                 tracing::error!(why, slot = index, "the host device went while textures picked by index were made ready; last: {text}");
                 crate::host::log_removal_context();
-                return;
+                break;
             }
             let (bytes, whole) = crate::texture::staged(resource).unwrap_or((0, true));
             // Not all of it there: looked at again next frame, and from
@@ -1707,7 +1804,7 @@ impl State {
                 None
             };
             crate::texture::unstage(resource);
-            SPENT.fetch_add(bytes, Ordering::Relaxed);
+            uploads.spent = uploads.spent.saturating_add(bytes);
             HEAP_TEXTURE_BYTES.fetch_add(bytes, Ordering::Relaxed);
             HEAP_TEXTURES.fetch_add(1, Ordering::Relaxed);
             HEAP_PHASES[8].fetch_add(1, Ordering::Relaxed);
@@ -1719,6 +1816,10 @@ impl State {
                 None => host.texture_slot_done(index, write, again),
             }
             phase(6, rest);
+        }
+        if bake {
+            uploads.bake_spent = uploads.bake_spent.saturating_add(uploads.spent - spent_before);
+            uploads.bake_time = uploads.bake_time.saturating_add(began.elapsed());
         }
     }
 
@@ -2847,6 +2948,32 @@ pub(crate) fn depth_bounds(list: &HostList, min: f32, max: f32) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn texture_upload_budgets_are_shared_across_early_passes() {
+        use super::{Duration, TexturePass, TextureUploads};
+
+        let regular = Duration::from_millis(12);
+        let bake = Duration::from_millis(1_500);
+        let mut frame = TextureUploads::new(Some(5));
+        frame.spent = 8 << 20;
+        assert_eq!(frame.budget(TexturePass::Indexed), Some((Duration::from_millis(250), 192 << 20, false)));
+        let ordinary = || TexturePass::Early { regular, bake: Duration::ZERO };
+        assert_eq!(frame.budget(ordinary()), Some((regular, 72 << 20, false)));
+        assert_eq!(frame.budget(ordinary()), None);
+
+        let before_bake = || TexturePass::Early { regular, bake };
+        assert_eq!(frame.budget(before_bake()), Some((bake, (2 << 30) + (8 << 20), true)));
+        frame.spent += 128 << 20;
+        frame.bake_spent += 128 << 20;
+        frame.bake_time += Duration::from_millis(450);
+        assert_eq!(frame.budget(before_bake()), Some((Duration::from_millis(1_050), (2 << 30) + (8 << 20), true)));
+        frame.bake_time = bake;
+        assert_eq!(frame.budget(before_bake()), None);
+        frame.bake_time = Duration::ZERO;
+        frame.bake_spent = 2 << 30;
+        assert_eq!(frame.budget(before_bake()), None);
+    }
+
     use super::{GivesBack, gives_back};
 
     /// A shader that reads title memory by address and stores only through
