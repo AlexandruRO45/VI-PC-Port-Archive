@@ -19,7 +19,7 @@ constexpr HRESULT E_NOT_SUFFICIENT_BUFFER_HR = HRESULT_FROM_WIN32(ERROR_INSUFFIC
 
 // Identifiants fixes de la console émulée (tailles : XSystemConsoleIdBytes = 39,
 // XSystemAppSpecificDeviceIdBytes = 45, XSystemXboxLiveSandboxIdMaxBytes = 16).
-constexpr char kConsoleId[] = "AXBX000000000000000000000000000000001";
+constexpr char kConsoleId[] = "00000000.00000000.00000000.00000000.00";
 constexpr char kSandboxId[] = "RETAIL";
 constexpr char kAppDeviceId[] = "QW55WGJveFgtZGV2aWNlLTAwMDAwMDAwMDAwMDAx";
 

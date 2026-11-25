@@ -92,6 +92,7 @@ pub(super) unsafe extern "system" fn timestamp_at(list: &List, address: u64, arg
         let (heap, index) = state.timestamp_page.as_mut().unwrap();
         let packet = super::memory_wait::Packet::Timestamp(heap.clone(), *index, resource, offset);
         *index += 1;
+        super::memory_wait::trace_write("timestamp", address, 8, 0);
         state.prefix.push(&list.native, packet)
     })();
     if let Err(error) = result { state.error = error.code(); }

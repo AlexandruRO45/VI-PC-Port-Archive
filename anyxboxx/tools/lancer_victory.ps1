@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-  Builds (if needed) and launches VIctory (third_party/victory) on the user's own game folder.
+  Builds (cargo skips the work when current) and launches VIctory (third_party/victory) on the user's own game folder.
 
 .PARAMETER GameDir
   Folder of the game package (kept outside this repository). It must contain game_scarlett_master.exe.
@@ -70,11 +70,11 @@ if (-not (Test-Path -LiteralPath $gameExe)) {
 $target = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { Join-Path $victory 'target' }
 $exe = Join-Path $target 'diag\victory.exe'
 
-if (-not (Test-Path -LiteralPath $exe)) {
-    Write-Host 'Building VIctory (diag profile, diagnostics feature)...'
-    & cargo build --profile diag -p victory --features diagnostics --manifest-path $manifest
-    if ($LASTEXITCODE -ne 0) { throw "cargo build failed (exit code $LASTEXITCODE)." }
-}
+# Always ask cargo: it does nothing when victory.exe is current, and rebuilds it after a submodule update (an old
+# victory.exe would ignore the settings the pinned commit reads).
+Write-Host 'Building VIctory (diag profile, diagnostics feature)...'
+& cargo build --profile diag -p victory --features diagnostics --manifest-path $manifest
+if ($LASTEXITCODE -ne 0) { throw "cargo build failed (exit code $LASTEXITCODE)." }
 
 # No victory.toml is needed: VIctory reads the game folder from VICTORY_GAME_DIR.
 $env:VICTORY_GAME_DIR = $GameDir

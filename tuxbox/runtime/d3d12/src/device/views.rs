@@ -567,7 +567,7 @@ pub(crate) unsafe fn linear_resource(device_ptr: *mut c_void, address: u64, byte
     let (buffer, host) = unsafe { command_buffer_address(device_ptr, address, bytes)? };
     let Some(buffer) = buffer else {
         crate::diagnostics::recording_error(format_args!(
-            "slot 62 destination {address:#x} ({bytes:#x} bytes) is not a buffer or texture"
+            "slot 62 address {address:#x} ({bytes:#x} bytes) is not a buffer or texture"
         ));
         return Err(E_INVALIDARG.into());
     };

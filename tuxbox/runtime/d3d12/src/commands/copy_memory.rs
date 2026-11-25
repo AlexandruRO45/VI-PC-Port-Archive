@@ -1,15 +1,17 @@
-//! Slot 62 copies a linear CPU image into a resource named by GPU address.
+//! Slot 62, `CopyMemoryToMemoryX(Destination, Source, SizeBytes, Flags)`
+//! (GDK d3d12_xs.h): a GPU copy between two GPU virtual addresses.
 //!
-//! Scarlett's video path (title RVA 0x979650) calls the graphics list with a
-//! CPU pointer, the resource's GPU VA, a byte count, and flags. Callers fill
-//! that CPU buffer only after the call returns, so the bytes are read at
-//! ExecuteCommandLists. The copy itself is recorded at the call so later
-//! commands in the same list see the upload.
+//! Either address can name guest memory or a texture. ProjectScarlett reads
+//! textures back this way (title RVA 0x979650): it passes a CPU staging
+//! allocation as the destination and the texture as the source, waits for the
+//! GPU, then reads the rows at a 256-byte pitch. That is the desktop copy
+//! footprint, so texture bytes are exchanged in that linear layout. A guest
+//! that expects tiled bytes from a raw copy is not reproduced.
 
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use windows::core::Result;
-use windows::Win32::Foundation::{E_FAIL, E_INVALIDARG, E_OUTOFMEMORY};
+use windows::Win32::Foundation::{E_FAIL, E_INVALIDARG, E_NOTIMPL};
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
 
@@ -93,60 +95,6 @@ fn footprint_bytes(pitch: u32, rows: u32, depth: u32) -> Option<u64> {
         .checked_mul(u64::from(depth))
 }
 
-pub(super) struct Pending {
-    source: usize,
-    bytes: usize,
-    mapped: usize,
-    buffer: ID3D12Resource,
-}
-
-impl Pending {
-    fn mapped(buffer: ID3D12Resource, source: usize, bytes: usize) -> Result<Self> {
-        let mut mapped = core::ptr::null_mut();
-        let unread = D3D12_RANGE { Begin: 0, End: 0 };
-        // SAFETY: the upload buffer has `bytes` bytes and has not been mapped.
-        unsafe { buffer.Map(0, Some(&unread), Some(&mut mapped))? };
-        if mapped.is_null() {
-            return Err(E_FAIL.into());
-        }
-        Ok(Self {
-            source,
-            bytes,
-            mapped: mapped as usize,
-            buffer,
-        })
-    }
-
-    pub(super) fn snapshot(&self) -> windows::core::Result<()> {
-        if self.source == 0 || self.mapped == 0 || self.bytes == 0 {
-            return Err(E_INVALIDARG.into());
-        }
-        // SAFETY: `source` is the guest allocation captured at record time.
-        // The title keeps it alive through ExecuteCommandLists, which is the
-        // caller. `mapped` is this upload buffer's mapping of `bytes` bytes.
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                self.source as *const u8,
-                self.mapped as *mut u8,
-                self.bytes,
-            );
-        }
-        note_snapshot(self.source, self.bytes);
-        Ok(())
-    }
-}
-
-impl Drop for Pending {
-    fn drop(&mut self) {
-        if self.mapped != 0 {
-            // SAFETY: Map succeeded on this buffer and no copy is still using
-            // the pointer. Reset drops the record before the native list is reused.
-            unsafe { self.buffer.Unmap(0, None) };
-            self.mapped = 0;
-        }
-    }
-}
-
 fn note(detail: &str) {
     static COUNT: AtomicU32 = AtomicU32::new(0);
     if COUNT.fetch_add(1, Ordering::Relaxed) < 8 {
@@ -154,35 +102,8 @@ fn note(detail: &str) {
     }
 }
 
-fn note_snapshot(source: usize, bytes: usize) {
-    static COUNT: AtomicU32 = AtomicU32::new(0);
-    if COUNT.fetch_add(1, Ordering::Relaxed) >= 4 {
-        return;
-    }
-    let prefix = bytes.min(16);
-    // SAFETY: snapshot just read `bytes` from this guest pointer.
-    let (hex, zero) = unsafe {
-        let data = core::slice::from_raw_parts(source as *const u8, bytes);
-        let hex: String = data
-            .iter()
-            .take(prefix)
-            .map(|byte| format!("{byte:02x}"))
-            .collect();
-        let step = (bytes / 64).max(1);
-        let zero = data.iter().step_by(step).all(|byte| *byte == 0);
-        (hex, zero)
-    };
-    crate::diagnostics::log(&format!(
-        "slot 62 snapshot {bytes:#x} bytes from {source:#x} first={hex} {}",
-        if zero {
-            "source samples are zero"
-        } else {
-            "source has data"
-        }
-    ));
-}
-
-fn upload_buffer(device: &ID3D12Device, bytes: u64) -> Result<ID3D12Resource> {
+/// A device-local buffer holding bytes between the two halves of a copy.
+fn staging_buffer(device: &ID3D12Device, bytes: u64) -> Result<ID3D12Resource> {
     let desc = D3D12_RESOURCE_DESC {
         Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
         Width: bytes,
@@ -197,7 +118,7 @@ fn upload_buffer(device: &ID3D12Device, bytes: u64) -> Result<ID3D12Resource> {
         ..Default::default()
     };
     let heap = D3D12_HEAP_PROPERTIES {
-        Type: D3D12_HEAP_TYPE_UPLOAD,
+        Type: D3D12_HEAP_TYPE_DEFAULT,
         CreationNodeMask: 1,
         VisibleNodeMask: 1,
         ..Default::default()
@@ -209,12 +130,34 @@ fn upload_buffer(device: &ID3D12Device, bytes: u64) -> Result<ID3D12Resource> {
             &heap,
             D3D12_HEAP_FLAG_NONE,
             &desc,
-            D3D12_RESOURCE_STATE_GENERIC_READ,
+            D3D12_RESOURCE_STATE_COMMON,
             None,
             &mut native,
         )?;
     }
     native.ok_or_else(|| E_FAIL.into())
+}
+
+/// The staging buffer was promoted to a copy destination by its first copy.
+fn staging_becomes_source(list: &ID3D12GraphicsCommandList, buffer: &ID3D12Resource) {
+    let mut barrier = D3D12_RESOURCE_BARRIER {
+        Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+        Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+        Anonymous: D3D12_RESOURCE_BARRIER_0 {
+            Transition: std::mem::ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
+                pResource: std::mem::ManuallyDrop::new(Some(buffer.clone())),
+                Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                StateBefore: D3D12_RESOURCE_STATE_COPY_DEST,
+                StateAfter: D3D12_RESOURCE_STATE_COPY_SOURCE,
+            }),
+        },
+    };
+    // SAFETY: the transition arm is the active one, and the call borrows the
+    // barrier only while it records it.
+    unsafe {
+        list.ResourceBarrier(std::slice::from_ref(&barrier));
+        std::mem::ManuallyDrop::drop(&mut (*barrier.Anonymous.Transition).pResource);
+    }
 }
 
 fn plane_count(
@@ -309,22 +252,30 @@ fn regions_for(
     Ok((total, regions, layouts))
 }
 
+#[derive(Clone, Copy)]
+enum Direction {
+    IntoTexture,
+    FromTexture,
+}
+
+/// Copy one subresource between a texture and its footprint in `buffer`.
 fn record_texture(
     list: &ID3D12GraphicsCommandList,
-    destination: &ID3D12Resource,
-    source: &ID3D12Resource,
+    texture: &ID3D12Resource,
+    buffer: &ID3D12Resource,
     subresource: u32,
     footprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
+    direction: Direction,
 ) {
-    let mut src = D3D12_TEXTURE_COPY_LOCATION {
-        pResource: std::mem::ManuallyDrop::new(Some(source.clone())),
+    let mut linear = D3D12_TEXTURE_COPY_LOCATION {
+        pResource: std::mem::ManuallyDrop::new(Some(buffer.clone())),
         Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
         Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
             PlacedFootprint: footprint,
         },
     };
-    let mut dst = D3D12_TEXTURE_COPY_LOCATION {
-        pResource: std::mem::ManuallyDrop::new(Some(destination.clone())),
+    let mut image = D3D12_TEXTURE_COPY_LOCATION {
+        pResource: std::mem::ManuallyDrop::new(Some(texture.clone())),
         Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
         Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
             SubresourceIndex: subresource,
@@ -333,30 +284,26 @@ fn record_texture(
     // SAFETY: each location's active union field matches its type tag.
     // CopyTextureRegion copies the resource pointers before returning.
     unsafe {
-        list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
-        std::mem::ManuallyDrop::drop(&mut src.pResource);
-        std::mem::ManuallyDrop::drop(&mut dst.pResource);
+        match direction {
+            Direction::IntoTexture => list.CopyTextureRegion(&image, 0, 0, 0, &linear, None),
+            Direction::FromTexture => list.CopyTextureRegion(&linear, 0, 0, 0, &image, None),
+        }
+        std::mem::ManuallyDrop::drop(&mut linear.pResource);
+        std::mem::ManuallyDrop::drop(&mut image.pResource);
     }
 }
 
-fn texture_copies(
-    list: &List,
-    state: &mut super::Recording,
+/// The subresources a guest byte range covers, with their footprints placed in
+/// a staging buffer, and how many bytes of that buffer belong to the range.
+fn texture_layout(
     device: &ID3D12Device,
-    destination: &ID3D12Resource,
-    placed: Option<&std::sync::Arc<crate::device::placement::Texture>>,
+    texture: &ID3D12Resource,
     guest_offset: u64,
     guest_bytes: u64,
-    source: &ID3D12Resource,
-) -> Result<()> {
-    if let Some(texture) = placed {
-        state
-            .prepare_copy(Some(texture), None)
-            .map_err(windows::core::Error::from)?;
-    }
-    let (total, regions, layouts) = regions_for(device, destination)?;
+) -> Result<(u64, u64, Vec<(u32, D3D12_PLACED_SUBRESOURCE_FOOTPRINT)>)> {
+    let (total, regions, layouts) = regions_for(device, texture)?;
     let Some(plan) = plan(guest_offset, guest_bytes, total, &regions) else {
-        let desc = unsafe { destination.GetDesc() };
+        let desc = unsafe { texture.GetDesc() };
         let heads: Vec<String> = regions
             .iter()
             .take(4)
@@ -374,86 +321,127 @@ fn texture_copies(
         return Err(E_INVALIDARG.into());
     };
     match plan {
-        Plan::Whole => {
-            for (region, layout) in regions.iter().zip(&layouts) {
-                record_texture(&list.native, destination, source, region.index, *layout);
+        Plan::Whole => Ok((
+            total,
+            total.min(guest_bytes),
+            regions.iter().map(|r| r.index).zip(layouts).collect(),
+        )),
+        Plan::One(index) => {
+            let mut layout = *layouts.get(index as usize).ok_or(E_INVALIDARG)?;
+            layout.Offset = 0;
+            let span = regions
+                .iter()
+                .find(|r| r.index == index)
+                .ok_or(E_INVALIDARG)?
+                .span;
+            Ok((span, span.min(guest_bytes), vec![(index, layout)]))
+        }
+    }
+}
+
+fn record_copy(
+    list: &List,
+    state: &mut super::Recording,
+    device: &ID3D12Device,
+    destination: LinearResource,
+    source: LinearResource,
+    bytes: u64,
+) -> Result<()> {
+    use LinearResource::{Buffer, Texture};
+    let native = &list.native;
+    match (destination, source) {
+        (Buffer { resource: to, offset: to_offset }, Buffer { resource: from, offset: from_offset }) => {
+            super::raytracing::retain(state, &[&to, &from])?;
+            if to == from {
+                // One buffer cannot be both ends of a desktop copy.
+                let staging = staging_buffer(device, bytes)?;
+                super::raytracing::retain(state, &[&staging])?;
+                unsafe { native.CopyBufferRegion(&staging, 0, &from, from_offset, bytes) };
+                staging_becomes_source(native, &staging);
+                unsafe { native.CopyBufferRegion(&to, to_offset, &staging, 0, bytes) };
+            } else {
+                // SAFETY: both buffers belong to this open list and contain the range.
+                unsafe { native.CopyBufferRegion(&to, to_offset, &from, from_offset, bytes) };
             }
         }
-        Plan::One(index) => {
-            let layout = layouts.get(index as usize).ok_or(E_INVALIDARG)?;
-            let mut layout = *layout;
-            layout.Offset = 0;
-            record_texture(&list.native, destination, source, index, layout);
+        (Buffer { resource: to, offset: to_offset }, Texture { resource: from, placed, offset }) => {
+            if let Some(texture) = &placed {
+                state.prepare_copy(None, Some(texture)).map_err(windows::core::Error::from)?;
+            }
+            let (size, used, footprints) = texture_layout(device, &from, offset, bytes)?;
+            // Footprints need an aligned buffer offset, which a guest address
+            // need not have, so go through a staging buffer.
+            let staging = staging_buffer(device, size)?;
+            super::raytracing::retain(state, &[&to, &from, &staging])?;
+            for (index, layout) in footprints {
+                record_texture(native, &from, &staging, index, layout, Direction::FromTexture);
+            }
+            staging_becomes_source(native, &staging);
+            // SAFETY: `used` fits both the staging buffer and the guest range.
+            unsafe { native.CopyBufferRegion(&to, to_offset, &staging, 0, used) };
+        }
+        (Texture { resource: to, placed, offset }, Buffer { resource: from, offset: from_offset }) => {
+            if let Some(texture) = &placed {
+                state.prepare_copy(Some(texture), None).map_err(windows::core::Error::from)?;
+            }
+            let (size, used, footprints) = texture_layout(device, &to, offset, bytes)?;
+            let staging = staging_buffer(device, size)?;
+            super::raytracing::retain(state, &[&to, &from, &staging])?;
+            // SAFETY: `used` fits both the staging buffer and the guest range.
+            unsafe { native.CopyBufferRegion(&staging, 0, &from, from_offset, used) };
+            staging_becomes_source(native, &staging);
+            for (index, layout) in footprints {
+                record_texture(native, &to, &staging, index, layout, Direction::IntoTexture);
+            }
+        }
+        (Texture { .. }, Texture { .. }) => {
+            crate::diagnostics::recording_error(format_args!(
+                "slot 62 texture-to-texture copy of {bytes:#x} bytes"
+            ));
+            return Err(E_NOTIMPL.into());
         }
     }
     Ok(())
 }
 
-pub(super) unsafe extern "system" fn linear_upload(
+pub(super) unsafe extern "system" fn copy_memory(
     list: &List,
-    source: *const u8,
-    address: u64,
-    bytes: u32,
+    destination: u64,
+    source: u64,
+    bytes: u64,
     flags: u32,
 ) {
     let mut state = recording(list);
     if !state.can_record(&list.native) {
         return;
     }
-    let bytes_u = u64::from(bytes);
-    if source.is_null() || address == 0 || bytes == 0 || flags != 0 {
+    // The console flags decompress or reinterpret surfaces during the copy.
+    if flags != 0 || (bytes != 0 && (destination == 0 || source == 0)) {
         crate::diagnostics::recording_error(format_args!(
-            "slot 62 linear upload source={source:p} address={address:#x} bytes={bytes:#x} flags={flags:#x}"
+            "slot 62 copy destination={destination:#x} source={source:#x} bytes={bytes:#x} flags={flags:#x}"
         ));
-        state.error = E_INVALIDARG;
+        state.error = if flags != 0 { E_NOTIMPL } else { E_INVALIDARG };
+        return;
+    }
+    if bytes == 0 {
         return;
     }
     let result = (|| -> Result<()> {
-        let resolved = unsafe { device::linear_resource(parent(&list.parent), address, bytes_u)? };
-        let mut owner: Option<ID3D12Device> = None;
-        unsafe { list.native.GetDevice(&mut owner)? };
-        let device = owner.ok_or(E_FAIL)?;
-        let upload = upload_buffer(&device, bytes_u)?;
-        let pending = Pending::mapped(upload.clone(), source as usize, bytes as usize)?;
-        state
-            .uploads
-            .try_reserve(1)
-            .map_err(|_| windows::core::Error::from(E_OUTOFMEMORY))?;
-        super::raytracing::retain(&state, &[&upload])?;
-        match &resolved {
-            LinearResource::Buffer { resource, offset } => {
-                super::raytracing::retain(&state, &[resource])?;
-                // SAFETY: both buffers belong to this open list and contain the range.
-                unsafe {
-                    list.native
-                        .CopyBufferRegion(resource, *offset, &upload, 0, bytes_u)
-                };
-                note(&format!(
-                    "slot 62 buffer upload {bytes:#x} bytes to {address:#x} offset={offset:#x}"
-                ));
-            }
-            LinearResource::Texture {
-                resource,
-                placed,
-                offset,
-            } => {
-                super::raytracing::retain(&state, &[resource])?;
-                texture_copies(
-                    list,
-                    &mut state,
-                    &device,
-                    resource,
-                    placed.as_ref(),
-                    *offset,
-                    bytes_u,
-                    &upload,
-                )?;
-                note(&format!(
-                    "slot 62 texture upload {bytes:#x} bytes to {address:#x} offset={offset:#x}"
-                ));
-            }
-        }
-        state.uploads.push(pending);
+        super::memory_wait::trace_write("CopyMemoryToMemoryX", destination, bytes, 0);
+        let owner = parent(&list.parent);
+        let from = unsafe { device::linear_resource(owner, source, bytes)? };
+        let to = unsafe { device::linear_resource(owner, destination, bytes)? };
+        let kind = |resource: &LinearResource| match resource {
+            LinearResource::Buffer { .. } => "memory",
+            LinearResource::Texture { .. } => "texture",
+        };
+        let (to_kind, from_kind) = (kind(&to), kind(&from));
+        let mut native_device: Option<ID3D12Device> = None;
+        unsafe { list.native.GetDevice(&mut native_device)? };
+        record_copy(list, &mut state, &native_device.ok_or(E_FAIL)?, to, from, bytes)?;
+        note(&format!(
+            "slot 62 copied {bytes:#x} bytes from {from_kind} {source:#x} to {to_kind} {destination:#x}"
+        ));
         Ok(())
     })();
     if let Err(error) = result {

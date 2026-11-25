@@ -351,20 +351,15 @@ pub(super) unsafe extern "system" fn stream_output(
 }
 
 fn adopt_bundle(parent_state: &mut Recording, bundle: &Recording) -> Result<(), HRESULT> {
-    // Queue splits, raytracing replay and slot-62 uploads are applied to the
-    // submitted list. A bundle is not submitted on its own, so those recordings
+    // Queue splits and raytracing replay are applied to the submitted list. A bundle is not submitted on its own, so those recordings
     // cannot be replayed by ExecuteBundle yet.
-    if !bundle.prefix.segments.is_empty()
-        || !bundle.scene_commands.is_empty()
-        || !bundle.uploads.is_empty()
-    {
+    if !bundle.prefix.segments.is_empty() || !bundle.scene_commands.is_empty() {
         static FIRST: std::sync::Once = std::sync::Once::new();
         crate::diagnostics::log_once(&FIRST, || {
             format!(
-                "ExecuteBundle has {} waits, {} scene commands, {} uploads",
+                "ExecuteBundle has {} waits, {} scene commands",
                 bundle.prefix.segments.len(),
-                bundle.scene_commands.len(),
-                bundle.uploads.len()
+                bundle.scene_commands.len()
             )
         });
         return Err(E_NOTIMPL);

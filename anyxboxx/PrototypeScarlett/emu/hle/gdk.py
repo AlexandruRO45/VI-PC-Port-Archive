@@ -9,7 +9,7 @@ from .core import S_OK, hle
 # XSystemDeviceType : Unknown 0, Pc 1, XboxOne 2, XboxOneS 3, XboxOneX 4,
 # XboxOneXDevkit 5, XboxScarlettLockhart 6 (Series S), XboxScarlettAnaconda 7 (Series X).
 XBOX_SERIES_X = 7
-CONSOLE_ID = "00000000-0000-0000-0000-5CA71E770000"
+CONSOLE_ID = "00000000.00000000.00000000.00000000.00"
 DEVICE_ID = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
 SANDBOX = "RETAIL"
 OS_VERSION = (10, 0, 25398, 4908)

@@ -83,7 +83,8 @@ def test_console_id_follows_gdk_buffer_contract(machine):
     buffer, used = machine.heap.alloc(64), machine.heap.alloc(8)
     assert invoke(machine, "xgameruntime.dll", "XSystemGetConsoleId", 64, buffer, used) == 0
     size = struct.unpack("<Q", machine.cpu.mem_read(used, 8))[0]
-    assert size == 37
+    assert size == 39
+    assert bytes(machine.cpu.mem_read(buffer, size)) == b"00000000.00000000.00000000.00000000.00\0"
     result = invoke(machine, "xgameruntime.dll", "XSystemGetConsoleId", 4, buffer, used)
     assert result == hle.core.E_INVALIDARG
 

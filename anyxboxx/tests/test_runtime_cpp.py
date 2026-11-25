@@ -321,7 +321,9 @@ def test_system_identity_is_a_series_x(runtime_dir):
     sandbox = system.method(4, ctypes.c_uint32, ctypes.c_size_t, ctypes.c_char_p, ctypes.POINTER(ctypes.c_size_t))
     assert sandbox(16, buffer, ctypes.byref(used)) == S_OK and buffer.value == b"RETAIL"
     console = system.method(3, ctypes.c_uint32, ctypes.c_size_t, ctypes.c_char_p, ctypes.POINTER(ctypes.c_size_t))
-    assert console(39, buffer, ctypes.byref(used)) == S_OK and used.value <= 39
+    assert console(39, buffer, ctypes.byref(used)) == S_OK
+    assert buffer.value == b"00000000.00000000.00000000.00000000.00"
+    assert used.value == 39
 
     class Analytics(ctypes.Structure):
         _fields_ = [("os", ctypes.c_uint16 * 4), ("hosting", ctypes.c_uint16 * 4),

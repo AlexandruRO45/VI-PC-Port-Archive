@@ -208,7 +208,7 @@ git submodule update --init third_party/victory
 cargo build --profile diag -p victory --features diagnostics --manifest-path third_party/victory/Cargo.toml
 ```
 
-Le profil `diag` est nécessaire pour les touches scriptées, les captures d'images et les options de diagnostic ci-dessous. La première compilation télécharge et compile toutes les dépendances : comptez plusieurs minutes. L'exécutable est `third_party\victory\target\diag\victory.exe` (ou `%CARGO_TARGET_DIR%\diag\victory.exe` si cette variable est définie). `tools/lancer_victory.ps1` lance cette compilation à votre place quand l'exécutable manque.
+Le profil `diag` est nécessaire pour les touches scriptées, les captures d'images et les options de diagnostic ci-dessous. La première compilation télécharge et compile toutes les dépendances : comptez plusieurs minutes. L'exécutable est `third_party\victory\target\diag\victory.exe` (ou `%CARGO_TARGET_DIR%\diag\victory.exe` si cette variable est définie). `tools/lancer_victory.ps1` lance cette compilation à votre place à chaque lancement : cargo ne fait rien quand l'exécutable est à jour (environ 0,1 s) et le recompile après une mise à jour du sous-module, si bien qu'un ancien `victory.exe` ne tourne jamais avec des réglages qu'il ne lit pas. Si la compilation échoue, le lanceur s'arrête et donne le code de sortie de cargo.
 
 ## Lancement
 

@@ -22,7 +22,7 @@ mod depth;
 mod enhanced;
 mod descriptors;
 mod graphics;
-mod linear_upload;
+mod copy_memory;
 mod media;
 mod memory_wait;
 pub(crate) mod page_mapping;
@@ -55,8 +55,6 @@ struct Recording {
     media: Option<media::Recording>,
     placed_reads: Vec<Arc<Texture>>,
     placed_writes: Vec<Arc<Texture>>,
-    /// CPU bytes copied into upload heaps at ExecuteCommandLists.
-    uploads: Vec<linear_upload::Pending>,
     bound_placed_targets: Vec<Arc<Texture>>,
     resource_heap: Option<descriptors::ResourceHeap>,
     descriptor_arena: Option<Arc<device::descriptor_paging::Arena>>,
@@ -72,13 +70,6 @@ impl Recording {
         if !accesses.iter().any(|known| Arc::ptr_eq(known, texture)) {
             accesses.try_reserve(1).map_err(|_| E_OUTOFMEMORY)?;
             accesses.push(Arc::clone(texture));
-        }
-        Ok(())
-    }
-
-    fn snapshot_uploads(&self) -> Result<(), HRESULT> {
-        for upload in &self.uploads {
-            upload.snapshot().map_err(|error| error.code())?;
         }
         Ok(())
     }
@@ -424,7 +415,6 @@ unsafe extern "system" fn reset(
         )
     };
     if hr.is_ok() {
-        state.uploads.clear();
         state.phase = ListState::Open;
         state.resources = allocator.state.clone();
         state.timestamp_page = None;
@@ -1132,6 +1122,7 @@ unsafe extern "system" fn write_marker(list: &List, address: u64, value: u32, fl
         let (resource, dest) = unsafe { device::command_buffer_address(parent(&list.parent), address, 4)? };
         if let Some(buffer) = &resource { raytracing::retain(&state, &[buffer])?; }
         let write = D3D12_WRITEBUFFERIMMEDIATE_PARAMETER { Dest: dest, Value: value };
+        memory_wait::trace_write("Write32BitValueBottomOfPipeX", address, 4, u64::from(value));
         state.prefix.push(&list.native, memory_wait::Packet::Marker(write))
     })();
     if let Err(error) = result { state.error = error.code(); }
@@ -1192,12 +1183,11 @@ static LIST_SLOTS: Slots<149> = {
     slots[57] = crate::slot!(standard::begin_event);
     slots[58] = crate::slot!(standard::end_event);
     // Slots after EndEvent differ between Xbox generations. Keep traced
-    // assignments, including slot 59 and the slot 62 upload.
+    // assignments, including slot 59 and the slot 62 memory copy.
     slots[59] = crate::slot!(execute_indirect);
-    // Scarlett video upload, title RVA 0x979650. The CPU buffer is filled
-    // after this returns, so the bytes are snapshotted at execute. Device11
-    // and extended lists copy this table.
-    slots[62] = crate::slot!(linear_upload::linear_upload);
+    // CopyMemoryToMemoryX; ProjectScarlett reads textures back through it
+    // (title RVA 0x979650). Device11 and extended lists copy this table.
+    slots[62] = crate::slot!(copy_memory::copy_memory);
     slots[67] = crate::slot!(flush_texture_cache);
     slots[68] = crate::slot!(graphics::depth_bounds);
     slots[71] = crate::slot!(write_marker);
@@ -1349,7 +1339,6 @@ unsafe fn execute_batch(queue: &Queue, count: u32, lists: *const *mut c_void, fr
                     return Err(E_INVALIDARG);
                 }
             }
-            state.snapshot_uploads()?;
             splits.try_reserve(state.prefix.segments.len()).map_err(|_| E_OUTOFMEMORY)?;
             splits.extend(state.prefix.segments.iter().map(|s| (list_index, s.clone())));
             list_index += 1;
@@ -1539,6 +1528,23 @@ unsafe extern "system" fn present(
     result
 }
 
+/// Say every ten seconds how many frames reached the screen.
+fn frame_heartbeat(token: u64) {
+    static FRAMES: Mutex<Option<(std::time::Instant, u64, u64)>> = Mutex::new(None);
+    let mut state = FRAMES.lock().unwrap_or_else(|e| e.into_inner());
+    let (since, recent, total) = state.get_or_insert_with(|| (std::time::Instant::now(), 0, 0));
+    *recent += 1;
+    *total += 1;
+    let elapsed = since.elapsed().as_secs_f32();
+    if elapsed >= 10.0 {
+        crate::diagnostics::log(&format!(
+            "presented {recent} frames in {elapsed:.0}s, {total} in total, token={token}"
+        ));
+        *since = std::time::Instant::now();
+        *recent = 0;
+    }
+}
+
 unsafe fn present_planes(
     queue: &Queue, count: u32, planes: *const PresentPlane, params: *const PresentParameters,
 ) -> HRESULT {
@@ -1592,6 +1598,9 @@ unsafe fn present_planes(
         }
     }
     let result = queue.state.presentation.present(&queue.native, source);
+    if result == S_OK {
+        frame_heartbeat(plane.token);
+    }
     // Frame pacing must advance even if the host present failed; the title
     // otherwise waits forever for this token's flip.
     unsafe { device::frame_events::display_flip(parent(&queue.parent), plane.token) };
@@ -1684,7 +1693,6 @@ pub(crate) unsafe fn wrap_command_list(
             trace_samples: Vec::new(),
             placed_reads: Vec::new(),
             placed_writes: Vec::new(),
-            uploads: Vec::new(),
             bound_placed_targets: Vec::new(),
             resource_heap: None,
             descriptor_arena: None,

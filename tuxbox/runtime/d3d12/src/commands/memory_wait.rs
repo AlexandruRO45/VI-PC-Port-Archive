@@ -122,7 +122,49 @@ const STALL: Duration = Duration::from_secs(5);
 pub(super) struct Segment {
     prefix: Option<(ID3D12CommandList, ID3D12CommandAllocator)>,
     word: Word,
+    address: u64,
     target: u64,
+}
+
+/// Guest addresses the title has waited on, so writes to them can be logged.
+static WAITED: std::sync::Mutex<Vec<(u64, u64)>> = std::sync::Mutex::new(Vec::new());
+
+/// Log the first waits on each address, then each power of two.
+fn trace_wait(address: u64, target: u64, value: u64, list_type: i32, mid_list: bool) {
+    let mut waited = WAITED.lock().unwrap_or_else(|e| e.into_inner());
+    let count = if let Some((_, count)) = waited.iter_mut().find(|(known, _)| *known == address) {
+        *count += 1;
+        *count
+    } else if waited.len() < 256 {
+        waited.push((address, 1));
+        1
+    } else {
+        return;
+    };
+    drop(waited);
+    if count <= 4 || count.is_power_of_two() {
+        crate::diagnostics::log(&format!(
+            "memory wait trace #{count} address={address:#x} target={target:#x} value={value:#x} list_type={list_type} mid_list={mid_list}"
+        ));
+    }
+}
+
+/// Report a guest command that writes a waited-on address.
+pub(super) fn trace_write(source: &str, address: u64, bytes: u64, value: u64) {
+    let hit = WAITED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .any(|(waited, _)| address < waited.saturating_add(8) && *waited < address.saturating_add(bytes));
+    if hit {
+        static COUNT: AtomicU64 = AtomicU64::new(0);
+        let count = COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+        if count <= 32 || count.is_power_of_two() {
+            crate::diagnostics::log(&format!(
+                "memory wait write #{count} {source} address={address:#x} bytes={bytes:#x} value={value:#x}"
+            ));
+        }
+    }
 }
 
 pub(super) unsafe extern "system" fn wait_value64(
@@ -144,6 +186,8 @@ pub(super) unsafe extern "system" fn wait_value64(
         if target == 0 {
             return Ok(());
         }
+        let list_type = unsafe { list.native.GetType() }.0;
+        trace_wait(address, target, word.value(), list_type, state.prefix.in_body);
         if state.prefix.in_body {
             // Honoring this would split the list and replay its bound state.
             // Order the work already in this list with a global UAV barrier and
@@ -197,6 +241,7 @@ pub(super) unsafe extern "system" fn wait_value64(
         state.prefix.segments.push(Arc::new(Segment {
             prefix,
             word,
+            address,
             target,
         }));
         Ok(())
@@ -236,7 +281,7 @@ impl Worker {
                                 // Nothing wrote the value, for example because
                                 // the work that should have was dropped. A queue
                                 // held forever trips the title's GPU watchdog.
-                                report_stall(job.segment.target, job.segment.word.value());
+                                report_stall(job.segment.address, job.segment.target, job.segment.word.value());
                                 break;
                             }
                             std::thread::sleep(Duration::from_millis(1));
@@ -269,12 +314,12 @@ impl Worker {
 }
 
 /// Report a released wait: the first eight, then each power of two.
-fn report_stall(target: u64, value: u64) {
+fn report_stall(address: u64, target: u64, value: u64) {
     static COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let count = COUNT.fetch_add(1, Ordering::Relaxed) + 1;
     if count <= 8 || count.is_power_of_two() {
         crate::diagnostics::log(&format!(
-            "GPU memory wait released after {}s without reaching its target (#{count}): target={target:#x} value={value:#x}",
+            "GPU memory wait released after {}s without reaching its target (#{count}): address={address:#x} target={target:#x} value={value:#x}",
             STALL.as_secs()
         ));
     }
