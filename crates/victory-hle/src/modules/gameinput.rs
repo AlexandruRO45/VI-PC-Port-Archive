@@ -1246,13 +1246,62 @@ mod host {
         }
     }
 
+    #[cfg(feature = "diagnostics")]
+    type KeyHold = (std::ops::Range<Duration>, u8);
+
+    #[cfg(feature = "diagnostics")]
+    fn scheduled_key_holds(keys: impl Iterator<Item = (Duration, u8)>) -> Vec<KeyHold> {
+        let mut keys: Vec<_> = keys.collect();
+        keys.sort_by_key(|&(at, _)| at);
+        let mut holds: Vec<KeyHold> = Vec::new();
+        for (at, vk) in keys {
+            let end = at.saturating_add(Duration::from_millis(200));
+            // A key already held when the next press starts has no release
+            // between them. Keep the original start and extend the hold.
+            if let Some((window, _)) = holds.iter_mut().rev().find(|hold| hold.1 == vk)
+                && at <= window.end
+            {
+                window.end = end;
+            } else {
+                holds.push((at..end, vk));
+            }
+        }
+        holds
+    }
+
+    #[cfg(feature = "diagnostics")]
+    fn scripted_at(holds: &[KeyHold], elapsed: Duration) -> Vec<u8> {
+        holds
+            .iter()
+            .filter(|(window, _)| window.contains(&elapsed))
+            .map(|&(_, vk)| vk)
+            .collect()
+    }
+
+    #[cfg(all(test, feature = "diagnostics"))]
+    #[test]
+    fn overlapping_scripted_key_presses_are_one_continuous_hold() {
+        let holds = scheduled_key_holds(
+            [(100, b'A'), (150, b'B'), (200, b'A'), (450, b'A')]
+                .into_iter()
+                .map(|(ms, vk)| (Duration::from_millis(ms), vk)),
+        );
+        let keys = |ms| scripted_at(&holds, Duration::from_millis(ms));
+        assert_eq!(keys(175), b"AB");
+        assert_eq!(keys(250), b"AB");
+        assert_eq!(keys(320), b"AB");
+        assert_eq!(keys(350), b"A");
+        assert!(keys(400).is_empty());
+        assert_eq!(keys(450), b"A");
+    }
+
     /// Debugging aid: `VICTORY_KEYS=<seconds>:<key>,...` holds each key for
     /// 0.2 s that long after input starts, with or without focus. A key is a
     /// letter, a digit, or `Enter`, `Esc`, `Tab`, `Back`, `Up`, `Down`,
     /// `Left`, `Right` (the stand-in pad's table maps them to buttons).
     #[cfg(feature = "diagnostics")]
     fn scripted() -> Vec<u8> {
-        static SCRIPT: LazyLock<(Instant, Vec<(Duration, u8)>)> = LazyLock::new(|| {
+        static SCRIPT: LazyLock<(Instant, Vec<KeyHold>)> = LazyLock::new(|| {
             let list = std::env::var("VICTORY_KEYS").unwrap_or_default();
             let keys = list.split(',').filter_map(|entry| {
                 let (at, key) = entry.split_once(':')?;
@@ -1275,14 +1324,10 @@ mod host {
                     vk,
                 ))
             });
-            (Instant::now(), keys.collect())
+            (Instant::now(), scheduled_key_holds(keys))
         });
-        let (start, keys) = &*SCRIPT;
-        let now = start.elapsed();
-        keys.iter()
-            .filter(|&&(at, _)| (at..at + Duration::from_millis(200)).contains(&now))
-            .map(|&(_, vk)| vk)
-            .collect()
+        let (start, holds) = &*SCRIPT;
+        scripted_at(holds, start.elapsed())
     }
 
     /// The foreground window is one of ours (the title's or our fallback).
