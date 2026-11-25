@@ -446,10 +446,93 @@ fn need(block: usize) {
     });
 }
 
+/// The 16-bit operations [`Lower::valu16`] computes: f16 ones by their number of sources,
+/// then integer ones. GFX10 writes their result to one half of the destination VGPR and
+/// keeps the other ([`Lower::write_half`]), so the result depends on the old value of the
+/// register too ([`keeps_old`]).
+const HALF_FLOAT1: &[&str] = &[
+    "v_rcp_f16",
+    "v_sqrt_f16",
+    "v_rsq_f16",
+    "v_log_f16",
+    "v_exp_f16",
+    "v_fract_f16",
+    "v_trunc_f16",
+    "v_floor_f16",
+    "v_ceil_f16",
+    "v_rndne_f16",
+    "v_sin_f16",
+    "v_cos_f16",
+    "v_cvt_f16_u16",
+    "v_cvt_f16_i16",
+];
+/// See [`HALF_FLOAT1`].
+const HALF_FLOAT2: &[&str] = &[
+    "v_add_f16",
+    "v_sub_f16",
+    "v_subrev_f16",
+    "v_mul_f16",
+    "v_max_f16",
+    "v_min_f16",
+];
+/// See [`HALF_FLOAT1`].
+const HALF_FLOAT3: &[&str] = &[
+    "v_fma_f16",
+    "v_mad_f16",
+    "v_fmac_f16",
+    "v_mac_f16",
+    "v_max3_f16",
+    "v_min3_f16",
+    "v_med3_f16",
+];
+/// See [`HALF_FLOAT1`].
+const HALF_INT: &[&str] = &[
+    "v_add_nc_u16",
+    "v_sub_nc_u16",
+    "v_subrev_nc_u16",
+    "v_mul_lo_u16",
+    "v_lshlrev_b16",
+    "v_lshrrev_b16",
+    "v_ashrrev_i16",
+    "v_max_u16",
+    "v_max_i16",
+    "v_min_u16",
+    "v_min_i16",
+    "v_cvt_u16_f16",
+    "v_cvt_i16_f16",
+    "v_cvt_norm_i16_f16",
+    "v_cvt_norm_u16_f16",
+];
+
+/// Whether a VALU result takes part of its value from the old value of its destination VGPR
+/// in the lanes that run it: an accumulator (`v_fmac_f32`, `v_dot2c_f32_f16`...), or a 16-bit
+/// result GFX10 writes to one half of the register, keeping the other ([`HALF_FLOAT1`]...,
+/// `v_cvt_f16_f32`, `v_fma_mixlo_f16`).
+fn keeps_old(name: &str) -> bool {
+    matches!(
+        name,
+        "v_fmac_f32"
+            | "v_mac_f32"
+            | "v_mac_legacy_f32"
+            | "v_fma_mixlo_f16"
+            | "v_fma_mixhi_f16"
+            | "v_cvt_f16_f32"
+            | "v_pk_fmac_f16"
+            | "v_dot2c_f32_f16"
+            | "v_dot4c_i32_i8"
+    ) || [HALF_FLOAT1, HALF_FLOAT2, HALF_FLOAT3, HALF_INT]
+        .iter()
+        .any(|l| l.contains(&name))
+}
+
 /// VGPR values that are the same in every lane holding them (`all` is [`all_lane_blocks`]):
-/// written by an instruction every arriving lane runs (no guard), lane by lane, from scalars,
-/// constants and such values; or loaded from an address made of them. The compiler keeps
-/// wave-uniform data in VGPRs and fetches it with `v_readfirstlane`.
+/// written lane by lane from scalars, constants and such values, or loaded from an address
+/// made of them, by an instruction every arriving lane runs, or by one under a guard the lanes
+/// agree on whose registers' old values are such values too (when no lane runs it, the lanes
+/// keep those). A result that keeps part of the old value ([`keeps_old`]) needs it to be one
+/// as well. The compiler keeps wave-uniform data in VGPRs and fetches it with
+/// `v_readfirstlane`. M0-relative moves and swaps, which take or leave registers their
+/// operands do not name, never give one; nor does an interpolation (the lane's own primitive).
 ///
 /// Three more facts are proved, each only where no lane of a wave can part from the others:
 /// - the wave number (`tid >> 6` of the entry `v0`, in a group whose x size is a multiple of
@@ -544,18 +627,32 @@ fn lane_uniform(p: &Program, st: &Structured, all: &[bool], threads: Option<[u32
                         _ => true,
                     })
                 };
+                // the old values of the VGPRs it writes: what a lane keeps where it does not
+                // run it, or keeps in part where it does (`keeps_old`)
+                let old_alike = |same: &HashSet<Value>| {
+                    inst.writes
+                        .iter()
+                        .filter(|w| matches!(w.0, Reg::V(_)))
+                        .all(|w| inst.read(w.0).is_some_and(|x| same.contains(&x)))
+                };
+                // every arriving lane runs it; or the lanes agree on running it or not, and
+                // when none does they keep old values that are alike
+                let runs = match st.guards[b][i] {
+                    None => true,
+                    Some(g) => uniform_bool(g, &same, &cmp, &assumed_m) && old_alike(&same),
+                };
                 // a read of the group's LDS at an address the lanes agree on (`_d16` forms keep
                 // the other half of the destination register and are left out)
                 if let Fields::Ds { dst: Some(_), addr: Some(addr), gds: false, .. } = &inst.fields
                     && name.starts_with("ds_read")
                     && !name.contains("_d16")
                     && alike_ops(&[*addr], &same)
-                    && st.guards[b][i].is_none_or(|g| uniform_bool(g, &same, &cmp, &assumed_m))
+                    && runs
                 {
                     same.extend(inst.writes.iter().filter(|w| w.0 != Reg::Scc).map(|w| w.1));
                     continue;
                 }
-                let ops: Vec<Operand> = match &inst.fields {
+                let mut ops: Vec<Operand> = match &inst.fields {
                     Fields::Valu(v) if v.dpp.is_none() && v.sdwa.is_none() => v.src.clone(),
                     _ => continue,
                 };
@@ -566,8 +663,21 @@ fn lane_uniform(p: &Program, st: &Structured, all: &[bool], threads: Option<[u32
                     if name.starts_with("v_cmpx") {
                         continue;
                     }
-                } else if name.starts_with("v_mbcnt") || name.contains("lane") {
+                } else if name.starts_with("v_mbcnt")
+                    || name.contains("lane")
+                    || name.starts_with("v_movrel")
+                    || name.starts_with("v_swap")
+                    || name.starts_with("v_interp")
+                {
                     continue;
+                }
+                // the lane's bit of VCC, which `v_div_fmas` reads without naming it
+                if name.starts_with("v_div_fmas") {
+                    let dwords = 1 + u8::from(p.wave64);
+                    ops.push(Operand::Scalar {
+                        code: crate::ir::VCC,
+                        dwords,
+                    });
                 }
                 // `tid >> k` (k at least 6) of the entry thread number: the wave's
                 if waves_whole
@@ -575,16 +685,14 @@ fn lane_uniform(p: &Program, st: &Structured, all: &[bool], threads: Option<[u32
                     && let [Operand::Const(134..=159), Operand::Vector { reg: 0, .. }] = &ops[..]
                     && let Some(v0) = entry_v0
                     && inst.read(Reg::V(0)) == Some(v0)
-                    && st.guards[b][i].is_none_or(|g| uniform_bool(g, &same, &cmp, &assumed_m))
+                    && runs
                 {
                     same.extend(inst.writes.iter().filter(|w| w.0 != Reg::Scc).map(|w| w.1));
                     continue;
                 }
-                // lanes outside EXEC keep another value, unless the lanes agree on running it
-                if st.guards[b][i].is_some_and(|g| !uniform_bool(g, &same, &cmp, &assumed_m)) {
-                    continue;
-                }
-                if alike_ops(&ops, &same) {
+                // lanes outside EXEC keep another value, unless the lanes agree on running it;
+                // a result keeping part of the old value needs that alike too
+                if runs && alike_ops(&ops, &same) && (!keeps_old(name) || old_alike(&same)) {
                     same.extend(inst.writes.iter().filter(|w| w.0 != Reg::Scc).map(|w| w.1));
                 }
             }
@@ -8229,75 +8337,16 @@ impl<'a> Lower<'a> {
     /// products are exact there and round once to f16 (f32 has the 2 x 11 +
     /// 2 bits that make double rounding harmless); `None` if `name` is none.
     fn valu16(&mut self, inst: &Inst, name: &str, guard: Option<V>) -> Option<Result<(), Why>> {
-        const FLOAT2: &[&str] = &[
-            "v_add_f16",
-            "v_sub_f16",
-            "v_subrev_f16",
-            "v_mul_f16",
-            "v_max_f16",
-            "v_min_f16",
-        ];
-        const FLOAT3: &[&str] = &[
-            "v_fma_f16",
-            "v_mad_f16",
-            "v_fmac_f16",
-            "v_mac_f16",
-            "v_max3_f16",
-            "v_min3_f16",
-            "v_med3_f16",
-        ];
-        const FLOAT1: &[&str] = &[
-            "v_rcp_f16",
-            "v_sqrt_f16",
-            "v_rsq_f16",
-            "v_log_f16",
-            "v_exp_f16",
-            "v_fract_f16",
-            "v_trunc_f16",
-            "v_floor_f16",
-            "v_ceil_f16",
-            "v_rndne_f16",
-            "v_sin_f16",
-            "v_cos_f16",
-            "v_cvt_f16_u16",
-            "v_cvt_f16_i16",
-        ];
-        const INT: &[&str] = &[
-            "v_add_nc_u16",
-            "v_sub_nc_u16",
-            "v_subrev_nc_u16",
-            "v_mul_lo_u16",
-            "v_lshlrev_b16",
-            "v_lshrrev_b16",
-            "v_ashrrev_i16",
-            "v_max_u16",
-            "v_max_i16",
-            "v_min_u16",
-            "v_min_i16",
-            "v_cvt_u16_f16",
-            "v_cvt_i16_f16",
-            "v_cvt_norm_i16_f16",
-            "v_cvt_norm_u16_f16",
-        ];
-        let all = [FLOAT1, FLOAT2, FLOAT3, INT];
+        let all = [HALF_FLOAT1, HALF_FLOAT2, HALF_FLOAT3, HALF_INT];
         if !all.iter().any(|l| l.contains(&name))
             && !matches!(name, "v_cvt_f16_f32" | "v_cvt_f32_f16")
         {
             return None;
         }
-        Some(self.valu16_op(inst, name, guard, FLOAT1, FLOAT2, FLOAT3))
+        Some(self.valu16_op(inst, name, guard))
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn valu16_op(
-        &mut self,
-        inst: &Inst,
-        name: &str,
-        guard: Option<V>,
-        float1: &[&str],
-        float2: &[&str],
-        float3: &[&str],
-    ) -> Result<(), Why> {
+    fn valu16_op(&mut self, inst: &Inst, name: &str, guard: Option<V>) -> Result<(), Why> {
         let Fields::Valu(v) = &inst.fields else {
             unreachable!()
         };
@@ -8335,7 +8384,7 @@ impl<'a> Lower<'a> {
             let f = self.fsrc(inst, 0)?;
             return float_result(self, f);
         }
-        if float2.contains(&name) {
+        if HALF_FLOAT2.contains(&name) {
             let (a, b) = (self.half_fsrc(inst, 0)?, self.half_fsrc(inst, 1)?);
             let r = match name {
                 "v_add_f16" => self.s.m.bin(c, Bin::Add, a, b),
@@ -8347,7 +8396,7 @@ impl<'a> Lower<'a> {
             };
             return float_result(self, r);
         }
-        if float3.contains(&name) {
+        if HALF_FLOAT3.contains(&name) {
             let (a, b) = (self.half_fsrc(inst, 0)?, self.half_fsrc(inst, 1)?);
             let acc = if matches!(name, "v_fmac_f16" | "v_mac_f16") {
                 // The accumulator is the destination's half that is written.
@@ -8384,7 +8433,7 @@ impl<'a> Lower<'a> {
             };
             return float_result(self, r);
         }
-        if float1.contains(&name) {
+        if HALF_FLOAT1.contains(&name) {
             let r = match name {
                 "v_cvt_f16_u16" | "v_cvt_f16_i16" => {
                     let mut x = self.half_src(inst, 0)?;
@@ -12193,39 +12242,7 @@ mod tests {
                 S_ENDPGM,
             ]
         };
-        let run = |words: &[u32]| {
-            let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
-            let native = NativeProgram {
-                stage: HwStage::Cs,
-                wave64: true,
-                vgprs: 256,
-                layout: vec![],
-                used: vec![],
-                io: StageIo::Cs(ComputeIo {
-                    rsrc2: 1 << 15, // 512 bytes LDS
-                    threads: [128, 1, 1],
-                }),
-                code,
-            };
-            let p = ir::build(&native.code, true, 256).unwrap();
-            let st = structure::structure(&p).unwrap();
-            let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
-            let io = io::raise(&p, &native).unwrap();
-            let prev = super::TEST_HOST_WAVE.replace(Some(32));
-            let out = lower(&Parts {
-                native: &native,
-                p: &p,
-                st: &st,
-                io: &io,
-                res: &res,
-                inputs: vec![],
-                outputs: vec![],
-                prims: vec![],
-                mesh_stride: 0,
-            });
-            super::TEST_HOST_WAVE.set(prev);
-            out
-        };
+        let run = |words: &[u32]| lower_in_halves(words, 256);
 
         if let Err(e) = run(&make(1)) {
             panic!("uniform ds_read_b32 + scalar add must be recognised as wave-uniform, got: {e}");
@@ -12238,6 +12255,233 @@ mod tests {
             err.contains("a first-lane read where not every lane runs"),
             "per-lane ds_read_b32 must still require all lanes, got: {err}"
         );
+    }
+
+    /// A console wave64 program of 128 threads (`vgprs` VGPRs) lowered for a host whose
+    /// waves are 32 lanes: each console wave runs as two host waves exchanging through LDS.
+    fn lower_in_halves(words: &[u32], vgprs: u16) -> Result<Lowered, crate::ShaderError> {
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: true,
+            vgprs,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 1 << 15, // 512 bytes LDS
+                threads: [128, 1, 1],
+            }),
+            code,
+        };
+        let p = ir::build(&native.code, true, vgprs).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let prev = super::TEST_HOST_WAVE.replace(Some(32));
+        let out = lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+        });
+        super::TEST_HOST_WAVE.set(prev);
+        out
+    }
+
+    /// The instructions of `words` (wave64, 16 VGPRs) in code order, and the values
+    /// [`super::lane_uniform`] proves alike in every lane of a console wave, in a group of
+    /// 128 threads.
+    fn alike_in(words: &[u32]) -> (Vec<ir::Inst>, std::collections::HashSet<ir::Value>) {
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = ir::build(&code, true, 16).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let all = super::all_lane_blocks(&st).unwrap();
+        let same = super::lane_uniform(&p, &st, &all, Some([128, 1, 1]));
+        (p.blocks.into_iter().flat_map(|b| b.insts).collect(), same)
+    }
+
+    #[test]
+    fn first_lane_reads_of_results_made_with_old_values_need_every_lane() {
+        // The lane branch of `first_lane_read_of_uniform_lds_load_lowers_on_wave32` (v0 < 1),
+        // with `setup` before it and `region` in it, then `v_readfirstlane_b32 s17, v{read}`.
+        // Each region's instruction takes part of its result from a register the lanes hold
+        // differently (v0 or a value made from it): the accumulator of a multiply-add, the
+        // half a 16-bit result keeps, an M0-relative source, a register an M0-relative move
+        // may leave, a swapped register. The value read then differs between the lanes, and
+        // the read needs every lane (the host waves exchange) where only some run.
+        let program = |setup: &[u32], region: &[u32], read: u32| {
+            let mut w = vec![
+                0xBE90_0380, // s_mov_b32 s16, 0
+                0xBE91_0380, // s_mov_b32 s17, 0
+                0xD760_0004, // v_readlane_b32 s4, v0, 0 (a console wave in two host waves)
+                0x0001_0100,
+            ];
+            w.extend_from_slice(setup);
+            w.extend_from_slice(&[
+                0x7D88_0081,                             // v_cmp_gt_u32_e32 vcc, 1, v0
+                0xBE86_246A,                             // s_and_saveexec_b64 s[6:7], vcc
+                0xBF88_0000 | (region.len() as u32 + 1), // s_cbranch_execz -> restore exec
+            ]);
+            w.extend_from_slice(region);
+            w.extend_from_slice(&[
+                0x7E22_0500 | read, // v_readfirstlane_b32 s17, v{read}
+                0xBEFE_0406,        // s_mov_b64 exec, s[6:7]
+                0x8011_0411,        // s_add_u32 s17, s17, s4 (keep s17 and s4 live)
+                0x7E06_0211,        // v_mov_b32 v3, s17
+                0xD834_0000,        // ds_write_b32 v0, v3
+                0x0000_0300,
+                S_ENDPGM,
+            ]);
+            w
+        };
+        const PER_LANE_V8: u32 = 0x7E10_0D00; // v_cvt_f32_u32 v8, v0
+        const ALIKE_V8: u32 = 0x7E10_0210; // v_mov_b32 v8, s16
+        // v_mov_b32 v1, s16; ds_read_b32 v2, v1 (alike, as in the LDS test); then the writer
+        let lds = |writer: u32| vec![0x7E02_0210, 0xD8D8_0000, 0x0200_0001, writer];
+        let cases: [(&str, Vec<u32>, Vec<u32>, u32, u16); 6] = [
+            // v8 += s17 * v2
+            ("v_fmac_f32", vec![PER_LANE_V8], lds(0x5610_0411), 8, 16),
+            // the low half of v8 = f16(v2)
+            ("v_cvt_f16_f32", vec![PER_LANE_V8], lds(0x7E10_1502), 8, 16),
+            // the low half of v8 = s17 + v2
+            ("v_add_f16", vec![PER_LANE_V8], lds(0x6410_0411), 8, 16),
+            (
+                "v_movrels_b32",
+                vec![
+                    0x7E14_0210, // v_mov_b32 v10, s16
+                    0x7E16_0300, // v_mov_b32 v11, v0
+                    0xBEFC_0381, // s_mov_b32 m0, 1
+                ],
+                vec![0x7E10_870A], // v_movrels_b32 v8, v10: v8 = v[10 + M0] = v11
+                8,
+                12,
+            ),
+            (
+                "v_movreld_b32",
+                vec![
+                    0x7E10_0210, // v_mov_b32 v8, s16
+                    0x7E12_0300, // v_mov_b32 v9, v0
+                    0x7E02_0210, // v_mov_b32 v1, s16
+                    0xBEFC_0380, // s_mov_b32 m0, 0
+                ],
+                vec![0x7E10_8501], // v_movreld_b32 v8, v1: v[8 + M0] = v1, v9 kept
+                9,
+                10,
+            ),
+            (
+                "v_swap_b32",
+                vec![
+                    0x7E06_0300, // v_mov_b32 v3, v0
+                    0x7E04_0210, // v_mov_b32 v2, s16
+                ],
+                vec![0x7E06_CB02], // v_swap_b32 v3, v2: v2 = the old v3
+                2,
+                16,
+            ),
+        ];
+        const NEEDS_ALL: &str = "a first-lane read where not every lane runs";
+        let mut wrong = Vec::new();
+        for (name, setup, region, read, vgprs) in cases {
+            let words = program(&setup, &region, read);
+            let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            let p = ir::build(&code, true, vgprs).unwrap();
+            let has = |b: &ir::Block| b.insts.iter().any(|i| i.name() == name);
+            assert!(p.blocks.iter().any(has), "{name} is not in the program");
+            match lower_in_halves(&words, vgprs) {
+                Err(e) if e.to_string().contains(NEEDS_ALL) => {}
+                Err(e) => wrong.push(format!("{name}: {e}")),
+                Ok(_) => wrong.push(format!("{name}: lowered without every lane")),
+            }
+        }
+        // The same reads where the old value is alike: no exchange is needed.
+        for (name, writer) in [
+            ("v_fmac_f32", 0x5610_0411),
+            ("v_cvt_f16_f32", 0x7E10_1502),
+            ("v_add_f16", 0x6410_0411),
+        ] {
+            if let Err(e) = lower_in_halves(&program(&[ALIKE_V8], &lds(writer), 8), 16) {
+                wrong.push(format!("{name} over an alike old value: {e}"));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    #[test]
+    fn a_guard_every_lane_agrees_on_keeps_alike_only_what_it_may_leave_alike() {
+        // `v3` is written under a guard every lane of the wave agrees on (a compare of two
+        // alike values: false here, so no lane runs the write). The lanes then keep the old
+        // `v3`, and the value after the write is alike only where that old value is.
+        let program = |old: u32, write: &[u32]| {
+            let mut w = vec![
+                0xBE90_0380, // s_mov_b32 s16, 0
+                0xBE91_0380, // s_mov_b32 s17, 0
+                old,         // the old v3
+                0x7E02_0210, // v_mov_b32 v1, s16
+                0x7D8A_0210, // v_cmp_ne_u32_e32 vcc, s16, v1
+                0xBE86_246A, // s_and_saveexec_b64 s[6:7], vcc (no s_cbranch_execz)
+            ];
+            w.extend_from_slice(write);
+            w.extend_from_slice(&[
+                0xBEFE_0406, // s_mov_b64 exec, s[6:7]
+                0x7E24_0503, // v_readfirstlane_b32 s18, v3
+                S_ENDPGM,
+            ]);
+            w
+        };
+        let mut wrong = Vec::new();
+        for (old, alike) in [
+            (0x7E06_0300, false), // v_mov_b32 v3, v0
+            (0x7E06_0210, true),  // v_mov_b32 v3, s16
+        ] {
+            for (name, write) in [
+                ("v_mov_b32", &[0x7E06_0211][..]),            // v_mov_b32 v3, s17
+                ("ds_read_b32", &[0xD8D8_0000, 0x0300_0001]), // ds_read_b32 v3, v1
+                ("v_lshrrev_b32", &[0x2C06_0086]),            // v_lshrrev_b32 v3, 6, v0 (the wave)
+            ] {
+                let (insts, same) = alike_in(&program(old, write));
+                let at = |n: &str| insts.iter().position(|i| i.name() == n).unwrap();
+                // the guarded write, and the first-lane read of what it leaves in v3
+                let guarded = &insts[at("s_and_saveexec_b64") + 1];
+                assert_eq!(guarded.name(), name);
+                let v3 = guarded.write(ir::Reg::V(3)).unwrap();
+                let read = &insts[at("v_readfirstlane_b32")];
+                assert_eq!(read.read(ir::Reg::V(3)), Some(v3));
+                if same.contains(&v3) != alike {
+                    wrong.push(format!("{name} over an old v3 alike: {alike}"));
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    #[test]
+    fn v_div_fmas_results_are_alike_only_with_vcc() {
+        // `v_div_fmas_f32` scales its result by the lane's bit of VCC, which it reads without
+        // naming it: alike operands give alike results only with an alike VCC.
+        for (vcc, alike) in [
+            (0x7D88_0082, false), // v_cmp_gt_u32_e32 vcc, 2, v0
+            (0x7D8A_0210, true),  // v_cmp_ne_u32_e32 vcc, s16, v1
+        ] {
+            let (insts, same) = alike_in(&[
+                0xBE90_0380, // s_mov_b32 s16, 0
+                0xBE91_0380, // s_mov_b32 s17, 0
+                0x7E02_0210, // v_mov_b32 v1, s16
+                0x7E04_0211, // v_mov_b32 v2, s17
+                vcc,
+                0xD56F_0008, // v_div_fmas_f32 v8, v1, v2, v1
+                0x0406_0501,
+                0x7E24_0508, // v_readfirstlane_b32 s18, v8
+                S_ENDPGM,
+            ]);
+            let fmas = insts.iter().find(|i| i.name() == "v_div_fmas_f32").unwrap();
+            let v8 = fmas.write(ir::Reg::V(8)).unwrap();
+            assert_eq!(same.contains(&v8), alike, "VCC alike: {alike}");
+        }
     }
 
     #[test]
