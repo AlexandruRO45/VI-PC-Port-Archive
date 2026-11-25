@@ -2762,43 +2762,42 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
 /// address: the title places structured views at ring positions inside its
 /// big GPU heap (the culling constants, the colour bakes' parameter blocks),
 /// and such a view gets a copy of its own bytes instead of being refused —
-/// refused, its slot read zeros.
-pub(crate) fn for_view(address: u64, len: u64, element: u64) -> Option<Arc<Shadow>> {
+/// refused, its slot read zeros. `true` comes with such a copy: it lives
+/// while a heap slot made from the view or a list holds it.
+pub(crate) fn for_view(address: u64, len: u64, element: u64) -> Option<(Arc<Shadow>, bool)> {
     let shadow = find(address, len)?;
     if element == 0 || shadow.offset(address).is_multiple_of(element) {
-        return Some(shadow);
+        return Some((shadow, false));
     }
-    exact(address, len)
+    exact(address, len).map(|s| (s, true))
 }
 
-/// Copies of single views' bytes ([`for_view`]), by (start, length), with the
-/// tick that last asked for each.
+/// Copies of single views' bytes ([`for_view`]), by (start, length), held by
+/// the heap slots made from them and the lists that use them: a copy is found
+/// again for as long as a slot shows it, so draws refresh the copy the GPU
+/// reads. A capped cache dropped copies slots still showed, and a new copy of
+/// the same bytes took the refreshes. The size is where the map is next pruned
+/// of dead entries.
 #[allow(clippy::type_complexity)]
-static EXACT: Mutex<(u64, BTreeMap<(u64, u64), (Arc<Shadow>, u64)>)> = Mutex::new((0, BTreeMap::new()));
-
-/// Copies [`EXACT`] keeps: ring positions change every frame, so the least
-/// recently asked for go, and a list or heap slot using one keeps it alive.
-const EXACT_KEPT: usize = 1024;
+static EXACT: Mutex<(usize, BTreeMap<(u64, u64), std::sync::Weak<Shadow>>)> = Mutex::new((1024, BTreeMap::new()));
 
 fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
     let mut guard = EXACT.lock().unwrap_or_else(|e| e.into_inner());
-    let (tick, map) = &mut *guard;
-    *tick += 1;
-    if let Some((shadow, used)) = map.get_mut(&(address, len)) {
-        *used = *tick;
-        return Some(shadow.clone());
+    let (prune_at, map) = &mut *guard;
+    if let Some(shadow) = map.get(&(address, len)).and_then(std::sync::Weak::upgrade) {
+        return Some(shadow);
     }
-    if map.len() >= EXACT_KEPT
-        && let Some(&oldest) = map.iter().min_by_key(|(_, (_, used))| *used).map(|(k, _)| k)
-    {
-        map.remove(&oldest);
+    // Ring positions change every frame: entries die by the hundred.
+    if map.len() >= *prune_at {
+        map.retain(|_, w| w.strong_count() > 0);
+        *prune_at = (2 * map.len()).max(1024);
     }
     let (buffer, data) = host()?.shared_buffer(len.next_multiple_of(256))?;
     crate::host::name(&buffer, || format!("title view {address:#x}+{len:#x}"));
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
     let shadow = Arc::new(Shadow::new(buffer, data, gpu, address, len));
-    map.insert((address, len), (shadow.clone(), *tick));
+    map.insert((address, len), std::sync::Arc::downgrade(&shadow));
     Some(shadow)
 }
 
