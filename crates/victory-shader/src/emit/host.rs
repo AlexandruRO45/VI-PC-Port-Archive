@@ -650,6 +650,27 @@ impl Host {
             Ok(bits != 0)
         }
     }
+
+    /// The device's wave lane counts (`WaveLaneCountMin`, `WaveLaneCountMax`
+    /// of `D3D12_OPTIONS1`), none without wave operations. A program
+    /// requiring a wave size outside them runs on no wave of that size,
+    /// whatever pipeline creation says.
+    pub fn wave_lanes(&self) -> Option<(u32, u32)> {
+        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+        // SAFETY: a plain feature query into a struct of the size given.
+        unsafe {
+            self.device.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS1,
+                (&raw mut options).cast(),
+                size_of_val(&options) as u32,
+            )
+        }
+        .ok()?;
+        options
+            .WaveOps
+            .as_bool()
+            .then_some((options.WaveLaneCountMin, options.WaveLaneCountMax))
+    }
 }
 
 /// `v_fma_f32 v0, s0, s1, s2` (through VGPRs) stored to dword 0 of the raw

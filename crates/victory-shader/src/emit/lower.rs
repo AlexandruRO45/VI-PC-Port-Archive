@@ -401,6 +401,44 @@ fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
     })
 }
 
+/// Instructions that read, as a number, a value lowered from a ballot of a
+/// lane mask without naming the mask: SCC written by a mask or EXEC `sop`
+/// (whether the mask has a lane, [`Lower::scc_mask_bit`]), and registers
+/// joining a mask with data or with such SCC (phis, through phis). Each is
+/// a physical-wave ballot, exact only over the console's wave.
+fn reads_mask_derived(p: &Program, st: &Structured) -> bool {
+    let is_mask = |v: &Value| st.masks.contains_key(v) || st.highs.contains_key(v);
+    let mut derived: HashSet<Value> = p
+        .blocks
+        .iter()
+        .flat_map(|b| &b.insts)
+        .filter(|i| matches!(i.fields, Fields::Sop { .. }))
+        .filter(|i| {
+            i.writes
+                .iter()
+                .any(|&(r, w)| r == Reg::S(EXEC) || (matches!(r, Reg::S(_)) && is_mask(&w)))
+        })
+        .filter_map(|i| i.write(Reg::Scc))
+        .collect();
+    loop {
+        let before = derived.len();
+        for phi in p.blocks.iter().flat_map(|b| &b.phis) {
+            if !is_mask(&phi.value)
+                && phi.args.iter().any(|a| is_mask(a) || derived.contains(a))
+            {
+                derived.insert(phi.value);
+            }
+        }
+        if derived.len() == before {
+            break;
+        }
+    }
+    p.blocks
+        .iter()
+        .flat_map(|b| &b.insts)
+        .any(|i| i.reads.iter().any(|(_, v)| derived.contains(v)))
+}
+
 /// Where half `h` (dword h / 2, the high half when odd) of the parameter
 /// whose first element is in row `a` comes from, when the console packs
 /// 16-bit values two per dword: a row and channel of `elements`, none for
@@ -503,7 +541,8 @@ impl<'a> Lower<'a> {
                     || matches!(n, "v_readlane_b32" | "v_writelane_b32")
                     || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
                     || reads_mask_as_data(x.st, i)
-            }) || {
+            }) || reads_mask_derived(p, x.st)
+                || {
                 // Masks held as numbers or constant lane sets: the lane
                 // tests its own bit by its console lane.
                 let whens = x.st.exits.iter().filter_map(|e| match *e {

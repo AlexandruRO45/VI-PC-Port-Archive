@@ -65,6 +65,10 @@ fn program(whole: bool) -> Vec<u32> {
 }
 
 fn build(words: &[u32]) -> Result<HostShader, crate::ShaderError> {
+    build_wave(words, false)
+}
+
+fn build_wave(words: &[u32], wave64: bool) -> Result<HostShader, crate::ShaderError> {
     let range = |kind, table_offset_dwords, dwords, stride| UsedResource {
         kind,
         root: RootType::Table,
@@ -77,7 +81,7 @@ fn build(words: &[u32]) -> Result<HostShader, crate::ShaderError> {
     };
     let native = NativeProgram {
         stage: HwStage::Cs,
-        wave64: false,
+        wave64,
         vgprs: 32,
         layout: vec![RootParam {
             root: RootType::Table,
@@ -94,7 +98,7 @@ fn build(words: &[u32]) -> Result<HostShader, crate::ShaderError> {
         ],
         io: StageIo::Cs(ComputeIo {
             rsrc2: 1 << 1,
-            threads: [32, 1, 1],
+            threads: [if wave64 { 64 } else { 32 }, 1, 1],
         }),
         code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
     };
@@ -438,4 +442,298 @@ fn ordered_pixel_sections_use_rasterizer_ordered_views() {
         panic!("translated a collision id outside an ordered section");
     };
     assert_eq!(what, "a hardware SGPR input");
+}
+
+// ---- Lane-mask SCC and lane masks joined with data (PR 2289) ----
+//
+// One wave (32 or 64 lanes). Lane l reads [a, selector, b, 0] at l × 16 of
+// the raw SRV at table entry 1 into v[5:7] and stores v3, v4 at l × 8 of the
+// raw UAV at entry 2. Each program restores EXEC before the stores, so lanes
+// outside a narrowed EXEC record too.
+
+const MASK_PROLOGUE: &[u32] = &[
+    0xBE84_0300, // s_mov_b32 s4, s0
+    0xBE85_0380, // s_mov_b32 s5, 0
+    0xF408_0502,
+    0xFA00_0020, // s_load_dwordx4 s[20:23], s[4:5], 0x20
+    0xF408_0A02,
+    0xFA00_0040, // s_load_dwordx4 s[40:43], s[4:5], 0x40
+    0x3420_0084, // v_lshlrev_b32 v16, 4, v0
+    0x3422_0083, // v_lshlrev_b32 v17, 3, v0
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0xE03C_1000,
+    0x8005_0510, // buffer_load_dwordx3 v[5:7], v16, s[20:23], 0 offen
+    0xBF8C_3F70, // s_waitcnt vmcnt(0)
+];
+
+const MASK_EPILOGUE: &[u32] = &[
+    0xE070_1000,
+    0x800A_0311, // buffer_store_dword v3, v17, s[40:43], 0 offen
+    0xE070_1004,
+    0x800A_0411, // buffer_store_dword v4, v17, s[40:43], 0 offen offset:4
+    0xBF81_0000, // s_endpgm
+];
+
+fn mask_program(body: &[u32]) -> Vec<u32> {
+    [MASK_PROLOGUE, body, MASK_EPILOGUE].concat()
+}
+
+/// Lane records: a and b nonzero (and different lane to lane) exactly in
+/// the lanes of masks `a` and `b`; every lane's selector `sel`.
+fn lane_records(lanes: u32, a: u64, sel: u32, b: u64) -> Vec<u32> {
+    (0..lanes)
+        .flat_map(|l| {
+            let word = |m: u64, k: u32| if m >> l & 1 != 0 { 3 * l + k } else { 0 };
+            [word(a, 1), sel, word(b, 2), 0]
+        })
+        .collect()
+}
+
+/// The wave size `PSV0` requires (its runtime info's minimum and maximum
+/// wave lane counts, equal), none where any will do. `dxil.dll`, where
+/// present, checks them against the module's `WaveSize`.
+fn required_wave(shader: &HostShader) -> Option<u32> {
+    let c = crate::dxbc::Container::parse(&shader.dxil).expect("container");
+    let psv = c.part(crate::dxbc::FourCC::PSV0).expect("PSV0").data;
+    let min = crate::dxbc::u32_at(psv, 4 + 16).expect("PSV0 min wave lanes");
+    let max = crate::dxbc::u32_at(psv, 4 + 20).expect("PSV0 max wave lanes");
+    match (min, max) {
+        (0, u32::MAX) => None,
+        (n, m) => {
+            assert_eq!(n, m, "PSV0 wave lanes {n}..{m}");
+            Some(n)
+        }
+    }
+}
+
+/// Runs `shader` (one wave of `lanes`) once per input on each adapter whose
+/// wave lane counts include `lanes`: the UAV's dwords, by adapter and
+/// input. The program must require that wave size (it ballots the
+/// console's lane masks over the physical wave), on any host.
+fn run_inputs(
+    shader: &HostShader,
+    lanes: u32,
+    inputs: &[Vec<u32>],
+) -> Vec<(&'static str, Vec<Vec<u32>>)> {
+    assert_eq!(
+        required_wave(shader),
+        Some(lanes),
+        "the program must declare the console's wave of {lanes}"
+    );
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut shader.dxil.clone())
+            .expect("DXIL validation failed");
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut runs = Vec::new();
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        // Pipeline creation may accept a wave size the device never runs
+        // (a wave of 64 on a 32-lane GPU): its lane counts decide.
+        match host.wave_lanes() {
+            Some((min, max)) if (min..=max).contains(&lanes) => {}
+            bounds => {
+                eprintln!("{label}: wave lanes {bounds:?}, no wave of {lanes}; skipped");
+                continue;
+            }
+        }
+        let (root, pso) = host
+            .compute_pipeline(shader)
+            .unwrap_or_else(|e| panic!("{label}: no pipeline for a wave of {lanes}: {e}"));
+        let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        let outs = inputs
+            .iter()
+            .map(|data| {
+                assert_eq!(data.len(), 4 * lanes as usize);
+                let views = [
+                    View::Texture(1, 1, &[[0.0; 4]]),
+                    View::Buffer {
+                        data: &data[..],
+                        stride: Stride::Raw,
+                    },
+                    View::RawUav(2 * lanes),
+                ];
+                let out = host
+                    .dispatch(
+                        &root,
+                        &pso,
+                        &Dispatch {
+                            roots: vec![(0, Root::Constants(ud.clone()))],
+                            views: &views,
+                            samplers: &[],
+                            groups: [1, 1, 1],
+                        },
+                    )
+                    .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+                out[0].clone()
+            })
+            .collect();
+        runs.push((label, outs));
+    }
+    if runs.is_empty() {
+        eprintln!("SKIPPED: no adapter runs a wave of {lanes}; numerics unchecked");
+    }
+    runs
+}
+
+/// `s_and_saveexec` of the lanes whose a is set, then `s_cselect_b32 s6, 7,
+/// 9` on its SCC: lanes of the new EXEC write s6 to v3 (64 elsewhere);
+/// after EXEC is restored, every lane writes s6 to v4. Per mask: v3 is 7 in
+/// its lanes and 64 outside; v4 is 7 in every lane if the mask has a lane
+/// (SCC 1), else 9 (SCC 0).
+fn check_saveexec_scc(wave64: bool, masks: &[u64]) {
+    let lanes = if wave64 { 64 } else { 32 };
+    let body: [u32; 7] = [
+        0x7E06_02C0, // v_mov_b32 v3, 64
+        0x7D8A_0A80, // v_cmp_ne_u32_e32 vcc, 0, v5
+        if wave64 {
+            0xBE98_246A // s_and_saveexec_b64 s[24:25], vcc
+        } else {
+            0xBE98_3C6A // s_and_saveexec_b32 s24, vcc_lo
+        },
+        0x8506_8987, // s_cselect_b32 s6, 7, 9
+        0x7E06_0206, // v_mov_b32 v3, s6
+        if wave64 {
+            0xBEFE_0418 // s_mov_b64 exec, s[24:25]
+        } else {
+            0xBEFE_0318 // s_mov_b32 exec_lo, s24
+        },
+        0x7E08_0206, // v_mov_b32 v4, s6
+    ];
+    let shader = build_wave(&mask_program(&body), wave64).expect("lower");
+    // Both SCC values are exercised.
+    assert!(masks.contains(&0) && masks.iter().any(|&m| m != 0));
+    let inputs: Vec<_> = masks
+        .iter()
+        .map(|&m| lane_records(lanes, m, 0, 0))
+        .collect();
+    for (label, outs) in run_inputs(&shader, lanes, &inputs) {
+        for (&m, got) in masks.iter().zip(&outs) {
+            let want: Vec<u32> = (0..lanes)
+                .flat_map(|l| {
+                    let inside = m >> l & 1 != 0;
+                    [if inside { 7 } else { 64 }, if m != 0 { 7 } else { 9 }]
+                })
+                .collect();
+            assert_eq!(got, &want, "{label}: wave{lanes}, mask {m:#018x}");
+        }
+    }
+}
+
+#[test]
+fn saveexec_scc_reads_whether_the_new_exec_has_a_lane_wave32() {
+    check_saveexec_scc(false, &[0x8421_00F6, 0, 0x8000_0000, 0x1, 0xFFFF_FFFF]);
+}
+
+#[test]
+fn saveexec_scc_reads_both_dwords_of_the_new_exec_wave64() {
+    check_saveexec_scc(
+        true,
+        &[
+            // Low dword only, high dword only (SCC from lanes 32-63 alone),
+            // none, lanes 31 and 32 across the boundary, all.
+            0x0000_0000_0000_0110,
+            0x8000_0400_0000_0000,
+            0,
+            0x0000_0001_8000_0000,
+            u64::MAX,
+        ],
+    );
+}
+
+/// EXEC narrowed to the lanes whose b is set; `v_cmp` of the lanes whose a
+/// is set; then a uniform branch on lane 0's selector: nonzero takes
+/// `s_and s2, exec, vcc` (a tracked mask: a & b), zero `s_mov` of numbers.
+/// The join is one scalar data phi per dword. EXEC is restored before the
+/// stores.
+#[test]
+fn data_phi_of_a_tracked_mask_or_a_number_wave32() {
+    let body = [
+        0x7E0E_0506, // v_readfirstlane_b32 s7, v6
+        0x7D8A_0E80, // v_cmp_ne_u32_e32 vcc_lo, 0, v7
+        0xBE98_3C6A, // s_and_saveexec_b32 s24, vcc_lo
+        0x7D8A_0A80, // v_cmp_ne_u32_e32 vcc_lo, 0, v5
+        0xBF06_8007, // s_cmp_eq_u32 s7, 0
+        0xBF84_0003, // s_cbranch_scc0 +3 (the mask)
+        0xBE82_03FF,
+        0x0BAD_F00D, // s_mov_b32 s2, 0xbadf00d
+        0xBF82_0001, // s_branch +1 (the join)
+        0x8702_6A7E, // s_and_b32 s2, exec_lo, vcc_lo
+        0xBEFE_0318, // s_mov_b32 exec_lo, s24
+        0x7E06_0202, // v_mov_b32 v3, s2
+        0x2C08_0700, // v_lshrrev_b32 v4, v0, v3
+        0x3608_0881, // v_and_b32 v4, 1, v4
+    ];
+    let shader = build(&mask_program(&body)).expect("lower");
+    // (a, selector, b): s2 is a & b for a nonzero selector, else the number.
+    let cases: [(u64, u32, u64); 5] = [
+        (0xF0F0_A5C3, 1, 0x3C3C_FF0F),
+        (0xF0F0_A5C3, 0, 0x3C3C_FF0F),
+        (0x0000_000F, 7, 0x0000_00F0),
+        (0xFFFF_FFFF, 1, 0x8000_0001),
+        (0x0000_0000, 0, 0xFFFF_FFFF),
+    ];
+    let inputs: Vec<_> = cases
+        .iter()
+        .map(|&(a, sel, b)| lane_records(32, a, sel, b))
+        .collect();
+    for (label, outs) in run_inputs(&shader, 32, &inputs) {
+        for (&(a, sel, b), got) in cases.iter().zip(&outs) {
+            let s2 = if sel != 0 { (a & b) as u32 } else { 0x0BAD_F00D };
+            let want: Vec<u32> = (0..32).flat_map(|l| [s2, s2 >> l & 1]).collect();
+            assert_eq!(got, &want, "{label}: a {a:#x}, selector {sel}, b {b:#x}");
+        }
+    }
+}
+
+/// The wave64 form: s[2:3] joins a & b (both dwords of a tracked mask) or
+/// two numbers; every lane stores s2 and s3.
+#[test]
+fn data_phi_of_a_tracked_mask_or_a_number_wave64() {
+    let body = [
+        0x7E0E_0506, // v_readfirstlane_b32 s7, v6
+        0x7D8A_0E80, // v_cmp_ne_u32_e32 vcc, 0, v7
+        0xBE98_246A, // s_and_saveexec_b64 s[24:25], vcc
+        0x7D8A_0A80, // v_cmp_ne_u32_e32 vcc, 0, v5
+        0xBF06_8007, // s_cmp_eq_u32 s7, 0
+        0xBF84_0005, // s_cbranch_scc0 +5 (the mask)
+        0xBE82_03FF,
+        0x0BAD_F00D, // s_mov_b32 s2, 0xbadf00d
+        0xBE83_03FF,
+        0x5EED_1234, // s_mov_b32 s3, 0x5eed1234
+        0xBF82_0001, // s_branch +1 (the join)
+        0x8782_6A7E, // s_and_b64 s[2:3], exec, vcc
+        0xBEFE_0418, // s_mov_b64 exec, s[24:25]
+        0x7E06_0202, // v_mov_b32 v3, s2
+        0x7E08_0203, // v_mov_b32 v4, s3
+    ];
+    let shader = build_wave(&mask_program(&body), true).expect("lower");
+    let cases: [(u64, u32, u64); 5] = [
+        (0xFF00_00F0_8000_0F0F, 1, 0x0F0F_F0F0_8000_0FF0),
+        (0xFF00_00F0_8000_0F0F, 0, 0x0F0F_F0F0_8000_0FF0),
+        // High dword only, then low dword only.
+        (0x8000_0001_0000_0000, 3, u64::MAX),
+        (u64::MAX, 3, 0x0000_0000_4000_0002),
+        (0x0000_00FF_0000_0000, 9, 0x0000_FF00_0000_00FF),
+    ];
+    let inputs: Vec<_> = cases
+        .iter()
+        .map(|&(a, sel, b)| lane_records(64, a, sel, b))
+        .collect();
+    for (label, outs) in run_inputs(&shader, 64, &inputs) {
+        for (&(a, sel, b), got) in cases.iter().zip(&outs) {
+            let (lo, hi) = if sel != 0 {
+                ((a & b) as u32, ((a & b) >> 32) as u32)
+            } else {
+                (0x0BAD_F00D, 0x5EED_1234)
+            };
+            let want: Vec<u32> = (0..64).flat_map(|_| [lo, hi]).collect();
+            assert_eq!(got, &want, "{label}: a {a:#x}, selector {sel}, b {b:#x}");
+        }
+    }
 }
