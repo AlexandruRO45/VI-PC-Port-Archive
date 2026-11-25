@@ -4,6 +4,7 @@
 //! the user's cache directory (outside the repository).
 
 mod census;
+mod gui;
 mod inspect;
 mod prebuild;
 mod run;
@@ -122,6 +123,8 @@ enum Command {
     },
     /// Show the resolved configuration and check it.
     Config,
+    /// Choose a local executable with the Windows file picker and run it.
+    Gui,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -193,6 +196,7 @@ fn main() -> Result<()> {
             Ok(())
         }
         Command::Config => show_config(),
+        Command::Gui => gui::run(),
     }
 }
 

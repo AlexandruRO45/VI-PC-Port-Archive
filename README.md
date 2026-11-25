@@ -78,6 +78,10 @@ target\release\victory.exe translate --cache --pipelines <game dir>\shaders.rpf 
 target\release\victory.exe run <game dir>\<the title's exe> --execute
 ```
 
+On Windows, `victory gui` opens a file picker for a local executable and starts
+the same offline `run --execute` path. The picker is implemented in Rust and
+downloads no assets.
+
 The `translate --cache` step (minutes; again after a change of the shader
 translator) translates every shader the title can ask for into the cache
 (about 1.3 GB), so a run does not translate them while it plays; without it
@@ -132,6 +136,7 @@ victory translate [paths...] --cache [--pipelines] [--jobs N]
 victory run <exe> [--execute] [--unimplemented trap|zero] [--strict]
             [--console series-x|series-s] [-- <title arguments>]
 victory config
+victory gui
 ```
 
 Logging: `VICTORY_LOG=victory_loader=trace,info` (a release build logs
