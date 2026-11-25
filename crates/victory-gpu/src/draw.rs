@@ -1153,6 +1153,39 @@ impl State {
                         }
                         continue;
                     }
+                    if srv && slot == victory_shader::emit::VIEW_PAGE_TABLE_SLOT {
+                        // Ours, not the title's: the page table that
+                        // translates view-heap indices through pages. Bound
+                        // from whichever view heap the draw binds.
+                        let heap = self
+                            .heaps
+                            .iter()
+                            .filter(|&&h| h != 0)
+                            .map(|&h| crate::descriptor::heap(h as This))
+                            .find(|h| !h.samplers());
+                        let Some(heap) = heap else {
+                            once!("a shader reads view pages without a view heap: dropped");
+                            continue;
+                        };
+                        let Some(host) = heap.host() else {
+                            once!("a shader reads view pages without a host heap: dropped");
+                            continue;
+                        };
+                        let Some(gpu) = host.page_table_gpu() else {
+                            once!("a shader reads view pages without a page table");
+                            continue;
+                        };
+                        // SAFETY: an open list; the table lives as long
+                        // as the heap the list holds.
+                        unsafe {
+                            if compute {
+                                l.SetComputeRootShaderResourceView(param, gpu);
+                            } else {
+                                l.SetGraphicsRootShaderResourceView(param, gpu);
+                            }
+                        }
+                        continue;
+                    }
                     let tabled = srv && crate::pipeline::host::bounded_root_srvs();
                     let Some(&Root::View(address)) = self.roots_ref(compute).get(usize::from(slot))
                     else {

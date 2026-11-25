@@ -2,7 +2,7 @@
 //! the `dx.op` declarations it calls, its signatures and bound resources,
 //! and the metadata and container that wrap it up (SM 6.6, validator 1.6).
 
-use super::bitcode::{Attr, Md, Module, Ty, V};
+use super::bitcode::{Attr, Bin, Cast, Md, Module, Ty, V};
 use super::container::{self, Binding, Psv, SigElement};
 
 /// Where the shader reads its user data: `b0` in this space.
@@ -26,6 +26,18 @@ pub const ROOT_CBV_SPACE: u32 = 1;
 pub const SLOT_STRIDES: u8 = 255;
 /// Dwords of the [`SLOT_STRIDES`] buffer: heap indices are clamped to it.
 pub const SLOT_STRIDES_COUNT: u32 = 1 << 21;
+
+/// View heap size in slots that translated shaders may index (2^21).
+pub const HEAP_VIEWS: u32 = 1 << 21;
+/// View heap slots the host's sampler heap holds at most.
+pub const HEAP_SAMPLERS: u32 = 2048;
+/// View heap pages ([`super::Options::view_pages`]): view slots go in pages
+/// of this many, each placed anywhere in the host's heap.
+pub const VIEW_PAGE_SLOTS: u32 = 256;
+/// The root SRV slot of the page-table-only raw buffer: a dword per page,
+/// the host page that holds each virtual page. Dedicated (not `SLOT_STRIDES`)
+/// so ordinary texture shaders do not run the stride preparation path.
+pub const VIEW_PAGE_TABLE_SLOT: u8 = 252;
 
 /// Title memory by address (`resource::MEMORY`): console code reads and
 /// writes through raw 40-bit addresses it takes from root constants,
@@ -136,6 +148,23 @@ pub fn view_heap_limit() -> u32 {
     VIEW_LIMIT.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+thread_local! {
+    /// [`super::Options::view_pages`] for the translation on this thread.
+    static VIEW_PAGES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Sets [`super::Options::view_pages`] for this thread's translations
+/// until the guard drops.
+pub(crate) fn view_pages(on: bool) -> impl Drop {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            VIEW_PAGES.with(|v| v.set(self.0));
+        }
+    }
+    Restore(VIEW_PAGES.with(|v| v.replace(on)))
+}
+
 pub(crate) struct Shader {
     pub m: Module,
     pub t: Types,
@@ -172,6 +201,9 @@ pub(crate) struct Shader {
     lds: Option<V>,
     main: V,
     pub entry: usize,
+    /// View heap indices go through the view-page table
+    /// ([`super::Options::view_pages`]).
+    view_pages: bool,
 }
 
 impl Shader {
@@ -223,6 +255,7 @@ impl Shader {
             wave_size: None,
             lds_dwords: 0,
             lds: None,
+            view_pages: VIEW_PAGES.with(std::cell::Cell::get),
             main,
             entry,
         }
@@ -428,6 +461,32 @@ impl Shader {
             let v = self.op(block, "binary.i32", Attr::ReadNone, i32t, 40, &[index, last]);
             self.m.tag(v, super::bitcode::Tag::Clamp);
             v
+        } else {
+            index
+        };
+        // Paged view heaps: the host slot is the slot's page's place in the
+        // host heap, from the page table, and its offset in the page.
+        let index = if self.view_pages && !sampler {
+            let table = self.root_srv_handle(VIEW_PAGE_TABLE_SLOT);
+            let shift = self.m.i32(VIEW_PAGE_SLOTS.trailing_zeros());
+            let page = self.m.bin(block, Bin::LShr, index, shift);
+            let four = self.m.i32(4);
+            let at = self.m.bin(block, Bin::Mul, page, four);
+            let (u, mask, align) = (self.m.undef(self.t.i32), self.m.i8(1), self.m.i32(4));
+            let r = self.op(
+                block,
+                "rawBufferLoad.f32",
+                Attr::ReadOnly,
+                self.t.res_ret,
+                139,
+                &[table, at, u, mask, align],
+            );
+            let placed = self.m.extract(block, r, 0);
+            let placed = self.m.cast(block, Cast::Bitcast, placed, self.t.i32);
+            let placed = self.m.bin(block, Bin::Shl, placed, shift);
+            let within = self.m.i32(VIEW_PAGE_SLOTS - 1);
+            let within = self.m.bin(block, Bin::And, index, within);
+            self.m.bin(block, Bin::Or, placed, within)
         } else {
             index
         };

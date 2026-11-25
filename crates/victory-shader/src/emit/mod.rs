@@ -115,8 +115,9 @@ pub use sampler::StaticSampler;
 pub use lower::{host_max_wave, set_host_max_wave};
 pub use rect::rect_list_gs;
 pub use shader::{
-    MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
-    SLOT_STRIDES_COUNT, USER_DATA_SPACE, USER_GROUP_BASE, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
+    HEAP_SAMPLERS, HEAP_VIEWS, MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE,
+    SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES, SLOT_STRIDES_COUNT, USER_DATA_SPACE, USER_GROUP_BASE,
+    USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS, VIEW_PAGE_SLOTS, VIEW_PAGE_TABLE_SLOT,
     set_view_heap_limit, view_heap_limit,
 };
 
@@ -274,6 +275,13 @@ pub struct UserData {
 /// shader container.
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
     translate_code(container, None)
+}
+
+/// Runs `f` with view pages enabled or disabled for this thread's
+/// translations, restoring the previous setting when `f` returns.
+pub fn with_view_pages<R>(on: bool, f: impl FnOnce() -> R) -> R {
+    let _guard = shader::view_pages(on);
+    f()
 }
 
 /// [`translate`] with `code` in place of the program's own when given.

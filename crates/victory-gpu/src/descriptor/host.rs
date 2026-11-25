@@ -64,6 +64,9 @@ pub(crate) struct HostHeap {
     /// (`victory_shader::emit::SLOT_STRIDES`): an upload buffer of
     /// `SLOT_STRIDES_COUNT` dwords, its GPU address and its mapping.
     strides: Option<(ID3D12Resource, u64, usize)>,
+    /// Paged view heaps: the page table buffer, a dword per virtual page,
+    /// its GPU address and its mapping.
+    page_table: Option<(ID3D12Resource, u64, usize)>,
     /// Title slots holding buffer views. Such a view gets its host slot
     /// (and its memory a host copy) only when something reads it: a draw
     /// through a table, or [`HostHeap::buffer_slots`] for shaders that pick
@@ -97,6 +100,8 @@ pub(crate) struct HostHeap {
     /// other memory there makes stale, and which to look at again when the
     /// runtime maps, unmaps or writes memory ([`remapped`]).
     placed: Mutex<Spans>,
+    /// Paged view heaps ([`view_pages`]): where each page of slots is.
+    pages: Option<Pages>,
 }
 
 /// Title memory by the placed texture views that describe it: per span of
@@ -709,6 +714,172 @@ pub(crate) fn probe_view_limit() {
 /// table past them is made afresh in these slots like any other.
 pub(crate) const DYNAMIC: u32 = 1 << 18;
 
+/// Slots per page of a paged view heap.
+const PAGE: u32 = victory_shader::emit::VIEW_PAGE_SLOTS;
+/// Host pages every paged heap keeps: all null (where unplaced pages
+/// read), and a scratch page (what is written to slots of pages there was
+/// no room for, read by nothing).
+const NULL_PAGE: u32 = 0;
+const SCRATCH_PAGE: u32 = 1;
+
+/// A paged view heap's pages: the host page of each page of slots (0 for
+/// none: [`NULL_PAGE`]), entered in the page table shaders read, and the
+/// host pages not given out yet.
+struct Pages {
+    placed: Mutex<Placed>,
+    /// Host pages in all.
+    end: u32,
+    /// The page table, a dword per page, in the page-table buffer.
+    table: usize,
+}
+
+/// [`Pages`] as they are placed and written.
+struct Placed {
+    /// Per page of slots, its host page.
+    host: Vec<u32>,
+    /// The next host page to give out.
+    next: u32,
+    /// The first host page given out on a write (those before it hold the
+    /// dynamic slots, placed at once).
+    first: u32,
+    /// Per page of slots, a bit per slot written: how full the pages placed
+    /// on a write are tells whether smaller pages would fit more of a title.
+    written: Vec<u64>,
+    /// Slots written in pages placed on a write.
+    slots: u64,
+    /// Pages written when no host page was left, and their slots written.
+    refused: u32,
+    refused_slots: u64,
+}
+
+// A page's bits are whole words.
+const _: () = assert!(PAGE.is_multiple_of(64));
+
+impl Placed {
+    /// `host` per page of slots, `next` the first host page to give out.
+    fn new(host: Vec<u32>, next: u32) -> Self {
+        let words = host.len() * (PAGE / 64) as usize;
+        Self {
+            host,
+            next,
+            first: next,
+            written: vec![0; words],
+            slots: 0,
+            refused: 0,
+            refused_slots: 0,
+        }
+    }
+
+    /// Notes slot `index` written: whether it is the slot's first write,
+    /// and its page's.
+    fn note(&mut self, index: u32) -> (bool, bool) {
+        let words = (PAGE / 64) as usize;
+        let at = (index / PAGE) as usize * words;
+        let bits = &mut self.written[at..at + words];
+        let page_new = bits.iter().all(|&w| w == 0);
+        let k = (index % PAGE) as usize;
+        let bit = 1u64 << (k % 64);
+        let new = bits[k / 64] & bit == 0;
+        bits[k / 64] |= bit;
+        (new, new && page_new)
+    }
+
+    /// Slots in the pages placed on a write.
+    fn placed_slots(&self) -> u64 {
+        u64::from(self.next - self.first) * u64::from(PAGE)
+    }
+}
+
+impl Pages {
+    /// The host slot of slot `index`, placing its page if it has none and
+    /// `place` (a write); None where it has none (none left, or not to
+    /// place).
+    fn slot(&self, index: u32, place: bool) -> Option<u32> {
+        let page = (index / PAGE) as usize;
+        let mut guard = self.placed.lock().unwrap_or_else(|e| e.into_inner());
+        let p = &mut *guard;
+        let host = match *p.host.get(page)? {
+            NULL_PAGE if !place => return None,
+            NULL_PAGE => {
+                if p.next >= self.end {
+                    let (new, page_new) = p.note(index);
+                    p.refused_slots += u64::from(new);
+                    if page_new {
+                        p.refused += 1;
+                        if p.refused == 1 {
+                            tracing::warn!(
+                                pages = self.end,
+                                written = p.slots,
+                                of = p.placed_slots(),
+                                "no room left in the host view heap: slots of further pages read null"
+                            );
+                        } else if p.refused.is_power_of_two() {
+                            tracing::info!(
+                                pages = p.refused,
+                                written = p.refused_slots,
+                                placed_written = p.slots,
+                                of = p.placed_slots(),
+                                "view heap pages written with no room left"
+                            );
+                        }
+                    }
+                    return None;
+                }
+                let host = p.next;
+                p.next += 1;
+                p.host[page] = host;
+                // SAFETY: the mapped page table has a dword per page.
+                unsafe { (self.table as *mut u32).add(page).write_volatile(host) };
+                p.slots += u64::from(p.note(index).0);
+                if host.is_power_of_two() || p.next == self.end {
+                    tracing::info!(
+                        pages = host + 1,
+                        of = self.end,
+                        written = p.slots,
+                        of_slots = p.placed_slots(),
+                        "host view heap pages in use"
+                    );
+                }
+                host
+            }
+            host => {
+                if place && host >= p.first {
+                    p.slots += u64::from(p.note(index).0);
+                }
+                host
+            }
+        };
+        Some(host * PAGE + index % PAGE)
+    }
+}
+
+/// Whether view heaps are paged (`victory_shader::emit::Options::view_pages`):
+/// the host refuses a view heap of every index shaders take and the
+/// dynamic slots. Asked once; `VICTORY_VIEW_PAGES=1` pages on any host.
+pub(crate) fn view_pages() -> bool {
+    static PAGED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *PAGED.get_or_init(|| {
+        if std::env::var_os("VICTORY_VIEW_PAGES").is_some_and(|v| v == "1") {
+            return true;
+        }
+        let Some(host) = host() else { return false };
+        let desc = D3D12_DESCRIPTOR_HEAP_DESC {
+            Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+            NumDescriptors: victory_shader::emit::HEAP_VIEWS + DYNAMIC,
+            Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+            NodeMask: 0,
+        };
+        // SAFETY: plain heap creation; the heap is dropped at once.
+        let refused = unsafe {
+            host.device
+                .CreateDescriptorHeap::<ID3D12DescriptorHeap>(&desc)
+        }
+        .is_err();
+        tracing::info!(paged = refused, "host view heaps");
+        refused
+    })
+}
+
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
         let host = host()?;
@@ -786,6 +957,15 @@ impl HostHeap {
             u64::from(step),
             sampler,
         ));
+        // Paged view heaps: the host heap is what the host accepts, but the
+        // virtual heap is `HEAP_VIEWS` slots in pages of `PAGE`, translated
+        // through a page table in a dedicated root SRV buffer.
+        let paged = !sampler && view_pages();
+        let page_table_size = if paged {
+            u64::from(victory_shader::emit::HEAP_VIEWS / PAGE) * 4
+        } else {
+            0
+        };
         let strides = (!sampler)
             .then(|| {
                 let bytes = u64::from(victory_shader::emit::SLOT_STRIDES_COUNT) * 4;
@@ -799,6 +979,59 @@ impl HostHeap {
                 Some((buffer, gpu, data as usize))
             })
             .flatten();
+        // The page table: a dword per virtual page, zeroed so unplaced
+        // pages read the null page. Its mapped address is `table`.
+        let page_table = paged.then(|| {
+            let bytes = page_table_size;
+            let (buffer, data) = host.upload_buffer(bytes)?;
+            // SAFETY: the buffer's whole mapping; a live buffer.
+            let gpu = unsafe {
+                std::ptr::write_bytes(data, 0, bytes as usize);
+                buffer.GetGPUVirtualAddress()
+            };
+            crate::host::name(&buffer, || "view heap page table".to_owned());
+            Some((buffer, gpu, data as usize))
+        })
+        .flatten();
+        // A paged heap's page table is in its own buffer: without it shaders
+        // would find no page, so refuse the paged heap.
+        if paged && page_table.is_none() {
+            tracing::warn!(count, "no page table: no paged host view heap");
+            return None;
+        }
+        let table = page_table.as_ref().map_or(0, |p| p.2);
+        // Every slot is virtual: the host heap as large as it takes.
+        let slots = if paged {
+            victory_shader::emit::HEAP_VIEWS
+        } else {
+            size
+        };
+        // The dynamic slots' pages placed at once, together, past the null
+        // and scratch pages: a table of them is bound as a range of the
+        // host heap. Every other page reads the null page until placed.
+        let pages = paged.then(|| {
+            let virtual_pages = (victory_shader::emit::HEAP_VIEWS / PAGE) as usize;
+            let mut placed = vec![NULL_PAGE; virtual_pages];
+            let mut next = SCRATCH_PAGE + 1;
+            for page in count / PAGE..(count + extra).div_ceil(PAGE) {
+                placed[page as usize] = next;
+                // SAFETY: the mapped table, a dword per page.
+                unsafe { (table as *mut u32).add(page as usize).write_volatile(next) };
+                next += 1;
+            }
+            tracing::info!(
+                slots = count,
+                host_slots = size,
+                pages = virtual_pages,
+                fixed = next,
+                "view heap paged: the host caps view heaps, title slots are placed by page"
+            );
+            Pages {
+                placed: Mutex::new(Placed::new(placed, next)),
+                end: size / PAGE,
+                table,
+            }
+        });
         let h = HostHeap {
             heap,
             cpu,
@@ -812,6 +1045,7 @@ impl HostHeap {
             free: std::sync::atomic::AtomicU32::new(DYNAMIC - 1),
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
             strides,
+            page_table,
             buffers: Mutex::new(std::array::from_fn(|_| std::collections::HashSet::new())),
             changed: Mutex::default(),
             textures: Mutex::default(),
@@ -819,13 +1053,14 @@ impl HostHeap {
                 .map(|_| std::sync::atomic::AtomicU32::new(0))
                 .collect(),
             placed: Mutex::default(),
+            pages,
         };
         // A slot never written is undefined: shaders reading one (a slot
         // the title wrote in a way we do not know, or a table entry no
         // used-resource entry names) read a wild address. Every slot starts
         // null instead.
         let started = std::time::Instant::now();
-        if let Err(e) = h.fill_null(kind, size) {
+        if let Err(e) = h.fill_null(kind, slots) {
             tracing::warn!(error = %e, "host descriptor heap not made null");
         }
         tracing::debug!(ms = started.elapsed().as_millis(), "host descriptor heap made null");
@@ -863,7 +1098,7 @@ impl HostHeap {
             let mut done = 0;
             while done < total {
                 let n = BLOCK.min(total - done);
-                host.device.CopyDescriptorsSimple(n, self.cpu(done), start, kind);
+                host.device.CopyDescriptorsSimple(n, self.host_cpu(done), start, kind);
                 done += n;
             }
         }
@@ -963,6 +1198,11 @@ impl HostHeap {
     /// The table's buffer, for a list to hold.
     pub(crate) fn strides_buffer(&self) -> Option<&ID3D12Resource> {
         self.strides.as_ref().map(|s| &s.0)
+    }
+
+    /// The GPU address of the page-table buffer (paged view heaps).
+    pub(crate) fn page_table_gpu(&self) -> Option<u64> {
+        self.page_table.as_ref().map(|s| s.1)
     }
 
     /// Up to `max` title slots whose texture view is due at `frame`, each
@@ -1528,7 +1768,12 @@ impl HostHeap {
     pub(crate) fn make_null(&self, index: u32) {
         if self.sampler {
             self.null_sampler(index);
-        } else {
+        } else if self
+            .pages
+            .as_ref()
+            .is_none_or(|p| p.slot(index, false).is_some())
+        {
+            // (A page with no place reads null already: none is taken.)
             null_view(self.cpu(index));
         }
         self.keep(index, None);
@@ -1694,12 +1939,19 @@ impl HostHeap {
         };
     }
 
-    /// The shader-visible handle of slot `index`.
+    /// The shader-visible handle of slot `index` (in a paged heap, of the
+    /// mapped physical slot).
     pub(crate) fn gpu_handle(&self, index: u32) -> D3D12_GPU_DESCRIPTOR_HANDLE {
+        let slot = match &self.pages {
+            None => index,
+            Some(p) => p
+                .slot(index, false)
+                .unwrap_or(NULL_PAGE * PAGE + index % PAGE),
+        };
         // SAFETY: a live shader-visible heap.
         let start = unsafe { self.heap.GetGPUDescriptorHandleForHeapStart().ptr };
         D3D12_GPU_DESCRIPTOR_HANDLE {
-            ptr: start + u64::from(index) * u64::from(self.step),
+            ptr: start + u64::from(slot) * u64::from(self.step),
         }
     }
 
@@ -1719,9 +1971,22 @@ impl HostHeap {
         };
     }
 
+    /// Where slot `index` is written: in a paged heap its page is placed
+    /// first (the scratch page where there is no room left).
     fn cpu(&self, index: u32) -> D3D12_CPU_DESCRIPTOR_HANDLE {
+        match &self.pages {
+            None => self.host_cpu(index),
+            Some(p) => self.host_cpu(
+                p.slot(index, true)
+                    .unwrap_or(SCRATCH_PAGE * PAGE + index % PAGE),
+            ),
+        }
+    }
+
+    /// Host heap slot `slot` (not a title slot in a paged heap).
+    fn host_cpu(&self, slot: u32) -> D3D12_CPU_DESCRIPTOR_HANDLE {
         D3D12_CPU_DESCRIPTOR_HANDLE {
-            ptr: self.cpu + index as usize * self.step as usize,
+            ptr: self.cpu + slot as usize * self.step as usize,
         }
     }
 
@@ -3334,5 +3599,70 @@ mod tests {
         heap.release(a, 50);
         assert_eq!(heap.dynamic(50), Some(4));
         assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 41));
+    }
+
+    /// A paged heap's pages are placed on first write, in turn, each once,
+    /// and entered in the page table; reads place none; past the host's
+    /// pages, and past the virtual ones, a slot has no place.
+    #[test]
+    fn pages_are_placed_once_on_first_write() {
+        let mut table = vec![0u32; 8];
+        let pages = Pages {
+            placed: Mutex::new(Placed::new(vec![NULL_PAGE; 8], SCRATCH_PAGE + 1)),
+            end: 4,
+            table: table.as_mut_ptr() as usize,
+        };
+        let at = |page: u32, k: u32| page * PAGE + k;
+        assert_eq!(pages.slot(at(3, 5), false), None, "a read places nothing");
+        assert_eq!(pages.slot(at(3, 5), true), Some(at(2, 5)));
+        assert_eq!(
+            pages.slot(at(3, 200), false),
+            Some(at(2, 200)),
+            "the same page"
+        );
+        assert_eq!(pages.slot(at(6, 0), true), Some(at(3, 0)));
+        assert_eq!(pages.slot(at(7, 1), true), None, "no host page left");
+        assert_eq!(pages.slot(at(8, 0), true), None, "past the virtual pages");
+        assert_eq!(pages.placed.lock().unwrap().next, 4);
+        drop(pages);
+        assert_eq!(table, [0, 0, 0, 2, 0, 0, 3, 0]);
+    }
+
+    /// Slots written are counted once each, in the pages placed on a write
+    /// (not the ones placed at once) and in the pages with no room left;
+    /// reads count none.
+    #[test]
+    fn written_slots_are_counted_per_page() {
+        let mut table = vec![0u32; 8];
+        let mut host = vec![NULL_PAGE; 8];
+        host[0] = SCRATCH_PAGE + 1; // placed at once, as the dynamic slots
+        let pages = Pages {
+            placed: Mutex::new(Placed::new(host, SCRATCH_PAGE + 2)),
+            end: 5,
+            table: table.as_mut_ptr() as usize,
+        };
+        let at = |page: u32, k: u32| page * PAGE + k;
+        for k in [0, 1, 1, 63, 64, PAGE - 1] {
+            pages.slot(at(2, k), true);
+        }
+        pages.slot(at(2, 7), false);
+        pages.slot(at(0, 3), true);
+        pages.slot(at(4, 9), true);
+        {
+            let p = pages.placed.lock().unwrap();
+            assert_eq!(p.next, 5);
+            assert_eq!((p.slots, p.placed_slots()), (6, 2 * u64::from(PAGE)));
+            assert_eq!((p.refused, p.refused_slots), (0, 0));
+        }
+        pages.slot(at(5, 1), true);
+        pages.slot(at(5, 1), true);
+        pages.slot(at(5, 2), true);
+        pages.slot(at(6, 0), true);
+        let p = pages.placed.lock().unwrap();
+        assert_eq!((p.refused, p.refused_slots), (2, 3));
+        assert_eq!(p.slots, 6);
+        drop(p);
+        drop(pages);
+        assert_eq!(table, [0, 0, 3, 0, 4, 0, 0, 0]);
     }
 }

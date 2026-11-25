@@ -13,6 +13,11 @@ use crate::resource::{Memory, PAGEABLE_IIDS};
 #[cfg(windows)]
 pub(crate) mod host;
 
+/// Whether view heaps are paged on this host (`host::view_pages`).
+pub(crate) fn view_pages() -> bool {
+    host::view_pages()
+}
+
 const HEAP_IIDS: [Iid; 4] = [
     guid(
         0x8efb471d,

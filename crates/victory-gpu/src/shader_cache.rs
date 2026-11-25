@@ -74,6 +74,8 @@ fn build() -> &'static [u8; 32] {
             u32::from(victory_shader::emit::group_sync()),
             // And which clean-up passes ran over the translated code.
             victory_shader::emit::shader_opt(),
+            // Whether view heaps are paged on this host.
+            u32::from(crate::descriptor::view_pages()),
         ] {
             hash.update(&n.to_le_bytes());
         }
@@ -110,7 +112,14 @@ pub(crate) fn host_shader_cached(container: &[u8]) -> Result<(HostShader, bool),
     if let Some(s) = stand_in(container) {
         return Ok((s, false));
     }
-    let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
+    // Whether view heaps are paged on this host; shaders translated with it
+    // read heap indices through the page table, and the cache key carries it.
+    let view_pages = crate::descriptor::view_pages();
+    let translate = |c: &[u8]| {
+        victory_shader::emit::with_view_pages(view_pages, || {
+            victory_shader::emit::translate(c).map_err(|e| e.to_string())
+        })
+    };
     let r = match CACHE.get() {
         Some(cache) => cached(cache, build(), container, translate),
         None => translate(container).map(|shader| (shader, false)),
