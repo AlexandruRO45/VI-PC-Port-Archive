@@ -2592,6 +2592,34 @@ mod late_tests {
         }
     }
 
+    #[test]
+    fn declared_ranges_match_linear_reference() {
+        use std::sync::Arc;
+        // Equal values in distinct allocations must remain distinct.
+        let copies: Vec<_> = (0..32).map(|_| Arc::new(7)).collect();
+        let mut indexed = super::WriteRanges::new();
+        let mut reference: Vec<(Arc<i32>, Vec<(usize, usize)>)> = Vec::new();
+        for i in 0usize..4096 {
+            let copy = &copies[(i * 17) % copies.len()];
+            let from = (i * 31) % 128;
+            let range = (from, from + (i / 32) % 8);
+            indexed.add(copy, range);
+            match reference.iter_mut().find(|(entry, _)| Arc::ptr_eq(entry, copy)) {
+                Some((_, ranges)) => {
+                    if !ranges.contains(&range) {
+                        ranges.push(range);
+                    }
+                }
+                None => reference.push((copy.clone(), vec![range])),
+            }
+        }
+        assert_eq!(indexed.entries.len(), reference.len());
+        for ((actual, ranges), (expected, expected_ranges)) in indexed.entries.iter().zip(&reference) {
+            assert!(Arc::ptr_eq(actual, expected));
+            assert_eq!(ranges, expected_ranges);
+        }
+    }
+
     /// Copies join only when both ends continue and the whole does not
     /// overlap itself.
     #[test]
@@ -2718,26 +2746,48 @@ fn continues(last: (usize, usize, usize), next: (usize, usize, usize)) -> bool {
         && (d.checked_add(all).is_some_and(|end| end <= s) || s.checked_add(all).is_some_and(|end| end <= d))
 }
 
+/// Accumulate exact declared ranges in first-seen order, using copy
+/// identity and range membership only for lookup, never for iteration.
+struct WriteRanges<T> {
+    entries: Vec<(std::sync::Arc<T>, Vec<(usize, usize)>)>,
+    index: std::collections::HashMap<*const T, usize>,
+    seen: std::collections::HashSet<(usize, usize, usize)>,
+}
+
+impl<T> WriteRanges<T> {
+    fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+            index: std::collections::HashMap::new(),
+            seen: std::collections::HashSet::new(),
+        }
+    }
+
+    fn add(&mut self, copy: &std::sync::Arc<T>, range: (usize, usize)) {
+        let key = std::sync::Arc::as_ptr(copy);
+        let at = *self.index.entry(key).or_insert_with(|| {
+            let at = self.entries.len();
+            self.entries.push((copy.clone(), Vec::new()));
+            at
+        });
+        if self.seen.insert((at, range.0, range.1)) {
+            self.entries[at].1.push(range);
+        }
+    }
+}
+
 /// The ranges the shaders of `runs` may write, per host copy, as declared.
 /// One list's lock at a time: a submission may name a list twice.
 fn declared_writes(runs: &[&HostList]) -> Vec<Declared> {
-    let mut back: Vec<Declared> = Vec::new();
+    let mut back = WriteRanges::new();
     for list in runs {
         for step in &list.deferred().copies {
             if let Step::GpuWrite(shadow, address, len) = step {
-                let range = (*address, *address + *len);
-                match back.iter_mut().find(|(s, _)| std::sync::Arc::ptr_eq(s, shadow)) {
-                    Some((_, ranges)) => {
-                        if !ranges.contains(&range) {
-                            ranges.push(range);
-                        }
-                    }
-                    None => back.push((shadow.clone(), vec![range])),
-                }
+                back.add(shadow, (*address, *address + *len));
             }
         }
     }
-    back
+    back.entries
 }
 
 /// After `list` has run: the texels its read-backs copied into host
