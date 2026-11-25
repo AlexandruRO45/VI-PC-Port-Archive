@@ -285,6 +285,22 @@ pub(crate) fn log_removal_context() {
 /// Time spent in submissions since the last frame-rate line, in
 /// microseconds: preparing them on the CPU (title memory copies, texture
 /// detiling), then waiting for the GPU.
+/// Since the last frame line, microseconds of the submitting thread's
+/// preparing ([`SUBMISSION_US`] 0) by phase: the submission's one
+/// write-watch asking, the title's bytes put in under flights, the lists'
+/// deferred steps (the frame line's copies are part of these), their state
+/// preludes, the last refreshes, the snapshots of shader-written ranges,
+/// and the copies in the card's memory (what goes up, the compare). Settles
+/// inside a phase are not its time.
+static PREPARE_SPLIT: [std::sync::atomic::AtomicU64; 7] = [const { std::sync::atomic::AtomicU64::new(0) }; 7];
+const PREPARE_ASK: usize = 0;
+const PREPARE_MERGE: usize = 1;
+const PREPARE_DEFERRED: usize = 2;
+const PREPARE_PRELUDES: usize = 3;
+const PREPARE_FLUSH: usize = 4;
+const PREPARE_SNAPSHOTS: usize = 5;
+const PREPARE_CARD: usize = 6;
+
 static SUBMISSION_US: [std::sync::atomic::AtomicU64; 2] =
     [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
 
@@ -7581,8 +7597,17 @@ impl Host {
         // The buffer for the patches of the title's bytes put in under
         // flights, if they are put in (`stale_under_flights`).
         let mut reserve: Option<PatchBuffer> = None;
+        // Each phase of the preparing, timed for the frame line
+        // ([`PREPARE_SPLIT`]); a settle inside one is not its time.
+        let mut phase = std::time::Instant::now();
+        let split = |at: usize, since: &mut std::time::Instant, settled_in: std::time::Duration| {
+            let us = since.elapsed().saturating_sub(settled_in).as_micros() as u64;
+            PREPARE_SPLIT[at].fetch_add(us, Ordering::Relaxed);
+            *since = std::time::Instant::now();
+        };
         // One write-watch asking for everything the submission refreshes
         // (`VICTORY_ASK_ONCE`): per copy, the span of its refreshed ranges.
+        let settled_before = settled;
         if crate::watch::once() {
             let mut spans: std::collections::HashMap<usize, (usize, usize)> = std::collections::HashMap::new();
             for list in runs {
@@ -7599,6 +7624,7 @@ impl Host {
             }
             let ranges: Vec<(usize, usize)> = spans.into_values().collect();
             crate::watch::ask_once(&ranges);
+            split(PREPARE_ASK, &mut phase, std::time::Duration::ZERO);
             // Behind flights: the title wrote memory that a flight's shaders
             // may write too, and this submission refreshes it. The flights
             // are settled, and the asking made again: the copy-back wrote
@@ -7614,17 +7640,24 @@ impl Host {
             self.settle(&mut submitted, WHY_STALE);
             settled += settling.elapsed();
         }
+        split(PREPARE_MERGE, &mut phase, settled - settled_before);
+        let mut preludes = std::time::Duration::ZERO;
         for (i, list) in runs.iter().enumerate() {
             list.run_deferred(&mut batch);
             firsts.push(lists.len());
             let earlier = runs[..i].iter().filter(|l| std::ptr::eq(**l, *list)).count();
+            let making = std::time::Instant::now();
             if let Some(prelude) = list.prelude(earlier) {
                 lists.push(Some(prelude));
             }
+            preludes += making.elapsed();
             lists.push(list.list.cast().ok());
         }
+        PREPARE_SPLIT[PREPARE_PRELUDES].fetch_add(preludes.as_micros() as u64, Ordering::Relaxed);
+        split(PREPARE_DEFERRED, &mut phase, preludes);
         batch.flush();
         crate::watch::ask_once_end();
+        split(PREPARE_FLUSH, &mut phase, std::time::Duration::ZERO);
         // The snapshots of the ranges shaders may write, if they were left
         // for now (`crate::shadow::wide_back`): the refreshes are done, the
         // lists have not gone to the card.
@@ -7635,10 +7668,12 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::SnapshotUs, snapshots.elapsed().as_micros() as u64);
         }
+        split(PREPARE_SNAPSHOTS, &mut phase, std::time::Duration::ZERO);
         // Copies in the card's memory: what changed on their CPU side goes
         // up ahead of the lists, and a compare of what the shaders may
         // write follows them in the same submission.
         let flown = late && relay();
+        let settled_before = settled;
         if flown && self.card_results_low() {
             let settling = std::time::Instant::now();
             if relay_exact() {
@@ -7652,6 +7687,7 @@ impl Host {
         if let Some(check) = card.as_ref().and_then(|c| c.check.clone()) {
             lists.push(Some(check));
         }
+        split(PREPARE_CARD, &mut phase, settled - settled_before);
         let prepared = std::time::Instant::now();
         if late {
             // Only the staging buffers this flight copies from on the card:
@@ -8825,7 +8861,7 @@ impl HostList {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
         for step in &self.deferred().copies {
-            let started = std::time::Instant::now();
+            let mut started = std::time::Instant::now();
             let copied = match step {
                 &Step::Copy(dst, src, len) => {
                     #[cfg(feature = "diagnostics")]
@@ -8833,7 +8869,10 @@ impl HostList {
                         add(C::Copies, 1);
                         add(C::CopyBytes, len as u64);
                     }
+                    // The pending refreshes this flushes count their own
+                    // time (`Batch::update`): the copy's starts after them.
                     batch.title_written();
+                    started = std::time::Instant::now();
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
                     copy_ran(dst, src, len);
                     // With the submission's one asking: the journal learns it.
@@ -9576,6 +9615,22 @@ impl Meter {
         let [back_ms, back_mb] = [0, 1].map(|i| {
             COPY_BACK[i].swap(0, Ordering::Relaxed) as f64 / [1e3, 1e6][i] / frames
         });
+        {
+            let p = PREPARE_SPLIT.each_ref().map(|a| a.swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames);
+            let rest = cpu - p.iter().sum::<f64>();
+            tracing::info!(
+                "preparing per frame by phase: write-watch asking {:.1} ms, title bytes put in under flights {:.1} ms, \
+                 the lists' deferred steps {:.1} ms (copies {copy_ms:.1} ms of them), state preludes {:.1} ms, last refreshes \
+                 {:.1} ms, snapshots {:.1} ms, copies in the card's memory {:.1} ms; the rest {rest:.1} ms",
+                p[PREPARE_ASK],
+                p[PREPARE_MERGE],
+                p[PREPARE_DEFERRED],
+                p[PREPARE_PRELUDES],
+                p[PREPARE_FLUSH],
+                p[PREPARE_SNAPSHOTS],
+                p[PREPARE_CARD],
+            );
+        }
         let dropped = crate::draw::take_dropped() as f64 / frames;
         let indirect = crate::list::take_indirect() as f64 / frames;
         let mesh_largest = MESH_GROUPS[0].swap(0, Ordering::Relaxed);
