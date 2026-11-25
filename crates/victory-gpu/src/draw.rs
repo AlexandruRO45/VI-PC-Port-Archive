@@ -1785,9 +1785,11 @@ impl State {
             // page alone, one whose first page is the one missing counted
             // as not there.)
             let mut partly = None;
+            let mut upload_bytes = None;
             if let Some(View::Placed(false, resource, desc)) = heap.handle(index).and_then(crate::descriptor::view) {
                 let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
-                let len = crate::resource::placed_bytes(&resource).unwrap_or(1);
+                upload_bytes = crate::resource::placed_bytes(&resource);
+                let len = upload_bytes.unwrap_or(1);
                 let mapped = crate::texture::mapped_bytes(address as *const u8, len as usize);
                 phase(3, turn);
                 if mapped == 0 {
@@ -1851,6 +1853,20 @@ impl State {
                         "a texture already on the card is brought up to date although the card has no room for new ones"
                     );
                 }
+            }
+            // Mapping checks and view lookups can use up the rest of this
+            // pass. Check again before making and staging a host texture.
+            if began.elapsed() > span {
+                HEAP_PHASES[9].fetch_add(1, Ordering::Relaxed);
+                break;
+            }
+            // Defer another known-size upload if it exceeds the early
+            // budget. Allow the first upload so large textures make progress.
+            if early && uploads.spent > spent_before
+                && upload_bytes.is_some_and(|bytes| uploads.spent.saturating_add(bytes) > bytes_limit)
+            {
+                HEAP_PHASES[10].fetch_add(1, Ordering::Relaxed);
+                break;
             }
             let made = std::time::Instant::now();
             let view = heap.handle(index).and_then(|handle| host.mirror(index, handle, true));
