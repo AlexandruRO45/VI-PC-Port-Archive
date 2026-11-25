@@ -185,7 +185,7 @@ fn create() -> windows::core::Result<Host> {
         // Diagnostics: the software adapter, on which a shader's wild access
         // is an access violation in this process (a crash report with the
         // address and instruction) instead of a GPU fault and driver reset.
-        if cfg!(feature = "diagnostics") && crate::switch::on("VICTORY_D3D12_WARP") {
+        if on_warp() {
             let adapter = warp_adapter()?;
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
             tracing::info!("host device on the software adapter (WARP)");
@@ -281,6 +281,20 @@ fn process_memory() -> (u64, u64) {
     // SAFETY: our own process and a sized structure.
     unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb) };
     (c.PagefileUsage as u64, c.WorkingSetSize as u64)
+}
+
+/// Whether the host device is the software adapter (diagnostics,
+/// `VICTORY_D3D12_WARP=1`). Also tells the translator, so the view heap
+/// size it clamps to is WARP's, not the default adapter's
+/// ([`victory_shader::emit::heap_views_on_warp`]).
+pub(crate) fn on_warp() -> bool {
+    let warp = cfg!(feature = "diagnostics") && crate::switch::on("VICTORY_D3D12_WARP");
+    if warp && !victory_shader::emit::heap_views_on_warp() {
+        tracing::warn!(
+            "WARP chosen after the view heap size was: shaders keep the default adapter's"
+        );
+    }
+    warp
 }
 
 /// DXGI may return hardware for `EnumWarpAdapter` (notably under Proton).

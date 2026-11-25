@@ -49,11 +49,27 @@ static HEAP_VIEWS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
 pub fn heap_views() -> u32 {
     *HEAP_VIEWS.get_or_init(|| {
         #[cfg(all(windows, any(test, feature = "host")))]
-        if !super::host::takes_view_heap(HEAP_VIEWS_MAX) {
+        if !super::host::takes_view_heap(
+            HEAP_VIEWS_MAX,
+            HEAP_VIEWS_ON_WARP.load(std::sync::atomic::Ordering::Relaxed),
+        ) {
             return HEAP_VIEWS_PORTABLE;
         }
         HEAP_VIEWS_MAX
     })
+}
+
+static HEAP_VIEWS_ON_WARP: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// The host draws on WARP, not the default adapter: [`heap_views`] asks
+/// WARP what it takes. A capped default adapter (NVIDIA) would otherwise
+/// clamp indices below slots WARP's heap holds, and put the null buffer
+/// views among the title's. Before the first [`heap_views`]; returns
+/// whether some call was (one after it changes nothing).
+pub fn heap_views_on_warp() -> bool {
+    let told = HEAP_VIEWS_ON_WARP.swap(true, std::sync::atomic::Ordering::Relaxed);
+    told || HEAP_VIEWS.get().is_none()
 }
 
 /// The heap index of the host's null raw buffer view (the null raw

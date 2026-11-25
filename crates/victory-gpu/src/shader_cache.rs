@@ -64,6 +64,8 @@ fn build() -> &'static [u8; 32] {
                 "VICTORY_SHADER_LOOP_LIMIT: translated loops stop sooner"
             );
         }
+        // Before the size is fixed: a WARP host's, not the default adapter's.
+        crate::host::on_warp();
         let views = victory_shader::emit::heap_views();
         if views != victory_shader::emit::HEAP_VIEWS_MAX {
             tracing::info!(

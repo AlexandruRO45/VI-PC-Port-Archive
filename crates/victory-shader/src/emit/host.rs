@@ -158,15 +158,25 @@ fn hardware_adapter(factory: &IDXGIFactory4) -> windows::core::Result<IDXGIAdapt
 /// WARP pipeline compiles / dispatches crash with `0xC0000005` on Windows 11.
 static WARP_LOCK: Mutex<()> = Mutex::new(());
 
-/// Whether the default adapter makes a shader-visible view heap of `count`
-/// slots (NVIDIA refuses more than 1,000,000), for
-/// [`super::heap_views`]. Without a device, yes: nothing runs the
-/// translation on a host then, and WARP takes large heaps.
-pub(crate) fn takes_view_heap(count: u32) -> bool {
-    // SAFETY: plain device and heap creation with valid out pointers.
+/// Whether the adapter the host draws on makes a shader-visible view heap
+/// of `count` slots (NVIDIA refuses more than 1,000,000), for
+/// [`super::heap_views`]: the default adapter, or WARP with `warp` (the
+/// host's software device, whatever the default adapter caps). Without a
+/// device, yes: nothing runs the translation on a host then.
+pub(crate) fn takes_view_heap(count: u32, warp: bool) -> bool {
+    // SAFETY: plain DXGI/device and heap creation with valid out pointers.
     unsafe {
         let mut device: Option<ID3D12Device> = None;
-        if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device).is_err() {
+        let made = if warp {
+            CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
+                .and_then(|factory| factory.EnumWarpAdapter::<IDXGIAdapter1>())
+                .and_then(|adapter| {
+                    D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)
+                })
+        } else {
+            D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)
+        };
+        if made.is_err() {
             return true;
         }
         let Some(device) = device else { return true };
