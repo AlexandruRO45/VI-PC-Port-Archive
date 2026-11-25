@@ -167,7 +167,7 @@ const WINDOW_MOST: u64 = 128;
 /// run with windows was announced that way seconds ahead.
 fn windows() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_WINDOW").is_some_and(|v| v == "1")) && !crate::drvwatch::tripped()
+    *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_WINDOW").is_some_and(|v| v == "1")) && !crate::drvwatch::tripped() && !crate::indirect::batch::enabled()
 }
 
 /// Only widen to a window if two full padded records fit. The clamp copies
@@ -2092,6 +2092,7 @@ impl State {
 
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
+        list.stop_indirect_batch();
         // It may write the arguments active windows hold clamped.
         self.windows.clear();
         #[cfg(feature = "diagnostics")]
@@ -2403,6 +2404,7 @@ impl State {
     /// Runs a mesh dispatch of `x` groups on the host (the title's mesh
     /// programs are one-dimensional).
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
+        list.stop_indirect_batch();
         self.windows.clear();
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
@@ -2816,6 +2818,7 @@ impl State {
         first: u32,
         first_instance: u32,
     ) {
+        list.stop_indirect_batch();
         self.windows.clear();
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
@@ -2921,6 +2924,7 @@ impl State {
         base: i32,
         first_instance: u32,
     ) {
+        list.stop_indirect_batch();
         self.windows.clear();
         #[cfg(feature = "diagnostics")]
         self.trace("indexed", indices, first);
@@ -3056,6 +3060,12 @@ impl State {
         const WINDOW_USE: usize = usize::MAX - 0x77;
         let offset = args.offset(arguments);
         let stores = p.stages.iter().any(|stage| stage.translated().stores);
+        let from_batch = if crate::indirect::batch::accepts(kind, max, count.is_some(), stores) && !args.in_place() {
+            if crate::indirect::batch::enabled() { args.refresh(list, arguments, len); }
+            list.batch_argument(&args.buffer, offset, kind, stride)
+        } else { None };
+        if from_batch.is_none() { list.stop_indirect_batch(); }
+        if from_batch.is_some() { self.windows.clear(); }
         let windowed = windows() && kind != DISPATCH && max == 1 && count.is_none() && !stores;
         // Another host list (a new one after a cut, or this one after its
         // reset) has another scratch buffer, or this one's with old bytes.
@@ -3076,8 +3086,9 @@ impl State {
             })
             .flatten()
             .map(|w| (w.scratch.clone(), w.dst_offset + (offset - w.base), w.step));
-        let (bounded, at) = match hit {
-            Some((scratch, at, step)) => {
+        let (bounded, at) = match (from_batch, hit) {
+            (Some(pair), _) => pair,
+            (None, Some((scratch, at, step))) => {
                 // Diagnostics of windows: the record clamped again and
                 // compared (`crate::indirect::window_check`).
                 if crate::indirect::window_check()
@@ -3094,7 +3105,7 @@ impl State {
                 }
                 (scratch, at)
             }
-            None => {
+            (None, None) => {
                 // A record a short step after the last matching window's last
                 // one (the same step as that window's, if it had one): the
                 // title walks the buffer, so the ones that step apart after it

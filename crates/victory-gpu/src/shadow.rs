@@ -2257,6 +2257,12 @@ impl Shadow {
         self.watched.load(Ordering::Relaxed) == NOT_WATCHED
     }
 
+    /// Shaders access title memory itself, so CPU writes could change the
+    /// arguments between a preparation prelude and their eventual draw.
+    pub(crate) fn in_place(&self) -> bool {
+        self.place.is_some()
+    }
+
     /// The copy's own number (see the field).
     pub(crate) fn id(&self) -> u64 {
         self.id

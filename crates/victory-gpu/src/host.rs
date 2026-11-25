@@ -5,7 +5,7 @@
 //! (unless `VICTORY_LATE_WAIT=1`, see [`late`]);
 //! overlap them with per-submission fences once more than clears run.
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
@@ -898,6 +898,11 @@ pub(crate) struct HostList {
     /// Device-local scratch buffer for clamped indirect arguments (`indirect`),
     /// grown to the largest indirect execution recorded on the list.
     indirect_args: Mutex<Option<(ID3D12Resource, u64)>>,
+    /// An optional, sealed prefix of indirect clamps, executed before this
+    /// native list and kept with its allocator until all submissions finish.
+    indirect_batch: Mutex<crate::indirect::batch::Batch>,
+    batch_active: AtomicBool,
+    batch_forbidden: AtomicBool,
     /// The buffers of `crate::indirect::window_check`, made at its first use.
     window_check: OnceLock<Option<crate::indirect::WindowCheck>>,
     /// Counts the list in [`ALIVE`] while it lives.
@@ -3908,6 +3913,9 @@ impl Host {
                 budget: OnceLock::new(),
                 card_budget: OnceLock::new(),
                 indirect_args: Mutex::default(),
+                indirect_batch: Mutex::default(),
+                batch_active: AtomicBool::new(false),
+                batch_forbidden: AtomicBool::new(false),
                 window_check: OnceLock::new(),
                 _alive: Counted::new(),
                 meter: AtomicU32::new(u32::MAX),
@@ -5535,6 +5543,9 @@ impl Host {
             if let Some(prelude) = list.prelude() {
                 lists.push(Some(prelude));
             }
+            if let Some(clamps) = list.indirect_batch_prelude() {
+                lists.push(Some(clamps));
+            }
             lists.push(list.list.cast().ok());
         }
         batch.flush();
@@ -6051,7 +6062,11 @@ impl HostList {
     }
 
     pub(crate) fn close(&self) {
+        self.stop_indirect_batch();
         self.twins_to_depth();
+        if self.batch_active.load(Ordering::Relaxed) {
+            self.indirect_batch.lock().unwrap_or_else(|e| e.into_inner()).finish_owner(self);
+        }
         let scratch = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner()).clone();
         if let Some((scratch, _)) = scratch {
             self.indirect_common(&scratch);
@@ -6081,6 +6096,9 @@ impl HostList {
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
         self._alive.used();
+        self.indirect_batch.lock().unwrap_or_else(|e| e.into_inner()).reset();
+        self.batch_active.store(false, Ordering::Relaxed);
+        self.batch_forbidden.store(false, Ordering::Relaxed);
         *self.deferred() = Deferred::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -6124,7 +6142,7 @@ impl HostList {
         let copy = crate::resource::host_copy(resource)?;
         let wanted = legal_state(texture, wanted);
         let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
-        match states.entry(std::sync::Arc::as_ptr(&copy) as usize) {
+        let changed = match states.entry(std::sync::Arc::as_ptr(&copy) as usize) {
             std::collections::hash_map::Entry::Vacant(v) => {
                 v.insert((wanted, wanted, copy));
                 None
@@ -6133,7 +6151,10 @@ impl HostList {
                 let before = std::mem::replace(&mut o.get_mut().1, wanted);
                 (before != wanted).then_some((texture, before))
             }
-        }
+        };
+        drop(states);
+        if changed.is_some() { self.stop_indirect_batch(); }
+        changed
     }
 
     /// Moves host texture `copy` to `wanted` (a host state) in this list,
@@ -6155,6 +6176,7 @@ impl HostList {
         };
         drop(states);
         if let Some(before) = before {
+            self.stop_indirect_batch();
             let barrier = transition(
                 &copy.texture,
                 D3D12_RESOURCE_STATES(before as i32),
@@ -6253,6 +6275,7 @@ impl HostList {
         depth: &std::sync::Arc<crate::resource::HostTexture>,
         twin: &crate::resource::Twin,
     ) {
+        self.stop_indirect_batch();
         const UNORDERED_ACCESS: u32 = 0x8;
         const DEPTH_WRITE: u32 = 0x10;
         const PIXEL_SHADER_RESOURCE: u32 = 0x80;
@@ -6272,6 +6295,7 @@ impl HostList {
         twin: &crate::resource::Twin,
         colour: bool,
     ) {
+        self.stop_indirect_batch();
         const UNORDERED_ACCESS: u32 = 0x8;
         const COPY_DEST: u32 = 0x400;
         const COPY_SOURCE: u32 = 0x800;
@@ -6508,6 +6532,7 @@ impl HostList {
 
     /// Copies `len` bytes from `src` to `dst` when the list is submitted.
     pub(crate) fn defer_copy(&self, dst: *mut u8, src: *const u8, len: usize) {
+        self.stop_indirect_batch();
         let mut deferred = self.deferred();
         COPIES_JOINED[0].fetch_add(1, Ordering::Relaxed);
         // A copy that goes on where the one recorded just before it ended,
@@ -6577,6 +6602,7 @@ impl HostList {
 
     /// Stores `what` (`bytes` of it) at `dst` once the list has run.
     pub(crate) fn defer_write(&self, dst: *mut u8, what: crate::queue::Written, bytes: usize) {
+        self.stop_indirect_batch();
         self.deferred().writes.push((dst as usize, what, bytes));
     }
 
@@ -6633,9 +6659,57 @@ impl HostList {
         scratch.chunks.iter().map(|c| c.1).sum()
     }
 
+    /// Block a new prefix and finish an existing one before any command
+    /// that could produce arguments or observe a query/barrier scope.
+    pub(crate) fn stop_indirect_batch(&self) {
+        self.batch_forbidden.store(true, Ordering::Relaxed);
+        if self.batch_active.load(Ordering::Relaxed) {
+            self.indirect_batch.lock().unwrap_or_else(|e| e.into_inner()).seal();
+        }
+    }
+
+    pub(crate) fn batch_argument(
+        &self, src: &ID3D12Resource, offset: u64, kind: u32, stride: u32,
+    ) -> Option<(ID3D12Resource, u64)> {
+        if !crate::indirect::batch::enabled() { return None; }
+        self.append_indirect_batch(src, offset, kind, stride)
+    }
+
+    /// Also used by device tests independently of the process-wide rollout
+    /// flag. Production callers first prove the draw cannot store.
+    pub(crate) fn append_indirect_batch(
+        &self, src: &ID3D12Resource, offset: u64, kind: u32, stride: u32,
+    ) -> Option<(ID3D12Resource, u64)> {
+        if self.batch_forbidden.load(Ordering::Relaxed) { return None; }
+        if !self.batch_active.load(Ordering::Relaxed) && self.deferred().budget_zeroed {
+            self.stop_indirect_batch();
+            return None;
+        }
+        let got = self.indirect_batch.lock().unwrap_or_else(|e| e.into_inner())
+            .append(self, src, offset, kind, stride);
+        if got.is_some() {
+            self.batch_active.store(true, Ordering::Relaxed);
+        } else {
+            self.stop_indirect_batch();
+        }
+        got
+    }
+
+    fn indirect_batch_prelude(&self) -> Option<ID3D12CommandList> {
+        if !self.batch_active.load(Ordering::Relaxed) { return None; }
+        self.indirect_batch.lock().unwrap_or_else(|e| e.into_inner()).prelude()
+    }
+
     /// The host address of the list's indirect-work budget, zeroed at each
     /// submission of the list from the first use after a reset on.
     pub(crate) fn budget(&self) -> Option<u64> {
+        self.budget_on(&self.list)
+    }
+
+    /// The first use chooses where the zero is recorded. A batch prelude
+    /// must zero the original list budget before its clamps, with inline
+    /// clamps later in the consumer list continuing the same budget.
+    pub(crate) fn budget_on(&self, commands: &ID3D12GraphicsCommandList) -> Option<u64> {
         let (buffer, data) = self
             .budget
             .get_or_init(|| {
@@ -6664,7 +6738,7 @@ impl HostList {
             })));
             drop(deferred);
             if let Some(card) = card {
-                self.zero_card_budget(card);
+                self.zero_card_budget(commands, card);
             }
         }
         // SAFETY: a live buffer.
@@ -6686,8 +6760,8 @@ impl HostList {
     /// Records, before the list's first clamp, the zeroing of the card's
     /// copy of the budget: common, written as a copy, then left for
     /// unordered access until the list closes ([`HostList::card_budget_out`]).
-    fn zero_card_budget(&self, card: &ID3D12Resource) {
-        let Ok(list2) = self.list.cast::<ID3D12GraphicsCommandList2>() else {
+    fn zero_card_budget(&self, commands: &ID3D12GraphicsCommandList, card: &ID3D12Resource) {
+        let Ok(list2) = commands.cast::<ID3D12GraphicsCommandList2>() else {
             return;
         };
         // SAFETY: a live buffer.
@@ -6699,13 +6773,13 @@ impl HostList {
         // SAFETY: an open list; the buffer is the list's own and in the
         // common state at the start of every recording.
         unsafe {
-            self.list.ResourceBarrier(&[transition(
+            commands.ResourceBarrier(&[transition(
                 card,
                 D3D12_RESOURCE_STATE_COMMON,
                 D3D12_RESOURCE_STATE_COPY_DEST,
             )]);
             list2.WriteBufferImmediate(zeros.len() as u32, zeros.as_ptr(), None);
-            self.list.ResourceBarrier(&[transition(
+            commands.ResourceBarrier(&[transition(
                 card,
                 D3D12_RESOURCE_STATE_COPY_DEST,
                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
