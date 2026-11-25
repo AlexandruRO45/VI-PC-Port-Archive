@@ -443,15 +443,18 @@ mod tests {
 
     #[test]
     fn password_scope_masks_the_edit_control() {
-        use windows_sys::Win32::UI::WindowsAndMessaging as wm;
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::UI::WindowsAndMessaging as wm;
 
-        let plain = dialog::edit_style(false);
-        assert_eq!(
-            plain,
-            wm::WS_BORDER | wm::WS_TABSTOP | wm::ES_AUTOHSCROLL as u32
-        );
-        assert_eq!(plain & (wm::ES_PASSWORD as u32), 0);
-        assert_eq!(dialog::edit_style(true), plain | (wm::ES_PASSWORD as u32));
+            let plain = dialog::edit_style(false);
+            assert_eq!(
+                plain,
+                wm::WS_BORDER | wm::WS_TABSTOP | wm::ES_AUTOHSCROLL as u32
+            );
+            assert_eq!(plain & (wm::ES_PASSWORD as u32), 0);
+            assert_eq!(dialog::edit_style(true), plain | (wm::ES_PASSWORD as u32));
+        }
 
         type Entry = extern "system" fn(
             This,
