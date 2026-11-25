@@ -224,14 +224,14 @@ Do not repeat these:
 - **The rectangle geometry stage** from upstream #1020: this fork already
   handles rectangle lists, so it was not needed.
 
-## Automatic runs
+## Optional: automatic restarts
 
-`scripts/auto-run.sh` drives a run without a person. It starts the game,
-watches the log's mtime, and when a run goes quiet for 150 s it reads the last
-`host pipeline: making` line, adds those shader hashes to
-`auto-runs/skips.txt`, and restarts with `VICTORY_SKIP_PIPELINES` set from that
-file. Each run appends its best frame and fps to `auto-runs/ledger.txt`; three
-runs without a new skip stop the loop.
+`scripts/auto-run.sh` is a supervisor for unattended runs. It is not needed
+for a normal run. It starts the game, watches the log's mtime, and when a run
+goes quiet for 150 s it reads the last `host pipeline: making` line, adds those
+shader hashes to `auto-runs/skips.txt`, and restarts with
+`VICTORY_SKIP_PIPELINES` set from that file. Each run appends its best frame
+and fps to `auto-runs/ledger.txt`; three runs without a new skip stop the loop.
 
 Configure it with `REPO`, `EXE`, `GAME`, `WORK`, `RUNNER`, `MAX_RUNS`,
 `STALL_SECS`, `LOOP_LIMIT` and `SAME_STALL_LIMIT`. It defaults to the `run.sh`
@@ -245,7 +245,7 @@ wrapper at the repository root.
 | Watchdog hooks (upstream #454) | [#364](https://github.com/fxceless/victory-fork/pull/364) |
 | 512 MiB pipeline-worker stacks | [#28](https://github.com/fxceless/victory-fork/pull/28) |
 | Copy and pipeline-library work | [#363](https://github.com/fxceless/victory-fork/pull/363) |
-| This page, wrapper and supervisor | [#365](https://github.com/fxceless/victory-fork/pull/365) |
+| This page and wrapper (supervisor optional) | [#365](https://github.com/fxceless/victory-fork/pull/365) |
 
 ## References
 

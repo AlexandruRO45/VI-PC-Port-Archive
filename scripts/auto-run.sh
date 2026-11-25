@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Autonomous VIctory runner: each run picks up where the last one stalled.
+# Optional supervisor for unattended runs: each run picks up where the last
+# one stalled. Not needed for a normal run.
 #
 # A run writes to $WORK/run-<n>.log. When that log goes quiet for STALL_SECS
 # while the process is alive, the last "host pipeline: making" line names the
