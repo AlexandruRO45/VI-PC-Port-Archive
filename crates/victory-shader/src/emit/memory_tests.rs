@@ -678,7 +678,10 @@ fn heap_direct_texture_reads_mark_their_heap_index() {
             outputs: Vec::new(),
             prims: Vec::new(),
             mesh_stride: 0,
-            view_marks: true,
+            options: super::Options {
+                view_marks: true,
+                ..Default::default()
+            },
         })
         .expect("lower")
     };
