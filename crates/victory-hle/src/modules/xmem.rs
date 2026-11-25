@@ -1305,6 +1305,10 @@ fn log_memory(peak: &mut usize) {
 mod tests {
     use super::*;
 
+    // Two tests map a reservation whole; the section pool is global, so
+    // running them together makes one of them take the per-page path.
+    static WHOLE_TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn query(address: *const c_void) -> BasicInformation {
         // SAFETY: plain data; zero is a valid value.
         let mut info: BasicInformation = unsafe { std::mem::zeroed() };
@@ -1542,6 +1546,7 @@ mod tests {
     /// view; a mutation that disables `map_whole` must not pass the suite.
     #[test]
     fn a_large_run_of_pages_is_shown_whole() {
+        let _guard = WHOLE_TEST.lock().unwrap_or_else(|e| e.into_inner());
         const N: usize = 65;
         let pages = allocate(N);
         let reservation = XMemVirtualAlloc(
@@ -1580,6 +1585,7 @@ mod tests {
             reservation.cast::<u8>().write(5);
             assert_eq!(reservation.cast::<u8>().read(), 5);
         }
+        release_whole(reservation, N * PAGE);
         assert_eq!(XMemFreePhysicalPages(N, pages.as_ptr()), 1);
     }
 
@@ -1588,6 +1594,7 @@ mod tests {
     /// into it goes to that view too, not to placeholders it no longer has.
     #[test]
     fn a_small_run_into_a_reservation_shown_whole_is_mapped() {
+        let _guard = WHOLE_TEST.lock().unwrap_or_else(|e| e.into_inner());
         const N: usize = 80;
         const FIRST: usize = 70;
         let pages = allocate(N);
@@ -1613,7 +1620,33 @@ mod tests {
             rest.cast::<u8>().write(9);
             assert_eq!(rest.cast::<u8>().read(), 9);
         }
+        release_whole(reservation, N * PAGE);
         assert_eq!(XMemFreePhysicalPages(N, pages.as_ptr()), 1);
+    }
+
+    /// A whole view is not returned by `unmap`: remove the bookkeeping and
+    /// the virtual reservation explicitly so later tests start clean.
+    fn release_whole(base: *mut c_void, len: usize) {
+        {
+            let mut physical = physical();
+            physical.views.remove(&(base as usize));
+            physical
+                .whole
+                .retain(|&(at, _, _)| at != base as usize);
+        }
+        victory_gpu::title_memory_remapped(base as usize, len);
+        victory_gpu::title_memory_view_gone(base as usize, len);
+        // SAFETY: the view we made above; release it before the reservation.
+        unsafe {
+            UnmapViewOfFile2(
+                GetCurrentProcess(),
+                MEMORY_MAPPED_VIEW_ADDRESS { Value: base },
+                0,
+            );
+        }
+        // `map_whole` already coalesced the reservation into the view; after
+        // unmapping it there is no reservation left to release.
+        let _ = unsafe { VirtualFree(base, 0, MEM_RELEASE) };
     }
 
     /// `n` pages of one new allocation.

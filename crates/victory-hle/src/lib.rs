@@ -1,3 +1,7 @@
+// The low-level xmem bridges wrap Win32 calls whose preconditions are
+// described at the call site; keep `-D warnings` useful for real regressions.
+#![allow(clippy::undocumented_unsafe_blocks)]
+
 //! Our implementation of the Xbox system API surface.
 //!
 //! A title imports from three kinds of DLLs, and each gets its own policy:
