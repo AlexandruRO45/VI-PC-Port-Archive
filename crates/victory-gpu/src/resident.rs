@@ -430,13 +430,21 @@ pub(crate) fn forget(at: u64, end: u64, remap: bool) -> bool {
     forgot
 }
 
-/// The merge (one thread per 16 bytes of a declared range of `R`):
-/// `from`/`to` are offsets in `R` on 4 bytes; `title` is the arena at `R`'s
-/// first byte. A dword of `R` that differs from `B` goes into the title's
-/// memory, and into `B`: whole if every byte differs, else only the bytes
-/// that do, by two atomics, so that the other bytes of the dword stay what
-/// they are in the title's memory (the CPU may write them meanwhile).
-/// `counts` adds the dwords that differed and how many of them in part.
+/// The merge (a group of 64 threads per 1 KiB of a declared range of `R`,
+/// each thread a dword in each of its four 256-byte rows): `from`/`to` are
+/// offsets in `R` on 4 bytes; `title` is the arena at `R`'s first byte.
+/// A dword of `R` that differs from `B` goes into the title's memory, and
+/// into `B`: whole if every byte differs, else only the bytes that do, by
+/// two atomics, so that the other bytes of the dword stay what they are in
+/// the title's memory (the CPU may write them meanwhile). `counts` adds the
+/// dwords that differed and how many of them in part.
+///
+/// A row is 64 dwords side by side, so a group's stores and atomics into
+/// the arena go over the bus as runs of whole bytes. With a thread per 16
+/// bytes, as the merge was first, each store of a group was 64 dwords 16
+/// bytes apart: on the RTX 4090, 16 MB changed took 167 ms to merge whole
+/// and 327 ms in part (about 100 and 50 MB/s), 0.7 and 1.6 ms this way
+/// (`merge_on_hardware_runs_at_bus_speed`).
 pub(crate) const MERGE: &str = r#"
 #define RS "RootConstants(num32BitConstants=2, b0), SRV(t0), UAV(u0), UAV(u1), UAV(u2)"
 cbuffer Range : register(b0) {
@@ -451,7 +459,7 @@ groupshared uint changed;
 groupshared uint partial;
 [RootSignature(RS)]
 [numthreads(64, 1, 1)]
-void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
+void main(uint3 group : SV_GroupID, uint gi : SV_GroupIndex) {
     if (gi == 0u) {
         changed = 0u;
         partial = 0u;
@@ -459,10 +467,10 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     GroupMemoryBarrierWithGroupSync();
     uint c = 0u;
     uint p = 0u;
-    uint at = from + id.x * 16u;
+    uint at = from + group.x * 1024u + gi * 4u;
     [unroll]
     for (uint k = 0u; k < 4u; k++) {
-        uint o = at + k * 4u;
+        uint o = at + k * 256u;
         if (o < to) {
             uint gpu = now.Load(o);
             uint diff = gpu ^ twin.Load(o);
@@ -494,7 +502,7 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
 "#;
 
 /// The bytes of `R` one dispatch of the merge covers at most (32,768
-/// groups of 64 threads of 16 bytes; a dispatch takes 65,535 groups).
+/// groups of 1 KiB; a dispatch takes 65,535 groups).
 const MERGE_CHUNK: u64 = 32 << 20;
 
 /// What goes up to one resident in a submission: offsets of `R`.
@@ -1107,6 +1115,51 @@ mod tests {
         // SAFETY: plain device creation on the default adapter.
         unsafe { D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device).unwrap() };
         merge_with_the_cpu_writing(&device.unwrap());
+    }
+
+    /// The merge on this PC's card (`cargo test -p victory-gpu --release --
+    /// --ignored merge_on_hardware_runs_at_bus_speed`): 16 MB of `R`
+    /// changed in every dword, whole and in one byte, is merged into the
+    /// title's memory in well under 20 ms each (0.7 and 1.6 ms on the RTX
+    /// 4090; 167 and 327 ms with a thread per 16 bytes, [`MERGE`]).
+    #[test]
+    #[ignore = "opens a device on the card"]
+    fn merge_on_hardware_runs_at_bus_speed() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
+        let mut device: Option<ID3D12Device> = None;
+        // SAFETY: plain device creation on the default adapter.
+        unsafe { D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device).unwrap() };
+        let device = device.unwrap();
+        let pages = 256;
+        let (base, at) = title(&device, pages).unwrap();
+        let r = resident(&device, base, at);
+        let (n, words) = ((pages * K64) as u64, (pages * K64 / 4) as u32);
+        let mut rig = Rig::new(&device).unwrap();
+        let pass = Pass::new(&device).unwrap();
+        for (flip, part) in [(u32::MAX, 0), (0x00ab_0000, words)] {
+            // SAFETY (each run): an open list of the rig's; the resident
+            // lives through it.
+            rig.run(|list| unsafe {
+                record_upload(list, &[Upload { resident: &r, ranges: vec![(0, n)] }]);
+            })
+            .unwrap();
+            let twin = rig.fetch(&r.twin, 0, n as usize).unwrap();
+            let gpu: Vec<u8> = twin.chunks(4).flat_map(|t| (u32::from_le_bytes(t.try_into().unwrap()) ^ flip).to_le_bytes()).collect();
+            rig.store(&r.buffer, 0, &gpu).unwrap();
+            let before = pass.counts();
+            let started = std::time::Instant::now();
+            rig.run(|list| unsafe {
+                record_merge(list, &pass, &[Merge { resident: &r, ranges: vec![(0, n)] }]);
+            })
+            .unwrap();
+            let took = started.elapsed();
+            let after = pass.counts();
+            assert_eq!([after[0].wrapping_sub(before[0]), after[1].wrapping_sub(before[1])], [words, part]);
+            // SAFETY: inside the allocation.
+            assert!(unsafe { std::slice::from_raw_parts(base, n as usize) } == gpu.as_slice(), "the title's memory holds R");
+            assert!(took < std::time::Duration::from_millis(20), "16 MB merged in {took:?}");
+        }
+        drop(r);
     }
 
     /// Test (c): submission 1's shaders write a dword of `R` and its merge
