@@ -682,6 +682,9 @@ pub(crate) struct HostList {
     /// Buffers for clamped indirect arguments when this list holds the
     /// clamps of the list after it (`clamp_room`).
     clamp_chunks: Mutex<ClampChunks>,
+    /// Queued hoisted indirect clamps to flush as batched dispatches in
+    /// [`HostList::clamp_end`] (`crate::indirect::ClampBatch`).
+    clamp_batch: Mutex<crate::indirect::ClampBatch>,
     /// The texts of the markers `note_op` set, in order (for device-removed
     /// data without marker texts), with the host GPU range a copy reads.
     #[cfg(feature = "diagnostics")]
@@ -1087,6 +1090,7 @@ impl Host {
                 work: Mutex::default(),
                 writes: Default::default(),
                 clamp_chunks: Mutex::default(),
+                clamp_batch: Mutex::default(),
                 pipelines: Mutex::default(),
                 queries: Mutex::default(),
                 budget: OnceLock::new(),
@@ -1986,6 +1990,7 @@ impl HostList {
             chunks.at = 0;
             chunks.barrier = false;
         }
+        self.clamp_batch.lock().unwrap_or_else(|e| e.into_inner()).reset();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.queries.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -2373,6 +2378,7 @@ impl HostList {
     /// The clamped arguments written so far become readable as indirect
     /// arguments by the lists after this one.
     pub(crate) fn clamp_end(&self) {
+        crate::indirect::flush_before(self);
         let mut chunks = self.clamp_chunks.lock().unwrap_or_else(|e| e.into_inner());
         let used = chunks.used;
         let barriers: Vec<_> = chunks.all[..used]
@@ -2540,6 +2546,17 @@ impl HostList {
         }
         // SAFETY: a live buffer.
         Some(unsafe { buffer.GetGPUVirtualAddress() })
+    }
+
+    pub(crate) fn clamp_batch(&self) -> std::sync::MutexGuard<'_, crate::indirect::ClampBatch> {
+        self.clamp_batch.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The already-created indirect-work budget buffer and its GPU address.
+    pub(crate) fn budget_resource(&self) -> Option<(&ID3D12Resource, u64)> {
+        let (buffer, _) = self.budget.get()?.as_ref()?;
+        // SAFETY: a live buffer.
+        Some((buffer, unsafe { buffer.GetGPUVirtualAddress() }))
     }
 
     /// A device-local unordered-access buffer of at least `size` bytes for
