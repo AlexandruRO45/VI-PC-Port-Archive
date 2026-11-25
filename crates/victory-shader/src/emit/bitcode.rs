@@ -690,9 +690,15 @@ impl Module {
             if let (Some(Term::Br(h)), true, [p]) = (self.term(b), empty, &preds[b][..])
                 && plan.to(h) != b
             {
-                plan.fold[b] = Some((*p, h));
-                let (from, at) = (plan.src(b), plan.to(h));
-                let critical = succs(from).len() > 1 && preds[at].len() > 1 && pos[h] > pos[b];
+                let from = plan.src(*p);
+                plan.fold[b] = Some((from, h));
+                // With a single outgoing edge, folding can neither make it
+                // critical nor give its source a second path to the target.
+                if succs(from).len() == 1 {
+                    continue;
+                }
+                let at = plan.to(h);
+                let critical = preds[at].len() > 1 && pos[h] > pos[b];
                 if critical || succs(from).iter().filter(|&&s| plan.to(s) == at).count() != 1 {
                     plan.fold[b] = None;
                 }
@@ -1034,7 +1040,7 @@ struct Plan {
     layout: Vec<usize>,
     /// Per block: its place in `layout` (`u64::MAX` if not written).
     pos: Vec<u64>,
-    /// Per folded block: its one predecessor and its target.
+    /// Per folded block: its source (possibly folded later) and its target.
     fold: Vec<Option<(usize, usize)>>,
 }
 
