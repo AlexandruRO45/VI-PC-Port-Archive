@@ -1664,6 +1664,16 @@ ByteAddressBuffer now : register(t0);
 RWByteAddressBuffer hashes : register(u0);
 RWByteAddressBuffer differs : register(u1);
 groupshared uint4 accum[64];
+// Avalanche the right branch before combining it with the left. Adding a
+// constant preserved paired sign-bit deltas in lanes 0 and 32, cancelling
+// real writes when those lanes met. Both hash passes use this same shader.
+uint4 avalanche(uint4 x) {
+    x ^= x >> 16;
+    x *= 0x85EBCA6Bu;
+    x ^= x >> 13;
+    x *= 0xC2B2AE35u;
+    return x ^ (x >> 16);
+}
 [RootSignature(RS)]
 [numthreads(64, 1, 1)]
 void main(uint3 group : SV_GroupID, uint t : SV_GroupIndex) {
@@ -1686,8 +1696,8 @@ void main(uint3 group : SV_GroupID, uint t : SV_GroupIndex) {
     [unroll]
     for (uint stride = 32u; stride > 0u; stride >>= 1u) {
         if (t < stride) {
-            uint4 b = accum[t + stride];
-            uint4 a = (accum[t] ^ (b + uint4(0x9E3779B9u, 0x85EBCA6Bu, 0xC2B2AE35u, 0x27D4EB2Fu)))
+            uint4 b = avalanche(accum[t + stride]);
+            uint4 a = (accum[t] ^ b.zwxy)
                 * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
             accum[t] = a.yzwx ^ (a >> 15);
         }
