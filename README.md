@@ -1,7 +1,6 @@
 # VIctory
 
-Runs Grand Theft Auto VI (Xbox Series X|S) natively on Windows, from files
-the user supplies.
+Runs supported console titles natively on Windows, from files the user supplies.
 
 The title's x86-64 code runs unchanged inside our process; VIctory supplies
 the platform underneath it and converts the title's data, ahead of time where
@@ -74,17 +73,11 @@ Run the title:
 
 ```powershell
 cargo build --release -p victory
-target\release\victory.exe translate --cache --pipelines <game dir>\shaders.rpf <game dir>\<the title's exe> <game dir>\XboxBvhBuilder.dll <game dir>\amd_fidelityfx_upscaler_xbox.dll
+target\release\victory.exe translate --cache --pipelines <game folder>
 target\release\victory.exe run <game dir>\<the title's exe> --execute
 ```
 
-On Windows, `victory gui` opens VIctory's desktop library with Library,
-Activity, and Settings screens. Select a local executable there to start the
-existing offline `run --execute` path. The Python/QML interface and synthetic
-skyline are embedded in the Rust binary and extracted under
-`%LOCALAPPDATA%\victory\launcher`; the launcher makes no network requests or
-downloads artwork. See [the launcher setup](apps/victory/launcher/README.md)
-for its Python and PySide6 requirement.
+Double-click `victory.exe` to choose a console profile, run a title, or translate shaders and pipelines before launch.
 
 The `translate --cache` step (minutes; again after a change of the shader
 translator) translates every shader the title can ask for into the cache
@@ -140,7 +133,6 @@ victory translate [paths...] --cache [--pipelines] [--jobs N]
 victory run <exe> [--execute] [--unimplemented trap|zero] [--strict]
             [--console series-x|series-s] [-- <title arguments>]
 victory config
-victory gui
 ```
 
 Logging: `VICTORY_LOG=victory_loader=trace,info` (a release build logs

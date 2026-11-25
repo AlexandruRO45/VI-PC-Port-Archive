@@ -4,9 +4,8 @@
 //! the user's cache directory (outside the repository).
 
 mod census;
-mod gui;
-mod gui_ui;
 mod inspect;
+mod menu;
 mod prebuild;
 mod run;
 mod shader;
@@ -124,8 +123,6 @@ enum Command {
     },
     /// Show the resolved configuration and check it.
     Config,
-    /// Choose a local executable with the Windows file picker and run it.
-    Gui,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -146,6 +143,10 @@ fn main() -> Result<()> {
     #[cfg(all(windows, feature = "diagnostics"))]
     if victory_hle::modules::audio::capture::child() {
         return Ok(());
+    }
+    // A double-click gets the console menu.
+    if menu::wanted() {
+        return menu::run();
     }
     let cli = Cli::parse();
     match cli.command {
@@ -197,7 +198,6 @@ fn main() -> Result<()> {
             Ok(())
         }
         Command::Config => show_config(),
-        Command::Gui => gui::run(),
     }
 }
 
