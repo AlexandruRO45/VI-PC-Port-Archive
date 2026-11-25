@@ -4126,7 +4126,10 @@ impl<'a> Lower<'a> {
         }
         if !made.is_none_or(|b| self.all_lanes(b)) {
             need(made.unwrap_or(0));
-            return Err("a lane mask exchanged where not every lane runs");
+            // (not the same words as a mask read as a number, which the local
+            // forms take: the two need different fixes; the suffix keeps the
+            // retries' `needs_every_lane`)
+            return Err("an SCC of a lane mask exchanged where not every lane runs");
         }
         // (with pair meetings the halves meet here, where every lane must run too)
         let at = if self.pair_meet.is_some() && at != self.cur {

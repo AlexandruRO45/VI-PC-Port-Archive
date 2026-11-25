@@ -159,7 +159,20 @@ impl Shader {
     pub(crate) fn translated(&self) -> Option<&Translated> {
         self.translated
             .get_or_init(|| {
-                let done = translate(&self.container, wave_wide_only().contains(&self.hash));
+                let wide = wave_wide_only().contains(&self.hash);
+                // `VICTORY_WAVE_WHY`: the translator's lines about a wave64 program's forms
+                // carry no hash and come from translations on several threads; with the
+                // switch, one at a time, each between two lines that name its shader
+                let done = if std::env::var_os("VICTORY_WAVE_WHY").is_some() {
+                    static ONE: Mutex<()> = Mutex::new(());
+                    let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
+                    eprintln!("WAVE64-SHADER {} {} begin", self.hash, self.stage);
+                    let done = translate(&self.container, wide);
+                    eprintln!("WAVE64-SHADER {} {} end", self.hash, self.stage);
+                    done
+                } else {
+                    translate(&self.container, wide)
+                };
                 // `VICTORY_SHADER_SAVE=<dir>`: each shader as the title gave it (`.cdxil`) and as
                 // translated (`.dxil`), by the hash crash reports name it with
                 if let Some(dir) = std::env::var_os("VICTORY_SHADER_SAVE") {
