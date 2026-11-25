@@ -4205,9 +4205,10 @@ fn back_alias() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_BACK_ALIAS").is_some_and(|v| v == "1"))
 }
 
-/// Copy-back writes per frame for the log: through our own view, and
-/// through the title's address.
-pub(crate) static BACK_WRITES: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+/// Copy-back writes per frame for the log: through our own view, through
+/// the title's address (all), and of those: not view memory, the runtime
+/// remapping, a fault.
+pub(crate) static BACK_WRITES: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
 
 /// Writes `n` bytes from `src` into title memory at `at` through our view
 /// of its section ([`back_alias`]) and tells the journal, for every
@@ -4230,15 +4231,32 @@ pub(crate) fn write_unseen(at: usize, src: *const u8, n: usize) -> Option<(u64, 
     }
     // The runtime does not move a physical page between finding where the
     // bytes show and writing them; if it is moving pages now, write as before.
-    let _still = crate::watch::title_memory_reading_now()?;
-    let alias = crate::inplace::alias_of(at, n)?;
-    #[cfg(target_arch = "x86_64")]
-    // SAFETY: `alias` shows `n` bytes of the section; a fault is caught.
-    let done = unsafe { direct_copy::try_copy(alias as *mut u8, src, n) };
-    #[cfg(not(target_arch = "x86_64"))]
-    let done = false;
-    if !done {
+    let Some(_still) = crate::watch::title_memory_reading_now() else {
+        BACK_WRITES[3].fetch_add(1, Ordering::Relaxed);
         return None;
+    };
+    // By title view: the range may cross several.
+    let mut parts = Vec::new();
+    let mut a = at;
+    while a < at + n {
+        let Some((alias, held)) = crate::inplace::alias_run(a, at + n - a) else {
+            BACK_WRITES[2].fetch_add(1, Ordering::Relaxed);
+            return None;
+        };
+        parts.push((alias, a - at, held));
+        a += held;
+    }
+    for (alias, from, held) in parts {
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: `alias` shows `held` bytes of the section; a fault is caught.
+        let done = unsafe { direct_copy::try_copy(alias as *mut u8, src.add(from), held) };
+        #[cfg(not(target_arch = "x86_64"))]
+        let done = false;
+        if !done {
+            // What was written already is written again the old way.
+            BACK_WRITES[4].fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
     }
     let first = at / crate::watch::PAGE;
     let last = (at + n).div_ceil(crate::watch::PAGE);
@@ -9683,10 +9701,10 @@ impl Meter {
             tracing::info!(
                 "preparing per frame, by part: {under:.1} ms putting title bytes in under flights, {steps:.1} the lists' steps, {flush:.1} flushing their refreshes, {card:.1} the card copies' sends and compare"
             );
-            let [unseen, seen] = [0, 1].map(|i| BACK_WRITES[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            let [unseen, seen, not_view, remapping, fault] = [0, 1, 2, 3, 4].map(|i| BACK_WRITES[i].swap(0, Ordering::Relaxed) as f64 / frames);
             if back_alias() {
                 tracing::info!(
-                    "copy-back writes per frame (VICTORY_BACK_ALIAS=1): {unseen:.0} through our own view of the section, {seen:.0} through the title's address"
+                    "copy-back writes per frame (VICTORY_BACK_ALIAS=1): {unseen:.0} through our own view of the section, {seen:.0} through the title's address ({not_view:.0} not view memory, {remapping:.0} while the runtime remapped, {fault:.1} faulted)"
                 );
             }
             let [through, again, fills, stale] = [0, 1, 2, 3].map(|i| COPY_NO_WAIT[i].swap(0, Ordering::Relaxed) as f64 / frames);

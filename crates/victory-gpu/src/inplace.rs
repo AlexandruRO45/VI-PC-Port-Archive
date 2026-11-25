@@ -312,13 +312,22 @@ static ALIASES: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
 /// mapped whole the first time; `None` if the range is not inside one title
 /// view of a section the runtime told us of.
 pub(crate) fn alias_of(at: usize, len: usize) -> Option<usize> {
-    let (section, offset) = {
+    alias_run(at, len).filter(|&(_, n)| n == len).map(|(alias, _)| alias)
+}
+
+/// Where title memory at `at` shows in our view of its section
+/// ([`alias_of`]), and how many of the `len` bytes from there the one title
+/// view that holds `at` holds; `None` if `at` is not in a view of a
+/// section the runtime told us of. The heap's views are often 64 KiB each,
+/// so a write of a few pages crosses several.
+pub(crate) fn alias_run(at: usize, len: usize) -> Option<(usize, usize)> {
+    let (section, offset, held) = {
         let v = views();
         let (&base, &(bytes, section, offset)) = v.views.range(..=at).next_back()?;
-        if at.checked_add(len)? > base + bytes || !v.sections.iter().any(|s| s.0 == section) {
+        if at >= base + bytes || !v.sections.iter().any(|s| s.0 == section) {
             return None;
         }
-        (section, offset + (at - base) as u64)
+        (section, offset + (at - base) as u64, (base + bytes - at).min(len))
     };
     let mut aliases = ALIASES.lock().unwrap_or_else(|e| e.into_inner());
     let base = match aliases.iter().find(|a| a.0 == section) {
@@ -334,7 +343,7 @@ pub(crate) fn alias_of(at: usize, len: usize) -> Option<usize> {
             base
         }
     };
-    (base != 0).then(|| base + offset as usize)
+    (base != 0).then(|| (base + offset as usize, held))
 }
 
 /// The runtime mapped `[at, at + len)` as a view of `section` from
