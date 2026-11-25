@@ -53,8 +53,35 @@ pub(crate) mod flags {
     pub const RESOURCE_HEAP: u64 = 1 << 30;
     pub const SAMPLER_HEAP: u64 = 1 << 31;
     pub const ATOMIC64_HEAP: u64 = 1 << 32;
+    /// A vertex (or hull, domain, geometry) shader that declares a UAV: the
+    /// validator recomputes this from the declarations and refuses the
+    /// module without it ("Flags must match usage", #1987). Stages that have
+    /// always been able to hold one — pixel, compute, mesh — do not set it.
+    pub const UAVS_AT_EVERY_STAGE: u64 = 1 << 16;
 }
 
+/// The `SFI0` feature-info bits of a module's shader flags, as DXC's
+/// `DxilShaderFlags::GetFeatureInfo` computes them (`ShaderFeatureInfo_*`).
+pub(crate) fn feature_info(flags: u64) -> u64 {
+    let mut features = 0u64;
+    for (flag, feature) in [
+        (flags::STENCIL_REF, 0x200),
+        (flags::TYPED_UAV_LOADS, 0x800),
+        (flags::UAVS_AT_EVERY_STAGE, 0x4),
+        (flags::ROVS, 0x1000),
+        (flags::WAVE_OPS, 0x4000),
+        (flags::INT64, 0x8000),
+        (flags::RESOURCE_HEAP, 0x200_0000),
+        (flags::SAMPLER_HEAP, 0x400_0000),
+        (flags::ATOMIC64_TYPED, 0x40_0000),
+        (flags::ATOMIC64_HEAP, 0x1000_0000),
+    ] {
+        if flags & flag != 0 {
+            features |= feature;
+        }
+    }
+    features
+}
 pub(crate) struct Types {
     pub void: Ty,
     pub i1: Ty,
@@ -793,6 +820,16 @@ impl Shader {
         if self.pixel && self.outputs.iter().any(|o| o.kind == 20) {
             self.flags |= flags::STENCIL_REF;
         }
+        // A stage that traditionally had no UAVs, declaring one: the write
+        // marking is what put one in a vertex shader (#1987).
+        if !self.pixel
+            && self.threads.is_none()
+            && self.mesh.is_none()
+            && self.gs.is_none()
+            && (self.view_writes.is_some() || !self.root_uavs.is_empty())
+        {
+            self.flags |= flags::UAVS_AT_EVERY_STAGE;
+        }
         // Entry properties: shader flags (tag 0), thread-group size (4),
         // wave size (11).
         let mut props = Vec::new();
@@ -878,34 +915,7 @@ impl Shader {
         dxil.extend((bitcode.len() as u32).to_le_bytes());
         dxil.extend(&bitcode);
 
-        let mut features = 0u64;
-        if self.flags & flags::STENCIL_REF != 0 {
-            features |= 0x200;
-        }
-        if self.flags & flags::TYPED_UAV_LOADS != 0 {
-            features |= 0x800;
-        }
-        if self.flags & flags::ROVS != 0 {
-            features |= 0x1000;
-        }
-        if self.flags & flags::WAVE_OPS != 0 {
-            features |= 0x4000;
-        }
-        if self.flags & flags::INT64 != 0 {
-            features |= 0x8000;
-        }
-        if self.flags & flags::RESOURCE_HEAP != 0 {
-            features |= 0x200_0000;
-        }
-        if self.flags & flags::SAMPLER_HEAP != 0 {
-            features |= 0x400_0000;
-        }
-        if self.flags & flags::ATOMIC64_TYPED != 0 {
-            features |= 0x40_0000;
-        }
-        if self.flags & flags::ATOMIC64_HEAP != 0 {
-            features |= 0x1000_0000;
-        }
+        let features = feature_info(self.flags);
         let sfi0 = features.to_le_bytes();
         let isg1 = container::signature(&self.inputs, true);
         let osg1 = container::signature(&self.outputs, false);
@@ -984,5 +994,33 @@ impl Shader {
             list.push(Some(self.m.md_node(ops)));
         }
         Some(self.m.md_node(list))
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The feature part has to say what the module's flags say, or the
+    /// validator rejects the container ("Container part 'Feature Info' does
+    /// not match expected for module", #1987). The bit values are DXC's
+    /// `ShaderFeatureInfo_*`.
+    #[test]
+    fn the_feature_bits_follow_the_shader_flags() {
+        assert_eq!(feature_info(0), 0);
+        assert_eq!(feature_info(flags::UAVS_AT_EVERY_STAGE), 0x4);
+        assert_eq!(feature_info(flags::STENCIL_REF), 0x200);
+        assert_eq!(feature_info(flags::TYPED_UAV_LOADS), 0x800);
+        assert_eq!(feature_info(flags::ROVS), 0x1000);
+        assert_eq!(feature_info(flags::WAVE_OPS), 0x4000);
+        assert_eq!(feature_info(flags::INT64), 0x8000);
+        assert_eq!(feature_info(flags::ATOMIC64_TYPED), 0x40_0000);
+        assert_eq!(feature_info(flags::RESOURCE_HEAP), 0x200_0000);
+        assert_eq!(feature_info(flags::SAMPLER_HEAP), 0x400_0000);
+        assert_eq!(feature_info(flags::ATOMIC64_HEAP), 0x1000_0000);
+        assert_eq!(
+            feature_info(flags::RAW_BUFFERS | flags::UAVS_AT_EVERY_STAGE),
+            0x4,
+            "raw buffers alone carry no feature bit"
+        );
     }
 }
