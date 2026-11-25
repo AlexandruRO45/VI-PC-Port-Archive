@@ -172,6 +172,13 @@ impl Shader {
     }
 }
 
+/// Initializes the host shader capabilities before warming the disk cache.
+#[cfg(windows)]
+pub fn prepare_shader_warmup() {
+    let _ = crate::host::host();
+    crate::descriptor::host::probe_view_limit();
+}
+
 #[cfg(windows)]
 fn translate(container: &[u8]) -> Result<Translated, String> {
     use victory_shader::{Container, FourCC, HwStage};
