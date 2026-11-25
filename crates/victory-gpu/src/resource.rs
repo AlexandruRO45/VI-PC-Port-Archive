@@ -284,7 +284,11 @@ pub(crate) fn family(format: u32) -> u32 {
 /// without changing what the texels mean.
 pub(crate) fn family_formats(f: u32) -> impl Iterator<Item = u32> {
     let head = family(f);
-    (1..=115).filter(move |&g| family(g) == head)
+    // `f` itself is in `1..=115` only for `f <= 115`, so a higher format
+    // with no family would otherwise iterate nothing, not "`f` alone".
+    (1..=115)
+        .filter(move |&g| family(g) == head)
+        .chain((f > 115).then_some(f))
 }
 
 /// sRGB formats and their linear twins.
@@ -2562,7 +2566,14 @@ mod tests {
         }
         let takes =
             |f: u32| family_formats(f).any(crate::descriptor::host::typed_store);
-        assert!(!takes(86), "B5G5R5A1_UNORM takes no typed UAV, so must lose the flag");
+        // A format above the scanned range with no family is still itself.
+        assert!(
+            family_formats(200).any(|g| g == 200),
+            "a format with no family is its own family"
+        );
+        // The rule, not what this host supports: a device that stores
+        // `B5G5R5A1_UNORM` typed (WARP, some AMD) keeps the flag on 86, so the
+        // test must not hard-code that 86 loses it.
         for &format in &[27u32, 28, 29, 86, 87, 10] {
             let mut d = texture(4, 4, format, 1);
             d.flags |= UNORDERED;
