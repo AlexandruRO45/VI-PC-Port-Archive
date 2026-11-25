@@ -39,9 +39,11 @@ powershell -ExecutionPolicy Bypass -File scripts\play.ps1 -Game "<your game fold
 
 `scripts\play.ps1` keeps the shader cache and saves in folders you choose
 (`-Cache`, `-Data`) and presses no buttons for you. Controller: Xbox pads
-through XInput; a DualSense or DualShock 4 (USB or Bluetooth) is read directly,
-no DS4Windows or Steam Input needed, and takes the first slot XInput leaves
-empty. With no pad connected the keyboard acts as one while the game window
+through XInput. Other pads are read directly from HID, one at a time, in the
+first slot XInput leaves empty, with no DS4Windows or Steam Input: DualSense and
+DualShock 4 (USB or Bluetooth, with rumble), Switch Pro, and any other HID
+gamepad by a guessed button layout (`VICTORY_HID_GENERIC=1` forces that path).
+Only the PlayStation pads are tested; the rest are not. With no pad connected the keyboard acts as one while the game window
 has focus.
 
 ## Faster settings (optional, off by default)

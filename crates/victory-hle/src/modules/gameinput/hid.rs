@@ -16,8 +16,9 @@ use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
     CM_Get_Device_Interface_ListW, CR_SUCCESS,
 };
 use windows_sys::Win32::Devices::HumanInterfaceDevice::{
-    HIDP_CAPS, HidD_FreePreparsedData, HidD_GetFeature, HidD_GetHidGuid, HidD_GetPreparsedData,
-    HidP_GetCaps,
+    HIDP_CAPS, HIDP_VALUE_CAPS, HidD_FreePreparsedData, HidD_GetFeature, HidD_GetHidGuid,
+    HidD_GetPreparsedData, HidP_GetCaps, HidP_GetUsageValue, HidP_GetUsages, HidP_GetValueCaps,
+    HidP_Input,
 };
 use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_IO_PENDING, GENERIC_READ, GENERIC_WRITE, GetLastError, HANDLE,
@@ -30,7 +31,7 @@ use windows_sys::Win32::Storage::FileSystem::{
 use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 use windows_sys::Win32::System::Threading::{CreateEventW, ResetEvent, WaitForSingleObject};
 
-use super::{PadState, playstation};
+use super::{PadState, generic, nintendo, playstation};
 
 /// How often to look for a pad while none is open.
 const RESCAN: Duration = Duration::from_secs(1);
@@ -53,7 +54,10 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 pub(super) fn connected_pad() -> Option<Reading> {
     static STARTED: OnceLock<()> = OnceLock::new();
     STARTED.get_or_init(|| {
-        if let Err(e) = std::thread::Builder::new().name("hid-pad".into()).spawn(run) {
+        if let Err(e) = std::thread::Builder::new()
+            .name("hid-pad".into())
+            .spawn(run)
+        {
             tracing::warn!(error = %e, "no HID pad reader thread");
         }
     });
@@ -70,6 +74,16 @@ pub(super) fn set_rumble(low: u16, high: u16) {
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Driver {
     Sony(playstation::Kind),
+    SwitchPro,
+    /// Any other gamepad or joystick; mapped by guess (`generic`).
+    Generic,
+}
+
+impl Driver {
+    /// Native drivers come first when several pads are connected.
+    fn rank(self) -> u8 {
+        u8::from(self == Driver::Generic)
+    }
 }
 
 struct Found {
@@ -84,24 +98,75 @@ struct Found {
 fn ids_of(path: &str) -> Option<(u16, u16)> {
     let path = path.to_ascii_lowercase();
     let hex = |at: usize| u16::from_str_radix(path.get(at..at + 4)?, 16).ok();
-    let vid = path.find("vid_").map(|i| i + 4).or_else(|| path.find("vid&").map(|i| i + 4 + 4))?;
-    let pid = path.find("pid_").map(|i| i + 4).or_else(|| path.find("pid&").map(|i| i + 4))?;
+    let vid = path
+        .find("vid_")
+        .map(|i| i + 4)
+        .or_else(|| path.find("vid&").map(|i| i + 4 + 4))?;
+    let pid = path
+        .find("pid_")
+        .map(|i| i + 4)
+        .or_else(|| path.find("pid&").map(|i| i + 4))?;
     Some((hex(vid)?, hex(pid)?))
 }
 
 /// Bluetooth HID devices carry the HID service's UUID in their path.
 fn is_bluetooth(path: &str) -> bool {
-    path.to_ascii_lowercase().contains("{00001124-0000-1000-8000-00805f9b34fb}")
+    path.to_ascii_lowercase()
+        .contains("{00001124-0000-1000-8000-00805f9b34fb}")
 }
 
-fn devices() -> Vec<Found> {
+/// Whether a device is one we leave to someone else: XInput pads (their
+/// path carries `ig_`), Microsoft's own, and Steam's virtual pads.
+fn excluded(path: &str, vendor: u16) -> bool {
+    path.to_ascii_lowercase().contains("ig_") || vendor == 0x045E || vendor == 0x28DE
+}
+
+/// `VICTORY_HID_GENERIC=1` reads every pad through the generic mapping, to
+/// check that path with a pad whose layout is known.
+fn forced_generic() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HID_GENERIC").is_some())
+}
+
+/// Whether the device presents itself as a gamepad or joystick.
+fn is_gamepad(path: &[u16]) -> bool {
+    let handle = open(path, 0, 0);
+    if handle == INVALID_HANDLE_VALUE {
+        return false;
+    }
+    let usage = usage_of(handle);
+    // SAFETY: our handle.
+    unsafe { CloseHandle(handle) };
+    // Generic Desktop: Joystick (4) or Game Pad (5).
+    matches!(usage, Some((1, 4 | 5)))
+}
+
+/// The top-level usage page and usage of a device.
+fn usage_of(handle: HANDLE) -> Option<(u16, u16)> {
+    // SAFETY: preparsed data from this handle, freed after the query.
+    unsafe {
+        let mut pp = 0isize;
+        if !HidD_GetPreparsedData(handle, &mut pp) {
+            return None;
+        }
+        let mut caps: HIDP_CAPS = std::mem::zeroed();
+        let ok = HidP_GetCaps(pp, &mut caps) >= 0;
+        HidD_FreePreparsedData(pp);
+        ok.then_some((caps.UsagePage, caps.Usage))
+    }
+}
+
+/// The connected devices we can read, native drivers first. `skip` holds the
+/// paths already found to be no gamepad, so they are not opened again.
+fn devices(skip: &mut std::collections::HashSet<String>) -> Vec<Found> {
     // SAFETY: plain queries into buffers we size from the answer.
     unsafe {
         let mut guid = std::mem::zeroed();
         HidD_GetHidGuid(&mut guid);
         let mut len = 0u32;
         let flags = CM_GET_DEVICE_INTERFACE_LIST_PRESENT;
-        if CM_Get_Device_Interface_List_SizeW(&mut len, &guid, std::ptr::null(), flags) != CR_SUCCESS
+        if CM_Get_Device_Interface_List_SizeW(&mut len, &guid, std::ptr::null(), flags)
+            != CR_SUCCESS
             || len < 2
         {
             return Vec::new();
@@ -117,9 +182,25 @@ fn devices() -> Vec<Found> {
             .filter_map(|p| {
                 let text = String::from_utf16_lossy(p);
                 let (vendor, product) = ids_of(&text)?;
-                let driver = Driver::Sony(playstation::kind_of(vendor, product)?);
+                let path: Vec<u16> = p.iter().copied().chain(Some(0)).collect();
+                let native = if forced_generic() {
+                    None
+                } else if let Some(kind) = playstation::kind_of(vendor, product) {
+                    Some(Driver::Sony(kind))
+                } else {
+                    nintendo::is_pro(vendor, product).then_some(Driver::SwitchPro)
+                };
+                let driver = match native {
+                    Some(driver) => driver,
+                    None if excluded(&text, vendor) || skip.contains(&text) => return None,
+                    None if is_gamepad(&path) => Driver::Generic,
+                    None => {
+                        skip.insert(text);
+                        return None;
+                    }
+                };
                 Some(Found {
-                    path: p.iter().copied().chain(Some(0)).collect(),
+                    path,
                     driver,
                     vendor,
                     product,
@@ -131,8 +212,11 @@ fn devices() -> Vec<Found> {
 }
 
 fn run() {
+    let mut skip = std::collections::HashSet::new();
     loop {
-        for found in devices() {
+        let mut found = devices(&mut skip);
+        found.sort_by_key(|f| f.driver.rank());
+        for found in found {
             if read_pad(&found) {
                 break;
             }
@@ -168,7 +252,12 @@ fn report_sizes(handle: HANDLE) -> Option<(usize, usize)> {
         let mut caps: HIDP_CAPS = std::mem::zeroed();
         let ok = HidP_GetCaps(pp, &mut caps) >= 0;
         HidD_FreePreparsedData(pp);
-        ok.then(|| (usize::from(caps.InputReportByteLength), usize::from(caps.OutputReportByteLength)))
+        ok.then(|| {
+            (
+                usize::from(caps.InputReportByteLength),
+                usize::from(caps.OutputReportByteLength),
+            )
+        })
     }
 }
 
@@ -180,6 +269,175 @@ fn feature(handle: HANDLE, id: u8, size: usize) -> Option<Vec<u8>> {
     // SAFETY: a buffer of `size` bytes.
     let ok = unsafe { HidD_GetFeature(handle, buf.as_mut_ptr().cast(), size as u32) };
     ok.then_some(buf)
+}
+
+/// Writes an output report over the synchronous handle.
+fn write(control: HANDLE, report: &[u8]) {
+    let mut written = 0u32;
+    // SAFETY: the report's bytes and a synchronous handle of our own.
+    let ok = unsafe {
+        WriteFile(
+            control,
+            report.as_ptr(),
+            report.len() as u32,
+            &mut written,
+            std::ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        // SAFETY: a plain query.
+        tracing::debug!(error = unsafe { GetLastError() }, "HID write failed");
+    }
+}
+
+/// What turns a pad's reports into readings.
+enum Decoder {
+    Sony(playstation::Kind),
+    SwitchPro,
+    Generic(GenericPad),
+}
+
+impl Decoder {
+    /// The reading after `report`, given the one before.
+    fn after(&self, report: &[u8], current: Option<PadState>) -> Option<PadState> {
+        match self {
+            Decoder::Sony(kind) => playstation::after(*kind, report, current),
+            Decoder::SwitchPro => nintendo::parse(report).or(current),
+            Decoder::Generic(pad) => pad.read(report).or(current),
+        }
+    }
+}
+
+/// An axis of a generic pad: where it lives in a report and its range.
+struct ValueCap {
+    link: u16,
+    usage: u16,
+    min: i64,
+    max: i64,
+    bits: u16,
+}
+
+/// A generic pad's report layout, from its HID descriptor.
+struct GenericPad {
+    preparsed: isize,
+    values: Vec<ValueCap>,
+}
+
+impl GenericPad {
+    fn new(handle: HANDLE) -> Option<Self> {
+        // SAFETY: preparsed data owned by the result (freed in `drop`), and
+        // buffers sized by the counts the API gave.
+        unsafe {
+            let mut preparsed = 0isize;
+            if !HidD_GetPreparsedData(handle, &mut preparsed) {
+                return None;
+            }
+            let mut pad = GenericPad {
+                preparsed,
+                values: Vec::new(),
+            };
+            let mut caps: HIDP_CAPS = std::mem::zeroed();
+            if HidP_GetCaps(preparsed, &mut caps) < 0 {
+                return None;
+            }
+            let mut n = caps.NumberInputValueCaps;
+            let mut raw = vec![HIDP_VALUE_CAPS::default(); usize::from(n)];
+            if n > 0 && HidP_GetValueCaps(HidP_Input, raw.as_mut_ptr(), &mut n, preparsed) < 0 {
+                return None;
+            }
+            for c in &raw[..usize::from(n)] {
+                if c.UsagePage != 1 {
+                    continue;
+                }
+                let (first, last) = if c.IsRange {
+                    (c.Anonymous.Range.UsageMin, c.Anonymous.Range.UsageMax)
+                } else {
+                    (c.Anonymous.NotRange.Usage, c.Anonymous.NotRange.Usage)
+                };
+                for usage in first..=last {
+                    pad.values.push(ValueCap {
+                        link: c.LinkCollection,
+                        usage,
+                        min: i64::from(c.LogicalMin),
+                        max: i64::from(c.LogicalMax),
+                        bits: c.BitSize,
+                    });
+                }
+            }
+            Some(pad)
+        }
+    }
+
+    /// A reading from an input report (its id byte first); `None` for a
+    /// report this layout does not describe.
+    fn read(&self, report: &[u8]) -> Option<PadState> {
+        const SUCCESS: i32 = 0x0011_0000;
+        let mut data = report.to_vec();
+        let len = data.len() as u32;
+        let mut usages = [0u16; 64];
+        let mut count = usages.len() as u32;
+        // SAFETY: the report copy and buffers outlive the calls.
+        let status = unsafe {
+            HidP_GetUsages(
+                HidP_Input,
+                9,
+                0,
+                usages.as_mut_ptr(),
+                &mut count,
+                self.preparsed,
+                data.as_mut_ptr().cast(),
+                len,
+            )
+        };
+        if status != SUCCESS {
+            return None;
+        }
+        let mut axes = Vec::new();
+        let mut hat = None;
+        for cap in &self.values {
+            let mut raw = 0u32;
+            // SAFETY: as above.
+            let status = unsafe {
+                HidP_GetUsageValue(
+                    HidP_Input,
+                    1,
+                    cap.link,
+                    cap.usage,
+                    &mut raw,
+                    self.preparsed,
+                    data.as_mut_ptr().cast(),
+                    len,
+                )
+            };
+            if status != SUCCESS {
+                continue;
+            }
+            let value = if cap.min < 0 && (1..32).contains(&cap.bits) {
+                let shift = 32 - u32::from(cap.bits);
+                i64::from(((raw << shift) as i32) >> shift)
+            } else {
+                i64::from(raw)
+            };
+            if cap.usage == generic::HAT {
+                hat = Some((value, cap.min, cap.max));
+            } else {
+                axes.push(generic::Axis {
+                    usage: cap.usage,
+                    value,
+                    min: cap.min,
+                    max: cap.max,
+                });
+            }
+        }
+        Some(generic::map(&usages[..count as usize], hat, &axes))
+    }
+}
+
+impl Drop for GenericPad {
+    fn drop(&mut self) {
+        // SAFETY: the data from `new`.
+        unsafe { HidD_FreePreparsedData(self.preparsed) };
+    }
 }
 
 /// Sends rumble to a Sony pad.
@@ -207,20 +465,7 @@ impl Rumble {
         // The device wants its own report size.
         report.resize(self.output_len.max(report.len()), 0);
         report.truncate(self.output_len.max(1));
-        let mut written = 0u32;
-        // SAFETY: the report's bytes and a synchronous handle of our own.
-        let ok = unsafe {
-            WriteFile(
-                self.control,
-                report.as_ptr(),
-                report.len() as u32,
-                &mut written,
-                std::ptr::null_mut(),
-            )
-        };
-        if ok == 0 {
-            tracing::debug!(error = unsafe { GetLastError() }, "rumble write failed");
-        }
+        write(self.control, &report);
         self.sent = (low, high);
     }
 
@@ -258,34 +503,57 @@ fn read_pad(found: &Found) -> bool {
         close_all(read, control);
         return false;
     };
-    let Driver::Sony(kind) = found.driver;
     let mut rumble = None;
-    if control != INVALID_HANDLE_VALUE {
-        // Over Bluetooth a pad sends a short report, and ignores output,
-        // until a title reads its calibration feature report (0x05).
-        if found.bluetooth || kind == playstation::Kind::DualSense {
-            let _ = feature(control, 0x05, 41);
+    let decoder = match found.driver {
+        Driver::Sony(kind) => {
+            if control != INVALID_HANDLE_VALUE {
+                // Over Bluetooth a pad sends a short report, and ignores
+                // output, until a title reads its calibration feature report.
+                if found.bluetooth || kind == playstation::Kind::DualSense {
+                    let _ = feature(control, 0x05, 41);
+                }
+                // DualSense firmware before update 2.21 wants the old bit.
+                let new_vibration = match (kind, found.product) {
+                    (playstation::Kind::DualSense, 0x0CE6) => feature(control, 0x20, 64)
+                        .is_none_or(|f| u16::from_le_bytes([f[44], f[45]]) >= 0x0215),
+                    _ => true,
+                };
+                if output_len > 0 {
+                    rumble = Some(Rumble {
+                        control,
+                        kind,
+                        bluetooth: found.bluetooth,
+                        new_vibration,
+                        output_len,
+                        sequence: 0,
+                        sent: (0, 0),
+                    });
+                }
+            }
+            Decoder::Sony(kind)
         }
-        // DualSense firmware before update 2.21 wants the old rumble bit.
-        let new_vibration = match (kind, found.product) {
-            (playstation::Kind::DualSense, 0x0CE6) => feature(control, 0x20, 64)
-                .map_or(true, |f| u16::from_le_bytes([f[44], f[45]]) >= 0x0215),
-            _ => true,
-        };
-        if output_len > 0 {
-            rumble = Some(Rumble {
-                control,
-                kind,
-                bluetooth: found.bluetooth,
-                new_vibration,
-                output_len,
-                sequence: 0,
-                sent: (0, 0),
-            });
+        Driver::SwitchPro => {
+            // Over USB the pad waits for a handshake; over Bluetooth it
+            // already sends its simple report.
+            if !found.bluetooth && control != INVALID_HANDLE_VALUE {
+                for mut report in nintendo::usb_handshake() {
+                    report.resize(output_len.max(report.len()), 0);
+                    write(control, &report);
+                    std::thread::sleep(Duration::from_millis(30));
+                }
+            }
+            Decoder::SwitchPro
         }
-    }
+        Driver::Generic => match GenericPad::new(read) {
+            Some(pad) => Decoder::Generic(pad),
+            None => {
+                close_all(read, control);
+                return false;
+            }
+        },
+    };
     tracing::info!(
-        ?kind,
+        driver = ?found.driver,
         vendor = found.vendor,
         product = found.product,
         bluetooth = found.bluetooth,
@@ -305,7 +573,13 @@ fn read_pad(found: &Found) -> bool {
         // for or cancelled and waited for before they go out of scope.
         let started = unsafe {
             ResetEvent(event);
-            ReadFile(read, buf.as_mut_ptr().cast(), size as u32, std::ptr::null_mut(), &mut overlapped)
+            ReadFile(
+                read,
+                buf.as_mut_ptr().cast(),
+                size as u32,
+                std::ptr::null_mut(),
+                &mut overlapped,
+            )
         };
         // SAFETY: a plain query.
         if started == 0 && unsafe { GetLastError() } != ERROR_IO_PENDING {
@@ -333,13 +607,16 @@ fn read_pad(found: &Found) -> bool {
         }
         let report = &buf[..got as usize];
         if first {
-            tracing::info!(id = report.first().copied().unwrap_or(0), bytes = got, "HID pad first report");
+            tracing::info!(
+                id = report.first().copied().unwrap_or(0),
+                bytes = got,
+                "HID pad first report"
+            );
             first = false;
         }
-        let Driver::Sony(kind) = found.driver;
-        let now = playstation::after(kind, report, state);
+        let now = decoder.after(report, state);
         if state.is_some() && now.is_none() {
-            tracing::info!("PlayStation adapter: its pad left");
+            tracing::info!("HID adapter: its pad left");
         }
         state = now;
         *lock(&LATEST) = state.map(|pad| (pad, (found.vendor, found.product)));
@@ -377,7 +654,10 @@ mod tests {
 
     #[test]
     fn ids_come_out_of_usb_and_bluetooth_paths() {
-        assert_eq!(ids_of(r"\\?\hid#vid_054c&pid_0ce6#7&1#{4d1e55b2}"), Some((0x054C, 0x0CE6)));
+        assert_eq!(
+            ids_of(r"\\?\hid#vid_054c&pid_0ce6#7&1#{4d1e55b2}"),
+            Some((0x054C, 0x0CE6))
+        );
         assert_eq!(
             ids_of(r"\\?\hid#{00001124-0000-1000-8000-00805f9b34fb}_vid&0002054c_pid&05c4#a"),
             Some((0x054C, 0x05C4))
@@ -385,9 +665,65 @@ mod tests {
         assert_eq!(ids_of(r"\\?\hid#nothing"), None);
     }
 
+    /// Hardware check, run by hand with a pad connected and its buttons
+    /// pressed: `cargo test -p victory-hle generic_mapping_of_a_real_pad -- --ignored --nocapture`.
+    /// Reads the first gamepad through the generic mapping and prints what it
+    /// sees for about three seconds.
+    #[test]
+    #[ignore = "needs a pad"]
+    fn generic_mapping_of_a_real_pad() {
+        let mut skip = std::collections::HashSet::new();
+        // SAFETY: set before any other thread reads it; run on its own.
+        unsafe { std::env::set_var("VICTORY_HID_GENERIC", "1") };
+        let found = devices(&mut skip)
+            .into_iter()
+            .next()
+            .expect("no gamepad connected");
+        let handle = open(&found.path, GENERIC_READ, 0);
+        assert_ne!(handle, INVALID_HANDLE_VALUE);
+        let pad = GenericPad::new(handle).expect("no layout");
+        println!(
+            "axes: {:?}",
+            pad.values
+                .iter()
+                .map(|v| (v.usage, v.min, v.max))
+                .collect::<Vec<_>>()
+        );
+        let (size, _) = report_sizes(handle).unwrap();
+        let mut buf = vec![0u8; size];
+        let end = std::time::Instant::now() + Duration::from_secs(3);
+        while std::time::Instant::now() < end {
+            let mut got = 0u32;
+            // SAFETY: a synchronous read into our buffer.
+            let ok = unsafe {
+                ReadFile(
+                    handle,
+                    buf.as_mut_ptr().cast(),
+                    size as u32,
+                    &mut got,
+                    std::ptr::null_mut(),
+                )
+            };
+            if ok == 0 {
+                println!("read failed: {}", unsafe { GetLastError() });
+                break;
+            }
+            if got > 0 && buf[0] != 0 {
+                println!("report {:#x} len {got}", buf[0]);
+            }
+            {
+                if let Some(p) = pad.read(&buf[..got as usize]) {
+                    println!("{p:?}");
+                }
+            }
+        }
+    }
+
     #[test]
     fn bluetooth_paths_are_told_apart() {
-        assert!(is_bluetooth(r"\\?\hid#{00001124-0000-1000-8000-00805f9b34fb}_vid&0002054c_pid&0ce6#a"));
+        assert!(is_bluetooth(
+            r"\\?\hid#{00001124-0000-1000-8000-00805f9b34fb}_vid&0002054c_pid&0ce6#a"
+        ));
         assert!(!is_bluetooth(r"\\?\hid#vid_054c&pid_0ce6#7&1"));
     }
 }

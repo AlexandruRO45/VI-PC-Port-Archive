@@ -19,8 +19,10 @@ use std::sync::{Condvar, LazyLock, Mutex, MutexGuard, PoisonError};
 use std::thread::ThreadId;
 use std::time::{Duration, Instant};
 
+mod generic;
 #[cfg(windows)]
 mod hid;
+mod nintendo;
 mod playstation;
 
 use super::xasync::{E_INVALIDARG, E_NOTIMPL};
