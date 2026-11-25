@@ -462,7 +462,33 @@ pub(crate) static HEAP_TEXTURES_QUEUE: [AtomicU64; 5] = [const { AtomicU64::new(
 /// the ones whose first page was not there (asked by the first page alone,
 /// as before, they counted as not there at all).
 pub(crate) static HEAP_TEXTURES_PARTLY: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+/// Since the start: looks that found more of a placed texture's memory
+/// mapped than at its last look although no notice of the runtime
+/// (`descriptor::host::remapped`) had made its slot due: memory that
+/// arrives unannounced, which only the looks find ([`park_frames`]).
+pub(crate) static HEAP_TEXTURES_UNANNOUNCED: AtomicU64 = AtomicU64::new(0);
 static DROPPED: AtomicU64 = AtomicU64::new(0);
+
+/// `VICTORY_TEXTURE_PARK_FRAMES=<n>`: a texture uploaded in part whose look
+/// found no more of its memory mapped is looked at again after up to `n`
+/// frames, not after at most 256 (or less: about 4 s). The runtime's
+/// notices make it due at once when memory is mapped, unmapped or written
+/// under it, so the looks are only for memory that arrives without one: 0,
+/// the default, keeps them as they are. Each look asks the kernel about
+/// every 64 KiB of the texture (4.5 ms a frame on average in a release
+/// run, 241 slots looked at, peaks of 13-16 ms). To try only where the
+/// frame line's "arrived unannounced" stays at about 0 through a long run
+/// with streaming: a texture whose memory arrived so stays partly uploaded
+/// for up to `n` frames.
+pub(crate) fn park_frames() -> u64 {
+    static FRAMES: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *FRAMES.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURE_PARK_FRAMES")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(0)
+    })
+}
 
 /// Marks the last traced draw as not run on the host.
 #[cfg(feature = "diagnostics")]
@@ -890,6 +916,13 @@ impl State {
             // Its geometry stage would turn each triangle into a rectangle.
             once!("a rectangle pipeline drawn with another topology");
         }
+        // A depth texture shaders also write: what they wrote, first, and
+        // the depth plane drawn from its twin before a draw tests it.
+        if self.depth != 0 && list.twin_use_now(self.depth as This) {
+            // The plane's pass set its own heap, root signature, pipeline,
+            // target, viewport, scissor and topology.
+            self.replay(list);
+        }
         if !self.bind(list, p, false) {
             return false;
         }
@@ -940,8 +973,7 @@ impl State {
             crate::list::ensure_state(list, t as This, RENDER_TARGET);
         }
         if self.depth != 0 {
-            // A depth texture shaders also write: what they wrote, first.
-            list.twin_use(self.depth as This, false, true);
+            // (what shaders wrote of it is in: `twin_use_now` above)
             // A view that writes neither plane keeps the texture readable:
             // the depth read state, together with the shader read states
             // if this draw's shaders read the same texture (the write state
@@ -1462,9 +1494,9 @@ impl State {
         // Per host heap: the host copy and range each slot's buffer view
         // reads, kept from pass to pass. Only the slots written since the
         // last pass are looked at again (83,000 slots a pass otherwise, 0.1 s
-        // at best); all of them every 16 passes, because a view of a
-        // released resource goes stale without a write, and a slot written
-        // before its memory had a host copy is only made then.
+        // at best), with a sixteenth of all of them in turn, because a view
+        // of a released resource goes stale without a write, and a slot
+        // written before its memory had a host copy is only made then.
         let (slots, mut kept) = host.buffers.begin_pass();
         let ranges = &mut kept.by_slot;
         // Whether the device was there before the pass: a view that removes
@@ -1556,7 +1588,9 @@ impl State {
         HEAP_BUFFER_PASSES.fetch_add(1, Ordering::Relaxed);
         HEAP_BUFFER_MICROS.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
         static LOGGED: AtomicU64 = AtomicU64::new(0);
-        // The first pass and every growth of the set by half.
+        // The first pass and every growth of the set by half. (After a
+        // heap's first pass, `slots` is a pass's share: those written since
+        // and a sixteenth of all.)
         let seen = LOGGED.load(Ordering::Relaxed);
         if u64::from(views) > seen + seen / 2 {
             LOGGED.store(u64::from(views), Ordering::Relaxed);
@@ -1750,6 +1784,9 @@ impl State {
         let now = crate::host::now_ms();
         let took = now.saturating_sub(PASSED.swap(now, Ordering::Relaxed)).max(1);
         let most = (4000 / took).clamp(16, 256);
+        // (a texture uploaded in part and found no further along: see
+        // `park_frames`)
+        let parked = most.max(park_frames());
         // What a table entry of a texture a shader samples says.
         let sampled = UsedResource {
             kind: ResourceType::Srv,
@@ -1796,6 +1833,12 @@ impl State {
                 let len = upload_bytes.unwrap_or(1);
                 let mapped = crate::texture::mapped_bytes(address as *const u8, len as usize);
                 phase(3, turn);
+                // More there than at the last look, with no notice between
+                // (a notice resets the looks).
+                let (was_mapped, looks) = host.texture_slot_seen(index);
+                if mapped > was_mapped && looks > 0 {
+                    HEAP_TEXTURES_UNANNOUNCED.fetch_add(1, Ordering::Relaxed);
+                }
                 if mapped == 0 {
                     HEAP_TEXTURES_AWAY.fetch_add(1, Ordering::Relaxed);
                     // Streamed out: what the slot showed is let go.
@@ -1804,9 +1847,9 @@ impl State {
                     continue;
                 }
                 if mapped < len {
-                    if mapped <= host.texture_slot_mapped(index) {
+                    if mapped <= was_mapped {
                         HEAP_TEXTURES_PARTLY[0].fetch_add(1, Ordering::Relaxed);
-                        host.texture_slot_later(index, write, frame, most);
+                        host.texture_slot_later(index, write, frame, parked);
                         continue;
                     }
                     if !crate::texture::committed(address as *const u8, 1) {

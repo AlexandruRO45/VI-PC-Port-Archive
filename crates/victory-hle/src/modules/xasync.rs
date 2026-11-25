@@ -803,15 +803,19 @@ pub fn pending_with(
                     // the block's address would leave a gap for a cancel
                     // and a new call between the two).
                     let block = block as *mut AsyncBlock;
-                    let Some(own) = own else { return };
-                    let (hr, len) = match &result {
-                        Ok(bytes) => (S_OK, bytes.len()),
-                        Err(hr) => (*hr, 0),
-                    };
-                    if let Ok(bytes) = result {
-                        state.lock().unwrap_or_else(|e| e.into_inner()).1 = bytes;
+                    if let Some(own) = own {
+                        let (hr, len) = match &result {
+                            Ok(bytes) => (S_OK, bytes.len()),
+                            Err(hr) => (*hr, 0),
+                        };
+                        if let Ok(bytes) = result {
+                            state.lock().unwrap_or_else(|e| e.into_inner()).1 = bytes;
+                        }
+                        complete_call(block, Some(&own), hr, len);
                     }
-                    complete_call(block, Some(&own), hr, len);
+                    // (the tests wait for this, not for a while)
+                    #[cfg(test)]
+                    tests::landed(block as usize);
                 });
             }
             // SAFETY: before cleanup, as above; the runtime checked the
@@ -1054,6 +1058,32 @@ mod tests {
     use super::*;
     use std::sync::atomic::AtomicU32;
 
+    /// Blocks whose `pending_with` thread has ended (completed its call or
+    /// left it), by address.
+    static LANDED: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+    static LANDING: Condvar = Condvar::new();
+
+    pub(super) fn landed(block: usize) {
+        lock(&LANDED).push(block);
+        LANDING.notify_all();
+    }
+
+    /// Waits until the `pending_with` thread of `block` has ended.
+    fn wait_landed(block: usize) {
+        let mut landed = lock(&LANDED);
+        loop {
+            if let Some(i) = landed.iter().position(|&b| b == block) {
+                landed.remove(i);
+                return;
+            }
+            let (next, timeout) = LANDING
+                .wait_timeout(landed, Duration::from_secs(10))
+                .unwrap_or_else(|e| e.into_inner());
+            assert!(!timeout.timed_out(), "the pending call's thread did not end");
+            landed = next;
+        }
+    }
+
     fn slot<F: Copy>(offset: usize) -> F {
         crate::modules::xgameruntime::method(&OBJECT, offset)
     }
@@ -1195,9 +1225,12 @@ mod tests {
             XAsyncBegin(&mut block, std::ptr::null_mut(), identity, std::ptr::null(), Some(idle)),
             S_OK
         );
+        // (a thread of an earlier test whose block sat at this address)
+        let at = std::ptr::addr_of_mut!(block) as usize;
+        lock(&LANDED).retain(|&b| b != at);
         go.send(()).unwrap();
         finished.recv().unwrap();
-        std::thread::sleep(Duration::from_millis(100));
+        wait_landed(at);
         assert_eq!(XAsyncGetStatus(&mut block, false), E_PENDING);
         XAsyncCancel(&mut block);
         assert_eq!(XAsyncGetStatus(&mut block, false), E_ABORT);

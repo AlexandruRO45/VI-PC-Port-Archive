@@ -501,7 +501,7 @@ pub fn emit(
         }
         other => other,
     };
-    let original = original.map(|(shader, _)| shader);
+    let original = host_takes(original);
     // Retry unsupported programs only. Threading can separate an unknown
     // register value from its apparent use on a mutually exclusive path.
     if !matches!(original, Err(ShaderError::Unsupported { .. })) {
@@ -515,7 +515,25 @@ pub fn emit(
     let st = structure::structure(&p)?;
     let io = io::raise(&p, native)?;
     let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
-    emit_program(c, native, &p, &st, &io, &res).map(|(shader, _)| shader)
+    host_takes(emit_program(c, native, &p, &st, &io, &res))
+}
+
+/// Why a console wave64 program that still needs 64-lane waves is refused on a host whose
+/// waves are 32 lanes ([`host_takes`]).
+const NEEDS_64_LANES: &str = "a console wave64 program that still needs 64-lane waves (this host's are 32)";
+
+/// The shader of a translation the host can take. One that declares `WaveSize(64)` on a host
+/// whose waves are at most 32 lanes (NVIDIA, Intel) is refused here, with the reason: the
+/// runtime's `CreateComputePipelineState` refuses it with E_INVALIDARG and none, on every
+/// run (the shader cache kept it), and the constant-edge retry never saw it.
+fn host_takes(r: Result<(HostShader, Option<u32>), ShaderError>) -> Result<HostShader, ShaderError> {
+    match r {
+        Ok((_, Some(64))) if host_uses_wave32() => Err(ShaderError::Unsupported {
+            offset: 0,
+            what: NEEDS_64_LANES,
+        }),
+        other => other.map(|(shader, _)| shader),
+    }
 }
 
 /// `p` (a console wave64 compute program on a host of 32-lane waves) with the per-lane
@@ -860,6 +878,41 @@ mod tests {
         assert_eq!(parse_shader_opt(Some("0x1")), 1);
         assert_eq!(parse_shader_opt(Some("0xffffffff")), all);
         assert_eq!(parse_shader_opt(Some("on")), all);
+    }
+
+    /// A translation that still declares `WaveSize(64)` is refused on a host whose waves are 32
+    /// lanes, with the reason, not handed over for `CreateComputePipelineState` to refuse
+    /// without one; on a host of 64-lane waves, and for any other wave size, it goes through.
+    #[test]
+    fn a_translation_that_still_needs_64_lanes_is_refused_on_a_32_lane_host() {
+        let shader = HostShader {
+            stage: HwStage::Cs,
+            dxil: vec![1, 2, 3],
+            user_data: Vec::new(),
+            samplers: Vec::new(),
+            static_samplers: Vec::new(),
+            root_cbvs: Vec::new(),
+            root_srvs: Vec::new(),
+            root_uavs: Vec::new(),
+            root_indexed_views: Vec::new(),
+        };
+        let on = |lanes: u32, wave: Option<u32>| {
+            let was = lower::TEST_HOST_WAVE.replace(Some(lanes));
+            let r = host_takes(Ok((shader.clone(), wave)));
+            lower::TEST_HOST_WAVE.set(was);
+            r
+        };
+        assert!(
+            matches!(on(32, Some(64)), Err(ShaderError::Unsupported { what, .. }) if what == NEEDS_64_LANES)
+        );
+        assert_eq!(on(64, Some(64)).unwrap().dxil, vec![1, 2, 3]);
+        for wave in [None, Some(32)] {
+            assert_eq!(on(32, wave).unwrap().dxil, vec![1, 2, 3], "{wave:?}");
+        }
+        let was = lower::TEST_HOST_WAVE.replace(Some(32));
+        let failed = host_takes(Err(ShaderError::Malformed("no DXIL part")));
+        lower::TEST_HOST_WAVE.set(was);
+        assert!(matches!(failed, Err(ShaderError::Malformed(_))));
     }
 
     #[test]

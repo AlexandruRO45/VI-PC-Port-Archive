@@ -3426,6 +3426,24 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn a_depth_planes_twin_is_drawn_into_the_plane() {
+        depth_plane_from_twin(false);
+    }
+
+    /// The same in the list that wrote the twin, as the title's tiled
+    /// lighting does it: the plane is drawn before the class draws bind the
+    /// depth texture (`twin_use_now`), once, not when the list closes,
+    /// after them (the class draws then tested the classes of the frame
+    /// before).
+    #[cfg(windows)]
+    #[test]
+    fn a_depth_planes_twin_is_drawn_before_a_draw_tests_the_plane() {
+        depth_plane_from_twin(true);
+    }
+
+    /// With `now`, the twin is written and the class draws are recorded in
+    /// one list, the plane's pass between them.
+    #[cfg(windows)]
+    fn depth_plane_from_twin(now: bool) {
         use std::sync::atomic::Ordering::Relaxed;
         use windows::Win32::Foundation::RECT;
         use windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY;
@@ -3601,12 +3619,18 @@ mod tests {
         host.execute(&[&fill]);
 
         // A list in which a shader writes the twins: closing it draws the
-        // depth plane's twin into the plane.
+        // depth plane's twin into the plane; with `now`, the depth target's
+        // bind for the class draws below does, once.
         let list = host.new_list().unwrap();
         assert!(list.twin_use(depth, true, true));
         list.twins_written();
-        list.close();
-        host.execute(&[&list]);
+        if now {
+            assert!(list.twin_use_now(depth));
+            assert!(!list.twin_use_now(depth), "the pass once");
+        } else {
+            list.close();
+            host.execute(&[&list]);
+        }
 
         // The draws: a triangle over the target at the depth of a class,
         // as the title's lighting places its rectangles.
@@ -3678,11 +3702,12 @@ float4 lit() : SV_Target { return 1.0; }
                 ..Default::default()
             }),
         );
-        let back = host.new_list().unwrap();
+        // (with `now`, the list's own moves left the depth texture tested)
+        let back = if now { list } else { host.new_list().unwrap() };
         // SAFETY: an open list and live resources and views.
         unsafe {
             let l = &back.list;
-            if state != tested {
+            if !now && state != tested {
                 l.ResourceBarrier(&[moved(host_depth, state, tested)]);
             }
             l.ClearRenderTargetView(colour, &[0.0; 4], None);

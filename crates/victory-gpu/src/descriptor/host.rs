@@ -17,6 +17,8 @@ use crate::host::host;
 
 pub(crate) struct BufferRanges<T> {
     passes: u64,
+    /// Where the next pass's share of all slots starts (a title slot).
+    cursor: u32,
     pub(crate) by_slot: std::collections::HashMap<u32, (T, u64, u64)>,
 }
 
@@ -35,6 +37,7 @@ impl<T> BufferViews<T> {
             changed: Mutex::default(),
             ranges: Mutex::new(BufferRanges {
                 passes: 0,
+                cursor: 0,
                 by_slot: Default::default(),
             }),
         }
@@ -55,19 +58,36 @@ impl<T> BufferViews<T> {
 
     pub(crate) fn begin_pass(&self) -> (Vec<u32>, std::sync::MutexGuard<'_, BufferRanges<T>>) {
         let mut kept = self.ranges.lock().unwrap_or_else(|e| e.into_inner());
+        // Its own statement: `written` locks `slots`, then `changed`.
         let changed = std::mem::take(&mut *self.changed.lock().unwrap_or_else(|e| e.into_inner()));
-        // A view may go stale without a write. Revisit all slots in a
-        // fresh heap and every 16 passes thereafter.
-        let slots = if kept.passes.is_multiple_of(16) {
+        // A view may go stale without a write. All slots are revisited in a
+        // fresh heap; after that, each pass revisits the next sixteenth of
+        // them in turn (each slot about every 16 passes; a little later
+        // while slots are added ahead of the turn), with the slots written
+        // since. It was all of them every 16th pass: 70,000 slots, some
+        // 73 ms of one frame in 16 on the thread recording the title's list,
+        // where the others took under 2 ms. The entries the pass keeps stay:
+        // it drops each slot's own before making it again.
+        let all = self.slots.lock().unwrap_or_else(|e| e.into_inner());
+        let slots = if kept.passes == 0 {
             kept.by_slot.clear();
-            self.slots
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .iter()
-                .copied()
-                .collect()
+            all.iter().copied().collect()
         } else {
-            changed.into_iter().collect()
+            let cursor = kept.cursor;
+            let mut slots: Vec<u32> = all
+                .range(cursor..)
+                .chain(all.range(..cursor))
+                .take(all.len().div_ceil(16))
+                .copied()
+                .collect();
+            drop(all);
+            if let Some(&last) = slots.last() {
+                kept.cursor = last.wrapping_add(1);
+            }
+            slots.extend(changed);
+            slots.sort_unstable();
+            slots.dedup();
+            slots
         };
         kept.passes = kept.passes.wrapping_add(1);
         (slots, kept)
@@ -654,9 +674,24 @@ impl TextureQueue {
     }
 
     /// Bytes of slot `index`'s memory that were mapped at its last upload
-    /// (0: not uploaded, or all of it was).
-    fn mapped(&self, index: u32) -> u64 {
-        self.slots.get(&index).map_or(0, |w| w.mapped)
+    /// (0: not uploaded, or all of it was), and the looks in a row that
+    /// found nothing to upload.
+    fn seen(&self, index: u32) -> (u64, u8) {
+        self.slots.get(&index).map_or((0, 0), |w| (w.mapped, w.looks))
+    }
+
+    /// Notices of the runtime were dropped ([`remapped`]): the slots that
+    /// wait on looks are due from frame `at`, as a notice would have made
+    /// them (with `crate::draw::park_frames`, they could otherwise wait that
+    /// long for memory that arrived). Fresh writes and table slots in their
+    /// grace stay as they are.
+    fn looked_due(&mut self, at: u64) {
+        for w in self.slots.values_mut() {
+            if w.looks > 0 || w.mapped > 0 {
+                w.due = w.due.min(at);
+                w.looks = 0;
+            }
+        }
     }
 }
 
@@ -1095,9 +1130,10 @@ impl HostHeap {
     }
 
     /// Bytes of title slot `index`'s memory that were mapped when it was
-    /// last uploaded in part (0: not uploaded, or whole).
-    pub(crate) fn texture_slot_mapped(&self, index: u32) -> u64 {
-        self.textures.lock().unwrap_or_else(|e| e.into_inner()).mapped(index)
+    /// last uploaded in part (0: not uploaded, or whole), and the looks in a
+    /// row at it that found nothing to upload (0 after a write or a notice).
+    pub(crate) fn texture_slot_seen(&self, index: u32) -> (u64, u8) {
+        self.textures.lock().unwrap_or_else(|e| e.into_inner()).seen(index)
     }
 
     /// Takes the ranges of title memory the runtime mapped, unmapped or
@@ -1112,6 +1148,13 @@ impl HostHeap {
     /// whose pass runs first takes them (a title has one view heap).
     pub(crate) fn texture_slots_remapped(&self, frame: u64) -> usize {
         use std::sync::atomic::Ordering::Relaxed;
+        // Notices dropped since the last pass (the kept ranges were full):
+        // with textures parked, what waits on looks is looked at again.
+        static SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let dropped = STALE[2].load(Relaxed);
+        if crate::draw::park_frames() > 0 && SEEN.swap(dropped, Relaxed) != dropped {
+            self.textures.lock().unwrap_or_else(|e| e.into_inner()).looked_due(frame + 1);
+        }
         let ranges = std::mem::take(&mut *REMAPPED.lock().unwrap_or_else(|e| e.into_inner()));
         if ranges.is_empty() {
             return 0;
@@ -2591,14 +2634,20 @@ mod tests {
         let weak = Arc::downgrade(&shadow);
         pass.by_slot.insert(7, (shadow, 16, 48));
         drop(pass);
-        for _ in 1..16 {
+        // After the first pass, the slots written since and a sixteenth of
+        // all in turn: each slot again within 16 passes. The pass's entries
+        // stay until a pass revisits their slot (it drops each before making
+        // it again).
+        let mut seen = std::collections::BTreeSet::new();
+        for _ in 1..=16 {
             views.written(3, true);
-            assert_eq!(views.begin_pass().0, [3]);
-            assert!(weak.upgrade().is_some());
+            let (slots, _pass) = views.begin_pass();
+            assert!(slots.contains(&3));
+            seen.extend(slots);
         }
-        let (slots, mut pass) = views.begin_pass();
-        assert_eq!(slots, [3, 7]);
-        assert!(weak.upgrade().is_none());
+        assert_eq!(seen, std::collections::BTreeSet::from([3, 7]));
+        assert!(weak.upgrade().is_some());
+        let (_, mut pass) = views.begin_pass();
 
         let shadow = Arc::new(());
         let weak = Arc::downgrade(&shadow);
@@ -2831,20 +2880,20 @@ mod tests {
         // Uploaded with part of its memory there: kept, with what was there.
         let w16 = write(&q, 16);
         q.partly(16, w16, 12, 4096);
-        assert_eq!(q.mapped(16), 4096);
+        assert_eq!(q.seen(16), (4096, 0));
         assert_eq!(q.due(12, 100).0[0].0, 16);
         // The title writes slot 16 again while the pass works on it: what
         // the pass then says about the old write changes nothing.
         q.written(16, 13, 0, false);
         q.done(16, w16);
         q.later(16, w16, 13, 4);
-        assert_eq!(q.mapped(16), 0);
+        assert_eq!(q.seen(16).0, 0);
         assert_eq!(q.due(13, 100).0[0].0, 16);
         // A draw that makes the host slot (`seen`) keeps what the queue knows,
         let w15 = write(&q, 15);
         q.partly(15, w15, 20, 8192);
         q.written(15, 14, 0, true);
-        assert_eq!(q.mapped(15), 8192);
+        assert_eq!(q.seen(15).0, 8192);
         // and queues a slot the queue did not hold.
         q.written(99, 14, 0, true);
         assert!(q.due(14, 100).0.iter().any(|d| d.0 == 99));
@@ -2852,6 +2901,35 @@ mod tests {
         q.written(98, 14, 16, false);
         assert!(!q.due(15, 100).0.iter().any(|d| d.0 == 98));
         assert!(q.due(16, 100).0.iter().any(|d| d.0 == 98));
+    }
+
+    /// Dropped notices make the slots that wait on looks due at once (a
+    /// texture looked at in vain, one uploaded in part), and leave fresh
+    /// writes and table slots in their grace as they are.
+    #[test]
+    fn dropped_notices_make_the_slots_waiting_on_looks_due() {
+        let mut q = TextureQueue::default();
+        let write = |q: &TextureQueue, index: u32| {
+            q.due(u64::MAX, 100).0.into_iter().find(|d| d.0 == index).unwrap().1
+        };
+        q.written(1, 0, 0, false);
+        q.written(2, 0, 0, false);
+        q.written(3, 0, 0, false);
+        q.written(4, 0, 500, false);
+        let (w2, w3) = (write(&q, 2), write(&q, 3));
+        // Slot 2 looked at in vain, twice; slot 3 uploaded in part.
+        q.later(2, w2, 0, 1024);
+        q.later(2, w2, 1, 1024);
+        assert_eq!(q.seen(2), (0, 2));
+        q.partly(3, w3, 900, 4096);
+        q.looked_due(10);
+        let due: Vec<u32> = q.due(10, 100).0.into_iter().map(|d| d.0).collect();
+        assert!(due.contains(&2) && due.contains(&3), "{due:?}");
+        assert_eq!(q.seen(2), (0, 0));
+        assert_eq!(q.seen(3), (4096, 0));
+        // The fresh write is due as it was, the table slot not before its frame.
+        assert!(due.contains(&1));
+        assert!(!due.contains(&4));
     }
 
     #[test]
