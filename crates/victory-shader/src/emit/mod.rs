@@ -204,6 +204,24 @@ pub const VIEW_SLOTS: u32 = 2_294_784;
 /// such views stay below.
 pub const OWN_SLOTS: u32 = VIEW_SLOTS - 1024;
 
+/// The dword of the runtime stride table the heap-slot remap starts at:
+/// one u32 per title slot, the host slot a capped heap mirrors it into.
+pub const REMAP_AT: u32 = VIEW_SLOTS;
+
+/// Whether the host's view heap is smaller than the title's indices: then
+/// every heap handle goes through the remap table (a host past the cap
+/// drops the slots, and the world's bindless reads of them fault the GPU).
+static HEAP_CAPPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The host heap could not take every title slot (see [`REMAP_AT`]).
+pub fn set_heap_capped(capped: bool) {
+    HEAP_CAPPED.store(capped, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether translated shaders must remap heap indices (see [`REMAP_AT`]).
+pub fn heap_capped() -> bool {
+    HEAP_CAPPED.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 /// Whether heap indices are kept below [`VIEW_SLOTS`]: skinning programs
 /// take them from title data, and one past the heap stops the host GPU.

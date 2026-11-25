@@ -26,6 +26,10 @@ pub(crate) struct HostHeap {
     /// Dynamic slots past the title's: [`DYNAMIC`] in a view heap,
     /// [`SAMPLER_DYNAMIC`] in a capped sampler heap, none in another.
     spare: u32,
+    /// First persistent remap slot (`u32::MAX`: the heap is not capped).
+    remap_first: u32,
+    remap_used: std::sync::atomic::AtomicU32,
+    remap_map: Mutex<HashMap<u32, u32>>,
     sampler: bool,
     /// The record (view index and generation) each slot was last made from.
     made: Mutex<Vec<u64>>,
@@ -75,11 +79,25 @@ struct StrideTable {
     len: u32,
 }
 
+/// The newest view heap's stride table GPU address: a dispatch may run with
+/// no descriptor heap bound, and the remap load still needs the table.
+static LAST_STRIDE_GPU: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn last_stride_gpu() -> u64 {
+    LAST_STRIDE_GPU.load(Ordering::Relaxed)
+}
+
 impl StrideTable {
     /// The element counts follow the strides, from [`COUNTS_AT`] dwords on
     /// (where shaders, which know no heap's size, look for them).
-    fn new(device: &ID3D12Device, len: u32) -> Option<Self> {
-        let bytes = ((u64::from(COUNTS_AT) + u64::from(len)) * 4).max(4);
+    fn new(device: &ID3D12Device, len: u32, remap: bool) -> Option<Self> {
+        let bytes = if remap {
+            (u64::from(victory_shader::emit::REMAP_AT)
+                + u64::from(victory_shader::emit::VIEW_SLOTS))
+                * 4
+        } else {
+            ((u64::from(COUNTS_AT) + u64::from(len)) * 4).max(4)
+        };
         let desc = D3D12_RESOURCE_DESC {
             Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
             Width: bytes,
@@ -525,6 +543,10 @@ const DYNAMIC: u32 = 1 << 20;
 /// [`PORTABLE_VIEWS`].
 const DYNAMIC_CAPPED: u32 = 1 << 16;
 
+/// Persistent slots a capped heap mirrors past-the-cap title slots into
+/// (the remap table names them; they are never released with a list).
+const REMAP_RESERVE: u32 = 1 << 19;
+
 /// The host's limit for shader-visible sampler heaps, on every binding
 /// tier.
 const SAMPLERS: u32 = D3D12_MAX_SHADER_VISIBLE_SAMPLER_HEAP_SIZE;
@@ -685,7 +707,16 @@ impl HostHeap {
                 SAMPLER_DYNAMIC,
             ));
         }
-        let extra = if sampler { 0 } else { DYNAMIC };
+        let extra = if sampler {
+            0
+        } else if std::env::var_os("VICTORY_HEAP_FULL").is_some_and(|v| v == "1") {
+            // Probe: a host that takes the whole title heap needs no dynamic
+            // reserve; slots past a capped heap are dropped today, and the
+            // world's bindless reads of them fault the GPU.
+            0
+        } else {
+            DYNAMIC
+        };
         let wanted = count;
         let (heap, count, extra) = match make(count + extra) {
             Ok(heap) => (heap, count, extra),
@@ -701,7 +732,7 @@ impl HostHeap {
                 );
                 (
                     make(PORTABLE_VIEWS - crate::memory::SLOTS).ok()?,
-                    PORTABLE_VIEWS - DYNAMIC_CAPPED - crate::memory::SLOTS,
+                    PORTABLE_VIEWS - DYNAMIC_CAPPED - REMAP_RESERVE - crate::memory::SLOTS,
                     DYNAMIC_CAPPED,
                 )
             }
@@ -733,17 +764,34 @@ impl HostHeap {
         tracing::info!(count, extra, sampler, "host descriptor heap");
         // SAFETY: a live shader-visible heap.
         let gpu = unsafe { heap.GetGPUDescriptorHandleForHeapStart().ptr };
+        // SAFETY: a plain call on a live heap.
+        let total = unsafe { heap.GetDesc() }.NumDescriptors;
+        // A heap shorter than the shaders' indices mirrors the past-the-cap
+        // title slots into a persistent reserve after the memory views.
+        let remap_first = if !sampler && total < victory_shader::emit::VIEW_SLOTS {
+            count + extra + crate::memory::SLOTS
+        } else {
+            u32::MAX
+        };
+        let slots = if remap_first == u32::MAX {
+            count + extra
+        } else {
+            remap_first + REMAP_RESERVE
+        };
         GPU_RANGES.lock().unwrap_or_else(|e| e.into_inner()).push((
             gpu,
-            u64::from(count + extra) * u64::from(step),
+            u64::from(slots) * u64::from(step),
             u64::from(step),
             sampler,
         ));
         let strides = if sampler {
             None
         } else {
-            StrideTable::new(&host.device, count + extra)
+            StrideTable::new(&host.device, slots, remap_first != u32::MAX)
         };
+        if let Some(t) = &strides {
+            LAST_STRIDE_GPU.store(t.gpu, Ordering::Relaxed);
+        }
         let h = HostHeap {
             heap,
             cpu,
@@ -751,11 +799,14 @@ impl HostHeap {
             count,
             spare: extra,
             sampler,
-            made: Mutex::new(vec![0; count as usize]),
-            kept: Mutex::new(vec![None; (count + extra) as usize]),
+            made: Mutex::new(vec![0; slots as usize]),
+            kept: Mutex::new(vec![None; slots as usize]),
             kept_textures: Mutex::default(),
             next: Mutex::new((0, vec![false; extra as usize], usize::MAX)),
             strides,
+            remap_first,
+            remap_used: std::sync::atomic::AtomicU32::new(0),
+            remap_map: Mutex::default(),
             bindless: Mutex::default(),
             recording: std::sync::atomic::AtomicBool::new(false),
             record_hint: std::sync::atomic::AtomicBool::new(false),
@@ -764,13 +815,29 @@ impl HostHeap {
             rewrites_seen: AtomicU64::new(0),
             memory_seen: Mutex::new(0),
         };
+        if remap_first != u32::MAX {
+            victory_shader::emit::set_heap_capped(true);
+            if let Some(t) = &h.strides {
+                // SAFETY: the persistent map of the stride table, its remap
+                // region sized VIEW_SLOTS dwords.
+                unsafe {
+                    let base = (t.ptr as *mut u32).add(victory_shader::emit::REMAP_AT as usize);
+                    std::ptr::write_bytes(
+                        base.cast::<u8>(),
+                        0xFF,
+                        victory_shader::emit::VIEW_SLOTS as usize * 4,
+                    );
+                    for i in 0..remap_first {
+                        base.add(i as usize).write(i);
+                    }
+                }
+            }
+        }
         // A slot never written is undefined: shaders reading one (a slot
         // the title wrote in a way we do not know, or a table entry no
         // used-resource entry names) read a wild address. Every slot starts
         // null instead.
         let started = std::time::Instant::now();
-        // SAFETY: a plain call on a live heap.
-        let total = unsafe { h.heap.GetDesc() }.NumDescriptors;
         if !sampler && total < victory_shader::emit::VIEW_SLOTS {
             tracing::warn!(total, "a view heap shorter than shaders keep their indices in");
         }
@@ -1150,7 +1217,39 @@ impl HostHeap {
     /// views are made only for draws (`for_draw`), which also copy their
     /// data: a host copy of a buffer is made on first use.
     pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<View> {
-        if index >= self.count {
+        if index >= self.count && index < self.remap_first {
+            // Past the capped heap: mirror into a persistent reserve slot
+            // the remap table names, so the shader's index still resolves.
+            let slot = {
+                let mut map = self.remap_map.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(&p) = map.get(&index) {
+                    p
+                } else {
+                    let n = self.remap_used.fetch_add(1, Ordering::Relaxed);
+                    if n >= REMAP_RESERVE {
+                        static ONCE: std::sync::Once = std::sync::Once::new();
+                        ONCE.call_once(|| {
+                            tracing::warn!(index, "the remap reserve is full");
+                        });
+                        return None;
+                    }
+                    let p = self.remap_first + n;
+                    map.insert(index, p);
+                    if let Some(t) = &self.strides {
+                        // SAFETY: the persistent map, remap region sized
+                        // VIEW_SLOTS dwords, index below VIEW_SLOTS.
+                        unsafe {
+                            (t.ptr as *mut u32)
+                                .add(victory_shader::emit::REMAP_AT as usize + index as usize)
+                                .write(p);
+                        }
+                    }
+                    p
+                }
+            };
+            return self.mirror(slot, handle, for_draw);
+        }
+        if index >= self.count && self.remap_first == u32::MAX {
             // Diagnostic (NVIDIA heap cap): the highest title slot past the
             // host heap seen so far.
             static HIGHEST: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -3033,14 +3132,18 @@ fn null_like(words: &[u32; 10], at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 /// page faults (2026-11-24, run w10), so they are not the cause.
 fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     let Some(host) = host() else { return };
+    // A raw buffer null: bindless buffer loads on a never-written slot must
+    // read zero, not fault; a texture null read as a buffer faults the GPU.
     let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
-        Format: DXGI_FORMAT_R8G8B8A8_UNORM,
-        ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+        Format: DXGI_FORMAT_R32_UINT,
+        ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
         Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
         Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
-            Texture2D: D3D12_TEX2D_SRV {
-                MipLevels: 1,
-                ..Default::default()
+            Buffer: D3D12_BUFFER_SRV {
+                FirstElement: 0,
+                NumElements: 1,
+                StructureByteStride: 0,
+                Flags: D3D12_BUFFER_SRV_FLAG_RAW,
             },
         },
     };

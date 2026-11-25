@@ -2,7 +2,7 @@
 //! the `dx.op` declarations it calls, its signatures and bound resources,
 //! and the metadata and container that wrap it up (SM 6.6, validator 1.6).
 
-use super::bitcode::{Attr, Md, Module, Ty, V};
+use super::bitcode::{Attr, Bin, Cast, Md, Module, Ty, V, pred};
 use super::container::{self, Binding, Psv, SigElement};
 
 /// Where the shader reads its user data: `b0` in this space.
@@ -427,6 +427,36 @@ impl Shader {
             flags::SAMPLER_HEAP
         } else {
             flags::RESOURCE_HEAP
+        };
+        // A capped host heap mirrors the title's past-the-cap slots into a
+        // reserve; the remap table (one u32 per title slot, after the
+        // strides and counts) says where. An unmapped slot reads the null
+        // slot 0 instead of a wild address that resets the GPU.
+        let index = if !sampler && super::heap_capped() {
+            let table = self.stride_table_handle();
+            let two = self.m.i32(2);
+            let base = self.m.i32(super::REMAP_AT * 4);
+            let zero = self.m.i32(0);
+            let at = self.m.bin(block, Bin::Shl, index, two);
+            let at = self.m.bin(block, Bin::Add, at, base);
+            let u = self.m.undef(self.t.i32);
+            let mask = self.m.i8(3);
+            let align = self.m.i32(4);
+            let r = self.op(
+                block,
+                "rawBufferLoad.f32",
+                Attr::ReadOnly,
+                self.t.res_ret,
+                139,
+                &[table, at, u, mask, align],
+            );
+            let v = self.m.extract(block, r, 0);
+            let v = self.m.cast(block, Cast::Bitcast, v, self.t.i32);
+            let invalid = self.m.i32(0xFFFF_FFFF);
+            let ok = self.m.cmp(block, pred::NE, v, invalid);
+            self.m.select(block, ok, v, zero)
+        } else {
+            index
         };
         self.nonuniform_handles += u32::from(nonuniform);
         let (s, n) = (self.m.bool(sampler), self.m.bool(nonuniform));
