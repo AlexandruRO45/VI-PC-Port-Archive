@@ -2356,12 +2356,6 @@ void main(uint3 id : SV_DispatchThreadID) {
         let Some(host) = crate::host::host() else {
             return; // no host GPU here
         };
-        if !host.device10() {
-            // Without ID3D12Device10 there is no castable format list, so even
-            // a pair that could share gets two textures: nothing to check.
-            eprintln!("no ID3D12Device10 (no castable formats on this runtime); skipped");
-            return;
-        }
         let slots = Slots::new(4);
         let read = compile_cs(READ);
         let (out, data) = host.shared_buffer(64 * 64 * 16).unwrap();
