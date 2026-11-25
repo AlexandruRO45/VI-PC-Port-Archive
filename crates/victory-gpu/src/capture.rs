@@ -55,9 +55,16 @@ pub(crate) fn presented(n: u64) {
     }
 }
 
+/// Use only the explicitly listed world/absolute frame(s) and avoid the
+/// extra all-run readbacks made by the broader diagnostics mode.
+pub(crate) fn listed_only() -> bool {
+    static ONLY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ONLY.get_or_init(|| std::env::var_os("VICTORY_CAPTURE_LISTED_ONLY").is_some_and(|s| s == "1"))
+}
+
 /// Whether frame `n` is saved.
 pub(crate) fn wanted(n: u64) -> bool {
-    folder().is_some() && (n.is_power_of_two() || listed(n))
+    folder().is_some() && (listed(n) || (!listed_only() && n.is_power_of_two()))
 }
 
 /// Saves 8-bit RGBA or BGRA rows (`pitch` bytes apart) as frame `n`.
@@ -532,20 +539,21 @@ pub(crate) fn dump_submission(sub: u64, targets: &[(usize, String)]) {
 /// `VICTORY_PEEK=<address>[:<bytes>],...` (hex addresses, 16 bytes by
 /// default): those bytes of title memory, as dwords and floats, after each
 /// submission of a listed frame.
+fn peek_ranges(var: &str) -> Vec<(u64, usize)> {
+    std::env::var(var)
+        .unwrap_or_default()
+        .split(',')
+        .filter_map(|e| {
+            let (a, n) = e.split_once(':').unwrap_or((e, "16"));
+            let a = u64::from_str_radix(a.trim().trim_start_matches("0x"), 16).ok()?;
+            Some((a, n.trim().parse().ok()?))
+        })
+        .collect()
+}
+
 fn peek(when: &str) {
     static LIST: std::sync::OnceLock<Vec<(u64, usize)>> = std::sync::OnceLock::new();
-    let list = LIST.get_or_init(|| {
-        std::env::var("VICTORY_PEEK")
-            .unwrap_or_default()
-            .split(',')
-            .filter_map(|e| {
-                let (a, n) = e.split_once(':').unwrap_or((e, "16"));
-                let a = u64::from_str_radix(a.trim().trim_start_matches("0x"), 16).ok()?;
-                Some((a, n.trim().parse().ok()?))
-            })
-            .collect()
-    });
-    for &(at, len) in list {
+    for &(at, len) in LIST.get_or_init(|| peek_ranges("VICTORY_PEEK")) {
         let mut bytes = vec![0u8; len.min(256)];
         if !crate::host::read_into(at as *const u8, &mut bytes) {
             continue;
@@ -561,6 +569,39 @@ fn peek(when: &str) {
     }
 }
 
+/// Optional shadow probes around the exact same refresh in a listed frame.
+/// Title VAs are per run. Only inspect an existing copy; never materialize one.
+pub(crate) fn shadow_peek(shadow: &crate::shadow::Shadow, from: usize, to: usize, phase: &str) {
+    static LIST: std::sync::OnceLock<Vec<(u64, usize)>> = std::sync::OnceLock::new();
+    let ranges = LIST.get_or_init(|| peek_ranges("VICTORY_PEEK_SHADOW"));
+    if ranges.is_empty() {
+        return;
+    }
+    let frame = crate::queue::presented() + 1;
+    if !listed(frame) {
+        return;
+    }
+    let (start, len) = shadow.range();
+    let end = start.saturating_add(len);
+    for &(at, n) in ranges {
+        let bytes = n.min(64) & !3;
+        if bytes == 0
+            || at < start.max(from as u64)
+            || !(at - start).is_multiple_of(4)
+            || at.checked_add(bytes as u64).is_none_or(|last| last > end.min(to as u64))
+        {
+            continue;
+        }
+        let mut title = [0; 64];
+        let readable = crate::host::read_into(at as *const u8, &mut title[..bytes]);
+        tracing::info!(target: "victory_gpu::trace", frame, phase,
+            shadow = ?std::ptr::from_ref(shadow), va = format_args!("{at:#x}"),
+            refresh_from = format_args!("{from:#x}"), refresh_to = format_args!("{to:#x}"),
+            ?readable, title = ?readable.then_some(&title[..bytes]), host = %shadow.peek(at, bytes as u64),
+            "shadow refresh probe");
+    }
+}
+
 /// In a listed frame: copies an indirect execution's records (`args`:
 /// buffer, offset; in the indirect-argument state) and its count (in the
 /// unordered-access state unless in the same buffer) to readback memory,
@@ -573,6 +614,9 @@ pub(crate) fn read_indirect(
     (kind, stride, max): (u32, u32, u32),
     name: String,
 ) {
+    if listed_only() && !listed(crate::queue::presented() + 1) {
+        return;
+    }
     struct Readback(ID3D12Resource);
     // SAFETY: D3D12 objects are free-threaded.
     unsafe impl Send for Readback {}

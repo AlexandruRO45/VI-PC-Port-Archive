@@ -1551,25 +1551,29 @@ impl HostList {
 
     #[cfg(feature = "diagnostics")]
     fn note(&self, what: impl FnOnce() -> String, range: Option<(u64, u64)>) {
-        if dred_on() {
-            let at = self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32;
-            if let Some((heap, _)) = self.stamps() && at < STAMPS - 1 {
-                // SAFETY: an open list and our query heap.
-                unsafe { self.list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, at) };
+        if !dred_on() {
+            if crate::capture::listed_only() && crate::capture::listed(crate::queue::presented() + 1) {
+                self.notes.lock().unwrap_or_else(|e| e.into_inner()).push((what(), range));
             }
-            let what = what();
-            traced(&what);
-            let text: Vec<u16> = what.encode_utf16().chain([0]).collect();
-            const UNICODE: u32 = 0;
-            // SAFETY: an open list; the marker is copied when recorded.
-            unsafe {
-                self.list.SetMarker(UNICODE, Some(text.as_ptr().cast()), 2 * text.len() as u32)
-            };
-            self.notes
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .push((what, range));
+            return;
         }
+        let at = self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32;
+        if let Some((heap, _)) = self.stamps() && at < STAMPS - 1 {
+            // SAFETY: an open list and our query heap.
+            unsafe { self.list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, at) };
+        }
+        let what = what();
+        traced(&what);
+        let text: Vec<u16> = what.encode_utf16().chain([0]).collect();
+        const UNICODE: u32 = 0;
+        // SAFETY: an open list; the marker is copied when recorded.
+        unsafe {
+            self.list.SetMarker(UNICODE, Some(text.as_ptr().cast()), 2 * text.len() as u32)
+        };
+        self.notes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((what, range));
     }
 
     /// Notes a texture the list renders to or writes, in a listed frame.
@@ -2009,9 +2013,13 @@ impl Batch {
         self.pending.clear();
         let mut total = 0;
         for (shadow, from, to) in self.refreshes.drain(..) {
+            #[cfg(feature = "diagnostics")]
+            crate::capture::shadow_peek(&shadow, from, to, "before");
             let started = std::time::Instant::now();
             let copied = shadow.update(from, to - from);
             let us = started.elapsed().as_micros() as u64;
+            #[cfg(feature = "diagnostics")]
+            crate::capture::shadow_peek(&shadow, from, to, "after");
             #[cfg(feature = "diagnostics")]
             crate::copystat::range(from, to - from, us, 0);
             PREPARING[0].fetch_add(us, Ordering::Relaxed);
