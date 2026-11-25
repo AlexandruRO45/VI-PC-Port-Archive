@@ -430,27 +430,38 @@ impl Drop for Tracked {
                 }
             }
         }
-        for page in free {
-            let watched_elsewhere = g.alias_of.get(&page).is_some_and(|o| o.iter().any(|p| g.holders.contains_key(p)));
-            if !watched_elsewhere {
-                open(&mut g, page);
-            }
-        }
+        let open: Vec<usize> = free
+            .into_iter()
+            .filter(|&page| !g.alias_of.get(&page).is_some_and(|o| o.iter().any(|p| g.holders.contains_key(p))))
+            .collect();
+        open_runs(&mut g, &open);
     }
 }
 
-/// Gives write access back to page `page` if we guarded it.
-fn open(g: &mut Guards, page: usize) -> bool {
+/// Gives write access back to `pages` if we guarded them, in runs: the
+/// kernel is asked once for a run of consecutive pages, not once a page
+/// (a world frame opens tens of thousands of pages: `copystat`, "pages
+/// opened", and each call was a `VirtualProtect`).
+fn open_runs(g: &mut Guards, pages: &[usize]) {
     use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
-    if !g.protected.remove(&page) {
-        return false;
+    let mut i = 0;
+    while i < pages.len() {
+        let first = pages[i];
+        i += 1;
+        if !g.protected.remove(&first) {
+            continue;
+        }
+        let mut last = first + 1;
+        while i < pages.len() && pages[i] == last && g.protected.remove(&last) {
+            last += 1;
+            i += 1;
+        }
+        let mut old = 0;
+        // SAFETY: a block we made read-only (failing harmlessly if it is gone).
+        unsafe { VirtualProtect((first * PAGE) as *const _, (last - first) * PAGE, PAGE_READWRITE, &mut old) };
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::OpenPages, (last - first) as u64);
     }
-    let mut old = 0;
-    // SAFETY: a block we made read-only (failing harmlessly if it is gone).
-    unsafe { VirtualProtect((page * PAGE) as *const _, PAGE, PAGE_READWRITE, &mut old) };
-    #[cfg(feature = "diagnostics")]
-    crate::copystat::add(crate::copystat::C::OpenPages, 1);
-    true
 }
 
 impl Tracked {
@@ -736,9 +747,7 @@ fn changed(g: &mut Guards, first: usize, last: usize, save: bool) -> bool {
 /// Gives write access back to the pages of `[first, last)` we guarded.
 fn open_guarded(g: &mut Guards, first: usize, last: usize) {
     let guarded: Vec<usize> = g.protected.range(first..last).copied().collect();
-    for page in guarded {
-        open(g, page);
-    }
+    open_runs(g, &guarded);
 }
 
 /// Marks `[first, last)` changed in the trackers holding its pages. With
