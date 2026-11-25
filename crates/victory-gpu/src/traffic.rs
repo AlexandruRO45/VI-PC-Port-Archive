@@ -49,6 +49,10 @@ fn on() -> bool {
 }
 
 static SEEN: Mutex<Option<HashMap<(Kind, usize), Counts>>> = Mutex::new(None);
+/// The present frame number at the last report: the frame line's `frames` is
+/// the last second's, and dividing a five-second window by it read five times
+/// too high.
+static AT: AtomicU64 = AtomicU64::new(u64::MAX);
 
 /// `read` bytes of `address` were brought up to date, `changed` of them really
 /// different.
@@ -69,11 +73,13 @@ pub(crate) fn note(kind: Kind, address: usize, size: u64, read: u64, changed: u6
 
 /// Logs the window's traffic, biggest first, and starts a new window. `frames`:
 /// the frames since the last call, to divide by.
-pub(crate) fn report(frames: f64) {
+pub(crate) fn report(_second: f64) {
     if !on() {
         return;
     }
-    let frames = frames.max(1.0);
+    let now = crate::frame::current();
+    let last = AT.swap(now, Ordering::Relaxed);
+    let frames = if last == u64::MAX { 5.0 } else { now.saturating_sub(last).max(1) as f64 };
     let read = TOTALS[0].swap(0, Ordering::Relaxed) as f64 / frames;
     let changed = TOTALS[1].swap(0, Ordering::Relaxed) as f64 / frames;
     let looks = TOTALS[2].swap(0, Ordering::Relaxed) as f64 / frames;
