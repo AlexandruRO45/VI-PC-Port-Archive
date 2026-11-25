@@ -247,7 +247,9 @@ impl GraphicsState {
                 )
             })
             .collect();
-        let bounds = if self.depth_bounds {
+        let bounds = if self.needs_depth_bounds_compatibility() {
+            " depth-bounds read-only-depth"
+        } else if self.depth_bounds {
             " depth-bounds"
         } else {
             ""
@@ -266,9 +268,17 @@ impl GraphicsState {
         )
     }
 
+    // WARP skips depth bounds when DepthEnable is false. An always-pass
+    // comparison with writes disabled keeps depth bounds as the only gate.
+    fn needs_depth_bounds_compatibility(&self) -> bool {
+        self.depth_bounds
+            && !self.depth.DepthEnable.as_bool()
+            && self.depth_format != DXGI_FORMAT_UNKNOWN
+    }
+
     fn depth1(&self) -> D3D12_DEPTH_STENCIL_DESC1 {
         let d = &self.depth;
-        D3D12_DEPTH_STENCIL_DESC1 {
+        let mut depth = D3D12_DEPTH_STENCIL_DESC1 {
             DepthEnable: d.DepthEnable,
             DepthWriteMask: d.DepthWriteMask,
             DepthFunc: d.DepthFunc,
@@ -278,7 +288,13 @@ impl GraphicsState {
             FrontFace: d.FrontFace,
             BackFace: d.BackFace,
             DepthBoundsTestEnable: self.depth_bounds.into(),
+        };
+        if self.needs_depth_bounds_compatibility() {
+            depth.DepthEnable = true.into();
+            depth.DepthFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+            depth.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
         }
+        depth
     }
 
     /// The vertex buffer slots the input layout reads.
