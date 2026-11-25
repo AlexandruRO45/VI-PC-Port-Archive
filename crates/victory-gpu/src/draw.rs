@@ -927,11 +927,22 @@ impl State {
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
         #[cfg(feature = "diagnostics")]
         self.probe_small(list, true);
+        #[cfg(feature = "diagnostics")]
+        list.crumb(|| pipeline_crumb(p, crate::crumbs::Command::Dispatch, [x, y, z]));
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
         #[cfg(feature = "diagnostics")]
         self.probe_written(list);
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[cfg(feature = "diagnostics")]
+    fn crumb(&self, list: &HostList, command: crate::crumbs::Command, args: [u32; 3]) {
+        list.crumb(|| {
+            let stages = crate::pipeline::host_pipeline(self.pipeline as This)
+                .into_iter().flat_map(|p| &p.stages);
+            crate::crumbs::Op::new(command, args, stages.map(|s| &s.shader.hash))
+        });
     }
 
     /// What a draw or dispatch runs, for the device-removed report
@@ -1023,6 +1034,8 @@ impl State {
             Ok(l6) => {
                 #[cfg(feature = "diagnostics")]
                 list.note_op(|| self.op_text(format!("mesh {x}"), false));
+                #[cfg(feature = "diagnostics")]
+                list.crumb(|| pipeline_crumb(p, crate::crumbs::Command::Mesh, [x, 1, 1]));
                 // SAFETY: an open list with everything set.
                 unsafe { l6.DispatchMesh(x, 1, 1) };
                 DRAWN.fetch_add(1, Ordering::Relaxed);
@@ -1054,6 +1067,8 @@ impl State {
             return false;
         }
         let l = &list.list;
+        #[cfg(feature = "diagnostics")]
+        list.crumb(|| pipeline_crumb(&f.compute, crate::crumbs::Command::MeshFallbackDispatch, [groups, 1, 1]));
         // SAFETY: live scratch and PSOs retained by the list.
         unsafe {
             l.ResourceBarrier(&[crate::host::transition(
@@ -1063,8 +1078,12 @@ impl State {
             l.SetComputeRoot32BitConstant(f.base, 0, 0);
             l.Dispatch(groups, 1, 1);
         }
-        self.draw_mesh_records(list, p, f, &record, |l| unsafe {
-            l.DrawInstanced(f.layout.max_primitives * 3, groups, 0, 0);
+        self.draw_mesh_records(list, p, f, &record, |l| {
+            let count = f.layout.max_primitives * 3;
+            #[cfg(feature = "diagnostics")]
+            list.crumb(|| pipeline_crumb(p, crate::crumbs::Command::MeshFallbackDraw, [count, groups, 0]));
+            // SAFETY: the draw's state is set by draw_mesh_records.
+            unsafe { l.DrawInstanced(count, groups, 0, 0) };
         })
     }
 
@@ -1171,6 +1190,8 @@ impl State {
         let ran = self.bind_as(list, &f.compute, true, false) && {
             // The title may release the pipeline before submitting the list.
             list.keep(&f.dispatch);
+            #[cfg(feature = "diagnostics")]
+            list.crumb(|| pipeline_crumb(&f.compute, crate::crumbs::Command::MeshFallbackIndirectDispatch, [records, group_cap, stride]));
             // SAFETY: prepared dispatch stream uses this CS root signature.
             unsafe {
                 l.ResourceBarrier(&[transition(&record, common, uav)]);
@@ -1184,8 +1205,11 @@ impl State {
                     0,
                 );
             }
-            self.draw_mesh_records(list, p, f, &record, |l| unsafe {
-                l.ExecuteIndirect(&draw, 1, &commands, base, None, 0);
+            self.draw_mesh_records(list, p, f, &record, |l| {
+                #[cfg(feature = "diagnostics")]
+                list.crumb(|| pipeline_crumb(p, crate::crumbs::Command::MeshFallbackIndirectDraw, [1, 16, 0]));
+                // SAFETY: the draw's state is set and the argument chunk is held.
+                unsafe { l.ExecuteIndirect(&draw, 1, &commands, base, None, 0) };
             })
         };
         // SAFETY: prepare moved the held chunk to INDIRECT_ARGUMENT.
@@ -1569,6 +1593,8 @@ impl State {
             list.note_op(|| self.op_text(format!("draw {count}x{instances}"), false));
             #[cfg(feature = "diagnostics")]
             self.probe_small(list, false);
+            #[cfg(feature = "diagnostics")]
+            self.crumb(list, crate::crumbs::Command::Draw, [count, instances, from]);
             // SAFETY: an open list with everything set.
             unsafe {
                 list.list
@@ -1663,6 +1689,8 @@ impl State {
         if ran {
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("indexed {indices}x{instances}"), false));
+            #[cfg(feature = "diagnostics")]
+            self.crumb(list, crate::crumbs::Command::Indexed, [indices, instances, first]);
             // SAFETY: an open list with everything set.
             unsafe {
                 list.list
@@ -1808,6 +1836,8 @@ impl State {
         list.note_op(|| {
             self.op_text(format!("indirect kind {kind} max {max} at {arguments:#x}"), kind == DISPATCH)
         });
+        #[cfg(feature = "diagnostics")]
+        self.crumb(list, crate::crumbs::Command::Indirect, [kind, max, stride]);
         // SAFETY: an open list with everything set; the buffers are host
         // copies the list keeps alive (refresh), the signature is cached.
         unsafe {
@@ -1873,6 +1903,11 @@ fn host_signature(kind: u32, stride: u32) -> Option<ID3D12CommandSignature> {
     let signature = signature?;
     made.push(((kind, stride), signature.clone()));
     Some(signature)
+}
+
+#[cfg(feature = "diagnostics")]
+fn pipeline_crumb(p: &HostPipeline, command: crate::crumbs::Command, args: [u32; 3]) -> crate::crumbs::Op {
+    crate::crumbs::Op::new(command, args, p.stages.iter().map(|s| &s.shader.hash))
 }
 
 /// Gets what a shader reads or writes through a view ready: buffer data

@@ -108,6 +108,8 @@ pub fn on_failure(report: fn(&str) -> !) {
 /// the debug layer's first error, if any (`VICTORY_D3D12_DEBUG=1` in a
 /// diagnostics build names the command).
 pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
+    #[cfg(feature = "diagnostics")]
+    crate::crumbs::flush();
     let mut text = what.to_string();
     if let Some(host) = host() {
         // SAFETY: a plain query.
@@ -174,15 +176,23 @@ fn create() -> windows::core::Result<Host> {
                 tracing::info!("GPU-based validation on");
             }
         }
-        // Diagnostics: device-removed data (the command that faulted, the
-        // faulting address), read when the device is removed.
-        if dred_on() {
+        // CRUMBS requests only native progress; full DRED also collects
+        // GPU fault addresses and keeps detailed per-command marker text.
+        #[cfg(feature = "diagnostics")]
+        let compact = crate::crumbs::enabled();
+        #[cfg(not(feature = "diagnostics"))]
+        let compact = false;
+        if dred_on() || compact {
             let mut dred: Option<ID3D12DeviceRemovedExtendedDataSettings> = None;
             if D3D12GetDebugInterface(&mut dred).is_ok()
                 && let Some(dred) = dred
             {
                 dred.SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
-                dred.SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+                dred.SetPageFaultEnablement(if dred_on() {
+                    D3D12_DRED_ENABLEMENT_FORCED_ON
+                } else {
+                    D3D12_DRED_ENABLEMENT_FORCED_OFF
+                });
             }
         }
         let mut device: Option<ID3D12Device> = None;
@@ -243,6 +253,8 @@ fn create() -> windows::core::Result<Host> {
             ),
             Err(e) => tracing::debug!(error = %e, "multiply-add fusing not checked"),
         }
+        #[cfg(feature = "diagnostics")]
+        crate::crumbs::start_sampler(&device);
         Ok(Host {
             device,
             barycentrics: OnceLock::new(),
@@ -406,6 +418,8 @@ pub(crate) struct HostList {
     /// data without marker texts), with the host GPU range a copy reads.
     #[cfg(feature = "diagnostics")]
     notes: Mutex<Vec<Note>>,
+    #[cfg(feature = "diagnostics")]
+    crumbs: Option<Box<Mutex<crate::crumbs::ListOps>>>,
     /// In a frame `crate::capture` lists: the textures the list renders to
     /// or writes, and the pipeline that first wrote each (diagnostics).
     #[cfg(feature = "diagnostics")]
@@ -690,6 +704,8 @@ impl Host {
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
+                crumbs: crate::crumbs::enabled().then(|| Box::new(Mutex::default())),
+                #[cfg(feature = "diagnostics")]
                 targets: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
                 show: Mutex::default(),
@@ -713,10 +729,19 @@ impl Host {
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
         let submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
-        self.execute_locked(runs, submitted);
+        self.execute_locked(
+            runs, submitted,
+            #[cfg(feature = "diagnostics")]
+            crate::crumbs::Kind::Title,
+        );
     }
 
-    fn execute_locked(&self, runs: &[&HostList], mut submitted: std::sync::MutexGuard<'_, u64>) {
+    fn execute_locked(
+        &self,
+        runs: &[&HostList],
+        mut submitted: std::sync::MutexGuard<'_, u64>,
+        #[cfg(feature = "diagnostics")] origin: crate::crumbs::Kind,
+    ) {
         self.retired.begin();
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
@@ -791,6 +816,19 @@ impl Host {
             transient.extend(uploads.into_iter().map(|(_, _, buffer)| buffer));
             lists.push(list.list.cast().ok());
         }
+        #[cfg(feature = "diagnostics")]
+        let list_crumbs = |start: usize, end: usize| {
+            use crate::crumbs::{Kind, List};
+            (start..end).flat_map(|j| {
+                let run = runs[j];
+                let end = firsts.get(j + 1).copied().unwrap_or(lists.len());
+                let prelude = (end - firsts[j] > 1).then(|| {
+                    List::new(Kind::Prelude, run.prelude.1.as_raw() as usize, Default::default())
+                });
+                let kind = if j == 0 && uploads.is_some() { Kind::Upload } else { origin };
+                prelude.into_iter().chain([run.list_crumb(kind)])
+            })
+        };
         batch.flush();
         let prepared = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
@@ -815,27 +853,42 @@ impl Host {
             let started = std::time::Instant::now();
             #[cfg(feature = "diagnostics")]
             crate::resource::life::note(0, crate::resource::life::SUBMITTED, *submitted, 0);
+            #[cfg(feature = "diagnostics")]
+            let crumb = crate::crumbs::enabled().then(|| {
+                let (first, end) = if timing() { (i, i + 1) } else { (0, runs.len()) };
+                crate::crumbs::begin(*submitted, crate::queue::presented(), list_crumbs(first, end))
+            });
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
                 self.queue.ExecuteCommandLists(group);
-                let waited = self
-                    .queue
-                    .Signal(&self.fence, *submitted)
-                    .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
-                match waited {
-                    Ok(()) => {
-                        let waited = WaitForSingleObject(self.event, INFINITE);
-                        let completed = self.fence.GetCompletedValue();
-                        if completed == u64::MAX {
-                            removed_fence = true;
-                            removed_in = Some(i);
-                            break;
-                        }
-                        if waited != WAIT_OBJECT_0 || completed < *submitted {
-                            fail(format_args!("host fence not confirmed: wait {waited:?}, completed {completed}, expected {submitted}"));
-                        }
-                    }
-                    Err(e) => fail(format_args!("host submission not waited for: {e}")),
+                if let Err(e) = self.queue.Signal(&self.fence, *submitted) {
+                    #[cfg(feature = "diagnostics")]
+                    crate::crumbs::finish(crumb, crumb.map(|_| self.fence.GetCompletedValue()), crate::crumbs::Outcome::SignalFailed);
+                    fail(format_args!("host submission not signaled: {e}"));
+                }
+                if let Err(e) = self.fence.SetEventOnCompletion(*submitted, self.event) {
+                    #[cfg(feature = "diagnostics")]
+                    crate::crumbs::finish(crumb, crumb.map(|_| self.fence.GetCompletedValue()), crate::crumbs::Outcome::EventFailed);
+                    fail(format_args!("host submission not waited for: {e}"));
+                }
+                let waited = WaitForSingleObject(self.event, INFINITE);
+                let completed = self.fence.GetCompletedValue();
+                let confirmed = waited == WAIT_OBJECT_0 && completed >= *submitted;
+                #[cfg(feature = "diagnostics")]
+                crate::crumbs::finish(crumb, Some(completed), if completed == u64::MAX {
+                    crate::crumbs::Outcome::Removed
+                } else if confirmed {
+                    crate::crumbs::Outcome::Complete
+                } else {
+                    crate::crumbs::Outcome::WaitFailed
+                });
+                if completed == u64::MAX {
+                    removed_fence = true;
+                    removed_in = Some(i);
+                    break;
+                }
+                if !confirmed {
+                    fail(format_args!("host fence not confirmed: wait {waited:?}, completed {completed}, expected {submitted}"));
                 }
             }
             #[cfg(feature = "diagnostics")]
@@ -982,7 +1035,8 @@ impl Host {
         // SAFETY: the outputs are the runtime's, valid while the device
         // lives; nodes are walked as linked, histories have their counts.
         unsafe {
-            if let Ok(fault) = dred.GetPageFaultAllocationOutput1()
+            if dred_on()
+                && let Ok(fault) = dred.GetPageFaultAllocationOutput1()
                 && fault.PageFaultVA != 0
             {
                 let va = fault.PageFaultVA;
@@ -1032,7 +1086,8 @@ impl Host {
                 let done = p.pLastBreadcrumbValue.as_ref().copied().unwrap_or(0);
                 let ours = p.pCommandList.as_ref().map(|l| l.as_raw());
                 let index = runs.iter().position(|r| Some(r.list.as_raw()) == ours);
-                progress.push(format!("{done}/{} {index:?}", p.BreadcrumbCount));
+                let raw = ours.map_or(0, |p| p as usize);
+                progress.push(format!("{done}/{} {index:?}@{raw:#x}", p.BreadcrumbCount));
                 node = p.pNext;
             }
             text.push_str(&format!("; breadcrumbs (done/count, list) {progress:?}"));
@@ -1042,11 +1097,12 @@ impl Host {
                 if done < p.BreadcrumbCount && !p.pCommandHistory.is_null() {
                     let history =
                         std::slice::from_raw_parts(p.pCommandHistory, p.BreadcrumbCount as usize);
+                    let list = p.pCommandList.as_ref().map(|l| l.as_raw());
+                    let raw = list.map_or(0, |p| p as usize);
                     text.push_str(&format!(
-                        "; a list stopped at command {done} of {} (op {})",
+                        "; list {raw:#x} stopped at command {done} of {} (op {})",
                         p.BreadcrumbCount, history[done as usize].0
                     ));
-                    let list = p.pCommandList.as_ref().map(|l| l.as_raw());
                     let run = runs.iter().find(|r| Some(r.list.as_raw()) == list);
                     // The k-th marker command is the k-th note.
                     #[cfg(feature = "diagnostics")]
@@ -1267,6 +1323,10 @@ impl HostList {
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
+        if let Some(crumbs) = &self.crumbs {
+            *crumbs.lock().unwrap_or_else(|e| e.into_inner()) = Default::default();
+        }
+        #[cfg(feature = "diagnostics")]
         self.targets.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
         {
@@ -1457,6 +1517,20 @@ impl HostList {
             fail(format_args!("a host state prelude did not record ({e})"));
         }
         list.cast().ok()
+    }
+
+    #[cfg(feature = "diagnostics")]
+    fn list_crumb(&self, kind: crate::crumbs::Kind) -> crate::crumbs::List {
+        let ops = self.crumbs.as_ref().map(|v| *v.lock().unwrap_or_else(|e| e.into_inner())).unwrap_or_default();
+        crate::crumbs::List::new(kind, self.list.as_raw() as usize, ops)
+    }
+
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn crumb(&self, op: impl FnOnce() -> crate::crumbs::Op) {
+        if let Some(crumbs) = &self.crumbs {
+            let op = op();
+            crumbs.lock().unwrap_or_else(|e| e.into_inner()).push(op);
+        }
     }
 
     /// Notes what the command about to be recorded does, as a marker
@@ -2407,7 +2481,11 @@ impl Host {
             }
             list.ResourceBarrier(&[transition(&back, back_state, D3D12_RESOURCE_STATE_PRESENT)]);
             p.copy.close();
-            self.execute_locked(&[&p.copy], submitted);
+            self.execute_locked(
+                &[&p.copy], submitted,
+                #[cfg(feature = "diagnostics")]
+                crate::crumbs::Kind::Present,
+            );
             #[cfg(feature = "diagnostics")]
             if let Some((buffer, footprint)) = capture {
                 crate::capture::save_read_back(frame, &buffer, &footprint);
