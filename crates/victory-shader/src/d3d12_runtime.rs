@@ -138,6 +138,12 @@ fn agility(probe: &D3D12_VERSIONED_ROOT_SIGNATURE_DESC) -> Result<Runtime, Strin
     }
 }
 
+/// Whether the Agility runtime is the one in use: the system runtime's
+/// serializer then cannot serve callers outside this module either.
+pub fn uses_agility() -> bool {
+    matches!(runtime(), Runtime::Agility { .. })
+}
+
 /// Which runtime is in use and why, for the log.
 pub fn description() -> String {
     match runtime() {
