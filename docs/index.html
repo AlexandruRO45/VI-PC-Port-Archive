@@ -4,11 +4,11 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>GTA6 PC Port Archive</title>
-<meta name="description" content="Archive of the open-source projects trying to run GTA VI on PC: Leonida (old and new), xcl, VIctory, victory-fork, AnyXboxX, ztrx, Xbox2Windows and TuxBox. Code, branches, pull requests, issues and comments, synced hourly. Projects removed from GitHub stay here.">
+<meta name="description" content="Archive of the open-source projects trying to run GTA VI on PC: Leonida (old and new), xcl, VIctory, victory-fork, AnyXboxX, ztrx, DexNom Runtime, VIctory-Belobug-AMD, Xbox2Windows and TuxBox. Code, branches, pull requests, issues and comments, synced hourly. Projects removed from GitHub stay here.">
 <link rel="icon" href="favicon.svg" type="image/svg+xml">
 <script>
   // old links pointed issues at index.html#project/number; they live on browse.html now ("leonida" is now "leonida-old")
-  if (/^#(leonida|leonida-old|leonida-new|xcl|victory|xbox2windows|tuxbox|victory-fork|anyxboxx|ztrx|victory-gta6)(\/\d+)?$/.test(location.hash))
+  if (/^#(leonida|leonida-old|leonida-new|xcl|victory|xbox2windows|tuxbox|victory-fork|anyxboxx|ztrx|dexnom|belobug|victory-gta6)(\/\d+)?$/.test(location.hash))
     location.replace("browse.html" + location.hash.replace(/^#leonida(?=\/|$)/, "#leonida-old").replace(/^#victory-gta6/, "#victory-fork"));
 </script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -170,7 +170,7 @@
 </main>
 
 <footer><div class="wrap">
-  <span>Licenses: Leonida (old and new) GPL-3.0 · xcl GPL-2.0 · VIctory GPL-3.0 · Xbox2Windows MIT · TuxBox Apache-2.0 · victory-fork GPL-3.0 · AnyXboxX GPL-3.0 · ztrx GPL-3.0</span>
+  <span>Licenses: Leonida (old and new) GPL-3.0 · xcl GPL-2.0 · VIctory GPL-3.0 · Xbox2Windows MIT · TuxBox Apache-2.0 · victory-fork GPL-3.0 · AnyXboxX GPL-3.0 · ztrx GPL-3.0 · DexNom Runtime GPL-3.0 · VIctory-Belobug-AMD GPL-3.0</span>
   <a href="https://github.com/Guernica4u/GTA6-PC-Port-Archive">GitHub repository</a>
 </div></footer>
 
@@ -179,6 +179,7 @@ const REPO = "https://github.com/Guernica4u/GTA6-PC-Port-Archive";
 const STEPS = ["Starts", "Menus", "Loads the world", "World on screen", "Playable"];
 // reached = how many STEPS work, from each project's README (24 Nov 2026); branch = its branch prefix in this repo;
 // gone = date it was removed from GitHub (listed in the graveyard); born and commits come from its archived history
+// top = pinned to the top of the archive in this order (picked by hand), the rest sort by reached
 // gta = made only for GTA VI (the others run Xbox Series games in general); the "Only GTA VI projects" button keeps these
 const PROJECTS = {
   "leonida-new": { repo: "ubiquitarianism/leonida", saved: "24 Nov 2026", name: "Leonida", tag: "new", gta: true, lic: "GPL-3.0", branch: "leonida-new", up: "https://github.com/ubiquitarianism/leonida",
@@ -208,13 +209,19 @@ const PROJECTS = {
   ztrx: { repo: "Zettrox/ztrx", saved: "25 Nov 2026", name: "ztrx", gta: true, lic: "GPL-3.0", branch: "ztrx", up: "https://github.com/Zettrox/ztrx",
     desc: "Runs GTA VI's Xbox Series build natively on Windows with NVIDIA cards. Built on VIctory and victory-fork.", reached: 5,
     note: "The prologue is playable from the cell to the boat chase, and it ran 1 h 30 min without a crash. Only 1-3 fps, shadows are black and there is no ray-traced lighting yet.", src: "https://github.com/Zettrox/ztrx#status-2026-11-25" },
+  dexnom: { repo: "DexNom/VIctory", saved: "25 Nov 2026", name: "DexNom Runtime", gta: true, top: 1, lic: "GPL-3.0", branch: "dexnom", up: "https://github.com/DexNom/VIctory",
+    desc: "A VIctory fork for AMD Radeon cards, with a one-click setup and experimental ray tracing.", reached: 4,
+    note: "Plays in the city on an RX 7900 XTX, with experimental ray-traced lighting. Frames can still take seconds and some objects show black.", src: "https://github.com/DexNom/VIctory#changes-in-this-snapshot" },
+  belobug: { repo: "Belobug/VIctory-Belobug-AMD", saved: "25 Nov 2026", name: "VIctory-Belobug-AMD", gta: true, top: 2, lic: "GPL-3.0", branch: "belobug", up: "https://github.com/Belobug/VIctory-Belobug-AMD",
+    desc: "A VIctory fork for AMD Radeon cards that renders the world lit, with textures, people, vehicles and water.", reached: 4,
+    note: "The world renders lit at 5-7 fps on an RX 9070 XT and saves work. Not playable yet: the phone turns the world black and there is no ray-traced light.", src: "https://github.com/Belobug/VIctory-Belobug-AMD#state-of-this-fork-2026-11-25" },
 };
 const $ = id => document.getElementById(id);
 const esc = s => String(s).replace(/[&<>"']/g, c => ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;", "'":"&#39;" }[c]));
 const label = P => P.tag ? `${P.name} <small>(${P.tag})</small>` : P.name;
 const plain = P => P.name + (P.tag ? ` (${P.tag})` : "");
 const KEYS = Object.keys(PROJECTS);
-const ALIVE = KEYS.filter(k => !PROJECTS[k].gone).sort((a, b) => PROJECTS[b].reached - PROJECTS[a].reached || plain(PROJECTS[a]).localeCompare(plain(PROJECTS[b]))), DEAD = KEYS.filter(k => PROJECTS[k].gone);
+const ALIVE = KEYS.filter(k => !PROJECTS[k].gone).sort((a, b) => (PROJECTS[a].top || 99) - (PROJECTS[b].top || 99) || PROJECTS[b].reached - PROJECTS[a].reached || plain(PROJECTS[a]).localeCompare(plain(PROJECTS[b]))), DEAD = KEYS.filter(k => PROJECTS[k].gone);
 const fmt = n => n == null ? "—" : n.toLocaleString("en-US");
 const ago = t => { const h = Math.round((Date.now() / 1000 - t) / 3600); return h < 1 ? "under an hour ago" : h < 48 ? `${h} hour${h === 1 ? "" : "s"} ago` : `${Math.round(h / 24)} days ago`; };
 const pulse = `<svg width="34" height="14" viewBox="0 0 34 14" aria-hidden="true"><path d="M0 7h9l3-6 4 12 3-9 2 3h13" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" stroke-linecap="round"/></svg>`;

@@ -20,6 +20,8 @@ PROJECTS = {
     "victory-fork": ("fxceless/victory-fork", r"## Status of this fork"),
     "anyxboxx": ("LooperSalty/AnyXboxX", r"> \*\*Where we are"),
     "ztrx": ("Zettrox/ztrx", r"## Status"),
+    "dexnom": ("DexNom/VIctory", r"## Changes in this snapshot"),
+    "belobug": ("Belobug/VIctory-Belobug-AMD", r"## State of this fork"),
 }
 PUSH_BUDGET = 300  # seconds of branch pushing per project per run; the rest waits for the next run
 TODAY = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")

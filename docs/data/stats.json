@@ -3,7 +3,7 @@
   "issues": 48,
   "prs": 542,
   "comments": 5720,
-  "updated": 1795614952
+  "updated": 1795506056
  },
  "leonida-old": {
   "issues": 371,
@@ -15,42 +15,54 @@
   "issues": 405,
   "prs": 658,
   "comments": 11221,
-  "updated": 1795614079
+  "updated": 1795504328
  },
  "victory": {
   "issues": 563,
   "prs": 612,
   "comments": 10772,
-  "updated": 1795570613
+  "updated": 1795506755
  },
  "xbox2windows": {
   "issues": 263,
   "prs": 1137,
   "comments": 4983,
-  "updated": 1795616638
+  "updated": 1795506551
  },
  "tuxbox": {
   "issues": 16,
   "prs": 68,
   "comments": 91,
-  "updated": 1795616496
+  "updated": 1795541444
  },
  "victory-fork": {
   "issues": 190,
   "prs": 15,
   "comments": 1713,
-  "updated": 1795610616
+  "updated": 1795552504
  },
  "anyxboxx": {
   "issues": 47,
   "prs": 138,
   "comments": 265,
-  "updated": 1795616548
+  "updated": 1795556730
  },
  "ztrx": {
   "issues": 49,
   "prs": 20,
   "comments": 169,
   "updated": 1795569112
+ },
+ "dexnom": {
+  "issues": 0,
+  "prs": 48,
+  "comments": 27,
+  "updated": 1795628767
+ },
+ "belobug": {
+  "issues": 50,
+  "prs": 146,
+  "comments": 249,
+  "updated": 1795629969
  }
 }
