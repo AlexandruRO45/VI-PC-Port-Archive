@@ -437,6 +437,178 @@ fn clamp_into(
     recorded
 }
 
+/// Whether indirect records that no shader of the list may have written
+/// before the command are clamped in the list's prelude (on by default
+/// with [`ring`]; `VICTORY_INDIRECT_EARLY=0` clamps each in the list, as
+/// before).
+///
+/// A clamp in the list stops the card twice: the card turns from drawing
+/// to compute for the clamp and back, and its barrier waits for it before
+/// the indirect call. The title's ~2,500 clamps a frame took 19 ms of the
+/// card's ~95 (timing run of the gameplay, RTX 5090), and the calls around
+/// them could not overlap. Records that the list itself does not write
+/// before the command (by the writes its shaders declare,
+/// `HostList::writes_declared`) are what the card holds when the list
+/// begins: the title's CPU wrote them, or an earlier list's shaders. Their
+/// clamps run in the list's prelude, which the card runs just before the
+/// list ([`record_early`]): a wait for the earlier lists' shader writes,
+/// the clamps with no wait between them, and one barrier from their writes
+/// to the indirect reads. The command reads its room of the ring as
+/// before, and the list keeps its pipeline and root bindings.
+///
+/// The prelude's clamps are charged to a budget of their own
+/// (`HostList::early_budget`), which the prelude zeroes first at each
+/// submission, as the gathered records are to theirs ([`record_gathers`]).
+/// The list's own budget is zeroed inside the list, where its first clamp
+/// is recorded: a clamp that runs before the list would find in it what
+/// the list's last run left, and what it charged would be zeroed away. So
+/// a list's work is bounded once for each place its records are clamped
+/// in: its prelude's gathered records, its prelude's clamps, the list.
+///
+/// With [`gather`] on as well (`VICTORY_INDIRECT_GATHER=1`), a draw's
+/// single record that misses its window is gathered first, as without
+/// this; what is not gathered (a dispatch, several records, a list that
+/// no longer gathers, a full set) comes here if the list did not write it.
+/// The prelude records the gathered sets' passes first, as they are on
+/// their own, then these clamps: the two write different buffers and
+/// charge different budgets, so neither changes what the other clamps or
+/// leaves empty, and with `VICTORY_INDIRECT_EARLY=0` the prelude is what
+/// it is without this.
+pub(crate) fn early() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| ring() && std::env::var_os("VICTORY_INDIRECT_EARLY").is_none_or(|v| v != "0"))
+}
+
+/// A clamp for the list's prelude ([`early`]): the clamp pass's root
+/// constants and its source, count and ring addresses.
+pub(crate) struct Early {
+    constants: [u32; 6],
+    src: u64,
+    count: u64,
+    dst: u64,
+}
+
+/// [`bound`] or [`bound_ahead`] (`ahead`) of records the list has not
+/// written ([`early`]): room in the list's ring, and the clamp into it
+/// noted for the list's prelude, which charges the prelude's budget.
+/// Nothing is recorded in the list. `None` if the records cannot be
+/// clamped (the caller clamps nothing then, as with [`bound`]).
+pub(crate) fn bound_early(
+    list: &HostList,
+    (src, src_offset): (&ID3D12Resource, u64),
+    spec: (u32, u32, u32),
+    ahead: bool,
+) -> Option<(ID3D12Resource, u64)> {
+    let bytes = validate_layout(spec, src_offset, None)?;
+    clamp()?;
+    // SAFETY: a live D3D12 buffer resource.
+    let budget = unsafe { list.early_budget()?.GetGPUVirtualAddress() };
+    let (dst, at) = list.indirect_ring(bytes)?;
+    // SAFETY: a live D3D12 buffer resource.
+    let dst_gpu = unsafe { dst.GetGPUVirtualAddress() } + at;
+    let (constants, src_gpu, count_gpu) = clamp_arguments(dst_gpu, budget, (src, src_offset), None, spec, ahead)?;
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(crate::copystat::C::IndirectEarly, 1);
+    if constants[2] > 0 {
+        list.keep(src);
+        list.early_clamp(Early { constants, src: src_gpu, count: count_gpu, dst: dst_gpu }, &dst);
+    }
+    Some((dst, at))
+}
+
+/// Records `clamps` ([`bound_early`]) into `l`, a list the card runs just
+/// before the list they were noted for: the words of `budget` zeroed (the
+/// prelude's clamps have a budget of their own, [`early`]), a wait for
+/// every earlier shader write (the records may come from an earlier list,
+/// behind a barrier of the title's in this one), the clamps with no wait
+/// between them (each writes room of its own; the budget is taken
+/// atomically), and one barrier from their writes to the indirect reads of
+/// `rings`. False, with nothing recorded, if there is no clamp or `l`
+/// cannot take the commands: the rooms then hold no clamped records and
+/// the list must not run.
+///
+/// # Safety
+/// An open list; live buffers behind the addresses; `rings` live; `budget`
+/// common, as it is between the list's runs.
+pub(crate) unsafe fn record_early(
+    l: &ID3D12GraphicsCommandList,
+    clamps: &[Early],
+    rings: &[ID3D12Resource],
+    budget: &ID3D12Resource,
+) -> bool {
+    let Some(c) = clamp() else {
+        return false;
+    };
+    // SAFETY: as the caller vouches.
+    unsafe { record_early_with(c, l, clamps, rings, budget) }
+}
+
+/// [`record_early`] with `c`, a clamp of `l`'s device.
+///
+/// # Safety
+/// As [`record_early`].
+unsafe fn record_early_with(
+    c: &Clamp,
+    l: &ID3D12GraphicsCommandList,
+    clamps: &[Early],
+    rings: &[ID3D12Resource],
+    budget: &ID3D12Resource,
+) -> bool {
+    use windows::core::Interface;
+    let (Ok(l2), Ok(l7)) = (l.cast::<ID3D12GraphicsCommandList2>(), l.cast::<ID3D12GraphicsCommandList7>()) else {
+        return false;
+    };
+    // SAFETY: a live buffer.
+    let charged = unsafe { budget.GetGPUVirtualAddress() };
+    let zeros = [0u64, 4, 8].map(|offset| D3D12_WRITEBUFFERIMMEDIATE_PARAMETER { Dest: charged + offset, Value: 0 });
+    let before = [D3D12_GLOBAL_BARRIER {
+        SyncBefore: D3D12_BARRIER_SYNC_ALL,
+        SyncAfter: D3D12_BARRIER_SYNC_COMPUTE_SHADING,
+        AccessBefore: D3D12_BARRIER_ACCESS_UNORDERED_ACCESS,
+        AccessAfter: D3D12_BARRIER_ACCESS_SHADER_RESOURCE | D3D12_BARRIER_ACCESS_UNORDERED_ACCESS,
+    }];
+    let after: Vec<D3D12_BUFFER_BARRIER> = rings
+        .iter()
+        .map(|ring| D3D12_BUFFER_BARRIER {
+            SyncBefore: D3D12_BARRIER_SYNC_COMPUTE_SHADING,
+            SyncAfter: D3D12_BARRIER_SYNC_EXECUTE_INDIRECT,
+            AccessBefore: D3D12_BARRIER_ACCESS_UNORDERED_ACCESS,
+            AccessAfter: D3D12_BARRIER_ACCESS_INDIRECT_ARGUMENT,
+            pResource: std::mem::ManuallyDrop::new(Some(ring.clone())),
+            Offset: 0,
+            Size: u64::MAX,
+        })
+        .collect();
+    // SAFETY: as the caller vouches; the barriers name live buffers. The
+    // budget is zeroed as a copy destination, charged for unordered access
+    // and left common, as the gathered records' is ([`record_gathers`]).
+    unsafe {
+        l.ResourceBarrier(&[transition(budget, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST)]);
+        l2.WriteBufferImmediate(zeros.len() as u32, zeros.as_ptr(), None);
+        l.ResourceBarrier(&[transition(budget, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)]);
+        l7.Barrier(&[D3D12_BARRIER_GROUP {
+            Type: D3D12_BARRIER_TYPE_GLOBAL,
+            NumBarriers: 1,
+            Anonymous: D3D12_BARRIER_GROUP_0 { pGlobalBarriers: before.as_ptr() },
+        }]);
+        for e in clamps {
+            dispatch_clamp(c, l, &e.constants, (e.src, e.count), e.dst, charged);
+        }
+        if !after.is_empty() {
+            l7.Barrier(&[D3D12_BARRIER_GROUP {
+                Type: D3D12_BARRIER_TYPE_BUFFER,
+                NumBarriers: after.len() as u32,
+                Anonymous: D3D12_BARRIER_GROUP_0 { pBufferBarriers: after.as_ptr() },
+            }]);
+        }
+        l.ResourceBarrier(&[transition(budget, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON)]);
+    }
+    for b in after {
+        drop(std::mem::ManuallyDrop::into_inner(b.pResource));
+    }
+    true
+}
+
 /// Whether clamped indirect records go each to room of their own in a ring
 /// of the list's ([`HostList::indirect_ring`]), behind one barrier of the
 /// host's enhanced kind that orders the clamp's writes before the indirect
@@ -2908,6 +3080,403 @@ void main() {
         assert_eq!(host.log_messages(), None, "the debug layer found an error");
         host.execute(&[&list]);
         list.reset();
+    }
+
+    /// Clamps noted for the list's prelude ([`bound_early`]) run there, at
+    /// each submission of the list: the indirect dispatches the list
+    /// records read their records clamped (a record over the groups a
+    /// dispatch runs is cut to 65,535 in x; one of all ones runs empty),
+    /// the title's records stay as they are, and a second submission of
+    /// the list (records changed by the CPU in between) clamps them again.
+    #[test]
+    fn early_clamps_run_in_the_prelude_at_each_submission() {
+        let Some(host) = super::host() else {
+            return;
+        };
+        if !enhanced_barriers(&host.device) {
+            return;
+        }
+        let Ok(list) = host.new_list() else {
+            return;
+        };
+        let (Some((src_buf, src_ptr)), Some((hits_buf, hits_ptr))) = (host.shared_buffer(256), host.shared_buffer(256)) else {
+            return;
+        };
+        let worker = compile_cs(&host.device, WORKER_CS).expect("worker shader must compile");
+        let signature = {
+            let arg = D3D12_INDIRECT_ARGUMENT_DESC { Type: D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH, ..Default::default() };
+            let desc = D3D12_COMMAND_SIGNATURE_DESC { ByteStride: 12, NumArgumentDescs: 1, pArgumentDescs: &arg, NodeMask: 0 };
+            let mut sig: Option<ID3D12CommandSignature> = None;
+            // SAFETY: a single-argument command signature description.
+            unsafe { host.device.CreateCommandSignature(&desc, None::<&ID3D12RootSignature>, &mut sig) }.unwrap();
+            sig.unwrap()
+        };
+        let records: [[u32; 3]; 3] = [[3, 2, 1], [70_000, 1, 1], [u32::MAX, u32::MAX, u32::MAX]];
+        let write = |records: &[[u32; 3]; 3]| {
+            for (i, r) in records.iter().enumerate() {
+                for (k, w) in r.iter().enumerate() {
+                    // SAFETY: inside the 256-byte mapping.
+                    unsafe { src_ptr.cast::<u32>().add(i * 3 + k).write_volatile(*w) };
+                }
+            }
+            // SAFETY: as above.
+            unsafe { hits_ptr.cast::<u32>().write_volatile(0) };
+        };
+        write(&records);
+        let rooms: Vec<(ID3D12Resource, u64)> =
+            (0..3u64).map(|i| bound_early(&list, (&src_buf, i * 12), (2, 12, 1), false).expect("an early clamp")).collect();
+        assert_eq!(list.deferred_early(), 3, "three clamps noted for the prelude");
+        // SAFETY: an open list; the worker's own root signature; live buffers.
+        unsafe {
+            list.list.SetComputeRootSignature(&worker.root);
+            list.list.SetPipelineState(&worker.pso);
+            list.list.SetComputeRootUnorderedAccessView(0, hits_buf.GetGPUVirtualAddress());
+            for (ring, at) in &rooms {
+                list.list.ExecuteIndirect(&signature, 1, ring, *at, None, 0);
+            }
+        }
+        list.close();
+        assert_eq!(host.log_messages(), None, "the debug layer found an error");
+        host.execute(&[&list]);
+        // SAFETY: the submission was waited for.
+        let hits = || unsafe { hits_ptr.cast::<u32>().read_volatile() };
+        assert_eq!(hits(), 3 * 2 + 65_535, "6 groups, 65,535 groups, none");
+        // SAFETY: as above.
+        let kept = unsafe { src_ptr.cast::<u32>().add(3).read_volatile() };
+        assert_eq!(kept, 70_000, "the title's record is left as it was");
+        // Submitted again with other records: clamped again in the prelude.
+        write(&[[1, 1, 1], [5, 1, 1], [2, 2, 2]]);
+        host.execute(&[&list]);
+        assert_eq!(hits(), 1 + 5 + 8);
+        list.reset();
+        assert_eq!(list.deferred_early(), 0, "a reset forgets them");
+    }
+
+    /// The prelude's clamps are charged to a budget of their own, zeroed
+    /// in the prelude at each submission. A list whose own clamps spend
+    /// its budget leaves a record clamped in its prelude to run, at its
+    /// next submission too (the list's budget still holds what its last
+    /// run spent when the prelude runs); and what the prelude's clamps
+    /// spend leaves the list's own clamps their budget.
+    #[test]
+    fn early_clamps_charge_a_budget_of_their_own_at_each_submission() {
+        let Some(host) = super::host() else {
+            return;
+        };
+        if !enhanced_barriers(&host.device) {
+            return;
+        }
+        let Ok(list) = host.new_list() else {
+            return;
+        };
+        const KIND_DISPATCH: u32 = 2;
+        const STRIDE: u32 = 12;
+        let (Some((big, big_ptr)), Some((small, small_ptr)), Some((hits_buf, hits_ptr))) =
+            (host.shared_buffer(4 * u64::from(STRIDE)), host.shared_buffer(u64::from(STRIDE)), host.shared_buffer(256))
+        else {
+            return;
+        };
+        let worker = compile_cs(&host.device, WORKER_CS).expect("worker shader must compile");
+        let signature = {
+            let arg = D3D12_INDIRECT_ARGUMENT_DESC { Type: D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH, ..Default::default() };
+            let desc = D3D12_COMMAND_SIGNATURE_DESC { ByteStride: STRIDE, NumArgumentDescs: 1, pArgumentDescs: &arg, NodeMask: 0 };
+            let mut sig: Option<ID3D12CommandSignature> = None;
+            // SAFETY: a single-argument command signature description.
+            unsafe { host.device.CreateCommandSignature(&desc, None::<&ID3D12RootSignature>, &mut sig) }.unwrap();
+            sig.unwrap()
+        };
+        // Three records of 65,535 x 16 groups (about half a budget each)
+        // and one of a single group after them: clamped together they are
+        // charged in lane order, so the last one finds the budget spent
+        // and runs empty. And a record of one group on its own.
+        // SAFETY: mapped buffers of these sizes; nothing runs yet.
+        unsafe {
+            for i in 0..3 {
+                std::ptr::copy_nonoverlapping([65_535u32, 16, 1].as_ptr().cast::<u8>(), big_ptr.add(i * STRIDE as usize), 12);
+            }
+            std::ptr::copy_nonoverlapping([1u32, 1, 1].as_ptr().cast::<u8>(), big_ptr.add(3 * STRIDE as usize), 12);
+            std::ptr::copy_nonoverlapping([1u32, 1, 1].as_ptr().cast::<u8>(), small_ptr, 12);
+        }
+        // SAFETY: a live buffer.
+        let hits_gpu = unsafe { hits_buf.GetGPUVirtualAddress() };
+        // SAFETY: mapped words; only between submissions.
+        let hits = || unsafe { hits_ptr.cast::<u32>().read_volatile() };
+        // The dispatches of `rooms`, one record each.
+        let run = |rooms: &[(ID3D12Resource, u64)]| {
+            // SAFETY: an open list; the worker's own root signature and
+            // pipeline; buffers the test holds until the list has run.
+            unsafe {
+                list.list.SetComputeRootSignature(&worker.root);
+                list.list.SetPipelineState(&worker.pso);
+                list.list.SetComputeRootUnorderedAccessView(0, hits_gpu);
+                for (buffer, at) in rooms {
+                    list.list.ExecuteIndirect(&signature, 1, buffer, *at, None, 0);
+                }
+            }
+        };
+        let last = 3 * u64::from(STRIDE);
+
+        // The list's own clamp spends the list's budget (its last record
+        // runs empty); the record clamped in the prelude runs.
+        let early = bound_early(&list, (&small, 0), (KIND_DISPATCH, STRIDE, 1), false).expect("an early clamp");
+        let (spent, at) = bound(&list, (&big, 0), None, (KIND_DISPATCH, STRIDE, 4)).expect("a clamp in the list");
+        run(&[early, (spent, at + last)]);
+        list.close();
+        for submission in 0..2 {
+            // SAFETY: nothing runs.
+            unsafe { hits_ptr.cast::<u32>().write_volatile(0) };
+            host.execute(&[&list]);
+            assert_eq!(hits(), 1, "the prelude's record runs, the list's last one does not (submission {submission})");
+        }
+        list.reset();
+
+        // The other way round: the prelude's clamp spends the prelude's
+        // budget (its last record runs empty); the list's own clamp runs.
+        let (spent, at) = bound_early(&list, (&big, 0), (KIND_DISPATCH, STRIDE, 4), false).expect("an early clamp");
+        let own = bound(&list, (&small, 0), None, (KIND_DISPATCH, STRIDE, 1)).expect("a clamp in the list");
+        run(&[(spent, at + last), own]);
+        list.close();
+        for submission in 0..2 {
+            // SAFETY: nothing runs.
+            unsafe { hits_ptr.cast::<u32>().write_volatile(0) };
+            host.execute(&[&list]);
+            assert_eq!(hits(), 1, "the list's record runs, the prelude's last one does not (submission {submission})");
+        }
+        list.reset();
+    }
+
+    /// A list's prelude with both kinds of record: some gathered for it
+    /// ([`gather`]) and some whose clamps are noted for it
+    /// ([`bound_early`]). The gathered set's pass is recorded first, as on
+    /// its own, then the clamps: every command reads its record clamped,
+    /// from the set's scratch buffer or from the list's ring (one of all
+    /// ones runs empty either way), at a second submission too, and what
+    /// the records of one kind spend of their budget leaves the other
+    /// kind's records theirs.
+    #[test]
+    fn a_prelude_clamps_gathered_records_and_early_ones_side_by_side() {
+        let Some(host) = super::host() else {
+            return;
+        };
+        if !enhanced_barriers(&host.device) {
+            return;
+        }
+        let Ok(list) = host.new_list() else {
+            return;
+        };
+        const KIND_DISPATCH: u32 = 2;
+        const STRIDE: u32 = 12;
+        // The argument buffer's number, as its host copy has one.
+        const COPY: u64 = 1;
+        let (Some((src, src_ptr)), Some((hits_buf, hits_ptr))) = (host.shared_buffer(1024), host.shared_buffer(256)) else {
+            return;
+        };
+        let worker = compile_cs(&host.device, WORKER_CS).expect("worker shader must compile");
+        let signature = {
+            let arg = D3D12_INDIRECT_ARGUMENT_DESC { Type: D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH, ..Default::default() };
+            let desc = D3D12_COMMAND_SIGNATURE_DESC { ByteStride: STRIDE, NumArgumentDescs: 1, pArgumentDescs: &arg, NodeMask: 0 };
+            let mut sig: Option<ID3D12CommandSignature> = None;
+            // SAFETY: a single-argument command signature description.
+            unsafe { host.device.CreateCommandSignature(&desc, None::<&ID3D12RootSignature>, &mut sig) }.unwrap();
+            sig.unwrap()
+        };
+        // Records scattered through one argument buffer. From `SPEND` on,
+        // three of 65,535 x 16 groups (about half a budget each) and one of
+        // a single group: charged in that order, the last finds its budget
+        // spent and runs empty.
+        const SPEND: u64 = 0x200;
+        let last = SPEND + 3 * u64::from(STRIDE);
+        let records: [(u64, [u32; 3]); 9] = [
+            (0x010, [5, 1, 1]),
+            (0x040, [3, 2, 1]),
+            (0x100, [u32::MAX, u32::MAX, u32::MAX]),
+            (0x180, [u32::MAX, u32::MAX, u32::MAX]),
+            (SPEND, [65_535, 16, 1]),
+            (SPEND + 12, [65_535, 16, 1]),
+            (SPEND + 24, [65_535, 16, 1]),
+            (last, [1, 1, 1]),
+            (0x300, [7, 1, 1]),
+        ];
+        // SAFETY: a mapped buffer of 1024 bytes; nothing runs yet.
+        unsafe {
+            std::ptr::write_bytes(src_ptr, 0x5A, 1024);
+            for (at, words) in records {
+                std::ptr::copy_nonoverlapping(words.as_ptr().cast::<u8>(), src_ptr.add(at as usize), 12);
+            }
+        }
+        // SAFETY: a live buffer.
+        let hits_gpu = unsafe { hits_buf.GetGPUVirtualAddress() };
+        // SAFETY: mapped words; only between submissions.
+        let hits = || unsafe { hits_ptr.cast::<u32>().read_volatile() };
+        let gathered = |at: u64| gather(&list, (&src, COPY), at, (KIND_DISPATCH, STRIDE)).expect("a gathered record");
+        let early = |at: u64, records: u32| bound_early(&list, (&src, at), (KIND_DISPATCH, STRIDE, records), false).expect("an early clamp");
+        // The dispatches of `rooms`, one record each, then the list run
+        // twice: `groups` groups each time.
+        let run = |rooms: &[(ID3D12Resource, u64)], groups: u32, what: &str| {
+            // SAFETY: an open list; the worker's own root signature and
+            // pipeline; buffers the test holds until the list has run.
+            unsafe {
+                list.list.SetComputeRootSignature(&worker.root);
+                list.list.SetPipelineState(&worker.pso);
+                list.list.SetComputeRootUnorderedAccessView(0, hits_gpu);
+                for (buffer, at) in rooms {
+                    list.list.ExecuteIndirect(&signature, 1, buffer, *at, None, 0);
+                }
+            }
+            list.close();
+            for submission in 0..2 {
+                // SAFETY: nothing runs.
+                unsafe { hits_ptr.cast::<u32>().write_volatile(0) };
+                host.execute(&[&list]);
+                assert_eq!(hits(), groups, "{what} (submission {submission})");
+            }
+            list.reset();
+        };
+
+        // Gathered: two records of the title's, the three that spend the
+        // gathered records' budget, and the one after them (empty). In the
+        // prelude's own clamps: two records, of which neither is emptied.
+        let (a, ones) = (gathered(0x040), gathered(0x100));
+        for i in 0..3 {
+            gathered(SPEND + i * u64::from(STRIDE));
+        }
+        let spent = gathered(last);
+        assert_eq!(spent.1, 5 * u64::from(STRIDE), "a gathered record's slot follows the ones before it");
+        let (b, more_ones) = (early(0x010, 1), early(0x180, 1));
+        assert_ne!(a.0.as_raw(), b.0.as_raw(), "gathered records do not go to the list's ring");
+        run(&[a, ones, spent, b, more_ones], 3 * 2 + 5, "6 groups gathered, none of all ones, none past the gathered records' budget; 5 from the ring, none of all ones");
+
+        // The other way round: the prelude's own clamp spends its budget
+        // (its last record runs empty); the gathered record runs.
+        let (spent, at) = early(SPEND, 4);
+        let c = gathered(0x300);
+        run(&[(spent, at + 3 * u64::from(STRIDE)), c], 7, "7 groups gathered, none past the budget of the prelude's clamps");
+    }
+
+    /// The prelude's clamps ([`record_early_with`]) on the test's own
+    /// device, with a clamp made for it: a list recorded once, whose
+    /// indirect dispatches read rooms of a ring, runs twice, each time
+    /// behind a prelude recorded for that run, as a host list's is at each
+    /// of its submissions. The rooms hold the records clamped before the
+    /// list reads them (a record over the groups a dispatch runs is cut to
+    /// 65,535 in x; one of all ones runs empty), the title's records stay
+    /// as they were, records the CPU changed between the runs are clamped
+    /// anew, and the budget holds the second run's charge alone.
+    #[test]
+    fn warp_early_clamps_fill_their_rooms_before_the_list_runs() {
+        let Some(warp) = WarpHarness::new() else {
+            return;
+        };
+        if warp.enhanced().is_none() {
+            return;
+        }
+        const KIND_DISPATCH: u32 = 2;
+        const STRIDE: u32 = 12;
+        // Room for one clamp, as the list's ring gives it.
+        const ROOM: u64 = 256;
+        let (src_buf, src_ptr, _) = warp.shared_buffer(256);
+        let (_hits_buf, hits_ptr, hits_gpu) = warp.shared_buffer(256);
+        let (readback_buf, readback_ptr, _) = warp.shared_buffer(256);
+        let ring_buf = warp.default_uav(3 * ROOM);
+        let budget_buf = warp.default_uav(256);
+        let sig = warp.signature(KIND_DISPATCH, STRIDE);
+        let write = |records: &[[u32; 3]; 3]| {
+            for (i, r) in records.iter().enumerate() {
+                for (k, w) in r.iter().enumerate() {
+                    // SAFETY: inside the 256-byte mapping; nothing runs.
+                    unsafe { src_ptr.cast::<u32>().add(i * 3 + k).write_volatile(*w) };
+                }
+            }
+            // SAFETY: as above.
+            unsafe { hits_ptr.cast::<u32>().write_volatile(0) };
+        };
+        // SAFETY: mapped words; only between runs.
+        let hits = || unsafe { hits_ptr.cast::<u32>().read_volatile() };
+        // The clamps as `bound_early` notes them: one record each, into
+        // room of its own.
+        // SAFETY: live buffers.
+        let (ring_gpu, budget_gpu) = unsafe { (ring_buf.GetGPUVirtualAddress(), budget_buf.GetGPUVirtualAddress()) };
+        let clamps: Vec<Early> = (0..3u64)
+            .map(|i| {
+                let dst = ring_gpu + i * ROOM;
+                let (constants, src, count) =
+                    clamp_arguments(dst, budget_gpu, (&src_buf, i * u64::from(STRIDE)), None, (KIND_DISPATCH, STRIDE, 1), false).expect("a clamp");
+                Early { constants, src, count, dst }
+            })
+            .collect();
+        // The prelude's own list, as a host list has one, closed until used.
+        // SAFETY: plain object creation; a list is made open.
+        let (prelude_allocator, prelude): (ID3D12CommandAllocator, ID3D12GraphicsCommandList) = unsafe {
+            let allocator: ID3D12CommandAllocator = warp.device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+            let list: ID3D12GraphicsCommandList = warp.device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None).unwrap();
+            list.Close().unwrap();
+            (allocator, list)
+        };
+        // The list, recorded once: three dispatches, each from its room.
+        // SAFETY: an open list; the worker's root signature and pipeline;
+        // buffers the test holds until the list has run.
+        unsafe {
+            warp.list.SetComputeRootSignature(&warp.worker.root);
+            warp.list.SetPipelineState(&warp.worker.pso);
+            warp.list.SetComputeRootUnorderedAccessView(0, hits_gpu);
+            for i in 0..3u64 {
+                warp.list.ExecuteIndirect(&sig, 1, &ring_buf, i * ROOM, None, 0);
+            }
+            warp.list.Close().unwrap();
+        }
+        // One run: `record` into the prelude's list, then it and, if asked
+        // for, the list, in one submission that is waited for.
+        let mut submitted = 0u64;
+        let mut run = |with_list: bool, record: &dyn Fn(&ID3D12GraphicsCommandList)| {
+            submitted += 1;
+            // SAFETY: nothing of ours is executing; closed lists; the
+            // fence and event are the harness's.
+            unsafe {
+                prelude_allocator.Reset().unwrap();
+                prelude.Reset(&prelude_allocator, None).unwrap();
+                record(&prelude);
+                prelude.Close().unwrap();
+                let mut lists = vec![Some(prelude.cast::<ID3D12CommandList>().unwrap())];
+                if with_list {
+                    lists.push(Some(warp.list.cast::<ID3D12CommandList>().unwrap()));
+                }
+                warp.queue.ExecuteCommandLists(&lists);
+                warp.queue.Signal(&warp.fence, submitted).unwrap();
+                warp.fence.SetEventOnCompletion(submitted, warp.event).unwrap();
+                WaitForSingleObject(warp.event, INFINITE);
+            }
+        };
+        let clamp_early = |l: &ID3D12GraphicsCommandList| {
+            // SAFETY: an open list; the clamps' buffers live; the budget is
+            // common between runs.
+            assert!(unsafe { record_early_with(&warp.clamp, l, &clamps, std::slice::from_ref(&ring_buf), &budget_buf) });
+        };
+
+        write(&[[3, 2, 1], [70_000, 1, 1], [u32::MAX, u32::MAX, u32::MAX]]);
+        run(true, &clamp_early);
+        assert_eq!(hits(), 3 * 2 + 65_535, "6 groups, 65,535 groups, none");
+        // SAFETY: the run was waited for.
+        let kept = unsafe { src_ptr.cast::<u32>().add(3).read_volatile() };
+        assert_eq!(kept, 70_000, "the title's record is left as it was");
+
+        // Run again with other records: clamped anew, from an empty budget.
+        write(&[[1, 1, 1], [5, 1, 1], [2, 2, 2]]);
+        run(true, &clamp_early);
+        assert_eq!(hits(), 1 + 5 + 8);
+        // The budget and the rooms, read once the list has run.
+        run(false, &|l| {
+            // SAFETY: an open list; the buffers are common between runs.
+            unsafe {
+                l.CopyBufferRegion(&readback_buf, 0, &budget_buf, 0, 4);
+                for i in 0..3u64 {
+                    l.CopyBufferRegion(&readback_buf, 16 + i * 12, &ring_buf, i * ROOM, 12);
+                }
+            }
+        });
+        // SAFETY: the run was waited for; a mapped buffer.
+        let read = unsafe { std::slice::from_raw_parts(readback_ptr.cast::<u32>().cast_const(), 13).to_vec() };
+        assert_eq!(read[0], (1 + 5 + 8) * 64, "the budget holds the second run's charge alone");
+        assert_eq!(&read[4..13], &[1, 1, 1, 5, 1, 1, 2, 2, 2], "each room holds its record");
     }
 }
 
