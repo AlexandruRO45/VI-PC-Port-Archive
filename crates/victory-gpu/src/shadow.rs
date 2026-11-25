@@ -1156,7 +1156,6 @@ mod tests {
         assert_eq!(pages(0x1_fff0, 0x20), 2, "a range across a page boundary");
         assert_eq!(pages(0x2_0000, 0x1_0000), 1);
     }
-}
 
     #[test]
     fn copy_back_page_writes_only_changed_runs() {
