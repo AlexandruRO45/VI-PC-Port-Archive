@@ -4330,7 +4330,7 @@ impl<'a> Lower<'a> {
             || un.contains("atomic")
             || used.is_some_and(|u| u.kind == ResourceType::Uav);
         let u = if uav { 0x1000 } else { 0 };
-        let (props, image) = match &ui.fields {
+        let (props, image, div_stride) = match &ui.fields {
             Fields::Image { dim, .. } => {
                 let kind = match dim {
                     0 => 1,
@@ -4340,23 +4340,25 @@ impl<'a> Lower<'a> {
                     5 => 7,
                     _ => return Err("an image dimension (cube or MSAA)"),
                 };
-                ((kind | u, 0x409), Some(kind))
+                ((kind | u, 0x409), Some(kind), None)
             }
             Fields::Buffer { idxen, format, .. } => {
                 let stride = used.map_or(0, |u| u.stride);
-                let props = if un.starts_with("buffer_load_format")
+                let (props, div) = if un.starts_with("buffer_load_format")
                     || un.starts_with("buffer_store_format")
                 {
-                    (10 | u, 0x409)
+                    ((10 | u, 0x409), None)
                 } else if *idxen && format.is_none() && stride >= 4 && stride.is_multiple_of(4) {
-                    (12 | u, stride)
+                    // Structured buffers are viewed raw on the host; raw
+                    // `getDimensions` returns bytes, so divide by the stride.
+                    ((11 | u, 0), Some(stride))
                 } else {
-                    (11 | u, 0)
+                    ((11 | u, 0), None)
                 };
                 if used.is_some_and(|u| u.kind == ResourceType::Cbv) {
                     return Err("a constant buffer's descriptor read as data");
                 }
-                (props, None)
+                (props, None, div)
             }
             // A buffer the code reads with scalar loads (`buf[buf.Length - 1]`
             // at a uniform index): structured by the used-resource entry's
@@ -4366,12 +4368,12 @@ impl<'a> Lower<'a> {
                 if used.kind == ResourceType::Cbv {
                     return Err("a constant buffer's descriptor read as data");
                 }
-                let props = match used.stride {
-                    0 | 1 => (11 | u, 0),
-                    s if s.is_multiple_of(4) => (12 | u, s),
+                let div = match used.stride {
+                    0 | 1 => None,
+                    s if s.is_multiple_of(4) => Some(s),
                     _ => return Err("a scalar-loaded buffer of odd stride read as data"),
                 };
-                (props, None)
+                ((11 | u, 0), None, div)
             }
             _ => return Err("a scalar memory read as data"),
         };
@@ -4425,7 +4427,14 @@ impl<'a> Lower<'a> {
                 let d3 = self.s.m.bin(c, Bin::Or, base, last);
                 vec![(1, d1), (2, d2), (3, d3), (4, depth)]
             }
-            None => vec![(2, field(self, 0))],
+            None => {
+                let mut records = field(self, 0);
+                if let Some(stride) = div_stride {
+                    let s = self.s.m.i32(stride);
+                    records = self.s.m.bin(c, Bin::UDiv, records, s);
+                }
+                vec![(2, records)]
+            }
         };
         for k in 0..count {
             let rel = k.wrapping_sub(u32::from(first));
@@ -9545,11 +9554,11 @@ impl<'a> Lower<'a> {
                     if stride < 4 || !stride.is_multiple_of(4) {
                         return Err("a structured buffer of unknown stride");
                     }
-                    let h = self.handle(site, src, false, (12 | u, stride))?;
                     let s = self.s.m.i32(stride);
                     let row = self.s.m.bin(self.cur, Bin::Mul, index, s);
                     let byte = self.s.m.bin(self.cur, Bin::Add, row, off);
-                    (h, [index, off, iu], byte)
+                    let (h, byte) = self.raw_view(site, src, byte, 4, (11 | u, 0), true, guard)?;
+                    (h, [byte, iu, iu], byte)
                 }
                 None => {
                     let (h, off) = self.raw_view(site, src, off, 4, (11 | u, 0), true, guard)?;
@@ -9698,11 +9707,14 @@ impl<'a> Lower<'a> {
                         if stride < 4 || !stride.is_multiple_of(4) {
                             return Err("a structured buffer of unknown stride");
                         }
-                        args.push(self.handle(site, src, false, (12 | u, stride))?);
-                        args.extend([index, off]);
                         let s = self.s.m.i32(stride);
                         let row = self.s.m.bin(self.cur, Bin::Mul, index, s);
-                        (byte, bytes) = (self.s.m.bin(self.cur, Bin::Add, row, off), 4 * count);
+                        let off = self.s.m.bin(self.cur, Bin::Add, row, off);
+                        let n = 4 * count;
+                        let (h, off) =
+                            self.raw_view(site, src, off, n, (11 | u, 0), true, guard)?;
+                        args.extend([h, off, iu]);
+                        (byte, bytes) = (off, n);
                     }
                     None => {
                         let n = 4 * count;
@@ -9808,14 +9820,19 @@ impl<'a> Lower<'a> {
                     if stride < 4 || !stride.is_multiple_of(4) {
                         return Err("a structured buffer of unknown stride");
                     }
-                    let h = self.handle(site, src, false, (12 | u, stride))?;
+                    let s = self.s.m.i32(stride);
+                    let row = self.s.m.bin(c, Bin::Mul, index, s);
+                    let off = self.s.m.bin(c, Bin::Add, row, off);
+                    let bytes = 4 * count;
+                    let (h, off) =
+                        self.raw_view(site, src, off, bytes, (11 | u, 0), false, guard)?;
                     self.s.op(
-                        c,
+                        self.cur,
                         "rawBufferLoad.f32",
                         Attr::ReadOnly,
                         self.s.t.res_ret,
                         139,
-                        &[h, index, off, mask, align],
+                        &[h, off, iu, mask, align],
                     )
                 }
                 None => {

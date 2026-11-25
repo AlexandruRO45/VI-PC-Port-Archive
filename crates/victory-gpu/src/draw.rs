@@ -3605,7 +3605,12 @@ void main(uint3 id : SV_DispatchThreadID) {
             // SAFETY: a live buffer.
             unsafe { made.GetDesc() }.Width
         };
-        assert_eq!(width(start + 456), 1 << 16, "on an element: the buffer's copy");
+        // Structured buffers are viewed raw on the host (16-byte
+        // `D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT`): a 16-byte-aligned start
+        // (`2 * 456 = 912`) views the buffer's copy, while unaligned starts
+        // (`456` = 8 mod 16, `100` = 4 mod 16) get a copy of their own bytes.
+        assert_eq!(width(start + 2 * 456), 1 << 16, "16-byte aligned: the buffer's copy");
+        assert_ne!(width(start + 456), 1 << 16, "8 mod 16: a copy of its own bytes");
         assert_ne!(width(start + 100), 1 << 16, "off: a copy of its own bytes (in a shared buffer)");
         let (copy, address, len) = crate::descriptor::host::view_copy(&view(start + 100)).unwrap();
         assert_eq!((copy.range(), address, len), ((start + 100, 4 * 456), start + 100, 4 * 456));
@@ -3621,8 +3626,8 @@ void main(uint3 id : SV_DispatchThreadID) {
         let slots = crate::descriptor::heap(heap).host().expect("a host view heap");
         slots.make_at(0, &view(start + 100));
         let shown = std::sync::Arc::downgrade(&crate::descriptor::host::view_copy(&view(start + 100)).unwrap().0);
-        for k in 1..1200 {
-            if (100 + 4 * k) % 456 != 0 {
+        for k in 1..1500 {
+            if (100 + 4 * k) % 16 != 0 {
                 crate::descriptor::host::view_copy(&view(start + 100 + 4 * k)).unwrap();
             }
         }
