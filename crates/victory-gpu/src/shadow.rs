@@ -905,6 +905,32 @@ mod difference_tests {
     }
 }
 
+/// Grow copy-back scratch only for bytes that will actually be read.
+fn copyback_scratch(scratch: &mut Vec<u8>, len: usize) -> &mut [u8] {
+    if scratch.len() < len {
+        scratch.resize(len, 0);
+    }
+    &mut scratch[..len]
+}
+
+#[cfg(test)]
+mod copyback_scratch_tests {
+    use super::copyback_scratch;
+
+    #[test]
+    fn scratch_is_lazy_and_reuses_storage() {
+        let mut scratch = Vec::new();
+        assert!(copyback_scratch(&mut scratch, 0).is_empty());
+        assert_eq!(scratch.capacity(), 0);
+        copyback_scratch(&mut scratch, 8).fill(7);
+        let ptr = scratch.as_ptr();
+        assert_eq!(copyback_scratch(&mut scratch, 2), &[7, 7]);
+        assert_eq!(scratch.as_ptr(), ptr);
+        assert_eq!(scratch.len(), 8);
+        assert_eq!(copyback_scratch(&mut scratch, 10), &[7, 7, 7, 7, 7, 7, 7, 7, 0, 0]);
+    }
+}
+
 /// The unit shader writes are looked for and put back in.
 const PIECE: usize = 64 << 10;
 
@@ -1914,7 +1940,7 @@ impl Shadow {
             for &(at, n) in &differing {
                 self.changed(at, at + n);
             }
-            let mut title = vec![0u8; PIECE];
+            let mut title = Vec::new();
             for (at, n) in differing {
                 // SAFETY: inside the mapping; only the submitting thread
                 // writes it.
@@ -1930,7 +1956,7 @@ impl Shadow {
                 let last = last_difference(host, old).unwrap_or(first);
                 let (at, n) = (at + first, last + 1 - first);
                 let (host, old) = (&mut host[first..=last], &old[first..=last]);
-                let title = &mut title[..n];
+                let title = copyback_scratch(&mut title, n);
                 if !crate::host::read_into((start + at) as *const u8, title) {
                     continue;
                 }
@@ -2252,7 +2278,7 @@ impl Shadow {
             return true;
         }
         let base = start / PAGE;
-        let mut title = vec![0u8; PAGE];
+        let mut title = Vec::new();
         for (a, e) in busy {
             // As the refresh itself asks (`update_free`): the journal if
             // the submission's asking covered the range, else the kernel,
@@ -2277,7 +2303,7 @@ impl Shadow {
                     continue;
                 }
                 let n = hi - lo;
-                let title = &mut title[..n];
+                let title = copyback_scratch(&mut title, n);
                 // The lock of the copy's reference (the snapshot, or the
                 // CPU's side of a copy in the card's memory), from before
                 // title memory is read until the title's bytes are in: with
