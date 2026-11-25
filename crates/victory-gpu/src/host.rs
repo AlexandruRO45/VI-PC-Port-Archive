@@ -658,6 +658,8 @@ struct Deferred {
     /// Destination, source, bytes.
     copies: Vec<Step>,
     uploads: Vec<ID3D12Resource>,
+    /// Linear texture readbacks recorded so far, in command order.
+    readbacks: Vec<crate::list::TextureReadback>,
     /// Host objects the list's commands name (pipelines, root signatures,
     /// descriptor heaps): the title may release its objects before it
     /// submits the list.
@@ -1677,6 +1679,14 @@ impl HostList {
     /// bottom-of-pipe writes.
     pub(crate) fn defer_after(&self, work: impl Fn() + Send + 'static) {
         self.deferred().after.push(Box::new(work));
+    }
+
+    pub(crate) fn defer_texture_readback(&self, readback: crate::list::TextureReadback) {
+        self.deferred().readbacks.push(readback);
+    }
+
+    pub(crate) fn texture_readbacks(&self, range: &std::ops::Range<u64>) -> Vec<crate::list::TextureReadback> {
+        self.deferred().readbacks.iter().filter(|r| r.overlaps(range)).cloned().collect()
     }
 
     /// Stores `what` (`bytes` of it) at `dst` once the list has run.
