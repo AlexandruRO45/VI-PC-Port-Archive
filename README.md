@@ -1,4 +1,4 @@
-# VIctory for Windows
+# Vice-Tay
 
 A Windows compatibility project based on [VIctory](https://github.com/Marvisak/VIctory).
 It runs an Xbox Series title using files from a copy you supply. The development
@@ -67,7 +67,7 @@ for the rendering settings and implementation.
   [XCL](https://github.com/ivall/xcl)
 - TaynanGT maintains this repository and documents testing on the development
   PC. Individual code contributions are credited in the
-  [commit history](https://github.com/TaynanGT/victory-windows/commits/local/fxceless-render).
+  [commit history](https://github.com/TaynanGT/Vice-Tay/commits/local/fxceless-render).
 
 The compatibility code is licensed GPL-3.0-or-later. See [LICENSE](LICENSE).
 
