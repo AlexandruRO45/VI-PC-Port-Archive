@@ -292,6 +292,7 @@ pub(crate) struct EmulatedMeshPipeline {
     pub(crate) cs_uav_param: u32,
     pub(crate) cs_cbv_param: Option<u32>,
     pub(crate) cs_srv_param: Option<u32>,
+    pub(crate) cs_marks: Option<(u32, u32)>,
     pub(crate) draw_srv_param: u32,
 }
 
@@ -316,6 +317,10 @@ pub(crate) struct HostPipeline {
     pub(crate) inputs: Vec<Input>,
     /// Its shaders, for reports of slow submissions.
     pub(crate) name: String,
+    /// Our root parameters of the view-mark table and the buffer views'
+    /// written-pages bitmap, if a stage marks its writes through views
+    /// (`victory_shader::emit`, "Write marks").
+    pub(crate) marks: Option<(u32, u32)>,
 }
 
 fn aniso_point_mip_supported(device: &ID3D12Device) -> bool {
@@ -453,6 +458,27 @@ fn push_stage_params(
     Some(stage)
 }
 
+fn push_marks_params(params: &mut Vec<D3D12_ROOT_PARAMETER1>) -> (u32, u32) {
+    let first = params.len() as u32;
+    for (kind, register) in [
+        (D3D12_ROOT_PARAMETER_TYPE_SRV, victory_shader::emit::VIEW_MARKS),
+        (D3D12_ROOT_PARAMETER_TYPE_UAV, victory_shader::emit::VIEW_WRITES),
+    ] {
+        params.push(D3D12_ROOT_PARAMETER1 {
+            ParameterType: kind,
+            Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                    ShaderRegister: register,
+                    RegisterSpace: MEMORY_SPACE,
+                    Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE,
+                },
+            },
+            ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+        });
+    }
+    (first, first + 1)
+}
+
 /// Logs a pipeline that gets no host pipeline, once per reason.
 fn refuse(reason: &'static str, shaders: &[Arc<Shader>]) -> Option<HostPipeline> {
     static SEEN: std::sync::Mutex<Vec<&str>> = std::sync::Mutex::new(Vec::new());
@@ -564,6 +590,11 @@ impl HostPipeline {
                 &mut samplers,
             )?);
         }
+        // One pair for all stages: they share the heap and the bitmap.
+        let marks = stages
+            .iter()
+            .any(|(s, _)| s.translated().is_some_and(|t| t.host.view_marks))
+            .then(|| push_marks_params(&mut params));
         let (root, root_blob) =
             match root_signature(&host.device, &params, &samplers, compute.is_some()) {
                 Ok(root) => root,
@@ -617,6 +648,7 @@ impl HostPipeline {
                 rectangles: false,
                 slots: 0,
                 inputs: Vec::new(),
+                marks,
             });
         }
         let Some(g) = g else {
@@ -651,6 +683,7 @@ impl HostPipeline {
                 rectangles: false,
                 slots: 0,
                 inputs: Vec::new(),
+                marks,
             });
         }
 
@@ -748,6 +781,7 @@ impl HostPipeline {
             rectangles: !gs.is_empty(),
             slots: g.slots(),
             inputs: g.elements(),
+            marks,
         })
     }
 }
@@ -811,6 +845,11 @@ fn emulated_mesh_pipeline(
     } else {
         (None, None)
     };
+    let cs_marks = cs_stage
+        .translated()
+        .host
+        .view_marks
+        .then(|| push_marks_params(&mut cs_params));
     let (cs_root, cs_root_blob) = match root_signature(&host.device, &cs_params, &cs_samplers, true)
     {
         Ok(root) => root,
@@ -881,6 +920,10 @@ fn emulated_mesh_pipeline(
         },
         ShaderVisibility: D3D12_SHADER_VISIBILITY_VERTEX,
     });
+    let marks = gfx_stages
+        .iter()
+        .any(|s| s.translated().host.view_marks)
+        .then(|| push_marks_params(&mut gfx_params));
     let (gfx_root, gfx_root_blob) = match root_signature(
         &host.device,
         &gfx_params,
@@ -958,12 +1001,14 @@ fn emulated_mesh_pipeline(
             cs_uav_param,
             cs_cbv_param,
             cs_srv_param,
+            cs_marks,
             draw_srv_param,
         }),
         rectangles: false,
         slots: 0,
         inputs: Vec::new(),
         name: format!("{shaders:?}"),
+        marks,
     })
 }
 

@@ -758,7 +758,7 @@ mod tests {
     }
 
     use super::super::host::{EmulatedMeshDraw, Host};
-    use super::super::{HostShader, emit_with};
+    use super::super::{HostShader, Options, emit_with};
     use crate::native::{HwStage, MeshIo, NativeProgram, PsInput, StageIo, Usage, VsOutput};
     use crate::{io, ir, resource, structure};
 
@@ -867,7 +867,19 @@ mod tests {
         let st = structure::structure(&p).unwrap();
         let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
         let raised = io::raise(&p, &native).unwrap();
-        let shader = emit_with(&c, &native, &p, &st, &raised, &res, MeshMode::Emulate).unwrap();
+        let shader = emit_with(
+            &c,
+            &native,
+            &p,
+            &st,
+            &raised,
+            &res,
+            Options {
+                mesh: MeshMode::Emulate,
+                ..Options::default()
+            },
+        )
+        .unwrap();
         if let Ok(mut v) = Validator::load(Validator::default_path().as_deref()) {
             v.validate(&mut shader.dxil.clone())
                 .expect("emulated mesh CS validation failed");
@@ -919,7 +931,19 @@ mod tests {
         let st = structure::structure(&p).unwrap();
         let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
         let raised = io::raise(&p, &native).unwrap();
-        let shader = emit_with(&c, &native, &p, &st, &raised, &res, MeshMode::Emulate).unwrap();
+        let shader = emit_with(
+            &c,
+            &native,
+            &p,
+            &st,
+            &raised,
+            &res,
+            Options {
+                mesh: MeshMode::Emulate,
+                ..Options::default()
+            },
+        )
+        .unwrap();
         if let Ok(mut v) = Validator::load(Validator::default_path().as_deref()) {
             v.validate(&mut shader.dxil.clone())
                 .expect("PS validation failed");

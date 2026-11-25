@@ -613,7 +613,11 @@ fn translate(
                 if let (Some(r), Some(i), Some(s)) = (res, raised, structured) {
                     let label = || format!("{} {:?}", example(), p.stage);
                     *counter(t, p.stage, 0) += 1;
-                    match emit::emit_with(&container, &p, &program, &s, &i, &r, checks.mesh) {
+                    let options = emit::Options {
+                        view_marks: true,
+                        mesh: checks.mesh,
+                    };
+                    match emit::emit_with(&container, &p, &program, &s, &i, &r, options) {
                         Ok(shader) => {
                             *counter(t, p.stage, 1) += 1;
                             check(shader, t, checks, label);

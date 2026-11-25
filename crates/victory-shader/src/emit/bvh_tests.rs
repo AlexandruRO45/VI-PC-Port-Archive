@@ -593,6 +593,7 @@ fn build(wide: bool, memory: bool) -> HostShader {
         prims: Vec::new(),
         mesh_stride: 0,
         emulate_mesh: false,
+        view_marks: false,
     })
     .expect("lower");
     let shader = HostShader {
@@ -610,6 +611,7 @@ fn build(wide: bool, memory: bool) -> HostShader {
         heap: lowered.heap,
         heap_writes: lowered.heap_writes,
         mesh_emu: None,
+        view_marks: lowered.view_marks,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         v.validate(&mut shader.dxil.clone())

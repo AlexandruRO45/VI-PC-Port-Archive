@@ -83,8 +83,14 @@ fn key(translator: &str, encoding: &[u8], limit: u32) -> [u8; 32] {
 /// there is one, and whether it came from there. Mesh programs translate
 /// in `mesh` mode, which has entries of its own.
 pub fn host_shader(container: &[u8], mesh: MeshMode) -> (Result<HostShader, String>, bool) {
+    // Writes through views mark their pages: copy-backs compare only those
+    // (`crate::shadow::copy_back_marks`).
+    let options = victory_shader::emit::Options {
+        view_marks: true,
+        mesh,
+    };
     let translate =
-        |c: &[u8]| victory_shader::emit::translate_with(c, mesh).map_err(|e| e.to_string());
+        |c: &[u8]| victory_shader::emit::translate_with(c, options).map_err(|e| e.to_string());
     let id = match mesh {
         MeshMode::Native => "shader.dxil",
         MeshMode::Emulate => "shader.dxil.mesh-emu",
@@ -218,6 +224,7 @@ fn encode(translation: &Result<HostShader, String>) -> Vec<u8> {
         heap,
         heap_writes,
         mesh_emu,
+        view_marks,
     } = s;
     let mut out = MAGIC.to_vec();
     let word = |out: &mut Vec<u8>, v: u32| out.extend(v.to_le_bytes());
@@ -266,7 +273,8 @@ fn encode(translation: &Result<HostShader, String>) -> Vec<u8> {
             | u32::from(*memory_writes) << 1
             | u32::from(*view_addresses) << 2
             | u32::from(*heap) << 3
-            | u32::from(*heap_writes) << 4,
+            | u32::from(*heap_writes) << 4
+            | u32::from(*view_marks) << 5,
     );
     let encode_outputs = |out: &mut Vec<u8>, items: &[MeshOutput]| {
         word(out, items.len() as u32);
@@ -430,6 +438,7 @@ fn decode(bytes: &[u8]) -> Option<Result<HostShader, String>> {
         heap: memory & 8 != 0,
         heap_writes: memory & 16 != 0,
         mesh_emu,
+        view_marks: memory & 32 != 0,
     }))
 }
 
@@ -463,6 +472,7 @@ mod tests {
             heap: true,
             heap_writes: true,
             mesh_emu: None,
+            view_marks: true,
         }
     }
 
@@ -481,6 +491,7 @@ mod tests {
             view_addresses: false,
             heap: false,
             heap_writes: false,
+            view_marks: false,
             mesh_emu: Some(MeshEmu {
                 threads: 64,
                 max_vertices: 32,

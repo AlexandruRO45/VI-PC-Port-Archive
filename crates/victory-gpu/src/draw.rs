@@ -201,7 +201,9 @@ fn root_view(list: &HostList, address: u64, srv: bool, uav: bool) -> Option<u64>
     if srv || uav || gpu % 256 == 0 {
         shadow.refresh(list, address, len);
         if uav {
-            shadow.gpu_writes(list, address, len);
+            // A host root descriptor: no heap view, so its writes are not
+            // marked.
+            shadow.gpu_writes(list, address, len, false);
         }
         return Some(gpu);
     }
@@ -522,9 +524,20 @@ impl State {
     /// False if the draw or dispatch must not run: a table it reads could
     /// not be made.
     fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
-        self.bind_pipeline(list, &p.stages, &p.root, &p.pso, &p.name, compute);
+        if !self.bind_pipeline(list, &p.stages, &p.root, &p.pso, &p.name, p.marks, compute) {
+            return false;
+        }
         for stage in &p.stages {
-            if !self.bind_stage(list, stage, &p.root, &p.pso, &p.name, compute, compute) {
+            if !self.bind_stage(
+                list,
+                stage,
+                &p.root,
+                &p.pso,
+                &p.name,
+                p.marks,
+                compute,
+                compute,
+            ) {
                 return false;
             }
         }
@@ -533,9 +546,41 @@ impl State {
         true
     }
 
+    fn bind_marks(&self, list: &HostList, marks: Option<(u32, u32)>, compute: bool) -> bool {
+        // The bound view heap's mark table and the bitmap shaders mark
+        // their writes through views in (`crate::shadow::copy_back_marks`).
+        if let Some((table_param, bitmap_param)) = marks {
+            let heap = match self.heaps[0] {
+                0 => crate::memory::heap(),
+                h => crate::descriptor::heap(h as This).host(),
+            };
+            let (Some(table), Some(bitmap)) = (heap.and_then(|h| h.marks()), crate::shadow::view_writes()) else {
+                once!("a shader marking its writes without a view heap: dropped");
+                not_run("write marks without a view heap");
+                return false;
+            };
+            list.keep(table);
+            // SAFETY: an open list; the table lives while the list holds it,
+            // the bitmap for good.
+            unsafe {
+                let table = table.GetGPUVirtualAddress();
+                let l = &list.list;
+                if compute {
+                    l.SetComputeRootShaderResourceView(table_param, table);
+                    l.SetComputeRootUnorderedAccessView(bitmap_param, bitmap);
+                } else {
+                    l.SetGraphicsRootShaderResourceView(table_param, table);
+                    l.SetGraphicsRootUnorderedAccessView(bitmap_param, bitmap);
+                }
+            }
+        }
+        true
+    }
+
     /// Binds `root` and `pso` for the stages of a draw or dispatch, with the
     /// heaps those stages need; a pipeline of an emulated mesh dispatch binds
     /// its compute and graphics forms through this too.
+    #[allow(clippy::too_many_arguments)]
     fn bind_pipeline(
         &mut self,
         list: &HostList,
@@ -543,8 +588,9 @@ impl State {
         root: &ID3D12RootSignature,
         pso: &ID3D12PipelineState,
         name: &str,
+        marks: Option<(u32, u32)>,
         compute: bool,
-    ) {
+    ) -> bool {
         let l = &list.list;
         // A depth copy of ours (`crate::twin`) since the last one ran a
         // compute pipeline.
@@ -584,6 +630,9 @@ impl State {
         }
         #[cfg(feature = "diagnostics")]
         crate::capture::binding(name);
+        if !self.bind_marks(list, marks, compute) {
+            return false;
+        }
         // Shaders taking views from the heap itself read (or write) views no
         // table names: everything the bound heap's views reach is brought up
         // to date at submission (`crate::bindless`).
@@ -597,6 +646,7 @@ impl State {
             }
             crate::bindless::note_draw(writes);
         }
+        true
     }
 
     /// Binds one stage's root arguments: the user data, root views and the
@@ -614,6 +664,7 @@ impl State {
         root: &ID3D12RootSignature,
         pso: &ID3D12PipelineState,
         name: &str,
+        marks: Option<(u32, u32)>,
         title_compute: bool,
         host_compute: bool,
     ) -> bool {
@@ -638,6 +689,9 @@ impl State {
             } else {
                 0
             };
+            if host_compute && !self.bind_marks(list, marks, true) {
+                return false;
+            }
         }
         if self.table_failed {
             static DROPPED_TABLES: AtomicU64 = AtomicU64::new(0);
@@ -790,7 +844,7 @@ impl State {
                 if let (Some(shadow), Some((_, map))) = (shadow, &self.memory) {
                     let len = shadow.left(*address).min(1 << 20);
                     shadow.refresh(list, *address, len);
-                    shadow.gpu_writes(list, *address, len);
+                    shadow.gpu_writes(list, *address, len, false);
                     map.precise(*address, len);
                 }
             }
@@ -843,7 +897,10 @@ impl State {
         let offset = u32::try_from(shadow.offset(address)).ok()?;
         shadow.refresh(list, address, shadow.left(address));
         if uav {
-            shadow.gpu_writes(list, address, shadow.left(address).min(1 << 20));
+            // Writes through the view are marked wherever they land in the
+            // copy; else declared for 1 MiB.
+            let len = if shadow.marked() { shadow.left(address) } else { shadow.left(address).min(1 << 20) };
+            shadow.gpu_writes(list, address, len, true);
         }
         let (key, host) = match self.heaps[0] {
             0 => (MEMORY_HEAP, crate::memory::heap()?),
@@ -869,6 +926,9 @@ impl State {
         self.root_run.1 += 1;
         ROOT_VIEW_SLOTS.fetch_add(1, Ordering::Relaxed);
         host.raw_view_at(index, Some(&shadow.buffer), 0, shadow.range().1 & !3, uav);
+        if uav {
+            host.set_mark(index, shadow.mark_entry(shadow.range().0));
+        }
         self.root_slots.insert((key, copy, uav), index);
         Some((index, offset))
     }
@@ -942,7 +1002,7 @@ impl State {
             user_data: 0,
             slot: 0,
         };
-        readable(list, &written, &view);
+        readable(list, &written, &view, false);
         self.bind_heaps(list, false);
         list.keep(&resource);
         let gpu = visible.gpu(slot);
@@ -1213,20 +1273,24 @@ impl State {
         let Some(emu) = &p.mesh_emu else {
             return false;
         };
-        self.bind_pipeline(
+        if !self.bind_pipeline(
             list,
             std::slice::from_ref(&emu.cs_stage),
             &emu.cs_root,
             &emu.cs_pso,
             &p.name,
+            emu.cs_marks,
             true,
-        );
+        ) {
+            return false;
+        }
         if !self.bind_stage(
             list,
             &emu.cs_stage,
             &emu.cs_root,
             &emu.cs_pso,
             &p.name,
+            emu.cs_marks,
             false,
             true,
         ) {
@@ -1261,9 +1325,20 @@ impl State {
         let Some(emu) = &p.mesh_emu else {
             return false;
         };
-        self.bind_pipeline(list, &p.stages, &p.root, &p.pso, &p.name, false);
+        if !self.bind_pipeline(list, &p.stages, &p.root, &p.pso, &p.name, p.marks, false) {
+            return false;
+        }
         for stage in &p.stages {
-            if !self.bind_stage(list, stage, &p.root, &p.pso, &p.name, false, false) {
+            if !self.bind_stage(
+                list,
+                stage,
+                &p.root,
+                &p.pso,
+                &p.name,
+                p.marks,
+                false,
+                false,
+            ) {
                 return false;
             }
         }
@@ -1320,7 +1395,7 @@ impl State {
             return;
         };
         if let Some(view) = host.mirror(index, handle, true) {
-            readable(list, u, &view);
+            readable(list, u, &view, true);
         }
     }
 
@@ -1400,7 +1475,7 @@ impl State {
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
                     if let Some(view) = crate::descriptor::view(handle) {
-                        readable(list, u, &view);
+                        readable(list, u, &view, true);
                     }
                 }
                 made.push((slot, first * 32));
@@ -1427,7 +1502,7 @@ impl State {
                     Some(view) => {
                         host.make_at(index, &view);
                         if let Some(u) = used {
-                            readable(list, u, &view);
+                            readable(list, u, &view, true);
                         }
                     }
                     None => {
@@ -2185,8 +2260,10 @@ fn host_signature(kind: u32, stride: u32) -> Option<ID3D12CommandSignature> {
 }
 
 /// Gets what a shader reads or writes through a view ready: buffer data
-/// copied, textures moved to the state they need.
-fn readable(list: &HostList, u: &UsedResource, view: &View) {
+/// copied, textures moved to the state they need. `marked`: a shader's
+/// writes through the view mark their pages (every translated shader's do);
+/// the host's own (clears) do not.
+fn readable(list: &HostList, u: &UsedResource, view: &View, marked: bool) {
     const SHADER_RESOURCE: u32 = 0x40 | 0x80;
     const UNORDERED_ACCESS: u32 = 0x8;
     let placed = crate::descriptor::host::placed_texture(view);
@@ -2214,7 +2291,7 @@ fn readable(list: &HostList, u: &UsedResource, view: &View) {
     {
         shadow.refresh(list, address, len);
         if u.kind == ResourceType::Uav {
-            shadow.gpu_writes(list, address, len);
+            shadow.gpu_writes(list, address, len, marked);
         }
     }
     match (view, u.kind) {
@@ -2785,9 +2862,9 @@ void main(uint3 id : SV_DispatchThreadID) {
             ));
             let list = host.new_list().unwrap();
             let copies = crate::texture::ALIAS_COPIES.load(Ordering::Relaxed);
-            readable(&list, &used(ResourceType::Uav), &unordered);
+            readable(&list, &used(ResourceType::Uav), &unordered, false);
             run(&list, &slots, &write, 0, None, (size / 8, size / 8));
-            readable(&list, &used(ResourceType::Srv), &view);
+            readable(&list, &used(ResourceType::Srv), &view, false);
             run(
                 &list,
                 &slots,
@@ -2888,11 +2965,11 @@ void main(uint3 id : SV_DispatchThreadID) {
         let (raw, raw_data) = host.shared_buffer(total).unwrap();
         let list = host.new_list().unwrap();
         for v in &planes {
-            readable(&list, &used(ResourceType::Uav), v);
+            readable(&list, &used(ResourceType::Uav), v, false);
         }
         run(&list, &slots, &write, 0, None, (8, 8));
         for v in &reads {
-            readable(&list, &used(ResourceType::Srv), v);
+            readable(&list, &used(ResourceType::Srv), v, false);
         }
         assert!(list.take_rebind(), "the conversion ran in the list");
         run(&list, &slots, &read, 2, Some(&out), (8, 8));
@@ -2969,7 +3046,7 @@ void main(uint3 id : SV_DispatchThreadID) {
                 None,
             )
         };
-        readable(&list, &used(ResourceType::Uav), &planes[0]);
+        readable(&list, &used(ResourceType::Uav), &planes[0], false);
         let twin = copy.twin.get().and_then(Option::as_ref).expect("a twin");
         let mut g = [D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); 2];
         for (p, plane) in twin.planes.iter().enumerate() {
@@ -3078,9 +3155,9 @@ void main(uint3 id : SV_DispatchThreadID) {
                 "#define RS \"DescriptorTable(SRV(t0)), UAV(u1)\"\n{get}\nRWByteAddressBuffer o : register(u1);\n[RootSignature(RS)]\n[numthreads(8, 8, 1)]\nvoid main(uint3 id : SV_DispatchThreadID) {{ o.Store4((id.y * 64 + id.x) * 16, asuint(get(id))); }}"
             ));
             let list = host.new_list().unwrap();
-            readable(&list, &used(ResourceType::Uav), &unordered);
+            readable(&list, &used(ResourceType::Uav), &unordered, false);
             run(&list, &slots, &write, 0, None, groups);
-            readable(&list, &used(ResourceType::Srv), &shader);
+            readable(&list, &used(ResourceType::Srv), &shader, false);
             run(&list, &slots, &read, 1, Some(&out), (8, 8));
             list.close();
             host.execute(&[&list]);
