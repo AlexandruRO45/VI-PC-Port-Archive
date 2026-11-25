@@ -162,7 +162,7 @@ pub fn run(
     let paths = crate::default_paths(paths)?;
     // `VICTORY_HOST_MAX_WAVE=32`: translate as for a host whose waves have
     // at most 32 lanes (as the runtime does on such a card).
-    if let Some(n) = std::env::var("VICTORY_HOST_MAX_WAVE").ok().and_then(|v| v.parse().ok()) {
+    if let Some(n) = host_max_wave_from_env(std::env::var("VICTORY_HOST_MAX_WAVE").ok()) {
         victory_shader::emit::set_host_max_wave(n);
     }
     let dll = validate.then(Validator::default_path).flatten();
@@ -323,14 +323,8 @@ fn translate(
     // Diagnostics: `VICTORY_TRANSLATE_ONLY=<hash prefix>,...` translates
     // those containers alone.
     static ONLY: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
-    let only = ONLY.get_or_init(|| {
-        std::env::var("VICTORY_TRANSLATE_ONLY")
-            .unwrap_or_default()
-            .split(',')
-            .map(|h| h.trim().to_lowercase())
-            .filter(|h| !h.is_empty())
-            .collect()
-    });
+    let only =
+        ONLY.get_or_init(|| translate_only_from_env(std::env::var("VICTORY_TRANSLATE_ONLY").ok()));
     if !only.is_empty() && !only.iter().any(|o| hash.starts_with(o.as_str())) {
         return;
     }
@@ -353,7 +347,10 @@ fn translate(
         && let Some((dir, texts)) = spec.split_once(';')
     {
         let line = example();
-        if texts.split('|').any(|text| !text.is_empty() && line.contains(text)) {
+        if texts
+            .split('|')
+            .any(|text| !text.is_empty() && line.contains(text))
+        {
             let name: String = source
                 .label()
                 .chars()
@@ -362,7 +359,10 @@ fn translate(
                 .take(70)
                 .collect();
             let _ = std::fs::create_dir_all(dir);
-            let _ = std::fs::write(std::path::Path::new(dir).join(format!("{name}.{hash}.cdxil")), &bytes[..]);
+            let _ = std::fs::write(
+                std::path::Path::new(dir).join(format!("{name}.{hash}.cdxil")),
+                &bytes[..],
+            );
         }
     }
     if !lock(seen).insert(code) {
@@ -379,21 +379,36 @@ fn translate(
     // `VICTORY_FAIL_DUMP=<dir>`: the first 3 containers of each failure reason, as the title
     // has them (`.cdxil`), to work on a translator gap offline
     let dump = std::env::var_os("VICTORY_FAIL_DUMP");
-    let before: Option<BTreeMap<String, usize>> = dump.as_ref().map(|_| t.failed.iter().map(|(k, v)| (k.clone(), v.0)).collect());
+    let before: Option<BTreeMap<String, usize>> = dump
+        .as_ref()
+        .map(|_| t.failed.iter().map(|(k, v)| (k.clone(), v.0)).collect());
     translate_programs(&container, programs, &example, t, checks);
     if let (Some(dir), Some(before)) = (dump, before) {
         for (reason, (n, _)) in &t.failed {
             let was = before.get(reason).copied().unwrap_or(0);
             if *n > was && was < 3 {
-                let stem: String = reason.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).take(60).collect();
+                let stem: String = reason
+                    .chars()
+                    .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+                    .take(60)
+                    .collect();
                 let _ = std::fs::create_dir_all(&dir);
-                let _ = std::fs::write(std::path::Path::new(&dir).join(format!("{stem}_{was}.cdxil")), &bytes[..]);
+                let _ = std::fs::write(
+                    std::path::Path::new(&dir).join(format!("{stem}_{was}.cdxil")),
+                    &bytes[..],
+                );
             }
         }
     }
 }
 
-fn translate_programs(container: &Container, programs: Vec<NativeProgram>, example: &dyn Fn() -> String, t: &mut Tally, checks: &mut Checks) {
+fn translate_programs(
+    container: &Container,
+    programs: Vec<NativeProgram>,
+    example: &dyn Fn() -> String,
+    t: &mut Tally,
+    checks: &mut Checks,
+) {
     for p in programs {
         t.programs += 1;
         match victory_shader::spill::build(&p) {
@@ -492,7 +507,11 @@ fn census_line(label: &str, native: &NativeProgram, p: &ir::Program, shader: &em
     static OUT: std::sync::OnceLock<Option<Mutex<std::fs::File>>> = std::sync::OnceLock::new();
     let Some(out) = OUT.get_or_init(|| {
         let path = std::env::var_os("VICTORY_SHADER_CENSUS")?;
-        let file = std::fs::OpenOptions::new().create(true).append(true).open(path).ok()?;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .ok()?;
         Some(Mutex::new(file))
     }) else {
         return;
@@ -517,7 +536,12 @@ fn census_line(label: &str, native: &NativeProgram, p: &ir::Program, shader: &em
         console[k] += 1;
     }
     let mut line = format!("{label}\twave64={}", u8::from(native.wave64));
-    for (name, n) in ["c_total", "c_valu", "c_sop", "c_smem", "c_buffer", "c_image", "c_ds", "c_sopp", "c_other"].iter().zip(console) {
+    for (name, n) in [
+        "c_total", "c_valu", "c_sop", "c_smem", "c_buffer", "c_image", "c_ds", "c_sopp", "c_other",
+    ]
+    .iter()
+    .zip(console)
+    {
         line.push_str(&format!("\t{name}={n}"));
     }
     for (name, n) in emit::census::KINDS.iter().zip(census.counts) {
@@ -782,4 +806,90 @@ fn tally_structured(program: &ir::Program, s: &structure::Structured, t: &mut Ta
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The wave size `VICTORY_HOST_MAX_WAVE` asks a translation to assume, from
+/// its value: `None` when it is unset, empty or not a number, so a typo
+/// translates for the host as usual rather than for a wave of zero lanes.
+///
+/// `main.rs` used to read a second name for the same setting
+/// (`VICTORY_HOST_WAVE`), which meant the variable documented in #37 and the
+/// one the command checked in front of this function were different: setting
+/// one and not the other looked like it worked or did nothing depending on
+/// which line ran first. There is one name now, and this says what it does
+/// with the value.
+/// The hash prefixes `VICTORY_TRANSLATE_ONLY` names, lowercased and trimmed:
+/// an empty list when it is unset or names nothing, which translates
+/// everything as usual.
+///
+/// The value is compared against the hash a run's log prints (`hash=` in
+/// "first bind", "shader does not translate", "host pipeline refused"), as a
+/// prefix, so a short one is enough to name a container. Case is folded
+/// because those log lines are lowercase hex and a paste from elsewhere may
+/// not be.
+fn translate_only_from_env(value: Option<String>) -> Vec<String> {
+    value
+        .unwrap_or_default()
+        .split(',')
+        .map(|h| h.trim().to_lowercase())
+        .filter(|h| !h.is_empty())
+        .collect()
+}
+
+fn host_max_wave_from_env(value: Option<String>) -> Option<u32> {
+    let value = value?;
+    let n = value.trim().parse::<u32>().ok()?;
+    // A wave of zero lanes is not a wave; neither is anything the host cannot
+    // report (D3D12's WaveLaneCountMax is a u32, and real GPUs are 4..128).
+    (n > 0).then_some(n)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::host_max_wave_from_env;
+
+    #[test]
+    fn the_translate_only_filter_splits_folds_and_ignores_empties() {
+        use super::translate_only_from_env;
+        // One, two, spaces around them, and case folded to match the log.
+        assert_eq!(
+            translate_only_from_env(Some("2cc4c197".into())),
+            ["2cc4c197"]
+        );
+        assert_eq!(
+            translate_only_from_env(Some("2cc4c197, 02384a60".into())),
+            ["2cc4c197", "02384a60"]
+        );
+        assert_eq!(
+            translate_only_from_env(Some("2CC4C197".into())),
+            ["2cc4c197"]
+        );
+        assert_eq!(
+            translate_only_from_env(Some(" 2cc4c197 ".into())),
+            ["2cc4c197"]
+        );
+        // Nothing named: the empty list, which translates everything.
+        assert!(translate_only_from_env(None).is_empty());
+        assert!(translate_only_from_env(Some(String::new())).is_empty());
+        assert!(translate_only_from_env(Some(" , ,".into())).is_empty());
+        // A trailing comma does not name an empty prefix, which would match
+        // every hash and translate the whole pack.
+        assert_eq!(
+            translate_only_from_env(Some("2cc4c197,".into())),
+            ["2cc4c197"]
+        );
+    }
+
+    #[test]
+    fn the_wave_override_reads_a_number_and_ignores_anything_else() {
+        assert_eq!(host_max_wave_from_env(Some("32".into())), Some(32));
+        assert_eq!(host_max_wave_from_env(Some(" 32 ".into())), Some(32));
+        assert_eq!(host_max_wave_from_env(Some("64".into())), Some(64));
+        // Unset, empty, not a number, or zero: translate for the host.
+        assert_eq!(host_max_wave_from_env(None), None);
+        assert_eq!(host_max_wave_from_env(Some(String::new())), None);
+        assert_eq!(host_max_wave_from_env(Some("lots".into())), None);
+        assert_eq!(host_max_wave_from_env(Some("0".into())), None);
+        assert_eq!(host_max_wave_from_env(Some("-32".into())), None);
+    }
 }
