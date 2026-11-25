@@ -90,7 +90,16 @@ pub(crate) struct Shadow {
     /// goes.
     base: u64,
     slice: Option<Slice>,
+    /// Whether its buffer sits in video memory the CPU writes write-combined
+    /// over the bus ([`crate::host::Host::loose_buffer`]): reading it is
+    /// uncached bus traffic, so every read of it counts.
+    wc: std::sync::atomic::AtomicBool,
 }
+
+/// Reads of write-combined windows (diagnostics): each is uncached bus
+/// traffic on the CPU's side.
+pub(crate) static WC_READS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 /// Snapshot segments (offset, bytes) and the pieces compared.
 type Snapshot = (Vec<(usize, Vec<u8>)>, std::collections::HashSet<usize>);
@@ -180,6 +189,27 @@ impl Shadow {
         format!("copy {:#x}+{:#x} {v:?}", self.start, self.len)
     }
 
+    /// Marks this copy's buffer as one in video memory the CPU writes
+    /// write-combined over the bus ([`crate::host::Host::loose_buffer`]):
+    /// reading it back is uncached bus traffic, so every read of it counts.
+    pub(crate) fn write_combined(&self) {
+        self.wc.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// A read of this copy's bytes on the CPU (diagnostics): counted when the
+    /// buffer is write-combined, and warned of once.
+    fn wc_read(&self) {
+        if self.wc.load(std::sync::atomic::Ordering::Relaxed) {
+            WC_READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                tracing::warn!(
+                    "a write-combined window was read on the CPU: uncached bus traffic, counted"
+                )
+            });
+        }
+    }
+
     /// Offset of a title address from the buffer's start.
     pub(crate) fn offset(&self, address: u64) -> u64 {
         address - self.start + self.base
@@ -206,6 +236,7 @@ impl Shadow {
         if from >= to {
             return 0;
         }
+        self.wc_read();
         if let Some(t) = &self.tracked
             && t.changed(page / PAGE)
         {
@@ -264,6 +295,7 @@ impl Shadow {
             marks,
             base: slice.map_or(0, |s| s.offset),
             slice,
+            wc: std::sync::atomic::AtomicBool::new(false),
         });
         if let Some(base) = marks {
             self::marks().owners.insert(base, Arc::downgrade(&shadow));
@@ -336,6 +368,7 @@ impl Shadow {
         if from >= to {
             return;
         }
+        self.wc_read();
         // SAFETY: inside the mapping.
         let host = |a: usize, b: usize| unsafe { std::slice::from_raw_parts(self.data.add(a), b - a) };
         let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
@@ -415,6 +448,7 @@ impl Shadow {
             && back
             && from < to
         {
+            self.wc_read();
             let before = &before[from - taken..to - taken];
             #[cfg(feature = "diagnostics")]
             let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::CompareUs);
@@ -1102,7 +1136,8 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
         );
         return Some(shadow.clone());
     }
-    let (buffer, data) = host()?.shared_buffer(len)?;
+    let host = host()?;
+    let (buffer, data, video) = host.loose_buffer(len)?;
     crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
@@ -1112,6 +1147,9 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
         "loose memory copied to the host"
     );
     let shadow = Shadow::new(buffer, data, gpu, start, len);
+    if video {
+        shadow.write_combined();
+    }
     map.insert((start, len), shadow.clone());
     changed();
     Some(shadow)
