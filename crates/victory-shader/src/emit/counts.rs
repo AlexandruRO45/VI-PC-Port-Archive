@@ -456,6 +456,9 @@ mod tests {
         assert_eq!(c.instructions, 23);
     }
 
+    /// Every shared opcode the writer has in both forms, the floats typed
+    /// by each record that gives a value its type, and integers read after
+    /// them, so a value id off by one names a binary op wrongly.
     #[test]
     fn counts_integer_and_float_binary_ops_separately() {
         let mut m = Module::default();
@@ -465,36 +468,74 @@ mod tests {
         let load = m.function("load_pair", load_ty, None, false);
         let main_ty = m.func_ty(void, vec![]);
         m.function("main", main_ty, None, true);
-        let entry = m.new_block();
+        let arr = m.array(4, float);
+        let lds = m.global("lds", arr, 3);
+        let (entry, exit) = (m.new_block(), m.new_block());
 
         let i = m.i32(2);
-        let sum = m.bin(entry, Bin::Add, i, i);
-        let product = m.bin(entry, Bin::Mul, sum, i);
-        m.bin(entry, Bin::SDiv, product, i);
+        let mut x = i;
+        for op in [
+            Bin::Add,
+            Bin::Sub,
+            Bin::Mul,
+            Bin::UDiv,
+            Bin::SDiv,
+            Bin::URem,
+        ] {
+            x = m.bin(entry, op, x, i);
+        }
 
+        // A constant, a call's result, a field, a cast, a load, a select
+        // and a phi.
+        let two = m.f32(2.0f32.to_bits());
         let pair = m.call(entry, load, vec![]);
         let f = m.extract(entry, pair, 0);
-        let two = m.f32(2.0f32.to_bits());
         let sum = m.bin(entry, Bin::Add, f, two);
-        let product = m.bin(entry, Bin::Mul, sum, two);
-        m.bin(entry, Bin::SDiv, two, product);
-        m.terminate(entry, Term::Ret);
+        let cast = m.cast(entry, Cast::Bitcast, x, float);
+        let difference = m.bin(entry, Bin::Sub, cast, sum);
+        let zero = m.i32(0);
+        let at = m.element(entry, lds, zero);
+        let loaded = m.load(entry, at);
+        let product = m.bin(entry, Bin::Mul, loaded, difference);
+        let less = m.cmp(entry, pred::IULT, x, i);
+        let picked = m.select(entry, less, product, two);
+        let quotient = m.bin(entry, Bin::SDiv, picked, two);
+        m.terminate(entry, Term::Br(exit));
+        let merged = m.phi(exit, float);
+        m.set_phi(merged, vec![(quotient, entry)]);
+        m.bin(exit, Bin::Mul, merged, merged);
+        m.bin(exit, Bin::Add, x, i);
+        m.terminate(exit, Term::Ret);
 
         let c = count(&m.write()).expect("counts");
         assert_eq!(
             kinds(&c),
             [
-                ("add", 1),
+                ("add", 2),
+                ("bitcast", 1),
+                ("br", 1),
                 ("extractvalue", 1),
                 ("fadd", 1),
                 ("fdiv", 1),
-                ("fmul", 1),
+                ("fmul", 2),
+                ("fsub", 1),
+                ("getelementptr", 1),
+                ("icmp", 1),
+                ("load", 1),
                 ("load_pair", 1),
                 ("mul", 1),
+                ("phi", 1),
                 ("ret", 1),
                 ("sdiv", 1),
+                ("select", 1),
+                ("sub", 1),
+                ("udiv", 1),
+                ("urem", 1),
             ]
         );
+        // Naming by type moves no instruction between kinds' totals.
+        assert_eq!(c.instructions, c.kinds.values().sum::<u64>());
+        assert_eq!((c.blocks, c.instructions), (2, 22));
     }
 
     #[test]
@@ -508,7 +549,25 @@ mod tests {
         m.instruction(2, &[forward, 2, forward, 1]).unwrap(); // fsub of vectors
         m.instruction(2, &[1, 1, 6]).unwrap(); // frem of vectors
         m.instruction(2, &[forward, 1, forward, 0]).unwrap(); // fadd of doubles
-        assert_eq!(kinds(&m.counts), [("fadd", 1), ("frem", 1), ("fsub", 1)]);
+        m.record(TYPE_BLOCK, 7, &[32]).unwrap(); // i32
+        m.record(TYPE_BLOCK, 12, &[4, 3]).unwrap(); // <4 x i32>
+        m.instruction(2, &[forward, 0, forward, 2]).unwrap(); // fmul of halves
+        m.instruction(2, &[forward, 4, forward, 0]).unwrap(); // add of vectors
+        m.instruction(2, &[1, 1, 4]).unwrap(); // sdiv of vectors
+        m.instruction(2, &[forward, 3, forward, 6]).unwrap(); // srem of i32
+        assert_eq!(
+            kinds(&m.counts),
+            [
+                ("add", 1),
+                ("fadd", 1),
+                ("fmul", 1),
+                ("frem", 1),
+                ("fsub", 1),
+                ("sdiv", 1),
+                ("srem", 1),
+            ]
+        );
+        assert_eq!(m.counts.instructions, 7);
     }
 
     /// Through a whole container, as a shader is handed to the host.
