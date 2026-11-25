@@ -7458,6 +7458,7 @@ impl PresentTimes {
                     .copied().unwrap_or(0);
                 let max = window.last().copied().unwrap_or(0);
                 writeln!(out, "window,{from},{to},{stalls},{p99},{max}")?;
+                out.flush()?;
                 from = to + 1;
                 window_us = 0;
                 window.clear();
