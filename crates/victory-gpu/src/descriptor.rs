@@ -92,6 +92,11 @@ impl Heap {
         {
             return None;
         }
+        // `mirror` queues only while the host heap is unset, under the lock
+        // that makes it, so nothing waits in `pending` once it is set.
+        if let Some(h) = self.host.get() {
+            return h.as_ref();
+        }
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         // A recorder can take the fast path as soon as the OnceLock is
         // initialized: queued writes are replayed before it is published,
@@ -357,7 +362,10 @@ struct Views {
     freed_total: u64,
 }
 
-static VIEWS: std::sync::Mutex<Views> = std::sync::Mutex::new(Views {
+// Read by every list recorder for every descriptor it binds: readers share
+// it. As a mutex it made the title's five recording threads take turns
+// (6,600 context switches a second each, PIX timing capture, 2026-11-25).
+static VIEWS: std::sync::RwLock<Views> = std::sync::RwLock::new(Views {
     list: Vec::new(),
     index: std::collections::BTreeMap::new(),
     by_resource: std::collections::BTreeMap::new(),
@@ -382,7 +390,7 @@ fn record(handle: u64, view: View) {
     if handle == 0 {
         return;
     }
-    let mut views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut views = VIEWS.write().unwrap_or_else(|e| e.into_inner());
     let i = match views.index.get(&view) {
         Some(&i) => i,
         None => {
@@ -414,7 +422,7 @@ fn record(handle: u64, view: View) {
 /// The title released `resource`: the views naming it go stale.
 pub(crate) fn forget(resource: usize) {
     let any_freed = {
-        let mut views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+        let mut views = VIEWS.write().unwrap_or_else(|e| e.into_inner());
         let Some(entries) = views.by_resource.remove(&resource) else {
             return;
         };
@@ -451,14 +459,14 @@ pub(crate) fn forget(resource: usize) {
 /// Total number of resource-backed view entries freed so far.
 #[cfg(windows)]
 fn freed_views_total() -> u64 {
-    VIEWS.lock().unwrap_or_else(|e| e.into_inner()).freed_total
+    VIEWS.read().unwrap_or_else(|e| e.into_inner()).freed_total
 }
 
 /// View indices freed since `seen`, or `None` if more than [`FREED_KEPT`] were
 /// freed since then, together with the current total.
 #[cfg(windows)]
 fn freed_views_since(seen: u64) -> (Option<Vec<u32>>, u64) {
-    let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    let views = VIEWS.read().unwrap_or_else(|e| e.into_inner());
     let total = views.freed_total;
     let n = total.saturating_sub(seen) as usize;
     if n == 0 {
@@ -475,7 +483,7 @@ fn freed_views_since(seen: u64) -> (Option<Vec<u32>>, u64) {
 /// stale: one look at the views for all.
 #[cfg(windows)]
 fn stale_views(entries: &[(u32, (u32, u32))]) -> Vec<(u32, (u32, u32))> {
-    let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    let views = VIEWS.read().unwrap_or_else(|e| e.into_inner());
     entries
         .iter()
         .filter(|(_, (i, generation))| {
@@ -491,7 +499,7 @@ fn stale_views(entries: &[(u32, (u32, u32))]) -> Vec<(u32, (u32, u32))> {
 /// The view of entry `i` if `generation` is still its own.
 #[cfg(windows)]
 fn view_at(i: u32, generation: u32) -> Option<View> {
-    let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    let views = VIEWS.read().unwrap_or_else(|e| e.into_inner());
     let (view, current) = views.list.get(i as usize)?;
     (*current == generation).then(|| view.clone())
 }
@@ -501,7 +509,7 @@ fn view_at(i: u32, generation: u32) -> Option<View> {
 #[cfg(windows)]
 fn views_at_batch(entries: &[Option<(u32, u32)>], out: &mut Vec<Option<View>>) {
     out.clear();
-    let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    let views = VIEWS.read().unwrap_or_else(|e| e.into_inner());
     for entry in entries {
         let view = entry.and_then(|(i, generation)| {
             let (view, current) = views.list.get(i as usize)?;
@@ -518,7 +526,7 @@ pub(crate) fn view(handle: u64) -> Option<View> {
     }
     // SAFETY: the handle is a descriptor slot the title passes back.
     let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
-    let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    let views = VIEWS.read().unwrap_or_else(|e| e.into_inner());
     let (view, current) = views.list.get(i as usize)?;
     (tag == VIEW_TAG && *current == generation).then(|| view.clone())
 }
