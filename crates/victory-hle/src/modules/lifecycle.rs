@@ -166,8 +166,13 @@ fn caption() -> Option<String> {
 /// `text` in the ANSI code page, NUL-terminated, as `CreateWindowExA`
 /// takes it (a character the code page lacks becomes its default one).
 fn ansi(text: &str) -> Vec<u8> {
+    encode(windows_sys::Win32::Globalization::CP_ACP, text)
+}
+
+/// `text` in `code_page`, NUL-terminated, interior NULs dropped.
+fn encode(code_page: u32, text: &str) -> Vec<u8> {
     use std::ptr::{null, null_mut};
-    use windows_sys::Win32::Globalization::{CP_ACP, WideCharToMultiByte};
+    use windows_sys::Win32::Globalization::WideCharToMultiByte;
     let wide: Vec<u16> = text.encode_utf16().filter(|&c| c != 0).collect();
     let Ok(len) = i32::try_from(wide.len()) else {
         return vec![0];
@@ -175,7 +180,7 @@ fn ansi(text: &str) -> Vec<u8> {
     // SAFETY: sizing call, then a call with room for `n` bytes.
     let mut narrow = unsafe {
         let n = WideCharToMultiByte(
-            CP_ACP,
+            code_page,
             0,
             wide.as_ptr(),
             len,
@@ -186,7 +191,7 @@ fn ansi(text: &str) -> Vec<u8> {
         );
         let mut narrow = vec![0u8; usize::try_from(n).unwrap_or(0)];
         WideCharToMultiByte(
-            CP_ACP,
+            code_page,
             0,
             wide.as_ptr(),
             len,
@@ -396,13 +401,25 @@ mod tests {
         assert_eq!(ansi("Neutral caption"), b"Neutral caption\0");
         assert_eq!(ansi("a\0b"), b"ab\0");
         assert_eq!(ansi(""), b"\0");
-        // Not passed on as UTF-8 bytes (unless the code page is UTF-8):
-        // one byte per character, whatever the code page makes of it.
-        use windows_sys::Win32::Globalization::{CP_UTF8, GetACP};
-        // SAFETY: a plain query.
-        if unsafe { GetACP() } != CP_UTF8 {
+        // Not passed on as UTF-8 bytes: in a single-byte code page, one
+        // byte per character, whatever the code page makes of it.
+        use windows_sys::Win32::Globalization::{CP_ACP, CPINFO, GetCPInfo};
+        let mut info = CPINFO {
+            MaxCharSize: 0,
+            DefaultChar: [0; 2],
+            LeadByte: [0; 12],
+        };
+        // SAFETY: `info` is a writable CPINFO.
+        if unsafe { GetCPInfo(CP_ACP, &mut info) } != 0 && info.MaxCharSize == 1 {
             assert_eq!(ansi("caf\u{e9}").len(), 5);
         }
+    }
+
+    #[test]
+    fn a_caption_takes_the_bytes_of_its_code_page() {
+        assert_eq!(encode(1252, "caf\u{e9}"), b"caf\xe9\0");
+        assert_eq!(encode(936, "caf\u{e9}"), b"caf\xa8\xa6\0");
+        assert_eq!(encode(65001, "caf\u{e9}"), "caf\u{e9}\0".as_bytes());
     }
 
     #[test]
