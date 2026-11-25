@@ -2095,7 +2095,6 @@ fn copy_source(inst: &Inst, k: usize) -> Option<Moved> {
         ("s_mov_b64", Operand::Literal(x)) if x >> 31 == 0 => {
             Some(Moved::Const(if k == 0 { x } else { 0 }))
         }
-        
         // 64-bit inline integers sign-extend and inline floats expand to binary64.
         ("s_mov_b64", Operand::Const(c)) => {
             inline64(c).map(|v| Moved::Const((v >> (32 * k)) as u32))
