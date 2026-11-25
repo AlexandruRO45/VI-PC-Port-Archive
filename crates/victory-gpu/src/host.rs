@@ -313,7 +313,7 @@ fn create() -> windows::core::Result<Host> {
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
             tracing::info!("host device on the software adapter (WARP)");
         } else {
-            match fastest_adapter() {
+            match chosen_adapter() {
                 Ok(adapter) => D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?,
                 Err(e) => {
                     tracing::warn!(error = %e, "no adapter preference; the default is used");
@@ -457,6 +457,83 @@ impl Host {
     }
 }
 
+/// The adapter `VICTORY_ADAPTER` names (a part of its description, ignoring
+/// case), or the one Windows ranks fastest. A machine with an integrated GPU
+/// as well as a discrete one can thus be told which to run on; a name that
+/// matches nothing falls back to the fastest, with a warning.
+fn chosen_adapter() -> windows::core::Result<IDXGIAdapter1> {
+    match requested_adapter(std::env::var("VICTORY_ADAPTER").ok().as_deref()) {
+        Some(name) => named_adapter(name).inspect_err(|e| {
+            tracing::warn!(name, error = %e, "no adapter matches VICTORY_ADAPTER; the fastest is used");
+        }),
+        None => fastest_adapter(),
+    }
+}
+
+/// The adapter name the environment asks for: trimmed, or none for unset or
+/// empty.
+fn requested_adapter(name: Option<&str>) -> Option<&str> {
+    name.map(str::trim).filter(|name| !name.is_empty())
+}
+
+/// Whether `flags` describe a hardware adapter.
+fn is_hardware(flags: u32) -> bool {
+    flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0
+}
+
+/// The first hardware adapter whose description holds `wanted`, ignoring
+/// case: an index into `(description, flags)`.
+fn adapter_index(adapters: &[(&str, u32)], wanted: &str) -> Option<usize> {
+    adapters
+        .iter()
+        .position(|(description, flags)| is_hardware(*flags) && adapter_matches(description, wanted))
+}
+
+/// The first hardware adapter whose description holds `name`, ignoring case.
+fn named_adapter(name: &str) -> windows::core::Result<IDXGIAdapter1> {
+    // SAFETY: plain DXGI adapter queries.
+    unsafe {
+        const MAX_ADAPTERS: u32 = 64;
+        let factory: IDXGIFactory6 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
+        let mut adapters: Vec<IDXGIAdapter1> = Vec::new();
+        let mut descriptions: Vec<(String, u32)> = Vec::new();
+        for i in 0..MAX_ADAPTERS {
+            let adapter = match factory.EnumAdapters1(i) {
+                Ok(adapter) => adapter,
+                Err(e) if adapters.is_empty() => return Err(e),
+                Err(_) => break,
+            };
+            let desc = adapter.GetDesc1()?;
+            let end = desc
+                .Description
+                .iter()
+                .position(|&c| c == 0)
+                .unwrap_or(desc.Description.len());
+            descriptions.push((String::from_utf16_lossy(&desc.Description[..end]), desc.Flags));
+            adapters.push(adapter);
+        }
+        let listed: Vec<(&str, u32)> = descriptions
+            .iter()
+            .map(|(description, flags)| (description.as_str(), *flags))
+            .collect();
+        let Some(index) = adapter_index(&listed, name) else {
+            return Err(windows::core::Error::from_hresult(
+                windows::Win32::Foundation::E_FAIL,
+            ));
+        };
+        tracing::info!(
+            adapter = listed[index].0,
+            "host adapter chosen by VICTORY_ADAPTER"
+        );
+        Ok(adapters.swap_remove(index))
+    }
+}
+
+/// Whether an adapter description holds `wanted`, ignoring case.
+fn adapter_matches(description: &str, wanted: &str) -> bool {
+    description.to_lowercase().contains(&wanted.to_lowercase())
+}
+
 /// The adapter Windows ranks fastest, so a machine with an integrated GPU
 /// too runs on its discrete one.
 fn fastest_adapter() -> windows::core::Result<IDXGIAdapter1> {
@@ -579,6 +656,90 @@ mod tests {
         unsafe { slot(1).write_volatile(0) };
         host.execute(&[&list]);
         assert_eq!(value(1), 5);
+    }
+
+    /// A name picks an adapter by a part of its description, ignoring case.
+    #[test]
+    fn adapter_names_match_a_part_ignoring_case() {
+        assert!(adapter_matches("AMD Radeon RX 9070 XT", "radeon"));
+        assert!(adapter_matches("NVIDIA GeForce RTX 4070", "RTX 4070"));
+        assert!(!adapter_matches("AMD Radeon RX 9070 XT", "nvidia"));
+        assert!(adapter_matches("Intel(R) UHD Graphics", "intel"));
+    }
+
+    #[test]
+    fn adapter_requests_are_trimmed_and_empty_means_default() {
+        assert_eq!(requested_adapter(None), None);
+        assert_eq!(requested_adapter(Some("")), None);
+        assert_eq!(requested_adapter(Some("   ")), None);
+        assert_eq!(requested_adapter(Some(" radeon ")), Some("radeon"));
+    }
+
+    #[test]
+    fn software_adapters_are_not_hardware() {
+        let software = DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32;
+        assert!(is_hardware(0));
+        assert!(!is_hardware(software));
+        assert!(!is_hardware(software | 1));
+    }
+
+    #[test]
+    fn the_first_hardware_adapter_with_a_matching_name_wins() {
+        let software = DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32;
+        let adapters = [
+            ("Intel(R) UHD Graphics", 0),
+            ("AMD Radeon RX 6700 XT", 0),
+            ("Microsoft Basic Render Driver", software),
+            ("AMD Radeon (software)", software),
+        ];
+        assert_eq!(adapter_index(&adapters, "radeon"), Some(1));
+        assert_eq!(adapter_index(&adapters, "RADEON"), Some(1));
+        assert_eq!(adapter_index(&adapters, "nvidia"), None);
+        // A software adapter is skipped even when its name matches.
+        assert_eq!(adapter_index(&adapters, "microsoft"), None);
+        assert_eq!(adapter_index(&[], "amd"), None);
+    }
+
+    #[test]
+    fn an_unknown_adapter_name_is_an_error() {
+        // DXGI may have no adapter (then creation fails) or several; either
+        // way the name matches none and the call returns Err.
+        assert!(named_adapter("no adapter has this name 0x5f3759df").is_err());
+    }
+
+    #[test]
+    fn a_name_from_a_real_adapter_is_found() {
+        // SAFETY: plain DXGI adapter queries.
+        let Ok(factory) = (unsafe {
+            CreateDXGIFactory2::<IDXGIFactory6>(DXGI_CREATE_FACTORY_FLAGS(0))
+        }) else {
+            return;
+        };
+        let mut names = Vec::new();
+        for i in 0..64 {
+            // SAFETY: plain DXGI adapter queries.
+            let Ok(adapter) = (unsafe { factory.EnumAdapters1(i) }) else {
+                break;
+            };
+            // SAFETY: as above.
+            let Ok(desc) = (unsafe { adapter.GetDesc1() }) else {
+                continue;
+            };
+            if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0 {
+                let end = desc
+                    .Description
+                    .iter()
+                    .position(|&c| c == 0)
+                    .unwrap_or(desc.Description.len());
+                names.push(String::from_utf16_lossy(&desc.Description[..end]));
+            }
+        }
+        for name in names {
+            assert!(
+                named_adapter(&name).is_ok(),
+                "adapter {name:?} should be found by its own name"
+            );
+        }
     }
 
     #[test]
