@@ -2466,19 +2466,20 @@ fn covered(ranges: &[(usize, usize)], address: usize, end: usize) -> bool {
 }
 
 /// Adds the range a flush copied to `ranges`, the ranges already copied:
-/// joined only where they meet across a page boundary. The flushes take
-/// only pages their ranges cover whole, so two ranges meeting inside a
-/// page (half each) together claim the page none of them took: a later
-/// request for the page must stay a refresh.
+/// joined only where they overlap by a whole page, or meet across a page
+/// boundary. A flush guards only pages its range covers whole, so a
+/// union of ranges meeting or overlapping inside a page could claim a
+/// page none of them guarded, and a later request for it would be
+/// skipped — the split page of #2473. Joined with the rule of #2474:
+/// the ranges join when their intersection contains a whole page.
 fn push_copied(ranges: &mut Vec<(usize, usize)>, from: usize, to: usize) {
     let (mut f, mut t) = (from, to);
     let mut i = 0;
     while i < ranges.len() {
         let (a, e) = ranges[i];
-        let overlaps = from < e && a < to;
-        let meets_right = from == e && e % crate::watch::PAGE == 0;
-        let meets_left = to == a && a % crate::watch::PAGE == 0;
-        if overlaps || meets_right || meets_left {
+        let (lo, hi) = (a.max(f), e.min(t));
+        let joins = lo.div_ceil(crate::watch::PAGE) <= hi / crate::watch::PAGE;
+        if joins {
             ranges.remove(i);
             f = f.min(a);
             t = t.max(e);
@@ -3590,17 +3591,27 @@ mod batch {   // `mod tests` is already taken at the top of this file
         // A page apart: not joined, the gap between them stays pending.
         assert_eq!(copied, [(0x1_0000, 0x1_1000), (0x2_1000, 0x2_2000)]);
         assert!(!covered(&copied, 0x1_1000, 0x2_1000));
-        // Meeting inside a page: not joined either — `Tracked::take` takes
-        // only pages a range covers whole, so two ranges meeting there
-        // together must not claim the page none of them took.
+        // Meeting inside a page: not joined either — a flush guards only
+        // pages its range covers whole, so ranges meeting there together
+        // must not claim the page none of them guarded.
         push_copied(&mut copied, 0x1_1000, 0x2_1000);
         assert_eq!(copied, [(0x1_0000, 0x1_1000), (0x1_1000, 0x2_1000), (0x2_1000, 0x2_2000)]);
         assert!(!covered(&copied, 0x1_1000 - 4, 0x1_1000 + 4));
-        // Meeting at a page boundary: joined, so a request inside is skipped.
+        // Overlapping without a whole page between them: not joined either,
+        // a union of page-flanking ranges would claim a page left unguarded.
+        let mut flanks = vec![(0x1_0000, 0x1_8000)];
+        push_copied(&mut flanks, 0x1_4000, 0x3_0000);
+        assert_eq!(flanks, [(0x1_0000, 0x1_8000), (0x1_4000, 0x3_0000)]);
+        assert!(!covered(&flanks, 0x1_0000, 0x2_0000));
+        // Meeting at a page boundary, or overlapping by a whole page: joined.
         let mut whole = vec![(0x1_0000, 0x2_0000)];
         push_copied(&mut whole, 0x2_0000, 0x3_0000);
         assert_eq!(whole, [(0x1_0000, 0x3_0000)]);
         assert!(covered(&whole, 0x1_1000, 0x2_1000));
+        let mut spans = vec![(0x1_0000, 0x3_0000)];
+        push_copied(&mut spans, 0x2_4000, 0x4_0000);
+        assert_eq!(spans, [(0x1_0000, 0x4_0000)]);
+        assert!(covered(&spans, 0x2_4000, 0x3_0000));
     }
 
     /// A submission asking for distant parts of one copy refreshes them
