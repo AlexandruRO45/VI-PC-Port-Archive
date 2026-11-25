@@ -295,6 +295,16 @@ fn scene() -> (Scene, Vec<Vec<Case>>) {
     let ids2 = [8, bvh::NONE, 24, 0x1fff_fffc];
     box_nodes.push((s.add(nodes::box32(ids2, around), 32), 5));
     box_nodes.push((s.add(nodes::box16(ids2, around), 16), 4));
+    // A finite bound on a missing child is closer than a present child.
+    let missing_first = [
+        moved(UNIT, [2.0, 0.0, 0.0]),
+        moved(UNIT, [4.0, 0.0, 0.0]),
+        off,
+        off,
+    ];
+    let ids3 = [bvh::NONE, 8, bvh::NONE, bvh::NONE];
+    box_nodes.push((s.add(nodes::box32(ids3, missing_first), 32), 5));
+    box_nodes.push((s.add(nodes::box16(ids3, missing_first), 16), 4));
     // Random boxes.
     for n in 0..6 {
         let boxes: [[f32; 6]; 4] = std::array::from_fn(|_| {

@@ -225,6 +225,18 @@ pub(crate) fn wrote(at: usize, len: usize) {
     }
 }
 
+/// Our copy-back wrote `pages` (page numbers) of title memory through a
+/// view no guard covers (`crate::host::write_title_unseen`): nothing faulted,
+/// so the journal is told here, as an asking of its own. Returns its number
+/// and, per page, the asking that had last found the page written (0: none).
+pub(crate) fn wrote_unseen(pages: &[usize]) -> (u64, Vec<u64>) {
+    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    j.asked += 1;
+    let now = j.asked;
+    let before = pages.iter().map(|&page| j.written.insert(page, now).unwrap_or(0)).collect();
+    (now, before)
+}
+
 /// One kernel asking for `pieces` (page ranges in order); by halves if it
 /// fails, as a run across two reservations or into memory that is not
 /// write-watched does. A piece alone is left to [`writes`].
@@ -945,6 +957,59 @@ mod tests {
         );
         // SAFETY: our allocation.
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+    }
+
+    /// The echo cut (`crate::host::write_title_unseen`): bytes written
+    /// through our own view of a section land in the title's view without
+    /// opening its guard, and the journal numbers the page with an asking
+    /// of its own. A title write after that still faults and gets a later
+    /// number; one before it is reported as the page's last write.
+    #[test]
+    fn writes_through_our_own_view_keep_the_guard_and_tell_the_journal() {
+        use windows_sys::Win32::System::Memory::{CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile};
+        // SAFETY: a pagefile section of two blocks, one view of it.
+        let (section, view) = unsafe {
+            let section = CreateFileMappingW(-1isize as _, std::ptr::null(), PAGE_READWRITE, 0, (2 * BLOCK) as u32, std::ptr::null());
+            assert!(!section.is_null());
+            (section as usize, MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 2 * BLOCK).Value as usize)
+        };
+        assert_ne!(view, 0);
+        crate::inplace::title_memory_section(section, (2 * BLOCK) as u64, true);
+        crate::inplace::title_memory_view(view, 2 * BLOCK, section, 0);
+        let page = view / PAGE;
+        // The title wrote the page before the copy-back: the journal has it.
+        // SAFETY: our view.
+        unsafe { ((view + 8) as *mut u32).write_volatile(7) };
+        assert!(guard(view, view + 2 * BLOCK).is_some());
+        let (title_write, _) = wrote_unseen(&[]);
+        JOURNAL.lock().unwrap().written.insert(page, title_write);
+        assert!(!writable(view + 100), "guarded");
+        let bytes = *b"through our own";
+        // Another test may be remapping (the write then waits for the next try).
+        let started = std::time::Instant::now();
+        let (now, pages) = loop {
+            if let Some(done) = crate::host::write_unseen(view + 100, bytes.as_ptr(), bytes.len()) {
+                break done;
+            }
+            assert!(started.elapsed().as_secs() < 5, "never written");
+            std::thread::yield_now();
+        };
+        // SAFETY: our view.
+        let landed = unsafe { std::slice::from_raw_parts((view + 100) as *const u8, bytes.len()) };
+        assert_eq!(landed, &bytes);
+        assert!(!writable(view + 100), "the guard stayed closed");
+        assert_eq!(pages, [(page, title_write)]);
+        assert!(now > title_write);
+        assert_eq!(JOURNAL.lock().unwrap().written.get(&page), Some(&now));
+        // A title write after it faults and gets a later number.
+        // SAFETY: our view.
+        unsafe { ((view + 200) as *mut u32).write_volatile(9) };
+        let (_, found) = writes(view, view + PAGE, true).expect("view memory");
+        assert!(found.iter().any(|&(p, at)| p == page && at > now), "{found:?}");
+        // Not a view of a section we know: written as before.
+        let mut plain = [0u8; 16];
+        assert!(crate::host::write_unseen(plain.as_mut_ptr() as usize, bytes.as_ptr(), 4).is_none());
+        crate::title_memory_remapped(view, 2 * BLOCK);
     }
 
     /// A kernel read into a guarded view block fails; opened first, it

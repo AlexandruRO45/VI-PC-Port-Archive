@@ -4215,6 +4215,68 @@ pub(crate) fn copy_source_written(at: usize, len: usize) {
     }
 }
 
+/// `VICTORY_BACK_ALIAS=1`: the copy-back writes title memory that is a view
+/// of a section through a view of our own of it ([`write_title_unseen`]),
+/// so the guard stays closed and the copy that merged the bytes does not
+/// take them again at its next refresh. Half the bytes refreshed a frame
+/// were that echo (65 of 129 MB, standing in the first room).
+fn back_alias() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BACK_ALIAS").is_some_and(|v| v == "1"))
+}
+
+/// Copy-back writes per frame for the log: through our own view, and
+/// through the title's address.
+pub(crate) static BACK_WRITES: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Writes `n` bytes from `src` into title memory at `at` through our view
+/// of its section ([`back_alias`]) and tells the journal, for every
+/// address the pages show at. Returns the journal's asking and, per page
+/// (page number, asking that had last found it written), for
+/// `Shadow::wrote_unseen`. `None`: nothing written that way (off, not a
+/// view, the runtime is remapping, or the write faulted); the caller
+/// writes as before.
+pub(crate) fn write_title_unseen(at: usize, src: *const u8, n: usize) -> Option<(u64, Vec<(usize, u64)>)> {
+    if !back_alias() {
+        return None;
+    }
+    write_unseen(at, src, n)
+}
+
+/// [`write_title_unseen`] whatever [`back_alias`] says.
+pub(crate) fn write_unseen(at: usize, src: *const u8, n: usize) -> Option<(u64, Vec<(usize, u64)>)> {
+    if n == 0 || !direct_copy_enabled() {
+        return None;
+    }
+    // The runtime does not move a physical page between finding where the
+    // bytes show and writing them; if it is moving pages now, write as before.
+    let _still = crate::watch::title_memory_reading_now()?;
+    let alias = crate::inplace::alias_of(at, n)?;
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: `alias` shows `n` bytes of the section; a fault is caught.
+    let done = unsafe { direct_copy::try_copy(alias as *mut u8, src, n) };
+    #[cfg(not(target_arch = "x86_64"))]
+    let done = false;
+    if !done {
+        return None;
+    }
+    let first = at / crate::watch::PAGE;
+    let last = (at + n).div_ceil(crate::watch::PAGE);
+    let mut pages = Vec::with_capacity(last - first);
+    for page in first..last {
+        let shown = crate::inplace::pages_of(page * crate::watch::PAGE);
+        if shown.is_empty() {
+            pages.push(page);
+        } else {
+            pages.extend(shown.iter().map(|a| a / crate::watch::PAGE));
+        }
+    }
+    let (now, before) = crate::watch::wrote_unseen(&pages);
+    crate::descriptor::host::remapped(at, n);
+    BACK_WRITES[0].fetch_add(1, Ordering::Relaxed);
+    Some((now, pages.into_iter().zip(before).collect()))
+}
+
 /// After a landing's copy-backs: makes again the copies whose source they
 /// wrote over.
 fn recopy_written_sources() {
@@ -4463,6 +4525,19 @@ fn refreshed_under_flights(runs: &[&HostList]) -> Vec<(std::sync::Arc<crate::sha
 /// is taken first (`take_reserve`, [`Host::patch_reserve`]) where a copy in
 /// the card's memory is among those refreshed: without it the short runs
 /// take copies too, and past 512 a settle is due, as before the patches.
+/// Nanoseconds of a submission's preparing, for the log: title bytes put in
+/// under flights, the lists' steps, the flush of their refreshes, the card
+/// copies' sends and compare.
+static PREPARING_NS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// Runs `f`, its time added to part `i` of [`PREPARING_NS`].
+fn timed<T>(i: usize, f: impl FnOnce() -> T) -> T {
+    let started = std::time::Instant::now();
+    let out = f();
+    PREPARING_NS[i].fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    out
+}
+
 fn put_in_under_flights<B>(
     spans: &[(std::sync::Arc<crate::shadow::Shadow>, usize, usize)],
     reserve: &mut Option<B>,
@@ -7651,18 +7726,19 @@ impl Host {
             // may write too, and this submission refreshes it. The flights
             // are settled, and the asking made again: the copy-back wrote
             // title memory, which other copies of it must see.
-            if behind && stale_under_flights(self, runs, &mut reserve) {
+            if behind && timed(0, || stale_under_flights(self, runs, &mut reserve)) {
                 let settling = std::time::Instant::now();
                 self.settle(&mut submitted, WHY_STALE);
                 settled += settling.elapsed();
                 crate::watch::ask_once(&ranges);
             }
-        } else if behind && stale_under_flights(self, runs, &mut reserve) {
+        } else if behind && timed(0, || stale_under_flights(self, runs, &mut reserve)) {
             let settling = std::time::Instant::now();
             self.settle(&mut submitted, WHY_STALE);
             settled += settling.elapsed();
         }
         split(PREPARE_MERGE, &mut phase, settled - settled_before);
+        let stepping = std::time::Instant::now();
         let mut preludes = std::time::Duration::ZERO;
         for (i, list) in runs.iter().enumerate() {
             list.run_deferred(&mut batch);
@@ -7675,9 +7751,10 @@ impl Host {
             preludes += making.elapsed();
             lists.push(list.list.cast().ok());
         }
+        PREPARING_NS[1].fetch_add(stepping.elapsed().as_nanos() as u64, Ordering::Relaxed);
         PREPARE_SPLIT[PREPARE_PRELUDES].fetch_add(preludes.as_micros() as u64, Ordering::Relaxed);
         split(PREPARE_DEFERRED, &mut phase, preludes);
-        batch.flush();
+        timed(2, || batch.flush());
         crate::watch::ask_once_end();
         split(PREPARE_FLUSH, &mut phase, std::time::Duration::ZERO);
         // The snapshots of the ranges shaders may write, if they were left
@@ -7705,7 +7782,7 @@ impl Host {
             }
             settled += settling.elapsed();
         }
-        let card = self.card_before(runs, flown, reserve, relay());
+        let card = timed(3, || self.card_before(runs, flown, reserve, relay()));
         if let Some(check) = card.as_ref().and_then(|c| c.check.clone()) {
             lists.push(Some(check));
         }
@@ -9706,6 +9783,16 @@ impl Meter {
                     "title buffer copies recorded per frame: {copies:.0}, of them {joined:.0} continue the one before \
                      (VICTORY_JOIN_COPIES=1 makes those one copy with it: now {})",
                     if join_copies() { "on" } else { "off" }
+                );
+            }
+            let [under, steps, flush, card] = [0, 1, 2, 3].map(|i| PREPARING_NS[i].swap(0, Ordering::Relaxed) as f64 / 1e6 / frames);
+            tracing::info!(
+                "preparing per frame, by part: {under:.1} ms putting title bytes in under flights, {steps:.1} the lists' steps, {flush:.1} flushing their refreshes, {card:.1} the card copies' sends and compare"
+            );
+            let [unseen, seen] = [0, 1].map(|i| BACK_WRITES[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            if back_alias() {
+                tracing::info!(
+                    "copy-back writes per frame (VICTORY_BACK_ALIAS=1): {unseen:.0} through our own view of the section, {seen:.0} through the title's address"
                 );
             }
             let [through, again, fills, stale] = [0, 1, 2, 3].map(|i| COPY_NO_WAIT[i].swap(0, Ordering::Relaxed) as f64 / frames);

@@ -286,9 +286,55 @@ fn views() -> std::sync::MutexGuard<'static, Views> {
 /// The runtime made a section of `bytes` for physical pages; `committed`
 /// if with `SEC_COMMIT` (only such a section can be opened as a heap).
 pub fn title_memory_section(section: usize, bytes: u64, committed: bool) {
-    let mut v = views();
-    v.sections.retain(|s| s.0 != section);
-    v.sections.push((section, bytes, committed));
+    {
+        let mut v = views();
+        v.sections.retain(|s| s.0 != section);
+        v.sections.push((section, bytes, committed));
+    }
+    // A handle used again names another section: our view of the old one goes.
+    let mut aliases = ALIASES.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(i) = aliases.iter().position(|a| a.0 == section) {
+        let (_, base) = aliases.swap_remove(i);
+        if base != 0 {
+            // SAFETY: a view we mapped; writes through it are fault-guarded
+            // (`crate::host::write_title_unseen`).
+            unsafe { mem::UnmapViewOfFile(mem::MEMORY_MAPPED_VIEW_ADDRESS { Value: base as *mut c_void }) };
+        }
+    }
+}
+
+/// Sections by handle, with a view of our own of each, mapped whole (0: it
+/// could not be mapped). No guard covers these views: a write through one
+/// changes the title's bytes without a fault (`crate::host::write_title_unseen`).
+static ALIASES: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
+
+/// Where title memory `[at, at + len)` shows in our view of its section,
+/// mapped whole the first time; `None` if the range is not inside one title
+/// view of a section the runtime told us of.
+pub(crate) fn alias_of(at: usize, len: usize) -> Option<usize> {
+    let (section, offset) = {
+        let v = views();
+        let (&base, &(bytes, section, offset)) = v.views.range(..=at).next_back()?;
+        if at.checked_add(len)? > base + bytes || !v.sections.iter().any(|s| s.0 == section) {
+            return None;
+        }
+        (section, offset + (at - base) as u64)
+    };
+    let mut aliases = ALIASES.lock().unwrap_or_else(|e| e.into_inner());
+    let base = match aliases.iter().find(|a| a.0 == section) {
+        Some(a) => a.1,
+        None => {
+            // SAFETY: a view of our own of a section the runtime made; the
+            // title's views commit its pages, never this one.
+            let base = unsafe { mem::MapViewOfFile(section as _, mem::FILE_MAP_WRITE, 0, 0, 0) }.Value as usize;
+            if base == 0 {
+                tracing::warn!(section, "no view of our own of a section of title memory: the copy-back writes it as before");
+            }
+            aliases.push((section, base));
+            base
+        }
+    };
+    (base != 0).then(|| base + offset as usize)
 }
 
 /// The runtime mapped `[at, at + len)` as a view of `section` from

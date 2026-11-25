@@ -187,6 +187,9 @@ pub fn boxes(children: &[u32; 4], boxes: &[[f32; 6]; 4], ray: &Ray, sort: bool) 
     let mut ids = [NONE; 4];
     let mut distances = [f32::INFINITY; 4];
     for (n, b) in boxes.iter().enumerate() {
+        if children[n] == NONE {
+            continue;
+        }
         let (mut near, mut far) = ([0f32; 3], [0f32; 3]);
         for a in 0..3 {
             let low = (b[a] - ray.origin[a]) * inverse[a];
@@ -425,6 +428,20 @@ pub(crate) mod tests {
         // Backwards: nothing.
         let back = Ray::new([0.0; 3], [-1.0, 0.0, 0.0], 1000.0);
         assert_eq!(intersect(&node, 5, &back, true), [NONE; 4]);
+    }
+
+    #[test]
+    fn an_absent_child_with_finite_bounds_sorts_after_a_hit() {
+        let children = [NONE, 8, NONE, NONE];
+        let bounds = [
+            moved(UNIT, [2.0, 0.0, 0.0]),
+            moved(UNIT, [4.0, 0.0, 0.0]),
+            [f32::NAN; 6],
+            [f32::NAN; 6],
+        ];
+        let ray = Ray::new([0.0; 3], [1.0, 0.0, 0.0], 10.0);
+        assert_eq!(boxes(&children, &bounds, &ray, true), [8, NONE, NONE, NONE]);
+        assert_eq!(boxes(&children, &bounds, &ray, false), [NONE, 8, NONE, NONE]);
     }
 
     #[test]

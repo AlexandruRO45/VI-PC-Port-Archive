@@ -387,8 +387,18 @@ fn translate(
     // has them (`.cdxil`), to work on a translator gap offline
     let dump = std::env::var_os("VICTORY_FAIL_DUMP");
     let before: Option<BTreeMap<String, usize>> = dump.as_ref().map(|_| t.failed.iter().map(|(k, v)| (k.clone(), v.0)).collect());
-    // `VICTORY_WAVE_WIDE=<hash>,...` names shaders as a run does
-    if victory_shader::emit::wave_wide_listed(&hash) {
+    // `VICTORY_WAVE_WIDE_ONLY=<hash>,...` names the shaders that may take the wave-wide form,
+    // as in a run
+    static WIDE_ONLY: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    let wide_only = WIDE_ONLY.get_or_init(|| {
+        std::env::var("VICTORY_WAVE_WIDE_ONLY")
+            .unwrap_or_default()
+            .split(',')
+            .map(|h| h.trim().to_ascii_lowercase())
+            .filter(|h| h.len() == 16 && h.bytes().all(|b| b.is_ascii_hexdigit()))
+            .collect()
+    });
+    if wide_only.contains(&hash) {
         victory_shader::emit::with_wave_wide(|| translate_programs(&container, programs, &example, t, checks));
     } else {
         translate_programs(&container, programs, &example, t, checks);
