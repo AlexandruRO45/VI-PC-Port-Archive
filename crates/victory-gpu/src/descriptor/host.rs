@@ -11,33 +11,9 @@ use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
 use super::{VIEW_TAG, View, view_at};
-    id: u64,
-                let bytes = u64::from(victory_shader::emit::SLOT_STRIDES_COUNT) * 4;
-                let bytes = u64::from(victory_shader::emit::SLOT_STRIDES_DWORDS) * 4;
-        static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-            id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-    /// Monotonic unique identifier for this host heap, used to key per-heap
-    /// caches without pointer-reuse aliasing.
-    pub(crate) fn id(&self) -> u64 {
-        self.id
-    }
-
-            // The title address of the buffer view, after the strides
-            // (`victory_shader::emit::SLOT_ADDRESSES`): low dword, then high.
-            let address = view
-                .and_then(buffer_range)
-                .map_or(0, |range| range.0);
-            // SAFETY: as above, two dwords inside the mapping.
-            unsafe {
-                let at = (*data as *mut u32).add((victory_shader::emit::SLOT_ADDRESSES + 2 * index) as usize);
-                at.write_volatile(address as u32);
-                at.add(1).write_volatile((address >> 32) as u32);
-            }
-
 use crate::host::host;
 
 pub(crate) struct HostHeap {
-    id: u64,
     pub(crate) heap: ID3D12DescriptorHeap,
     cpu: usize,
     step: u32,
@@ -75,8 +51,17 @@ pub(crate) struct HostHeap {
     too_long: std::sync::atomic::AtomicU32,
     /// View heaps: the bytes per element of the buffer view at each title
     /// slot, for shaders that pick a buffer by an index they compute
-    /// (`victory_shader::emit::SLOT_STRIDES`): an upload buffer of
-    /// `SLOT_STRIDES_COUNT` dwords, its GPU address and its mapping.
+    /// Where the [`SLOT_STRIDES`] buffer goes on, in dwords: two per heap slot,
+    /// the low and then the high dword of the title address of the buffer view
+    /// at that slot (0: none). For a program that takes a buffer view out of the
+    /// heap at an index it computes and reads the address out of the descriptor
+    /// to walk the memory behind it (the shadow-ray trace programs take their
+    /// ray-tracing structure this way).
+    /// The host keeps, after the strides of `SLOT_STRIDES`, two more dwords
+    /// per heap slot (low and high of the title address of the buffer view
+    /// there), written where the strides are written, and the shader reads them
+    /// by heap slot (`SLOT_ADDRESSES`). No new root parameter; the table grows
+    /// from 8 MB to 24 MB per view heap.
     strides: Option<(ID3D12Resource, u64, usize)>,
     /// Title slots holding buffer views. Such a view gets its host slot
     /// (and its memory a host copy) only when something reads it: a draw
@@ -764,7 +749,7 @@ impl HostHeap {
         ));
         let strides = (!sampler)
             .then(|| {
-                let bytes = u64::from(victory_shader::emit::SLOT_STRIDES_DWORDS) * 4;
+                let bytes = u64::from(victory_shader::emit::SLOT_STRIDES_COUNT) * 4;
                 let (buffer, data) = host.upload_buffer(bytes)?;
                 // SAFETY: the buffer's whole mapping; a live buffer.
                 let gpu = unsafe {
@@ -775,9 +760,7 @@ impl HostHeap {
                 Some((buffer, gpu, data as usize))
             })
             .flatten();
-        static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let h = HostHeap {
-            id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             heap,
             cpu,
             step,
@@ -872,12 +855,6 @@ fn null_sampler(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 }
 
 impl HostHeap {
-    /// Monotonic unique identifier for this host heap, used to key per-heap
-    /// caches without pointer-reuse aliasing.
-    pub(crate) fn id(&self) -> u64 {
-        self.id
-    }
-
     /// `n` consecutive free dynamic slots (view heaps only), taken until
     /// [`HostHeap::release`]: the first's index.
     pub(crate) fn dynamic(&self, n: u32) -> Option<u32> {
@@ -1272,17 +1249,6 @@ impl HostHeap {
             // SAFETY: inside the mapping; shaders read it while we write (a
             // dword, either value is one the slot had).
             unsafe { (*data as *mut u32).add(index as usize).write_volatile(stride.unwrap_or(0)) };
-            // The title address of the buffer view, after the strides
-            // (`victory_shader::emit::SLOT_ADDRESSES`): low dword, then high.
-            let address = view
-                .and_then(buffer_range)
-                .map_or(0, |range| range.0);
-            // SAFETY: as above, two dwords inside the mapping.
-            unsafe {
-                let at = (*data as *mut u32).add((victory_shader::emit::SLOT_ADDRESSES + 2 * index) as usize);
-                at.write_volatile(address as u32);
-                at.add(1).write_volatile((address >> 32) as u32);
-            }
         }
         let mut buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
         let was = if stride.is_some() {
