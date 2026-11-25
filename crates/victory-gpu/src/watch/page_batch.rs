@@ -62,7 +62,10 @@ mod tests {
         let pages: Vec<_> = (0..20).rev().collect();
         let busy = [(8, 9), (1, 12), (1, 12), (6, 7), (14, 14), (17, 19), (16, 15)];
         assert_eq!(eligible(&pages, &busy), [0, 12, 13, 14, 15, 16, 19]);
-        assert_eq!(eligible(&[usize::MAX, usize::MAX - 1], &[(usize::MAX - 2, usize::MAX)]), [usize::MAX]);
+        assert_eq!(
+            eligible(&[usize::MAX, usize::MAX - 1], &[(usize::MAX - 2, usize::MAX)]),
+            [usize::MAX]
+        );
     }
 
     #[test]
