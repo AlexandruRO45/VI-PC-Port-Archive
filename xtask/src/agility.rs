@@ -48,12 +48,15 @@ pub fn run(root: &Path, target: &Path) -> Result<()> {
         }
         println!("D3D12 Agility SDK {VERSION}: {}", dir.display());
     }
-    // victory-shader's and victory-gpu's build scripts export the runtime to
-    // their tests only when it is there, and do not watch for it while it is
-    // missing (that would rebuild the crates every time): make cargo rerun
-    // them.
-    for crate_ in ["victory-shader", "victory-gpu"] {
-        let script = root.join("crates").join(crate_).join("build.rs");
+    // victory.exe's build script and victory-shader's and victory-gpu's
+    // (for their tests) export the runtime only when it is there, and do not
+    // watch for it while it is missing (that would rebuild them every time):
+    // make cargo rerun them.
+    for script in [
+        root.join("apps").join("victory").join("build.rs"),
+        root.join("crates").join("victory-shader").join("build.rs"),
+        root.join("crates").join("victory-gpu").join("build.rs"),
+    ] {
         std::fs::File::options()
             .append(true)
             .open(&script)
