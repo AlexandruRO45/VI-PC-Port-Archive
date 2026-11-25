@@ -5,7 +5,17 @@
 //! GFX10 programs lowered to DXIL, validated by `dxil.dll` when present,
 //! and run on the host GPU and WARP.
 
-use windows::Win32::Graphics::Direct3D12::D3D12_SAMPLER_DESC;
+use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
+use windows::Win32::Graphics::Direct3D12::{
+    D3D_SHADER_MODEL_6_6, D3D12_DESCRIPTOR_HEAP_DESC, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+    D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, D3D12_FEATURE_DATA_SHADER_MODEL,
+    D3D12_FEATURE_SHADER_MODEL, D3D12_SAMPLER_DESC, D3D12CreateDevice, ID3D12DescriptorHeap,
+    ID3D12Device,
+};
+use windows::Win32::Graphics::Dxgi::{
+    CreateDXGIFactory2, DXGI_ADAPTER_FLAG_SOFTWARE, DXGI_CREATE_FACTORY_FLAGS, IDXGIAdapter1,
+    IDXGIFactory4,
+};
 
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT, DXGI_FORMAT_R16_FLOAT, DXGI_FORMAT_R16_UINT, DXGI_FORMAT_R16G16B16A16_FLOAT,
@@ -166,12 +176,12 @@ fn entry(kind: ResourceType, dwords: u8, user_data: u8) -> UsedResource {
     }
 }
 
-fn build(
+fn try_build(
     words: &[u32],
     layout: Vec<RootParam>,
     used: Vec<UsedResource>,
     threads: u32,
-) -> HostShader {
+) -> Result<HostShader, crate::ShaderError> {
     let native = NativeProgram {
         stage: HwStage::Cs,
         wave64: false,
@@ -184,10 +194,10 @@ fn build(
         }),
         code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
     };
-    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
-    let st = structure::structure(&p).expect("structure");
-    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
-    let io = io::raise(&p, &native).expect("io::raise");
+    let p = ir::build(&native.code, native.wave64, native.vgprs)?;
+    let st = structure::structure(&p)?;
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
+    let io = io::raise(&p, &native)?;
     let lowered = lower::lower(&lower::Parts {
         native: &native,
         p: &p,
@@ -199,8 +209,7 @@ fn build(
         prims: Vec::new(),
         mesh_stride: 0,
         view_marks: false,
-    })
-    .expect("lower");
+    })?;
     let shader = HostShader {
         stage: HwStage::Cs,
         dxil: lowered.dxil,
@@ -227,7 +236,16 @@ fn build(
     } else {
         eprintln!("no dxil.dll; validation skipped");
     }
-    shader
+    Ok(shader)
+}
+
+fn build(
+    words: &[u32],
+    layout: Vec<RootParam>,
+    used: Vec<UsedResource>,
+    threads: u32,
+) -> HostShader {
+    try_build(words, layout, used, threads).expect("build")
 }
 
 #[test]
@@ -579,6 +597,7 @@ fn a_sampler_chosen_by_a_uniform_branch_samples_as_chosen() {
     }
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
 }
+
 /// User data: s0 a table with a typed buffer UAV, s1 a table with a raw
 /// buffer of 2 dwords a lane, s2 a table with a raw UAV. Each lane stores
 /// its 4 halves to element `lane` of the typed view (`_d16`), loads them
@@ -743,4 +762,400 @@ fn d16_x_loads_read_r16_uint_and_r16_float_views() {
             assert_eq!(words[0], want, "{label} {format:?}");
         }
     }
+}
+
+/// User data: s2 a table with a raw UAV. Passes an immediate zeroed
+/// constant descriptor to `s_buffer_load_dword`.
+const CONST_DESCRIPTOR_WAVE32: &[u32] = &[
+    0xBE8C_0302, // s_mov_b32 s12, s2
+    0xBE8D_0380, // s_mov_b32 s13, 0
+    0xF408_0406,
+    0xFA00_0000, // s_load_dwordx4 s[16:19], s[12:13], 0x0
+    0xBE88_0380, // s_mov_b32 s8, 0
+    0xBE89_0380, // s_mov_b32 s9, 0
+    0xBE8A_0380, // s_mov_b32 s10, 0
+    0xBE8B_0380, // s_mov_b32 s11, 0
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0xF420_0504,
+    0xFA00_0008, // s_buffer_load_dword s20, s[8:11], 0x8
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0x7E02_0214, // v_mov_b32 v1, s20
+    0x3404_0082, // v_lshlrev_b32 v2, 2, v0
+    0xE070_1000,
+    0x8004_0102, // buffer_store_dword v1, v2, s[16:19], 0 offen
+    0xBF81_0000, // s_endpgm
+];
+
+/// User data: s0 a selector, s1 an unlisted table, s2 a table with a raw UAV,
+/// s3 a second unlisted table. Each lane stores dword 2 of the selected
+/// table's slot 0 to dword `lane` of the UAV.
+const PHI_TWO_TABLES_WAVE32: &[u32] = &[
+    0xBE8C_0302, // s_mov_b32 s12, s2
+    0xBE8D_0380, // s_mov_b32 s13, 0
+    0xF408_0406,
+    0xFA00_0000, // s_load_dwordx4 s[16:19], s[12:13], 0x0
+    0xBF06_8000, // s_cmp_eq_u32 s0, 0
+    0xBF85_0005, // s_cbranch_scc1 -> 0x2c (s3 arm)
+    0xBE86_0301, // s_mov_b32 s6, s1
+    0xBE87_0380, // s_mov_b32 s7, 0
+    0xF408_0203,
+    0xFA00_0000, // s_load_dwordx4 s[8:11], s[6:7], 0x0
+    0xBF82_0004, // s_branch -> 0x3c (join)
+    0xBE86_0303, // s_mov_b32 s6, s3
+    0xBE87_0380, // s_mov_b32 s7, 0
+    0xF408_0203,
+    0xFA00_0000, // s_load_dwordx4 s[8:11], s[6:7], 0x0
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0xF420_0504,
+    0xFA00_0008, // s_buffer_load_dword s20, s[8:11], 0x8
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0x7E02_0214, // v_mov_b32 v1, s20
+    0x3404_0082, // v_lshlrev_b32 v2, 2, v0
+    0xE070_1000,
+    0x8004_0102, // buffer_store_dword v1, v2, s[16:19], 0 offen
+    0xBF81_0000, // s_endpgm
+];
+
+/// User data: s0 a selector, s1 an unlisted table, s2 a table with a raw UAV.
+/// Joins a table load with a constant zero descriptor before
+/// `s_buffer_load_dword`.
+const PHI_TABLE_OR_CONST_WAVE32: &[u32] = &[
+    0xBE8C_0302, // s_mov_b32 s12, s2
+    0xBE8D_0380, // s_mov_b32 s13, 0
+    0xF408_0406,
+    0xFA00_0000, // s_load_dwordx4 s[16:19], s[12:13], 0x0
+    0xBF06_8000, // s_cmp_eq_u32 s0, 0
+    0xBF85_0005, // s_cbranch_scc1 -> 0x2c (const arm)
+    0xBE86_0301, // s_mov_b32 s6, s1
+    0xBE87_0380, // s_mov_b32 s7, 0
+    0xF408_0203,
+    0xFA00_0000, // s_load_dwordx4 s[8:11], s[6:7], 0x0
+    0xBF82_0004, // s_branch -> 0x3c (join)
+    0xBE88_0380, // s_mov_b32 s8, 0
+    0xBE89_0380, // s_mov_b32 s9, 0
+    0xBE8A_0380, // s_mov_b32 s10, 0
+    0xBE8B_0380, // s_mov_b32 s11, 0
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0xF420_0504,
+    0xFA00_0008, // s_buffer_load_dword s20, s[8:11], 0x8
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0x7E02_0214, // v_mov_b32 v1, s20
+    0x3404_0082, // v_lshlrev_b32 v2, 2, v0
+    0xE070_1000,
+    0x8004_0102, // buffer_store_dword v1, v2, s[16:19], 0 offen
+    0xBF81_0000, // s_endpgm
+];
+
+/// Every SM 6.6 hardware adapter on the machine, followed by WARP.
+fn test_hosts() -> Vec<(String, bool, Host)> {
+    let mut hosts = Vec::new();
+    let warp_only = std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1");
+    // SAFETY: plain DXGI enumeration and D3D12 device queries.
+    unsafe {
+        let Ok(factory) = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0)) else {
+            return hosts;
+        };
+        if !warp_only {
+            for index in 0.. {
+                let Ok(adapter) = factory.EnumAdapters1(index) else {
+                    break;
+                };
+                let Ok(desc) = adapter.GetDesc1() else {
+                    continue;
+                };
+                let software = desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0;
+                if software || desc.DedicatedVideoMemory == 0 {
+                    continue;
+                }
+                let end = desc
+                    .Description
+                    .iter()
+                    .position(|&c| c == 0)
+                    .unwrap_or(desc.Description.len());
+                let name = String::from_utf16_lossy(&desc.Description[..end]);
+                if let Some(host) = sm66_host(&adapter) {
+                    hosts.push((name, false, host));
+                }
+            }
+        }
+        if let Ok(warp) = factory.EnumWarpAdapter::<IDXGIAdapter1>()
+            && let Some(host) = sm66_host(&warp)
+        {
+            hosts.push(("warp".into(), true, host));
+        }
+    }
+    hosts
+}
+
+unsafe fn sm66_host(adapter: &IDXGIAdapter1) -> Option<Host> {
+    let mut device: Option<ID3D12Device> = None;
+    // SAFETY: valid adapter and out-pointer.
+    unsafe {
+        D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_12_0, &mut device).ok()?;
+        let device = device?;
+        let mut sm = D3D12_FEATURE_DATA_SHADER_MODEL {
+            HighestShaderModel: D3D_SHADER_MODEL_6_6,
+        };
+        device
+            .CheckFeatureSupport(
+                D3D12_FEATURE_SHADER_MODEL,
+                (&raw mut sm).cast(),
+                size_of_val(&sm) as u32,
+            )
+            .ok()?;
+        (sm.HighestShaderModel.0 >= D3D_SHADER_MODEL_6_6.0).then_some(Host { device })
+    }
+}
+
+/// Scalar constant loads through a descriptor table with no used-resource
+/// entry read raw buffer views guarded by `VIEW_STRIDES`: a typed null
+/// `Texture1D` SRV at heap slot 0 (as in `#1595`) or any non-buffer slot
+/// redirects to `NULL_BUFFER_VIEW` instead of reading a mismatched CBV
+/// handle over an SRV descriptor.
+#[test]
+fn an_unlisted_table_constant_load_reads_as_a_raw_buffer() {
+    let shader = build(
+        HEAP_CONSTANT_WAVE32,
+        vec![
+            param(RootType::Constants, 0),
+            param(RootType::Table, 1),
+            param(RootType::Table, 2),
+        ],
+        vec![entry(ResourceType::Uav, 4, 2)],
+        32,
+    );
+    assert!(
+        shader.heap && !shader.heap_writes,
+        "unlisted table buffer read marks heap access"
+    );
+    assert_eq!(shader.root_srvs, [VIEW_STRIDES]);
+    let texel = [[1.0f32, 2.0, 3.0, 4.0]];
+    let data: Vec<u32> = vec![7, 8, 9, 10];
+    let short_views = [
+        View::NullTexture1d,
+        View::Texture(1, 1, &texel),
+        View::Buffer {
+            data: &data,
+            stride: Stride::Raw,
+        },
+        View::RawUav(32),
+    ];
+    let full_views = [
+        View::NullTexture1d,
+        View::Texture(1, 1, &texel),
+        View::Buffer {
+            data: &data,
+            stride: Stride::Raw,
+        },
+        View::RawUav(32),
+        View::NullBuffers,
+    ];
+    let strides = vec![0, 0, 4, 4];
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp, host) in test_hosts() {
+        // SAFETY: a plain descriptor-heap creation probe on a live device.
+        let supports_heap_views = warp
+            || unsafe {
+                host.device.CreateDescriptorHeap::<ID3D12DescriptorHeap>(
+                    &D3D12_DESCRIPTOR_HEAP_DESC {
+                        Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                        NumDescriptors: super::HEAP_VIEWS,
+                        Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                        ..Default::default()
+                    },
+                )
+            }
+            .is_ok();
+        let (views, cases): (&[View], &[(u32, u32)]) = if supports_heap_views {
+            (&full_views, &[(0, 0), (1, 0), (2, 9)])
+        } else {
+            (&short_views, &[(2, 9)])
+        };
+        let (root, pso) = host
+            .compute_pipeline(&shader)
+            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+        for &(index, want) in cases {
+            let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+            for u in &shader.user_data {
+                ud[u.index as usize] = match (u.root, u.slot) {
+                    (RootType::Constants, 0) => index,
+                    (RootType::Table, 1) => 0,
+                    (RootType::Table, 2) => 3 * 32,
+                    other => panic!("unexpected user data {other:?}"),
+                };
+            }
+            let words = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![
+                            (0, Root::Constants(ud)),
+                            (
+                                1,
+                                Root::View {
+                                    srv: true,
+                                    data: strides.clone(),
+                                },
+                            ),
+                        ],
+                        views,
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{label}, slot {index}: dispatch failed: {e}"));
+            assert_eq!(words[0], vec![want; 32], "{label}, slot {index}");
+        }
+        eprintln!(
+            "{label}: unlisted table constant load ok ({} cases)",
+            cases.len()
+        );
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
+
+/// Scalar constant loads joined across two unlisted `RootType::Table` paths
+/// also read as guarded raw buffers; non-table loads (`Constants`), constant
+/// descriptors, and mixed table/constant phis do not.
+#[test]
+fn unlisted_table_constant_lowering_rejects_non_heap_sources() {
+    assert!(
+        try_build(
+            CONST_DESCRIPTOR_WAVE32,
+            vec![param(RootType::Table, 2)],
+            vec![entry(ResourceType::Uav, 4, 2)],
+            32,
+        )
+        .is_err(),
+        "constant descriptor must not lower as heap_constants"
+    );
+    assert!(
+        try_build(
+            HEAP_CONSTANT_WAVE32,
+            vec![
+                param(RootType::Constants, 0),
+                param(RootType::Constants, 1),
+                param(RootType::Table, 2),
+            ],
+            vec![entry(ResourceType::Uav, 4, 2)],
+            32,
+        )
+        .is_err(),
+        "RootType::Constants load must not lower as heap_constants"
+    );
+    assert!(
+        try_build(
+            PHI_TABLE_OR_CONST_WAVE32,
+            vec![
+                param(RootType::Constants, 0),
+                param(RootType::Table, 1),
+                param(RootType::Table, 2),
+            ],
+            vec![entry(ResourceType::Uav, 4, 2)],
+            32,
+        )
+        .is_err(),
+        "phi mixing table load and constant descriptor must not lower as heap_constants"
+    );
+
+    let shader = build(
+        PHI_TWO_TABLES_WAVE32,
+        vec![
+            param(RootType::Constants, 0),
+            param(RootType::Table, 1),
+            param(RootType::Table, 2),
+            param(RootType::Table, 3),
+        ],
+        vec![entry(ResourceType::Uav, 4, 2)],
+        32,
+    );
+    assert!(shader.heap && !shader.heap_writes);
+    assert_eq!(shader.root_srvs, [VIEW_STRIDES]);
+    let data: Vec<u32> = vec![7, 8, 42, 10];
+    let short_views = [
+        View::NullTexture1d,
+        View::Buffer {
+            data: &data,
+            stride: Stride::Raw,
+        },
+        View::RawUav(32),
+    ];
+    let full_views = [
+        View::NullTexture1d,
+        View::Buffer {
+            data: &data,
+            stride: Stride::Raw,
+        },
+        View::RawUav(32),
+        View::NullBuffers,
+    ];
+    let strides = vec![0, 4, 4];
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp, host) in test_hosts() {
+        // SAFETY: a plain descriptor-heap creation probe on a live device.
+        let supports_heap_views = warp
+            || unsafe {
+                host.device.CreateDescriptorHeap::<ID3D12DescriptorHeap>(
+                    &D3D12_DESCRIPTOR_HEAP_DESC {
+                        Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                        NumDescriptors: super::HEAP_VIEWS,
+                        Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                        ..Default::default()
+                    },
+                )
+            }
+            .is_ok();
+        let (views, cases): (&[View], &[(u32, u32)]) = if supports_heap_views {
+            (&full_views, &[(0, 0), (1, 42)])
+        } else {
+            (&short_views, &[(1, 42)])
+        };
+        let (root, pso) = host
+            .compute_pipeline(&shader)
+            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+        for &(selector, want) in cases {
+            let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+            for u in &shader.user_data {
+                ud[u.index as usize] = match (u.root, u.slot) {
+                    (RootType::Constants, 0) => selector,
+                    (RootType::Table, 1) => 32,
+                    (RootType::Table, 2) => 2 * 32,
+                    (RootType::Table, 3) => 0,
+                    other => panic!("unexpected user data {other:?}"),
+                };
+            }
+            let words = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![
+                            (0, Root::Constants(ud)),
+                            (
+                                1,
+                                Root::View {
+                                    srv: true,
+                                    data: strides.clone(),
+                                },
+                            ),
+                        ],
+                        views,
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{label}, selector {selector}: dispatch failed: {e}"));
+            assert_eq!(words[0], vec![want; 32], "{label}, selector {selector}");
+        }
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
 }

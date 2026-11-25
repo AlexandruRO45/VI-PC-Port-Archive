@@ -73,7 +73,8 @@
 //!   index `i`.
 //! * **Constant buffers in the heap** (added 2026-11-24): scalar buffer
 //!   loads through a descriptor taken from the resource heap itself (root
-//!   type 5, so no used-resource entry) read a raw buffer view, not a
+//!   type 5, so no used-resource entry) or a descriptor table slot with no
+//!   used-resource entry read a raw buffer view, not a
 //!   constant buffer view: the title's constant buffers are 16-byte
 //!   aligned, the host's views 256. The host makes a raw view at the
 //!   constant buffer's address for each constant buffer view in the heap.
@@ -90,19 +91,20 @@
 //!   reads nothing instead of faulting the device.
 //! * **Buffer views at computed heap indices** (added 2026-11-24): a
 //!   buffer read through a descriptor the shader takes from the resource
-//!   heap itself first looks up the view-stride table (root SRV
-//!   `t`[`VIEW_STRIDES`], which then covers every index below
-//!   [`HEAP_VIEWS`], dynamic slots too); where it holds 0 (no buffer view
-//!   there) the shader reads heap index [`NULL_BUFFER_VIEW`] instead (for
-//!   unordered access the index below), which the host keeps a null raw
-//!   buffer SRV (UAV). The index comes from data, and a texture descriptor
-//!   read as a buffer one is a wild address (the texture's shifted 8 bits
-//!   down: GPU faults at low addresses).
+//!   heap itself (or a table slot with no used-resource entry) first looks
+//!   up the view-stride table (root SRV `t`[`VIEW_STRIDES`], which then
+//!   covers every index below [`HEAP_VIEWS`], dynamic slots too); where it
+//!   holds 0 (no buffer view there) the shader reads heap index
+//!   [`NULL_BUFFER_VIEW`] instead (for unordered access the index below),
+//!   which the host keeps a null raw buffer SRV (UAV). The index comes from
+//!   data, and a texture descriptor read as a buffer one is a wild address
+//!   (the texture's shifted 8 bits down: GPU faults at low addresses).
 //! * **Heap access** ([`HostShader::heap`], [`HostShader::heap_writes`],
 //!   added 2026-11-24): whether the shader takes descriptors from the
-//!   resource heap itself, and unordered access views among them; the
-//!   host then keeps everything the heap's views reach current, and
-//!   copies back what such views may have written.
+//!   resource heap itself (or buffer views from an unlisted table slot), and
+//!   unordered access views among them; the host then keeps everything the
+//!   heap's views reach current, and copies back what such views may have
+//!   written.
 //!
 //! * **Texture atomics** (added 2026-11-23): a texture UAV the shader uses
 //!   atomically is declared a 32-bit unsigned single-channel view; the

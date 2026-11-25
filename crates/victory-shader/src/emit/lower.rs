@@ -3958,10 +3958,12 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
-        // Constant data through the resource heap itself is a raw buffer: the
-        // host's constant buffer views need 256-byte alignment, the title's
-        // 16 (module notes, "Constant buffers in the heap").
-        let heap_constants = kind.is_none() && self.is_heap_direct(src);
+        // Constant data through the resource heap itself, or a descriptor
+        // table slot with no used-resource entry, is a raw buffer: the host's
+        // constant buffer views need 256-byte alignment, the title's 16
+        // (module notes, "Constant buffers in the heap"), and empty or
+        // unmirrored heap slots hold raw or null SRVs, never CBVs.
+        let heap_constants = kind.is_none() && (self.is_heap_direct(src) || self.is_view_heap(src));
         // So is constant data in a table: the title's slot holds a raw view
         // of it, so tables need no copies of their own per draw.
         let table_constants =
@@ -5115,9 +5117,13 @@ impl<'a> Lower<'a> {
         } else {
             props
         };
-        // A descriptor from the resource heap itself: the host cannot tell
-        // which slots the program reads, or writes through unordered access.
-        if !sampler && self.is_heap_direct(src) {
+        // A descriptor from the resource heap itself, or a buffer in a table
+        // slot no used-resource entry names: the host cannot tell from `used`
+        // alone which slots the program reads, or writes through unordered
+        // access.
+        let unlisted_table =
+            !sampler && (10..=12).contains(&(props.0 & 0xFF)) && self.is_unlisted_table(src);
+        if (!sampler && self.is_heap_direct(src)) || unlisted_table {
             self.heap[0] = true;
             self.heap[1] |= props.0 & 0x1000 != 0;
         }
@@ -5298,15 +5304,20 @@ impl<'a> Lower<'a> {
     }
 
     /// The heap index to read a buffer view at, for a descriptor `src` from
-    /// the resource heap itself (module notes, "Buffer views at computed
-    /// heap indices"): `index`, or the host's null raw buffer view when the
-    /// view-stride table says the slot holds no buffer view. Indices come
-    /// from data; one naming a texture slot read a texture descriptor as a
-    /// buffer one (a wild address: the texture's address shifted 8 bits
-    /// down) and faulted the device.
+    /// the resource heap itself or an unlisted table slot (module notes,
+    /// "Buffer views at computed heap indices"): `index`, or the host's null
+    /// raw buffer view when the view-stride table says the slot holds no
+    /// buffer view. Indices come from data; one naming a texture slot read a
+    /// texture descriptor as a buffer one (a wild address: the texture's
+    /// address shifted 8 bits down) and faulted the device.
     fn buffer_guard(&mut self, src: &Source, index: V, sampler: bool, props: (u32, u32)) -> V {
-        // Typed, raw and structured buffers (DXIL resource kinds 10-12).
-        if sampler || !(10..=12).contains(&(props.0 & 0xFF)) || !self.is_heap_direct(src) {
+        // Typed, raw and structured buffers (DXIL resource kinds 10-12) from
+        // the resource heap itself or a table slot no used-resource entry
+        // names.
+        if sampler
+            || !(10..=12).contains(&(props.0 & 0xFF))
+            || (!self.is_heap_direct(src) && !self.is_unlisted_table(src))
+        {
             return index;
         }
         let c = self.cur;
@@ -5317,7 +5328,14 @@ impl<'a> Lower<'a> {
         let at = self.s.m.bin(c, Bin::Mul, index, four);
         let table = self.s.root_srv_handle(VIEW_STRIDES);
         let (iu, mask) = (self.s.m.undef(self.s.t.i32), self.s.m.i8(1));
-        let r = self.s.op(c, "rawBufferLoad.f32", Attr::ReadOnly, self.s.t.res_ret, 139, &[table, at, iu, mask, four]);
+        let r = self.s.op(
+            c,
+            "rawBufferLoad.f32",
+            Attr::ReadOnly,
+            self.s.t.res_ret,
+            139,
+            &[table, at, iu, mask, four],
+        );
         let x = self.s.m.extract(c, r, 0);
         let stride = self.as_int(x);
         let zero = self.s.m.i32(0);
@@ -5326,6 +5344,28 @@ impl<'a> Lower<'a> {
         let null = super::NULL_BUFFER_VIEW - u32::from(props.0 & 0x1000 != 0);
         let null = self.s.m.i32(null);
         self.s.m.select(c, none, null, index)
+    }
+
+    /// Whether every leaf of `src` is a scalar or global load from the
+    /// resource heap (`RootType::ResourceHeap`) or a descriptor table
+    /// (`RootType::Table`).
+    fn is_view_heap(&self, src: &Source) -> bool {
+        let leaves = src.leaves();
+        !leaves.is_empty()
+            && leaves.iter().all(|l| match l {
+                Source::Loaded { load, .. } | Source::Fetched { load, .. } => self
+                    .scalar
+                    .get(load)
+                    .and_then(|a| self.x.native.layout.get(a.param))
+                    .is_some_and(|p| matches!(p.root, RootType::ResourceHeap | RootType::Table)),
+                _ => false,
+            })
+    }
+
+    /// Whether `src` is an unlisted descriptor from a table (or a mix of
+    /// table and resource-heap loads) with no `UsedResource` entry.
+    fn is_unlisted_table(&self, src: &Source) -> bool {
+        self.used_kind(src).is_none() && self.is_view_heap(src)
     }
 
     /// Whether a descriptor comes from the resource heap itself (root type
