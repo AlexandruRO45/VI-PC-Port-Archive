@@ -539,7 +539,9 @@ mod unknown_dump {
     const KEY_GROUPS: u32 = 2;
 
     static DUMPED: [AtomicU32; 2] = [const { AtomicU32::new(0) }; 2];
-    static LAYOUTS: Mutex<Option<HashMap<(usize, [u64; 3]), u32>>> = Mutex::new(None);
+    /// Calls seen per slot and layout.
+    type Layouts = Mutex<Option<HashMap<(usize, [u64; 3]), u32>>>;
+    static LAYOUTS: Layouts = Mutex::new(None);
 
     /// Whether `[at, at + len)` is committed memory that can be read and has
     /// no guard page. What the dump reads is guessed, and the in-process copy
@@ -587,6 +589,7 @@ mod unknown_dump {
         };
         assert!(!guarded.is_null() && !open.is_null());
         assert!(read(guarded as u64, 64, 64).is_none(), "a guard page is not read");
+        // SAFETY: a structure of integers and pointers, valid all zero.
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
         // SAFETY: a query into a local structure.
         unsafe { VirtualQuery(guarded, &mut info, size_of::<MEMORY_BASIC_INFORMATION>()) };
