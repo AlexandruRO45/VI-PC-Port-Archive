@@ -3585,7 +3585,6 @@ mod batch {   // `mod tests` is already taken at the top of this file
     /// copied pages 0 and 2 and skipped 1).
     #[test]
     fn the_gap_between_copied_ranges_is_not_covered() {
-        use crate::watch::PAGE;
         let mut copied = vec![(0x1_0000, 0x1_1000)];
         push_copied(&mut copied, 0x2_1000, 0x2_2000);
         // A page apart: not joined, the gap between them stays pending.
