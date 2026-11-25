@@ -40,7 +40,7 @@ mod tests {
                getcompatpath) printf 'Z:%s\\n' \"$2\" ;;\n\
                waitforexitandrun)\n\
                  shift\n\
-                 printf 'launched %s %s umu=%s overrides=%s copy=%s nowatchdog=%s mangohud=%s vkd3dcache=%s mesacache=%s\\n' \"$0\" \"$*\" \"${{UMU_ID:-}}\" \"${{WINEDLLOVERRIDES:-}}\" \"${{VICTORY_COPY_MEMORY:-}}\" \"${{VICTORY_NO_WATCHDOG:-}}\" \"${{MANGOHUD:-}}\" \"${{VKD3D_SHADER_CACHE_PATH:-}}\" \"${{MESA_SHADER_CACHE_DIR:-}}\"\n\
+                 printf 'launched %s %s umu=%s overrides=%s copy=%s nowatchdog=%s mangohud=%s vkd3dcache=%s mesacache=%s console=%s logfile=%s\\n' \"$0\" \"$*\" \"${{UMU_ID:-}}\" \"${{WINEDLLOVERRIDES:-}}\" \"${{VICTORY_COPY_MEMORY:-}}\" \"${{VICTORY_NO_WATCHDOG:-}}\" \"${{MANGOHUD:-}}\" \"${{VKD3D_SHADER_CACHE_PATH:-}}\" \"${{MESA_SHADER_CACHE_DIR:-}}\" \"${{VICTORY_LOG_CONSOLE:-}}\" \"${{VICTORY_LOG_FILE:-}}\"\n\
                  ;;\n\
                *) printf 'unexpected verb %s\\n' \"$1\" >&2; exit 2 ;;\n\
              esac\n"
@@ -290,14 +290,13 @@ mod tests {
     }
 
     #[test]
-    fn proton_launcher_log_window_tees_the_run() {
+    fn proton_launcher_log_window_uses_the_wine_console() {
         let tmp = temp_dir("log-window");
         let prefix = tmp.join("prefix");
         let exe = tmp.join("victory.exe");
         fs::write(&exe, b"not a real exe").expect("stand-in exe");
         let proton = fake_proton(&tmp, &prefix, true);
         let log = tmp.join("run.log");
-        // `true` as the terminal: the tee path runs, no window opens.
         let out = Command::new("bash")
             .args(["proton/run.sh", "--prefix"])
             .arg(&prefix)
@@ -308,7 +307,7 @@ mod tests {
             .arg("--log-window")
             .args(["--", "config"])
             .current_dir(root())
-            .env("VICTORY_LOG_WINDOW", format!("{}:true", log.display()))
+            .env("VICTORY_LOG_FILE", &log)
             .output()
             .expect("bash");
         assert!(
@@ -316,10 +315,20 @@ mod tests {
             "run failed: {}",
             String::from_utf8_lossy(&out.stderr)
         );
-        let written = fs::read_to_string(&log).expect("log file");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        // cmd.exe allocates the Wine console; the log mirrors to CONOUT$
+        // and to the file, so a redirected run still shows its logs.
         assert!(
-            written.contains("launched"),
-            "the log window's file must carry the run output: {written}"
+            stdout.contains("cmd.exe /c"),
+            "the exe must run through cmd.exe for the Wine console: {stdout}"
+        );
+        assert!(
+            stdout.contains("console=1"),
+            "the console mirror must be on: {stdout}"
+        );
+        assert!(
+            stdout.contains(&format!("logfile={}", log.display())),
+            "the mirror log must follow VICTORY_LOG_FILE: {stdout}"
         );
         let _ = fs::remove_dir_all(&tmp);
     }

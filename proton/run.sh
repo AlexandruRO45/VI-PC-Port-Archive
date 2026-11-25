@@ -33,9 +33,8 @@ usage: proton/run.sh [options] [--] [victory args...]
                  GE-Proton, off elsewhere — MangoHud cannot present
                  through the Valve family's shared present mode)
   --no-mangohud  leave MANGOHUD unset (no overlay)
-  --log-window   tail the run's output in a terminal window (alacritty,
-                 konsole or xterm); VICTORY_LOG_WINDOW=file:term picks
-                 the log file and the terminal
+  --log-window   show the logs in Wine's console window (the exe runs
+                 through cmd.exe); VICTORY_LOG_FILE picks the mirror log
 
 Notes:
   VICTORY_COPY_MEMORY defaults to 1: under Wine the title memory used in
@@ -271,30 +270,14 @@ fi
 wexe=$("$proton/proton" getcompatpath "$exe" 2>/dev/null)
 [[ -n $wexe ]] || die "proton getcompatpath failed for $exe"
 
-# --log-window keeps a terminal tailing the run's output, the live view the
-# first runs had before everything went to a redirected log. The log itself
-# lives outside the prefix; VICTORY_LOG_WINDOW names both the file and,
-# with a colon, the terminal (`file:term`).
+# --log-window shows the run's logs in Wine's own console window, the live
+# view the first runs had: the exe goes through cmd.exe so Wine allocates a
+# console, and victory mirrors its log to CONOUT$ (which reaches that window
+# even with stdout redirected) plus VICTORY_LOG_FILE.
 if [[ -n $log_window ]]; then
-    log=${VICTORY_LOG_WINDOW:-$HOME/.local/share/victory/proton-run.log}
-    term=${log##*:}
-    [[ $term == "$log" ]] && term=""
-    log=${log%%:*}
-    mkdir -p "$(dirname "$log")"
-    : > "$log"
-    if [[ -z $term ]]; then
-        for candidate in alacritty konsole xterm; do
-            if command -v "$candidate" >/dev/null 2>&1; then
-                term=$candidate
-                break
-            fi
-        done
-    fi
-    if [[ -n $term ]]; then
-        "$term" -e tail -n 200 -f "$log" >/dev/null 2>&1 &
-    else
-        echo "proton/run.sh: no terminal for --log-window; tail $log" >&2
-    fi
-    exec "$proton/proton" waitforexitandrun "$wexe" "$@" > >(tee -a "$log") 2>&1
+    export VICTORY_LOG_CONSOLE=1
+    export VICTORY_LOG_FILE=${VICTORY_LOG_FILE:-$HOME/.local/share/victory/proton-run.log}
+    mkdir -p "$(dirname "$VICTORY_LOG_FILE")"
+    exec "$proton/proton" waitforexitandrun 'C:\windows\system32\cmd.exe' /c "$wexe" "$@"
 fi
 exec "$proton/proton" waitforexitandrun "$wexe" "$@"
