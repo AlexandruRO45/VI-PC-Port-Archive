@@ -3577,7 +3577,13 @@ impl Host {
             if let Some((buffer, footprint)) = capture {
                 crate::capture::save_read_back(frame, &buffer, &footprint);
             }
-            let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            let presented = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            if presented.is_err() {
+                static FAILED: AtomicU32 = AtomicU32::new(0);
+                if FAILED.fetch_add(1, Ordering::Relaxed) < 8 {
+                    tracing::warn!(result = %presented.message(), code = format_args!("{:#x}", presented.0), "swap chain present failed");
+                }
+            }
             p.meter.frame(p.hwnd);
             #[cfg(feature = "diagnostics")]
             return Some(probe.is_some_and(|b| crate::capture::black(&b)));
@@ -3592,10 +3598,12 @@ impl Host {
         height: u32,
         format: DXGI_FORMAT,
     ) -> Result<Presenter, (&'static str, windows::core::Error)> {
-        let hwnd = match title_window() {
-            Some(hwnd) => hwnd,
-            None => window(width, height).map_err(|e| ("window", e))?,
+        let (hwnd, own) = match title_window() {
+            Some(hwnd) => (hwnd, false),
+            None => (window(width, height).map_err(|e| ("window", e))?, true),
         };
+        // SAFETY: plain queries of a window handle.
+        let (stand_in, visible) = (is_stand_in(hwnd), unsafe { IsWindowVisible(hwnd) }.as_bool());
         // SAFETY: plain object creation for our window.
         unsafe {
             let factory: IDXGIFactory2 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))
@@ -3619,7 +3627,16 @@ impl Host {
                 .map_err(|e| ("swap chain", e))?;
             let copy = self.new_list().map_err(|e| ("copy list", e))?;
             copy.close();
-            tracing::info!(width, height, format = format.0, "presenting to a window");
+            tracing::info!(
+                width,
+                height,
+                format = format.0,
+                hwnd = format_args!("{:#x}", hwnd.0 as usize),
+                stand_in,
+                visible,
+                own,
+                "presenting to a window"
+            );
             Ok(Presenter {
                 swap_chain,
                 width,
@@ -3633,27 +3650,71 @@ impl Host {
     }
 }
 
-/// A visible top-level window of this process: the one the title made, if
-/// it made one.
+/// The class of the stand-in window `victory_hle`'s lifecycle module shows
+/// for a title's top-level window (`make_stand_in`).
+const STAND_IN_CLASS: PCWSTR = w!("VIctory.title");
+
+/// `VICTORY_PRESENT_STAND_IN` (default on): the swap chain goes to the
+/// title's stand-in window even while the title has not shown it yet. Off,
+/// only a visible window is taken, else the presenter makes its own: a
+/// first frame presented before the title showed its window then went to a
+/// window of ours, and the title's stayed white for the whole run.
+fn present_stand_in() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PRESENT_STAND_IN").is_none_or(|v| v != "0"))
+}
+
+/// The window the title shows its frames in: its stand-in (a shown one
+/// first, else one not shown yet, with `VICTORY_PRESENT_STAND_IN`), else a
+/// visible top-level window of this process.
 fn title_window() -> Option<HWND> {
+    #[derive(Default)]
+    struct Found {
+        shown_stand_in: Option<HWND>,
+        stand_in: Option<HWND>,
+        visible: Option<HWND>,
+    }
     extern "system" fn visit(hwnd: HWND, found: LPARAM) -> windows::core::BOOL {
+        // SAFETY: `found` is the caller's, alive through the enumeration.
+        let found = unsafe { &mut *(found.0 as *mut Found) };
         let mut process = 0;
-        // SAFETY: a window handle from the enumeration; `found` is ours.
+        // SAFETY: a window handle from the enumeration.
         unsafe {
             GetWindowThreadProcessId(hwnd, Some(&mut process));
-            if process == windows::Win32::System::Threading::GetCurrentProcessId()
-                && IsWindowVisible(hwnd).as_bool()
-            {
-                *(found.0 as *mut Option<HWND>) = Some(hwnd);
-                return false.into();
+            if process != windows::Win32::System::Threading::GetCurrentProcessId() {
+                return true.into();
+            }
+            let (stand_in, visible) = (is_stand_in(hwnd), IsWindowVisible(hwnd).as_bool());
+            if stand_in && visible && found.shown_stand_in.is_none() {
+                found.shown_stand_in = Some(hwnd);
+            }
+            if stand_in && found.stand_in.is_none() {
+                found.stand_in = Some(hwnd);
+            }
+            if visible && found.visible.is_none() {
+                found.visible = Some(hwnd);
             }
         }
         true.into()
     }
-    let mut found: Option<HWND> = None;
+    let mut found = Found::default();
     // SAFETY: the callback only writes `found`, which outlives the call.
     let _ = unsafe { EnumWindows(Some(visit), LPARAM(&raw mut found as isize)) };
-    found
+    if present_stand_in() {
+        found.shown_stand_in.or(found.stand_in).or(found.visible)
+    } else {
+        found.visible
+    }
+}
+
+/// Whether `hwnd` is a title's stand-in window.
+fn is_stand_in(hwnd: HWND) -> bool {
+    let mut name = [0u16; 32];
+    // SAFETY: a window handle; the buffer holds `name.len()` characters.
+    let n = unsafe { GetClassNameW(hwnd, &mut name) };
+    // SAFETY: a static NUL-terminated name.
+    let wanted = unsafe { STAND_IN_CLASS.as_wide() };
+    n > 0 && &name[..n as usize] == wanted
 }
 
 /// `state` without the bits the host texture's flags forbid: the console
@@ -4623,5 +4684,189 @@ void main() {
         drop(list);
         drop(copy);
         crate::watch::tests::free(p);
+    }
+}
+
+/// Presentation through a real window: what the window shows, read back
+/// from the compositor, not the texture handed to `present`. Opens a window
+/// for a few seconds, so it is ignored by default:
+/// `cargo test --release -p victory-gpu --lib -- --ignored reach_it`.
+#[cfg(test)]
+mod present_window {
+    use super::*;
+    use windows::Win32::Graphics::Gdi::{
+        BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateCompatibleBitmap, CreateCompatibleDC,
+        DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDC, GetDIBits, HDC, ReleaseDC, SelectObject,
+    };
+
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn PrintWindow(hwnd: HWND, hdc: HDC, flags: u32) -> i32;
+    }
+    /// `PW_CLIENTONLY | PW_RENDERFULLCONTENT`: the client area as composed,
+    /// swap chain content included.
+    const CLIENT_AS_COMPOSED: u32 = 1 | 2;
+
+    /// A render target of `width` x `height` cleared to `color`, left in the
+    /// render target state.
+    fn cleared(host: &Host, width: u32, height: u32, color: [f32; 4]) -> ID3D12Resource {
+        let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: u64::from(width),
+            Height: height,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+            ..Default::default()
+        };
+        let mut texture: Option<ID3D12Resource> = None;
+        // SAFETY: plain creation; the list is open and the texture live.
+        unsafe {
+            host.device
+                .CreateCommittedResource(
+                    &heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &desc,
+                    D3D12_RESOURCE_STATE_RENDER_TARGET,
+                    None,
+                    &mut texture,
+                )
+                .expect("render target");
+            let texture = texture.expect("render target");
+            let list = host.new_list().expect("list");
+            list.list.ClearRenderTargetView(host.rtv(&texture, None), &color, None);
+            list.close();
+            host.execute(&[&list]);
+            texture
+        }
+    }
+
+    /// The window's client area as the compositor shows it: (width, height,
+    /// BGRA pixels, top row first).
+    fn shown(hwnd: HWND) -> (i32, i32, Vec<u8>) {
+        // SAFETY: GDI objects made, used and freed here; `pixels` holds the
+        // whole bitmap.
+        unsafe {
+            let mut rect = RECT::default();
+            GetClientRect(hwnd, &mut rect).expect("client rectangle");
+            let (w, h) = (rect.right - rect.left, rect.bottom - rect.top);
+            let screen = GetDC(None);
+            let dc = CreateCompatibleDC(Some(screen));
+            let bitmap = CreateCompatibleBitmap(screen, w, h);
+            let old = SelectObject(dc, bitmap.into());
+            let printed = PrintWindow(hwnd, dc, CLIENT_AS_COMPOSED);
+            assert_ne!(printed, 0, "PrintWindow failed");
+            let mut info = BITMAPINFO {
+                bmiHeader: BITMAPINFOHEADER {
+                    biSize: size_of::<BITMAPINFOHEADER>() as u32,
+                    biWidth: w,
+                    biHeight: -h,
+                    biPlanes: 1,
+                    biBitCount: 32,
+                    biCompression: BI_RGB.0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let mut pixels = vec![0u8; (w * h * 4) as usize];
+            GetDIBits(dc, bitmap, 0, h as u32, Some(pixels.as_mut_ptr().cast()), &mut info, DIB_RGB_COLORS);
+            SelectObject(dc, old);
+            let _ = DeleteObject(bitmap.into());
+            let _ = DeleteDC(dc);
+            ReleaseDC(None, screen);
+            (w, h, pixels)
+        }
+    }
+
+    /// A stand-in like `victory_hle`'s (its class, its own pumping thread),
+    /// not shown yet.
+    fn hidden_stand_in() -> HWND {
+        extern "system" fn procedure(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+            // SAFETY: the default handling for our window.
+            unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
+        }
+        let (send, receive) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            // SAFETY: registers the class and makes a window of it on this
+            // thread, which then reads its messages.
+            unsafe {
+                let instance = GetModuleHandleW(None).expect("module");
+                let class = WNDCLASSEXW {
+                    cbSize: size_of::<WNDCLASSEXW>() as u32,
+                    lpfnWndProc: Some(procedure),
+                    hInstance: instance.into(),
+                    lpszClassName: STAND_IN_CLASS,
+                    ..Default::default()
+                };
+                RegisterClassExW(&class);
+                let hwnd = CreateWindowExW(
+                    WINDOW_EX_STYLE(0),
+                    STAND_IN_CLASS,
+                    w!("stand-in"),
+                    WS_OVERLAPPEDWINDOW,
+                    100,
+                    100,
+                    1280,
+                    720,
+                    None,
+                    None,
+                    Some(instance.into()),
+                    None,
+                )
+                .expect("stand-in window");
+                send.send(hwnd.0 as usize).expect("handle sent");
+                pump();
+            }
+        });
+        HWND(receive.recv().expect("stand-in made") as *mut _)
+    }
+
+    /// The title's first frames come before it shows its window (the
+    /// stand-in): they and every later one reach the stand-in once shown.
+    /// `VICTORY_PRESENT_STAND_IN=0` fails it (the frames go to a window of
+    /// the presenter's own, the stand-in stays white).
+    #[test]
+    #[ignore = "opens a window"]
+    fn frames_presented_before_the_title_shows_its_window_reach_it() {
+        let Some(host) = host() else { return };
+        let stand_in = hidden_stand_in();
+        // The title's size and format (`presenting to a window width=3840
+        // height=2160 format=28`).
+        let texture = cleared(host, 3840, 2160, [1.0, 0.0, 0.0, 1.0]);
+        let render_target = D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32;
+        let mut frame = 0;
+        let mut present = |n: u32| {
+            for _ in 0..n {
+                frame += 1;
+                assert!(host.present(&texture, render_target, frame).is_some(), "nothing presented");
+                std::thread::sleep(Duration::from_millis(16));
+            }
+        };
+        present(5);
+        // SAFETY: our window; its thread reads its messages.
+        let _ = unsafe { ShowWindow(stand_in, SW_SHOWNORMAL) };
+        present(60);
+        let (w, h, pixels) = shown(stand_in);
+        let presented_to = {
+            let presentation = host.presenter.lock().unwrap();
+            presentation.presenter.as_ref().expect("a presenter").hwnd
+        };
+        assert!(w > 0 && h > 0, "no client area");
+        let at = |x: i32, y: i32| {
+            let i = ((y * w + x) * 4) as usize;
+            [pixels[i + 2], pixels[i + 1], pixels[i]]
+        };
+        for (x, y) in [(w / 2, h / 2), (w / 4, h / 4), (3 * w / 4, 3 * h / 4)] {
+            let [r, g, b] = at(x, y);
+            assert!(
+                r > 200 && g < 60 && b < 60,
+                "the title's window shows ({r}, {g}, {b}) at ({x}, {y}), not the presented red \
+                 (frames went to {presented_to:?}, the stand-in is {stand_in:?})"
+            );
+        }
+        assert_eq!(presented_to, stand_in);
     }
 }
