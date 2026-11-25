@@ -1889,7 +1889,10 @@ mod tests {
 
     /// A hub with keyboard and mouse controls (the defaults).
     fn fake_kbm() -> (&'static Hub, Arc<Mutex<FakeHost>>) {
-        fake_with(Default::default())
+        fake_with(super::super::controls::Settings {
+            deadzone: 0.0,
+            ..Default::default()
+        })
     }
 
     fn fake_with(

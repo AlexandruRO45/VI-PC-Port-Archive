@@ -353,7 +353,7 @@ impl Default for Settings {
             invert_y: false,
             capture: true,
             carry: true,
-            deadzone: 0.0,
+            deadzone: 0.3,
             curve: 1.0,
             walk_speed: 0.5,
             by_position: true,
@@ -836,8 +836,16 @@ mod tests {
         key_code(name).unwrap()
     }
 
+    fn linear() -> Settings {
+        Settings {
+            deadzone: 0.0,
+            curve: 1.0,
+            ..Settings::default()
+        }
+    }
+
     fn controls() -> Controls {
-        Controls::new(Settings::default())
+        Controls::new(linear())
     }
 
     fn held(c: &mut Controls, keys: &[&str]) -> PadState {
@@ -1061,7 +1069,7 @@ mod tests {
         assert_eq!(xs[3], 0.0);
         let mut c = Controls::new(Settings {
             carry: false,
-            ..Settings::default()
+            ..linear()
         });
         c.take(0, None, &counts);
         counts.add(50, 0);
