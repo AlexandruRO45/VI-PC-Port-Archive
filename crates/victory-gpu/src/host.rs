@@ -59,6 +59,8 @@ pub(crate) struct Host {
     messages: Option<ID3D12InfoQueue>,
     next_rtv: AtomicU32,
     presenter: Mutex<Presentation>,
+    /// Reused, only under the submission lock, for clearing VRAM feedback.
+    heap_usage_reset: OnceLock<Option<HeapUsageReset>>,
 }
 
 // SAFETY: D3D12 devices, queues, fences and descriptor heaps are
@@ -254,6 +256,7 @@ fn create() -> windows::core::Result<Host> {
             messages,
             next_rtv: AtomicU32::new(0),
             presenter: Mutex::new(Presentation::default()),
+            heap_usage_reset: OnceLock::new(),
         })
     }
 }
@@ -660,6 +663,7 @@ struct Deferred {
     /// Destination, source, bytes.
     copies: Vec<Step>,
     uploads: Vec<ID3D12Resource>,
+    heap_usage_copies: Vec<HeapUsageCopy>,
     /// Linear texture readbacks recorded so far, in command order.
     readbacks: Vec<crate::list::TextureReadback>,
     /// Host objects the list's commands name (pipelines, root signatures,
@@ -684,6 +688,20 @@ struct Deferred {
     /// they wrote through views does not go back either.
     missed: Vec<Box<dyn Fn() -> bool + Send>>,
 }
+
+struct HeapUsageCopy {
+    bitmap: ID3D12Resource,
+    readback: ID3D12Resource,
+    pending: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+struct HeapUsageReset {
+    zero: ID3D12Resource,
+    allocator: ID3D12CommandAllocator,
+    list: ID3D12GraphicsCommandList,
+}
+
+const HEAP_USAGE_BYTES: u64 = victory_shader::emit::HEAP_VIEWS as u64 / 8;
 
 impl Host {
     /// Whether the host runs mesh shaders at shader model 6.6 (translated
@@ -865,12 +883,15 @@ impl Host {
             }
         }
         let mut lists: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(2 * runs.len());
+        let reset = self.reset_heap_usage(runs);
+        let has_reset = reset.is_some();
+        lists.extend(reset.map(Some));
         // Where each run's lists start in `lists`.
         let mut firsts = Vec::with_capacity(runs.len());
         let mut batch = Batch::default();
         for list in runs {
             list.run_deferred(&mut batch);
-            firsts.push(lists.len());
+            firsts.push(if firsts.is_empty() && has_reset { 0 } else { lists.len() });
             #[cfg(feature = "diagnostics")]
             let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::PreludeUs);
             if let Some(prelude) = list.prelude() {
@@ -1380,6 +1401,19 @@ impl HostList {
     }
 
     pub(crate) fn close(&self) {
+        for copy in &self.deferred().heap_usage_copies {
+            // SAFETY: both buffers belong to the list. The bitmap is used
+            // only as a UAV until this copy, or still COMMON if unused.
+            unsafe {
+                self.list.ResourceBarrier(&[transition(
+                    &copy.bitmap, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE,
+                )]);
+                self.list.CopyBufferRegion(&copy.readback, 0, &copy.bitmap, 0, HEAP_USAGE_BYTES);
+                self.list.ResourceBarrier(&[transition(
+                    &copy.bitmap, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON,
+                )]);
+            }
+        }
         #[cfg(feature = "diagnostics")]
         self.profile.resolve(&self.list);
         #[cfg(feature = "diagnostics")]
@@ -1718,6 +1752,34 @@ impl HostList {
     /// bottom-of-pipe writes.
     pub(crate) fn defer_after(&self, work: impl Fn() + Send + 'static) {
         self.deferred().after.push(Box::new(work));
+    }
+
+    /// A GPU-local feedback bitmap and its CPU-readable copy. The queue
+    /// zeros it before first use in a submission. Close records the copy.
+    pub(crate) fn heap_usage_vram(&self) -> Option<(u64, *const u32, std::sync::Arc<std::sync::atomic::AtomicBool>)> {
+        let host = host()?;
+        host.heap_usage_reset.get_or_init(|| host.make_heap_usage_reset()).as_ref()?;
+        let bitmap = host.copy_dest_buffer(
+            HEAP_USAGE_BYTES, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+        )?;
+        let readback = host.copy_dest_buffer(
+            HEAP_USAGE_BYTES, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE,
+        )?;
+        let mut data = std::ptr::null_mut();
+        // SAFETY: these are live buffers. The mapped readback is read only
+        // after the queue's submitted fence.
+        let gpu = unsafe {
+            readback.Map(0, None, Some(&mut data)).ok()?;
+            bitmap.GetGPUVirtualAddress()
+        };
+        if gpu == 0 || data.is_null() {
+            return None;
+        }
+        name(&bitmap, || "heap slots read (default heap)".into());
+        name(&readback, || "heap slots read (readback)".into());
+        let pending = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.deferred().heap_usage_copies.push(HeapUsageCopy { bitmap, readback, pending: pending.clone() });
+        Some((gpu, data.cast(), pending))
     }
 
     pub(crate) fn defer_texture_readback(&self, readback: crate::list::TextureReadback) {
@@ -2228,12 +2290,94 @@ mod title_copies {
     }
 }
 
+#[test]
+fn heap_usage_vram_retains_replayed_marks_and_resets_for_next_submission() {
+    use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+    use windows::Win32::Graphics::Direct3D::ID3DBlob;
+    use windows::core::s;
+
+    const SHADER: &str = r#"
+RWByteAddressBuffer marks : register(u0);
+RWByteAddressBuffer sequence : register(u1);
+[RootSignature("UAV(u0), UAV(u1)")]
+[numthreads(1,1,1)]
+void main() {
+    uint index;
+    sequence.InterlockedAdd(0, 1, index);
+    uint old;
+    marks.InterlockedOr(4, 1u << index, old);
+}
+"#;
+    let Some(host) = host() else { return };
+    let list = host.new_list().unwrap();
+    let (marks, readback, pending) = list.heap_usage_vram().unwrap();
+    let (counter, counter_data) = host.shared_buffer(256).unwrap();
+    let mut blob: Option<ID3DBlob> = None;
+    // SAFETY: the source, named entry point and output pointers are live.
+    unsafe {
+        D3DCompile(
+            SHADER.as_ptr().cast(), SHADER.len(), s!("feedback"), None, None,
+            s!("main"), s!("cs_5_1"), 0, 0, &mut blob, None,
+        ).unwrap();
+    }
+    let blob = blob.unwrap();
+    // SAFETY: the shader blob and the bound buffers outlive both submissions.
+    unsafe {
+        let code = std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize());
+        let root: ID3D12RootSignature = host.device.CreateRootSignature(0, code).unwrap();
+        let pso: ID3D12PipelineState = host.device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+            pRootSignature: std::mem::transmute_copy(&root),
+            CS: D3D12_SHADER_BYTECODE { pShaderBytecode: code.as_ptr().cast(), BytecodeLength: code.len() },
+            ..Default::default()
+        }).unwrap();
+        list.keep(&root);
+        list.keep(&pso);
+        counter_data.cast::<u32>().write(0);
+        list.list.SetComputeRootSignature(&root);
+        list.list.SetPipelineState(&pso);
+        list.list.SetComputeRootUnorderedAccessView(0, marks);
+        list.list.SetComputeRootUnorderedAccessView(1, counter.GetGPUVirtualAddress());
+        for _ in 0..2 {
+            list.list.Dispatch(1, 1, 1);
+            list.list.ResourceBarrier(&[transition(
+                &counter, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON,
+            )]);
+        }
+    }
+    list.close();
+    host.execute(&[&list]);
+    // SAFETY: the resolved readback and counter after both dispatches.
+    assert_eq!(unsafe { [readback.read(), readback.add(1).read(), counter_data.cast::<u32>().read()] }, [0, 3, 2]);
+    assert!(pending.swap(false, Ordering::Relaxed));
+    host.execute(&[&list]);
+    // The counter stays at 2 between submissions, while the marks reset.
+    // SAFETY: the synchronous execution has completed.
+    assert_eq!(unsafe { [readback.read(), readback.add(1).read()] }, [0, 12]);
+    assert!(pending.load(Ordering::Relaxed));
+    #[cfg(feature = "diagnostics")]
+    if timing() {
+        // The timing mode submits and waits for each execution separately.
+        // The one reset at the head of this submission covers both runs.
+        host.execute(&[&list, &list]);
+        // SAFETY: both queue fences completed.
+        assert_eq!(unsafe { readback.add(1).read() }, 0xf0);
+    }
+}
+
 impl Host {
-    /// A buffer in the upload heap, mapped for writing.
     /// A GPU-only buffer of `size` bytes in the copy-destination state.
     pub(crate) fn default_buffer(&self, size: u64) -> Option<ID3D12Resource> {
+        self.copy_dest_buffer(size, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_NONE)
+    }
+
+    fn copy_dest_buffer(
+        &self,
+        size: u64,
+        kind: D3D12_HEAP_TYPE,
+        flags: D3D12_RESOURCE_FLAGS,
+    ) -> Option<ID3D12Resource> {
         let heap = D3D12_HEAP_PROPERTIES {
-            Type: D3D12_HEAP_TYPE_DEFAULT,
+            Type: kind,
             ..Default::default()
         };
         let desc = D3D12_RESOURCE_DESC {
@@ -2244,6 +2388,7 @@ impl Host {
             MipLevels: 1,
             SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
             Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            Flags: flags,
             ..Default::default()
         };
         let mut buffer: Option<ID3D12Resource> = None;
@@ -2259,6 +2404,57 @@ impl Host {
             )
         };
         made.ok().and(buffer)
+    }
+
+    fn make_heap_usage_reset(&self) -> Option<HeapUsageReset> {
+        let (zero, data) = self.upload_buffer(HEAP_USAGE_BYTES)?;
+        // SAFETY: the upload mapping is sized for the bitmap. The list and
+        // allocator are private to submissions, and start closed.
+        unsafe {
+            data.write_bytes(0, HEAP_USAGE_BYTES as usize);
+            let allocator = self.device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).ok()?;
+            let list: ID3D12GraphicsCommandList = self.device.CreateCommandList(
+                0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None,
+            ).ok()?;
+            list.Close().ok()?;
+            Some(HeapUsageReset { zero, allocator, list })
+        }
+    }
+
+    /// Clear each bitmap once before the submission, so a list executed
+    /// twice in that submission reports the union of both runs' marks.
+    fn reset_heap_usage(&self, runs: &[&HostList]) -> Option<ID3D12CommandList> {
+        let reset = self.heap_usage_reset.get()?.as_ref()?;
+        let mut bitmaps = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for list in runs {
+            if seen.insert(std::ptr::from_ref(*list)) {
+                for copy in &list.deferred().heap_usage_copies {
+                    copy.pending.store(true, Ordering::Relaxed);
+                    bitmaps.push(copy.bitmap.clone());
+                }
+            }
+        }
+        if bitmaps.is_empty() {
+            return None;
+        }
+        // SAFETY: the submission lock serializes recording and execution.
+        // Each bitmap starts in COPY_DEST or promotes from COMMON, and
+        // returns to COMMON before the title list first accesses its UAV.
+        let recorded = unsafe {
+            reset.allocator.Reset().and_then(|()| {
+                reset.list.Reset(&reset.allocator, None)?;
+                for bitmap in &bitmaps {
+                    reset.list.CopyBufferRegion(bitmap, 0, &reset.zero, 0, HEAP_USAGE_BYTES);
+                    reset.list.ResourceBarrier(&[transition(
+                        bitmap, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON,
+                    )]);
+                }
+                reset.list.Close()?;
+                reset.list.cast()
+            })
+        };
+        Some(recorded.unwrap_or_else(|e| fail(format_args!("heap feedback reset list failed: {e}"))))
     }
 
     pub(crate) fn upload_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {

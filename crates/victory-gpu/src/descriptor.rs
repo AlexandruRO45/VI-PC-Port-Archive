@@ -199,6 +199,25 @@ pub(crate) fn sync_heaps() {
 #[cfg(windows)]
 pub(crate) fn usage_bitmap(list: &crate::host::HostList, heap: usize) -> Option<u64> {
     let words = (victory_shader::emit::HEAP_VIEWS / 32) as usize;
+    if heap_usage_vram_on() {
+        if let Some((gpu, data, pending)) = list.heap_usage_vram() {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| tracing::info!("heap usage feedback in default heap with per-list readback"));
+            let data = data as usize;
+            list.defer_after(move || {
+                // A submission can execute one list twice; its final
+                // readback contains both executions, processed once.
+                if pending.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                    // SAFETY: list-owned readback, after the GPU fence.
+                    let marks = unsafe { std::slice::from_raw_parts(data as *const u32, words) };
+                    publish_usage(heap, marks.iter().copied());
+                }
+            });
+            return Some(gpu);
+        }
+        static FALLBACK: std::sync::Once = std::sync::Once::new();
+        FALLBACK.call_once(|| tracing::warn!("default-heap feedback unavailable; using the shared bitmap"));
+    }
     let (bitmap, data) = crate::host::host()?.shared_buffer((words as u64 * 4).next_multiple_of(256))?;
     crate::host::name(&bitmap, || "heap slots read".into());
     // SAFETY: our mapped buffer of at least `words` dwords.
@@ -210,29 +229,51 @@ pub(crate) fn usage_bitmap(list: &crate::host::HostList, heap: usize) -> Option<
     list.defer_after(move || {
         // SAFETY: the bitmap is mapped and the list's run is over.
         let marks = unsafe { std::slice::from_raw_parts_mut(data as *mut u32, words) };
-        let on = heap_usage_on() && heap != 0;
-        if heap == 0 {
-            USAGE.2.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
-        let mut used = Vec::new();
-        for (w, mark) in marks.iter_mut().enumerate() {
-            if *mark == 0 {
-                continue;
-            }
-            let mut bits = std::mem::take(mark);
-            while on && bits != 0 {
-                used.push((w * 32) as u32 + bits.trailing_zeros());
-                bits &= bits - 1;
-            }
-        }
-        if used.is_empty() {
-            return;
-        }
-        let made = make_used(heap, &used);
-        USAGE.0.fetch_add(used.len() as u64, std::sync::atomic::Ordering::Relaxed);
-        USAGE.1.fetch_add(made, std::sync::atomic::Ordering::Relaxed);
+        publish_usage(heap, marks.iter_mut().map(|mark| {
+            if *mark == 0 { 0 } else { std::mem::take(mark) }
+        }));
     });
     Some(gpu)
+}
+
+#[cfg(windows)]
+fn usage_slots(marks: impl Iterator<Item = u32>, on: bool) -> Vec<u32> {
+    let mut used = Vec::new();
+    for (w, mut bits) in marks.enumerate() {
+        while on && bits != 0 {
+            used.push((w * 32) as u32 + bits.trailing_zeros());
+            bits &= bits - 1;
+        }
+    }
+    used
+}
+
+#[cfg(windows)]
+fn publish_usage(heap: usize, marks: impl Iterator<Item = u32>) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if heap == 0 {
+        USAGE.2.fetch_add(1, Relaxed);
+    }
+    let used = usage_slots(marks, heap_usage_on() && heap != 0);
+    if !used.is_empty() {
+        let made = make_used(heap, &used);
+        USAGE.0.fetch_add(used.len() as u64, Relaxed);
+        USAGE.1.fetch_add(made, Relaxed);
+    }
+}
+
+#[cfg(windows)]
+fn heap_usage_vram_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| matches!(std::env::var("VICTORY_HEAP_USAGE_VRAM").as_deref(), Ok("1")))
+}
+
+#[cfg(all(windows, test))]
+#[test]
+fn heap_usage_decodes_sparse_words_in_slot_order() {
+    let words = [0, 0x8000_0001, 0x10, 0];
+    assert_eq!(usage_slots(words.into_iter(), true), [32, 63, 68]);
+    assert!(usage_slots(words.into_iter(), false).is_empty());
 }
 
 /// Heap slots marked read, and views made for them, since the last call.
