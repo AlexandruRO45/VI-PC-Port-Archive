@@ -60,11 +60,15 @@ pub fn run(
     let prepared = victory_loader::prepare(&original)?;
     let hash = prepared.original_hash.to_hex();
     let title_dir = exe.parent().unwrap_or(Path::new("."));
+    // The exe may sit apart from the dump: when its own folder is not a
+    // package (no manifest beside it), the configured game directory holds
+    // the manifest, the startup archive and the package's virtual drive.
+    let content_dir = package_dir(cfg.game_dir.as_deref(), title_dir);
     match victory_game::identify(&hash) {
         Some(build) => {
             println!("build          {} ({hash})", build.label);
             if execute {
-                check_startup_archive(&title_dir.join(build.startup_archive))?;
+                check_startup_archive(&content_dir.join(build.startup_archive))?;
             }
         }
         None => println!("build          unknown ({hash})"),
@@ -86,10 +90,6 @@ pub fn run(
         HostPolicy::default()
     });
     let wanted = |dll: &str| title_dll(&resolver.host, dll);
-    // The exe may sit apart from the dump: when its own folder is not a
-    // package (no manifest beside it), the configured game directory holds
-    // the manifest and the package's virtual drive.
-    let content_dir = package_dir(cfg.game_dir.as_deref(), title_dir);
     // A missing manifest leaves id 0 and no storage quota.
     let manifest = std::fs::read_to_string(title_dir.join("MicrosoftGame.config"))
         .or_else(|_| std::fs::read_to_string(content_dir.join("MicrosoftGame.config")))
