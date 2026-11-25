@@ -144,3 +144,51 @@ wrong direction.
 narrowed says nothing about numerical equivalence on the GPU. A stall count
 on one machine says nothing about another. The limits belong next to the
 result, in the same place a reader will look.
+
+## Reproducing a shader census with validation
+
+The numbers quoted in the sections above come from one command, and anyone
+can repeat it. Two things are needed that are not present by default.
+
+**A validator.** `dxil.dll` ships with the Windows SDK and with the DXC
+releases. If it is not on the machine, take `dxc_<date>.zip` from the DXC
+releases page, unpack it, and point `VICTORY_DXIL` at `bin/x64/dxil.dll`.
+Without it the census still runs, but the validator column is absent and
+two of the three defect classes below are invisible.
+
+**The wave width of the host.** Set `VICTORY_HOST_WAVE=32` on a machine
+whose waves are 32 lanes, otherwise the translation targets a width the
+GPU does not have and the numbers are not comparable.
+
+```
+victory translate <shaders.rpf> --validate --pipelines --list
+```
+
+What the output is good for, in order of increasing cost:
+
+- the per-stage summary lines (`DXIL ... emitted ... validated ... pipelines`)
+  say whether a change moved anything at all
+- `--list` gives one line per program, so a specific hash can be followed
+  from "translated" to "pipeline created"
+- the failure summary at the end groups what is left by reason, which is
+  how the three classes below were found
+
+To look at one program rather than twenty-six thousand, set
+`VICTORY_TRANSLATE_ONLY` to a comma-separated list of the sixteen hex
+digits the log names a shader by.
+
+Three classes are worth checking by name, because none of them prevents a
+pipeline from being created and so none shows up in a census run without
+`--validate`:
+
+```
+interpolation mode that differs from another element packed into the same row
+Container part 'Program Input/Output Signature' does not match expected for module
+out of bound coord must be undef
+```
+
+On the retail pack, at the time of writing, the first two and the third are
+zero and 72 mesh programs still exceed the combined vertex and primitive
+output limit of 32768 components. That last class is a genuine budget
+question rather than a code defect: the overshoot is 128 to 896 components
+and the affected programs spend nothing on primitive outputs.
