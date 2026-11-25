@@ -43,6 +43,7 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <functional>
 #include <limits>
 #include <map>
@@ -1420,20 +1421,23 @@ inline bool zero_compressed_image(const ReplayFunctions& vk, VkCommandBuffer com
         }
     }
     if (!zero_buf && vk.copy_scratch && vk.fill_buffer) {
-        // Round up to a multiple of fmt.bytes (8 or 16, always a multiple of 4 for vkCmdFillBuffer).
-        const VkDeviceSize fill_bytes = ((needed + fmt.bytes - 1) / fmt.bytes) * fmt.bytes;
+        // vkCmdFillBuffer requires 4-byte aligned dstOffset and size (VUID-vkCmdFillBuffer-dstOffset-00024 /
+        // -size-00028), while vkCmdCopyBufferToImage requires fmt.bytes alignment (1, 2, 4, 8, or 16).
+        // Uncompressed 1B/2B color formats reach this path on copy-only queues (!can_clear).
+        const VkDeviceSize align = std::max<VkDeviceSize>(4, fmt.bytes);
+        const VkDeviceSize fill_bytes = ((needed + align - 1) / align) * align;
         VkBuffer scratch = VK_NULL_HANDLE;
         VkDeviceSize offset = 0;
         if (vk.copy_scratch(fill_bytes, scratch, offset)) {
-            const VkDeviceSize align = fmt.bytes;
             const VkDeviceSize pad = (align - (offset % align)) % align;
-            if (fill_bytes >= pad + fmt.bytes) {
-                vk.fill_buffer(command_buffer, scratch, offset + pad, fill_bytes - pad, 0);
+            const VkDeviceSize usable = fill_bytes > pad ? ((fill_bytes - pad) / align) * align : 0;
+            if (usable >= fmt.bytes) {
+                vk.fill_buffer(command_buffer, scratch, offset + pad, usable, 0);
                 memory_barrier(vk, command_buffer, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
                                VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
                 zero_buf = scratch;
                 zero_off = offset + pad;
-                zero_cap = fill_bytes - pad;
+                zero_cap = usable;
             }
         }
     }
@@ -3497,6 +3501,20 @@ inline void close_labels(VkCommandBuffer command_buffer, const ReplayFunctions& 
 // `open_labels` counts the debug labels begun and not yet ended in this command buffer: an EndEvent with none open
 // is dropped (Vulkan requires a matching begin), and the caller ends what is still open before it ends the buffer
 // (close_labels). Without it, the list's own events are balanced at its end.
+inline bool order_buffer_copies() {
+    static const bool enabled = [] {
+#ifdef _WIN32
+        char value[2]{};
+        std::size_t length = 0;
+        return getenv_s(&length, value, sizeof value, "LEONIDA_ORDER_BUFFER_COPIES") != 0 || length != 2 || value[0] != '0';
+#else
+        const char* value = std::getenv("LEONIDA_ORDER_BUFFER_COPIES");
+        return !value || value[0] != '0' || value[1];
+#endif
+    }();
+    return enabled;
+}
+
 inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, const ReplayFunctions& vk,
                  LayoutTracker* tracker = nullptr, std::uint32_t* open_labels = nullptr) {
     std::uint32_t own_labels = 0;
@@ -3624,16 +3642,23 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             const auto range = detail::planes_for_layout(p.binding, p.range, separate);
             const bool discard = (texture->flags & texture_barrier_discard) ||
                                  texture->layout_before == d3d12_layout::undefined;
+            // LayoutAfter UNDEFINED from a defined layout: the contents are no longer needed (the memory is about to
+            // be aliased, say). Vulkan has no transition into UNDEFINED (VUID-VkImageMemoryBarrier2-newLayout-01198),
+            // so each piece keeps the layout it is in and the barrier only orders the accesses; the tracker keeps
+            // that layout too. D3D12 has the next barrier on these subresources start from UNDEFINED, which discards
+            // from whatever layout they are in.
+            const bool release = texture->layout_after == d3d12_layout::undefined &&
+                                 texture->layout_before != d3d12_layout::undefined;
             const VkImageLayout new_layout =
                 image_layout(p.binding, vulkan_layout(texture->layout_after, p.binding.presentable));
             LayoutPieces pieces;
-            if (discard)
+            if (discard && !release)
                 pieces.push_back({range, VK_IMAGE_LAYOUT_UNDEFINED});
             else {
                 const VkImageLayout before =
                     image_layout(p.binding, vulkan_layout(texture->layout_before, p.binding.presentable));
                 pieces = detail::current(tracker, id, range, before);
-                detail::initialize(vk, command_buffer, p.binding, id, pieces, before, tracker);
+                if (!release) detail::initialize(vk, command_buffer, p.binding, id, pieces, before, tracker);
             }
             const BarrierScope src = vulkan_barrier_scope(texture->sync_before, texture->access_before, predicates);
             const BarrierScope dst = vulkan_barrier_scope(texture->sync_after, texture->access_after, predicates);
@@ -3644,6 +3669,8 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             VkImageMemoryBarrier2* const barriers = many.empty() ? few.data() : many.data();
             std::uint32_t barrier_count = 0;
             for (const auto& piece : pieces) {
+                // Released before it was ever used (the tracker still has it in UNDEFINED): nothing to order.
+                if (release && piece.layout == VK_IMAGE_LAYOUT_UNDEFINED) continue;
                 VkImageMemoryBarrier2& b = barriers[barrier_count++];
                 b = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
                 b.srcStageMask = src.stages;
@@ -3651,7 +3678,7 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                 b.srcAccessMask = src.access;
                 b.dstAccessMask = dst.access;
                 b.oldLayout = piece.layout;
-                b.newLayout = new_layout;
+                b.newLayout = release ? piece.layout : new_layout;
                 b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
                 b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
                 b.image = p.binding.image;
@@ -3659,11 +3686,13 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                 if (b.srcStageMask) detail::restrict_to_queue(vk, b.srcStageMask, b.srcAccessMask);
                 if (b.dstStageMask) detail::restrict_to_queue(vk, b.dstStageMask, b.dstAccessMask);
             }
-            VkDependencyInfo dependency{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
-            dependency.imageMemoryBarrierCount = barrier_count;
-            dependency.pImageMemoryBarriers = barriers;
-            vk.pipeline_barrier2(command_buffer, &dependency);
-            if (tracker) tracker->set(id, range, new_layout);
+            if (barrier_count) {
+                VkDependencyInfo dependency{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+                dependency.imageMemoryBarrierCount = barrier_count;
+                dependency.pImageMemoryBarriers = barriers;
+                vk.pipeline_barrier2(command_buffer, &dependency);
+            }
+            if (tracker && !release) tracker->set(id, range, new_layout);
         } else if (const auto* color_clear = std::get_if<ClearRenderTarget>(&command)) {
             if (p.skip) continue;
             const VulkanAccess state = vulkan_access(d3d12_state::render_target, false);
@@ -3799,6 +3828,14 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                 vk.emit_predicated_copy(command_buffer, p.predicated_copy);
                 begin_statistics();
             } else if (!p.buffer_copies.empty()) {
+                // Transfer dependency from natterman12, ubiquitarianism/leonida PR #354 (GPL-3.0).
+                // D3D12 orders buffer copies even across lists on one queue. A previous transfer write can
+                // overlap this copy's source or destination without an application barrier.
+                if (vk.pipeline_barrier && order_buffer_copies()) {
+                    detail::memory_barrier(vk, command_buffer, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                           VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+                                           VK_PIPELINE_STAGE_TRANSFER_BIT);
+                }
                 vk.copy_buffer(command_buffer, p.source.buffer, p.binding.buffer, std::uint32_t(p.buffer_copies.size()),
                                p.buffer_copies.data());
             } else if (p.staged) {

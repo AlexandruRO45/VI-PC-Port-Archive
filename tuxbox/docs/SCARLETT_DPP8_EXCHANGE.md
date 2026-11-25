@@ -255,3 +255,42 @@ AMD run, title shader acceptance percentage or FPS claim.
   }
 }
 ```
+
+
+## Signed extrema, XOR and FI variants
+
+Extend the exact full-participation DPP8 subset to signed min/max
+and XOR, and the alternate DPP8 FI=1 encoding. Signed comparisons
+reinterpret operands as int32 and return the original 32-bit result.
+FI does not change the result when all source lanes in the octet
+participate, as required by the existing straight-line proof.
+No branch, partial EXEC or additional memory side effects are admitted.
+This does not solve divergent collectives or establish retail coverage.
+
+The extended native GPU campaign checks eight operations, four
+selector patterns, three group/readlane combinations and both FI
+encodings (192 dispatches). LLVM gfx1030 encodings verified, actual
+emitted HLSL compiled/validated and native terminal UAV store exercised.
+RTX 4080: 73,728 guarded words, all exact. 164 shader compiler and
+232 Python tests pass. The staged provider is from 465318f; compiler
+source base dbc357b. No AMD or retail run.
+
+```json
+{
+  "schema": 1,
+  "scope": "Native synthetic instructions, actual emitted HLSL and reflected raw UAV store; no output instrumentation",
+  "adapter": "10de:2704",
+  "guest_exit": 0,
+  "passed": true,
+  "cases": 192,
+  "compared_words": 73728,
+  "result_words": 8192,
+  "tools_sha256": {
+    "emitter": "aea4ccb8a2f752eec6eee26dddea6ed69c401c4def21b6af85f7f7fb639f00ff",
+    "provider": "8e682fef5b467cf1b2b77cad0f4bc65bdc6479faa2bd72263e6360fa18260ff8",
+    "dxc": "3dfc856b76291ffc7e45e21fd37ab80e85b34101de76a03253df6608785c92a0",
+    "dxv": "33778294d67143d9f81526f4759c66d5a67a95ea9873448ef3595650a643cbd3"
+  },
+  "guest_sha256": "a1d529d66d6c8857495339fee08bbcdcdc67859c76f6dda40a0617c342337220"
+}
+```

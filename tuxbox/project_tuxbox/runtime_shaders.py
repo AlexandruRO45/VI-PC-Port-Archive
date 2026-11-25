@@ -12,9 +12,11 @@ import struct
 import subprocess
 from tempfile import TemporaryDirectory
 from threading import Event, Lock, Thread
+from time import monotonic, sleep
 
+from .dxil_store import DxilStore, write_identity
 from .inspect import digest
-from .shader_prep import SOURCE_CACHE, ToolFailure, compiler_tools, has_dxil_container, run_tool
+from .shader_prep import SOURCE_CACHE, ToolFailure, compiler_tools, run_tool
 
 
 MAX_SHADER_BYTES = 64 << 20
@@ -31,7 +33,8 @@ class ShaderRefused(ValueError):
         self.cached = cached
 
 
-def verified_input(path, expected):
+def bounded_shader(path):
+    """Snapshot a regular file without following links or blocking on FIFOs."""
     flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0)
     with os.fdopen(os.open(path, flags), "rb") as stream:
         info = os.fstat(stream.fileno())
@@ -40,19 +43,119 @@ def verified_input(path, expected):
         if info.st_size > MAX_SHADER_BYTES:
             raise ValueError("shader exceeds the 64 MiB runtime limit")
         data = stream.read(MAX_SHADER_BYTES + 1)
-    if len(data) > MAX_SHADER_BYTES or hashlib.sha256(data).hexdigest() != expected:
+    if len(data) > MAX_SHADER_BYTES:
+        raise ValueError("shader exceeds the 64 MiB runtime limit")
+    return data
+
+
+def verified_input(path, expected):
+    data = bounded_shader(path)
+    if hashlib.sha256(data).hexdigest() != expected:
         raise ValueError(f"{path.name} contents differ from the requested digest")
     return data
 
 
-def portable_stage(data):
-    if not has_dxil_container(data):
+STAGE_IDS = {"ps": 0, "vs": 1, "gs": 2, "cs": 5, "lib": 6, "ms": 13, "as": 14}
+
+
+def container_stage(data, *, portable):
+    """Match the runtime's container/stage gate, not just LLVM magic."""
+    if len(data) < 32 or len(data) > MAX_SHADER_BYTES or data[:4] != b"DXBC":
         return None
-    count, = struct.unpack_from("<I", data, 28)
-    stages = [struct.unpack_from("<H", data, offset + 10)[0]
-              for offset, in struct.iter_unpack("<I", memoryview(data)[32:32 + count * 4])
-              if data[offset:offset + 4] == b"DXIL"]
-    return stages[0] if len(stages) == 1 else None
+    size, count = struct.unpack_from("<II", data, 24)
+    end = 32 + count * 4
+    if size != len(data) or end > size:
+        return None
+    program = None
+    accc = psv = 0
+    for offset, in struct.iter_unpack("<I", memoryview(data)[32:end]):
+        if offset < end or offset + 8 > size:
+            return None
+        tag, length = struct.unpack_from("<4sI", data, offset)
+        start = offset + 8
+        if start + length > size:
+            return None
+        accc += tag == b"ACCC"
+        psv += tag == b"PSV0"
+        if tag == b"DXIL":
+            if program is not None:
+                return None
+            program = memoryview(data)[start:start + length]
+    if program is None:
+        # ACCC-only console compute. Full extraction still belongs to xshader.
+        return 5 if not portable and accc == 1 and psv == 1 else None
+    if len(program) < 24:
+        return None
+    version, words, magic, _, offset, length = struct.unpack_from("<II4sIII", program)
+    stage = version >> 16
+    start = 8 + offset
+    if (stage not in STAGE_IDS.values() or version & 0xf0 != 0x60
+            or words * 4 != len(program) or magic != b"DXIL"
+            or start < 24 or start + length > len(program)):
+        return None
+    bits = program[start:start + length]
+    if portable:
+        return stage if bits[:4] == b"BC\xc0\xde" else None
+    return stage if bits[:4] == b"BC\xc0\xde" or (program[24:28] == b"XDAT" and bits == b"NOBC") else None
+
+
+def portable_stage(data):
+    return container_stage(data, portable=True)
+
+
+def exact_marker(path, expected):
+    """Read a tiny regular marker, without following links or blocking."""
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        with os.fdopen(os.open(path, flags), "rb") as stream:
+            info = os.fstat(stream.fileno())
+            return (stat.S_ISREG(info.st_mode) and info.st_size == len(expected)
+                    and stream.read(len(expected) + 1) == expected)
+    except OSError:
+        return False
+
+
+@contextmanager
+def compile_lock(cache, key, timeout=90):
+    """Serialize an exact cold cache key across independent launcher processes.
+
+    Keep the lock inode for this compiler fingerprint: unlinking it on
+    release could let a later process lock a different inode while another
+    waiter still holds the original. No locks are acquired for warm hits.
+    """
+    import fcntl
+    if not any(re.fullmatch(pattern, key) for pattern in REQUEST_PATTERNS.values()):
+        raise ValueError("invalid shader cache key")
+    directory = cache / ".locks"
+    directory.mkdir(exist_ok=True)
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    with os.fdopen(os.open(directory / key, flags, 0o600), "r+b") as stream:
+        if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+            raise ValueError("shader cache lock is not a regular file")
+        deadline = monotonic() + timeout
+        while True:
+            try:
+                fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if monotonic() >= deadline:
+                    raise TimeoutError("shader cache lock wait timed out")
+                sleep(min(.025, max(0, deadline - monotonic())))
+        try:
+            yield
+        finally:
+            fcntl.flock(stream, fcntl.LOCK_UN)
+
+
+def cache_snapshot(dest, checksum, stages):
+    """Return only bounded, stage-correct bytes with their matching checksum."""
+    try:
+        data = bounded_shader(dest)
+        if portable_stage(data) in stages and exact_marker(checksum, hashlib.sha256(data).hexdigest().encode("ascii")):
+            return data
+    except (OSError, ValueError):
+        pass
+    return None
 
 
 def portable_pixel(data):
@@ -84,6 +187,26 @@ def archive_request(archive, source, inputs):
 O0_TIMEOUT = 90
 
 
+def compile_dxil(dxc, target, hlsl, output, store, request):
+    entry = [] if target == "lib_6_3" else ["-E", "main"]
+    unoptimised = [dxc, "-T", target, *entry, "-O0", "-Fo", output, hlsl]
+    # cs_6_6 programs from this boot either finish default optimisation in
+    # under a second or sit in it until the cap. The ones that sit there
+    # compile at -O0 in a few seconds, and the driver optimises that DXIL
+    # again when it builds the pipeline. A request that timed out before goes
+    # straight to -O0 rather than spending the cap again.
+    if target == "cs_6_6" or (store and store.is_slow(request, target)):
+        run_tool(unoptimised, timeout=O0_TIMEOUT)
+        return
+    try:
+        run_tool([dxc, "-T", target, *entry, "-Fo", output, hlsl], timeout=15)
+    except subprocess.TimeoutExpired:
+        if store:
+            store.mark_slow(request, target)
+        output.unlink(missing_ok=True)
+        run_tool(unoptimised, timeout=O0_TIMEOUT)
+
+
 def compile_request(source, key, tools, cache, session, *, remember=None):
     linked = source.suffix == ".link"
     xshader, dxc, dxv = tools
@@ -95,7 +218,8 @@ def compile_request(source, key, tools, cache, session, *, remember=None):
                 raise ValueError("linked shader request must be a directory")
             producer_hash, pixel_hash, dxil_hash = key.split("_")
             cooked = work / "producer.dxbc"
-            cooked.write_bytes(verified_input(source / "producer.dxbc", producer_hash))
+            source_data = verified_input(source / "producer.dxbc", producer_hash)
+            cooked.write_bytes(source_data)
             pixel = work / "pixel.dxbc"
             pixel.write_bytes(verified_input(source / "pixel.dxbc", pixel_hash))
             pixel_code = verified_input(source / "pixel.cso", dxil_hash)
@@ -112,7 +236,8 @@ def compile_request(source, key, tools, cache, session, *, remember=None):
                 flags = ["--stencil-target", slot]
             else:
                 source_hash = key
-            cooked.write_bytes(verified_input(source, source_hash))
+            source_data = verified_input(source, source_hash)
+            cooked.write_bytes(source_data)
             inputs = (cooked,)
 
         if remember:
@@ -122,63 +247,73 @@ def compile_request(source, key, tools, cache, session, *, remember=None):
         checksum = dest.with_suffix(".sha256")
         refusal = dest.with_suffix(".unsupported")
         reply = work / "reply"
-        if (dest.is_file() and dest.stat().st_size <= MAX_SHADER_BYTES
-                and checksum.is_file() and checksum.stat().st_size == 64):
-            # Check the exact bytes that will be returned even if a concurrent
-            # launch replaces the persistent entry while this worker is reading.
-            shutil.copyfile(dest, reply)
-            if checksum.read_bytes() == digest(reply).encode("ascii"):
+        stages = {1, 2} if linked else {0} if source.suffix == ".stencil" else set(STAGE_IDS.values())
+        expected_stage = container_stage(source_data, portable=False)
+        if expected_stage is not None:
+            stages &= {expected_stage}
+        del source_data
+        def reuse():
+            cached = cache_snapshot(dest, checksum, stages)
+            if cached is not None:
+                # Prelaunch hits need no temporary DXIL copy.
                 if session is not None:
+                    reply.write_bytes(cached)
                     os.replace(reply, session / dest.name)
+                return True
+            if exact_marker(refusal, key.encode("ascii")):
+                raise ShaderRefused("cached unsupported HLSL translation", cached=True)
+            return False
+
+        if reuse():
+            return False
+        with compile_lock(cache, key):
+            # The first process may have published while we waited.
+            if reuse():
                 return False
-
-        if refusal.is_file() and refusal.stat().st_size == len(key) and refusal.read_bytes() == key.encode("ascii"):
-            raise ShaderRefused("cached unsupported HLSL translation", cached=True)
-
-        hlsl, output, profile = (work / name for name in ("shader.hlsl", "out.cso", "profile"))
-        if linked:
-            run_tool([dxv, order], timeout=10)
-        try:
-            run_tool([xshader, cooked, *flags, "--hlsl-out", hlsl, "--profile-out", profile], timeout=30)
-        except ToolFailure as error:
-            # xshader reserves this status for the in-process HLSL emitter. DXC, DXV,
-            # input parsing, tool startup and filesystem failures remain retryable.
-            if error.returncode != XSHADER_UNSUPPORTED_HLSL:
-                raise
-            marker = work / "unsupported"
-            marker.write_text(key, encoding="ascii")
-            os.replace(marker, refusal)
-            raise ShaderRefused(str(error), cached=False) from error
-        target = profile.read_text().strip()
-        # Mesh and amplification stages start at shader model 6.5. Linked
-        # requests currently repack the outputs of vertex and geometry shaders.
-        profiles = r"(vs|gs)_6_[016]" if linked else r"((cs|ps|vs|gs)_6_[016]|cs_6_[45]|(ms|as)_6_[56]|lib_6_3)"
-        if not re.fullmatch(profiles, target):
-            raise ValueError(f"unsupported compiler profile {target!r}")
-        entry = [] if target == "lib_6_3" else ["-E", "main"]
-        # cs_6_6 programs from this boot either finish default optimisation in
-        # under a second or sit in it until the cap. The ones that sit there
-        # compile at -O0 in a few seconds, and the driver optimises that DXIL
-        # again when it builds the pipeline.
-        if target == "cs_6_6":
-            run_tool([dxc, "-T", target, *entry, "-O0", "-Fo", output, hlsl], timeout=O0_TIMEOUT)
-        else:
+            hlsl, output, profile = (work / name for name in ("shader.hlsl", "out.cso", "profile"))
+            if linked:
+                run_tool([dxv, order], timeout=10)
             try:
-                run_tool([dxc, "-T", target, *entry, "-Fo", output, hlsl], timeout=15)
-            except subprocess.TimeoutExpired:
+                run_tool([xshader, cooked, *flags, "--hlsl-out", hlsl, "--profile-out", profile], timeout=30)
+            except ToolFailure as error:
+                # xshader reserves this status for the in-process HLSL emitter. DXC, DXV,
+                # input parsing, tool startup and filesystem failures remain retryable.
+                if error.returncode != XSHADER_UNSUPPORTED_HLSL:
+                    raise
+                marker = work / "unsupported"
+                marker.write_text(key, encoding="ascii")
+                os.replace(marker, refusal)
+                raise ShaderRefused(str(error), cached=False) from error
+            target = profile.read_text().strip()
+            # Mesh and amplification stages start at shader model 6.5. Linked
+            # requests currently repack the outputs of vertex and geometry shaders.
+            profiles = r"(vs|gs)_6_[016]" if linked else r"((cs|ps|vs|gs)_6_[016]|cs_6_[45]|(ms|as)_6_[56]|lib_6_3)"
+            if not re.fullmatch(profiles, target):
+                raise ValueError(f"unsupported compiler profile {target!r}")
+            target_stage = STAGE_IDS[target.split("_", 1)[0]]
+            if target_stage not in stages:
+                raise ValueError("compiler profile differs from requested shader stage")
+            # An earlier translator may have produced this exact HLSL.
+            store = DxilStore.for_cache(cache)
+            content = store.key(hlsl.read_bytes(), target) if store else None
+            data = bounded_shader(output) if store and store.fetch(content, output) else None
+            if data is None or portable_stage(data) != target_stage:
                 output.unlink(missing_ok=True)
-                run_tool([dxc, "-T", target, *entry, "-O0", "-Fo", output, hlsl], timeout=O0_TIMEOUT)
-        run_tool([dxv, output], timeout=10)
-        if not has_dxil_container(output.read_bytes()):
-            raise ValueError("compiler returned an invalid DXIL container")
-        stamp = work / "sha256"
-        stamp.write_text(digest(output))
-        if session is not None:
-            shutil.copyfile(output, reply)
-        os.replace(output, dest)
-        os.replace(stamp, checksum)
-        if session is not None:
-            os.replace(reply, session / dest.name)
+                compile_dxil(dxc, target, hlsl, output, store, key)
+                run_tool([dxv, output], timeout=10)
+                data = bounded_shader(output)
+                if portable_stage(data) != target_stage:
+                    raise ValueError("compiler returned invalid DXIL or a different shader stage")
+                if store:
+                    store.save(content, output)
+            stamp = work / "sha256"
+            stamp.write_text(hashlib.sha256(data).hexdigest())
+            if session is not None:
+                reply.write_bytes(data)
+            os.replace(output, dest)
+            os.replace(stamp, checksum)
+            if session is not None:
+                os.replace(reply, session / dest.name)
     return True
 
 
@@ -239,6 +374,7 @@ def snapshot_compiler_cache(xshader, cache_root):
         fingerprint.update(bytes.fromhex(digest(Path(tool))))
     cache = cache_root / "runtime" / fingerprint.hexdigest()
     cache.mkdir(parents=True, exist_ok=True)
+    write_identity(cache, version, dxc, dxv)
     return tools, cache
 
 

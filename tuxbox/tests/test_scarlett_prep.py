@@ -55,3 +55,53 @@ class ScarlettPreparation(unittest.TestCase):
             self.assertIn("1 x unverified mesh shader bindings", log)
             self.assertNotIn("x cached unsupported HLSL", log)
             self.assertLess(log.index("2 x s_load"), log.index("1 x unverified"))
+
+
+class BoundedPreparation(unittest.TestCase):
+    def test_bounded_queue_completes_every_request_once(self):
+        from concurrent.futures import ThreadPoolExecutor
+        from project_tuxbox.scarlett_prep import bounded_results
+        seen=[]
+        def source():
+            for i in range(1000):
+                seen.append(i)
+                yield i
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            out=bounded_results(pool,lambda n:n,source(),3)
+            first=next(out)
+            self.assertLessEqual(len(seen),7)
+            self.assertCountEqual([first,*out],range(1000))
+            self.assertEqual(len(seen),1000)
+
+    def test_slow_request_does_not_block_fast_completion(self):
+        from concurrent.futures import ThreadPoolExecutor
+        from threading import Event
+        from project_tuxbox.scarlett_prep import bounded_results
+        release=Event()
+        def compile_one(n):
+            if n==0 and not release.wait(5):
+                raise TimeoutError("test gate")
+            return n
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            out=bounded_results(pool,compile_one,range(20),2)
+            try:
+                first=next(out)
+                self.assertNotEqual(first,0)
+            finally:
+                release.set()
+            self.assertCountEqual([first,*out],range(20))
+
+    def test_worker_failure_does_not_queue_remaining_archive(self):
+        from concurrent.futures import ThreadPoolExecutor
+        from project_tuxbox.scarlett_prep import bounded_results
+        seen=[]
+        def source():
+            for i in range(100):
+                seen.append(i)
+                yield i
+        def fail(_):
+            raise RuntimeError("unexpected error")
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            with self.assertRaisesRegex(RuntimeError,"unexpected error"):
+                list(bounded_results(pool,fail,source(),2))
+        self.assertEqual(len(seen),4)

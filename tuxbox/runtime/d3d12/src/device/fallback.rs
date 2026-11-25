@@ -66,6 +66,7 @@ pub(super) fn bytecode(code: &[u8]) -> windows::Win32::Graphics::Direct3D12::D3D
 /// Count and occasionally report substituted pipelines. Counts are per kind
 /// so each "so far" label describes the pipelines it names.
 pub(super) fn substituted(kind: &'static str) {
+    crate::progress::stand_in();
     static COUNTS: Mutex<Vec<(&str, u64)>> = Mutex::new(Vec::new());
     let count = bump(&mut COUNTS.lock().unwrap_or_else(|e| e.into_inner()), kind);
     if count.is_power_of_two() {

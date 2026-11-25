@@ -1,14 +1,14 @@
 # Leonida Continued GitHub export
 
-Issues, pull requests and comments from `ubiquitarianism/leonida`, exported from the GitHub REST API on 2026-11-24.
+Issues, pull requests and comments from `ubiquitarianism/leonida`, exported from the GitHub REST API on 2026-11-25.
 
 Each file in `data/` is gzipped JSON Lines: one API object per line, unchanged.
 
 | File | Contents | Items |
 |---|---|---|
 | `issues_and_prs.jsonl.gz` | every issue and PR (title, body, labels, state, author) | 571 |
-| `pulls.jsonl.gz` | PR details (head and base branch, merge state) | 1,360 |
-| `issue_comments.jsonl.gz` | conversation comments on issues and PRs | 3,842 |
+| `pulls.jsonl.gz` | PR details (head and base branch, merge state) | 1,402 |
+| `issue_comments.jsonl.gz` | conversation comments on issues and PRs | 4,050 |
 | `review_comments.jsonl.gz` | inline code-review comments | 29 |
 | `labels.jsonl.gz` | labels | 12 |
 

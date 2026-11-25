@@ -4,11 +4,22 @@
 
 This guide installs and starts the project, and lists everything you need to repeat our tests on the Xbox Series 1.0.2.1 build of GTA VI, up to where we are today: the first cutscene. It does not provide the game and does not explain how to get it: you bring your own copy. Never put game files in this repository or attach them to an issue.
 
-The launch goes through [VIctory](https://github.com/Marvisak/VIctory) (Marvisak, GPL-3.0 or later), tracked here as the `third_party/victory` submodule, pinned to the branch `anyxboxx/fork-7b0-lot8` of the maintainer's fork [LooperSalty/victory](https://github.com/LooperSalty/victory), which assembles the fork [fxceless/victory-fork](https://github.com/fxceless/victory-fork) (GPL-3.0) at `7b0f736` and eight of its pull requests (see below), at commit `d138351`. The script `tools/lancer_victory.ps1` builds it and starts it on your game folder.
+The launch goes through [VIctory](https://github.com/Marvisak/VIctory) (Marvisak, GPL-3.0 or later), tracked here as the `third_party/victory` submodule, pinned to the branch `anyxboxx/fork-7b0-lot8-xg` of the maintainer's fork [LooperSalty/victory](https://github.com/LooperSalty/victory), which assembles the fork [fxceless/victory-fork](https://github.com/fxceless/victory-fork) (GPL-3.0) at `7b0f736` and eight of its pull requests plus one commit of ours (optional texture layout by Microsoft's library, see below), at commit `19feca8`. The script `tools/lancer_victory.ps1` builds it and starts it on your game folder.
 
-## Pinned branch: batch 5 plus one pull request (25 November)
+## Pinned branch: batch 8 plus Microsoft's texture layout library (25 November)
 
-`third_party/victory` now points to the branch `anyxboxx/fork-7b0-lot8` of the maintainer's VIctory fork [LooperSalty/victory](https://github.com/LooperSalty/victory), at commit `d138351de32f860ab9df1aa1aa736fce0a40365e`. It is batch 5 (below) plus one pull request of the fork [fxceless/victory-fork](https://github.com/fxceless/victory-fork), cherry-picked with `-x`:
+`third_party/victory` now points to the branch `anyxboxx/fork-7b0-lot8-xg` of [LooperSalty/victory](https://github.com/LooperSalty/victory), at commit `19feca8650c934913063076b612e87739d8d1912`: batch 8 (below) plus one commit of ours, `xg: serve or check the title from Microsoft's own xg_xs.dll (local copy)`. Without `VICTORY_XG_DLL` the code runs exactly as batch 8.
+
+The title asks the console's texture layout library (`xg_xs.dll`: `XGSuggestSwizzleMode`, `XGCreateTextureComputer`) where each mip and slice lies. VIctory answers from its own reimplementation. The GDK ships an offline PC build of that library; with your own copy, `tools/lancer_victory.ps1 -XgDll <path to xg_xs.dll>` lets it answer instead. The DLL is a GDK file: it never goes into this repository, and the launcher only passes its path.
+
+Measured or observed by the maintainer (Windows 11, RTX 4070 Super, VIctory logs, 25 November, about 00:37 and 00:42), launcher settings of `main`:
+
+- `-XgMode compare` (VIctory's layouts, each difference logged once): 84 texture descriptions differ, all 64 KiB D textures (`layout` `0x10a`, some `0x105`). Tail mips are reported by the library in the parent mode (10) with a position in the tail; VIctory reports `256B_D` (2) and no position. Sizes, offsets and pitches match. The 64 KiB tiling lists every slice of an array with a mip tail (VIctory stops at two). No difference in suggested modes or in the tiled bytes of CPU copies. Measured.
+- `-XgMode real` (default with `-XgDll`): 5.4 to 7.1 fps at the end of the run against 5.1 to 5.6, about 6,080 draws per frame, no device loss in about 3 min 40; judged the best run so far by the maintainer. Measured, then observed.
+
+## Previous pin: batch 5 plus one pull request (25 November)
+
+`third_party/victory` pointed to the branch `anyxboxx/fork-7b0-lot8` of the maintainer's VIctory fork [LooperSalty/victory](https://github.com/LooperSalty/victory), at commit `d138351de32f860ab9df1aa1aa736fce0a40365e`. It is batch 5 (below) plus one pull request of the fork [fxceless/victory-fork](https://github.com/fxceless/victory-fork), cherry-picked with `-x`:
 
 | Fork pull request | Author | What it does | Commit |
 | --- | --- | --- | --- |
@@ -190,6 +201,8 @@ The script sets the variables below (unless you pass `-NoTunedSettings`, which k
 The former defaults `VICTORY_RT_MISS`, `VICTORY_WAVE32_READFIRSTLANE`, `VICTORY_WAVE32_CROSSLANE`, `VICTORY_SKIP_BVH_BUILDER` and `VICTORY_CAPPED_DYNAMIC` are gone: no file of the pinned commit reads them (the BVH builder is off unless `VICTORY_BVH_BUILDER=1`). `tests/test_lanceur_victory.py` now checks that VIctory reads every variable the launcher sets.
 
 `-Dred` sets `VICTORY_D3D12_DRED=1` (device-removed data) to diagnose a device loss. It is off by default: VIctory turns it on whenever the variable exists, and it notes every command list operation, which slows each frame.
+
+`-XgDll <path to xg_xs.dll>` sets `VICTORY_XG_DLL`: your own copy of the GDK's offline PC texture layout library lays out the title's textures (see the pinned branch above). `-XgMode compare` (`VICTORY_XG_MODE`) keeps VIctory's layouts and logs every difference with the library instead; `real` is the default. Never copy the DLL into this repository.
 
 The first cold launch may crash while the pipelines compile: launch again once the cache is filled.
 

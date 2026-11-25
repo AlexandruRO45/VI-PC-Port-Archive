@@ -15,19 +15,32 @@
   Optional. Turns on device-removed data (VICTORY_D3D12_DRED) to diagnose a device loss.
   Off by default: it notes every command list operation and slows each frame.
 
+.PARAMETER XgDll
+  Optional. Path to your own copy of xg_xs.dll, the offline PC build of the GDK's texture layout library (never in this
+  repository). VIctory then lays out the title's textures with it (VICTORY_XG_DLL).
+
+.PARAMETER XgMode
+  Optional, with -XgDll. 'real' (default) serves the title from xg_xs.dll; 'compare' keeps VIctory's layouts and logs
+  every difference with the library (VICTORY_XG_MODE).
+
 .NOTES
   The first cold launch may crash while the pipelines compile; launch again once the cache is filled.
   Settings measured on 2026-11-24 with the submodule's pinned commit (fxceless/victory-gta6).
 
 .EXAMPLE
   .\tools\lancer_victory.ps1 -GameDir D:\Games\MyPackage
+
+.EXAMPLE
+  .\tools\lancer_victory.ps1 -GameDir D:\Games\MyPackage -XgDll D:\MyGdk\xg_xs.dll
 #>
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)][string]$GameDir,
     [string]$SkipPipelines,
     [switch]$NoTunedSettings,
-    [switch]$Dred
+    [switch]$Dred,
+    [string]$XgDll,
+    [ValidateSet('real', 'compare')][string]$XgMode = 'real'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -82,6 +95,14 @@ if ($Dred) {
 }
 if ($PSBoundParameters.ContainsKey('SkipPipelines') -and $SkipPipelines) {
     $env:VICTORY_SKIP_PIPELINES = $SkipPipelines
+}
+# Your own copy of the GDK's offline PC xg_xs.dll (never in this repository): Microsoft's library lays out the textures.
+if ($PSBoundParameters.ContainsKey('XgDll') -and $XgDll) {
+    if (-not (Test-Path -LiteralPath $XgDll -PathType Leaf)) {
+        throw "xg_xs.dll not found: '$XgDll'."
+    }
+    $env:VICTORY_XG_DLL = (Resolve-Path -LiteralPath $XgDll).Path
+    $env:VICTORY_XG_MODE = $XgMode
 }
 
 & $exe run $gameExe --execute

@@ -125,6 +125,9 @@ struct VulkanDeviceInfo {
     // VK_EXT_host_image_copy and its hostImageCopy feature are enabled on `device`: WriteToSubresource and
     // ReadFromSubresource on textures in CPU-visible heaps copy on the CPU instead of through a staging submit.
     bool host_image_copy = false;
+    // Tests only: every host-transfer texture is treated as one the driver gave no memory type (a GTX 1050 Ti,
+    // NVIDIA 582.78), so it is made again without host-transfer usage and copies on the staging path on any GPU.
+    bool force_host_transfer_retry = false;
     // VK_KHR_shader_fma and its shaderFmaFloat32 feature are enabled on `device`: translated shaders built with
     // `rdna2spirv.py --fma khr` (OpFmaKHR, capability FMAKHR in the index) can be created. Without it only the
     // default `--fma glsl` shaders can.
@@ -285,6 +288,15 @@ bool device_sparse_buffer_tiles(ID3D12Device* device);
 
 // The size in bytes of the device's GPU address arena, or 0 without one. For tests.
 std::uint64_t device_arena_size(ID3D12Device* device);
+
+// The blocks of device memory that textures share (src/image_memory.h): how many, their bytes, and the textures in
+// them. For tests.
+struct ImageMemoryStats {
+    std::uint64_t blocks = 0;
+    std::uint64_t block_bytes = 0;
+    std::uint64_t textures = 0;
+};
+ImageMemoryStats image_memory_stats(ID3D12Device* device);
 
 // The bindless set 0 a device with VulkanDeviceInfo::bindless keeps (vulkan_bindless.h), and its layout: what a
 // pipeline whose shader declares set-0 bindings is created with and binds. Null without such a set. The set is

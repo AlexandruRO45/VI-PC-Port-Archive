@@ -16,6 +16,7 @@ from project_tuxbox.shader_prep import SOURCE_CACHE, ToolFailure, prepare_for_la
 
 def portable_program(stage, body):
     bitcode = b"BC\xc0\xde" + body
+    bitcode += bytes((-len(bitcode)) % 4)
     header = struct.pack("<II4sIII", stage << 16 | 0x60, (24 + len(bitcode)) // 4,
                          b"DXIL", 0x100, 16, len(bitcode))
     chunk = struct.pack("<4sI", b"DXIL", len(header) + len(bitcode)) + header + bitcode
@@ -78,7 +79,7 @@ class RuntimeShaderLinks(unittest.TestCase):
                 self.assertEqual(pipeline.call_count, 4)
 
     def test_compile_request_accepts_profile_with_trailing_whitespace(self):
-        result = portable_program(0, b"main")
+        result = portable_program(2, b"main")
         key, source = self.request(portable_program(0, b"r0.z"))
 
         def run(args, *, timeout):
@@ -94,6 +95,121 @@ class RuntimeShaderLinks(unittest.TestCase):
         with patch("project_tuxbox.runtime_shaders.run_tool", side_effect=run):
             self.assertTrue(compile_request(source, key, self.tools, self.cache, self.session))
             self.assertEqual((self.session / (key + ".cso")).read_bytes(), result)
+
+    def test_wrong_stage_and_malformed_warm_entries_are_rebuilt(self):
+        from project_tuxbox.runtime_shaders import cache_snapshot
+        key, source = self.request(portable_program(0, b"order"))
+        dest = self.cache / (key + ".cso")
+        stamp = dest.with_suffix(".sha256")
+        valid = portable_program(2, b"good")
+        def run(args, *, timeout):
+            if args[0] == "xshader":
+                args[args.index("--hlsl-out") + 1].write_text("shader")
+                args[args.index("--profile-out") + 1].write_text("gs_6_0")
+            elif args[0] == "dxc":
+                args[args.index("-Fo") + 1].write_bytes(valid)
+        for wrong in (portable_program(0,b"wrong"), valid+b"junk", b"bad"):
+            dest.write_bytes(wrong)
+            stamp.write_text(hashlib.sha256(wrong).hexdigest())
+            self.assertIsNone(cache_snapshot(dest, stamp, {1,2}))
+            with patch("project_tuxbox.runtime_shaders.run_tool",side_effect=run) as compiler:
+                self.assertTrue(compile_request(source,key,self.tools,self.cache,self.session))
+                self.assertEqual(compiler.call_count,4)
+                self.assertEqual(dest.read_bytes(),valid)
+                self.assertFalse(compile_request(source,key,self.tools,self.cache,None))
+                self.assertEqual(compiler.call_count,4)
+
+    def test_cold_wrong_stage_never_published(self):
+        key, source = self.request(portable_program(0,b"order"))
+        def run(args, *, timeout):
+            if args[0] == "xshader":
+                args[args.index("--hlsl-out") + 1].write_text("shader")
+                args[args.index("--profile-out") + 1].write_text("gs_6_0")
+            elif args[0] == "dxc":
+                args[args.index("-Fo") + 1].write_bytes(portable_program(0,b"wrong"))
+        with patch("project_tuxbox.runtime_shaders.run_tool",side_effect=run):
+            with self.assertRaisesRegex(ValueError,"different shader stage"):
+                compile_request(source,key,self.tools,self.cache,self.session)
+        for directory in (self.cache,self.session):
+            for suffix in (".cso",".sha256",".unsupported"):
+                self.assertFalse((directory/(key+suffix)).exists())
+
+    def test_known_source_stage_and_bounded_cache_files(self):
+        from project_tuxbox.runtime_shaders import cache_snapshot
+        data=portable_program(5,b"source")
+        key=hashlib.sha256(data).hexdigest()
+        source=self.requests/(key+".dxbc");source.write_bytes(data)
+        wrong=portable_program(0,b"wrong")
+        dest=self.cache/(key+".cso");dest.write_bytes(wrong)
+        stamp=dest.with_suffix(".sha256");stamp.write_text(hashlib.sha256(wrong).hexdigest())
+        def run(args, *, timeout):
+            if args[0]=="xshader":
+                args[args.index("--profile-out")+1].write_text("ps_6_0")
+        with patch("project_tuxbox.runtime_shaders.run_tool",side_effect=run):
+            with self.assertRaisesRegex(ValueError,"profile differs"):
+                compile_request(source,key,self.tools,self.cache,self.session)
+        dest.unlink();os.mkfifo(dest)
+        self.assertIsNone(cache_snapshot(dest,stamp,{5}))
+        dest.unlink();dest.symlink_to(source)
+        self.assertIsNone(cache_snapshot(dest,stamp,{5}))
+        dest.unlink();dest.touch()
+        with dest.open("r+b") as f:f.truncate((64<<20)+1)
+        self.assertIsNone(cache_snapshot(dest,stamp,{5}))
+
+    def test_duplicate_cold_requests_share_compile_across_workers(self):
+        from concurrent.futures import ThreadPoolExecutor
+        from threading import Event, Lock
+        from project_tuxbox.runtime_shaders import compile_lock
+        key, source = self.request(portable_program(0,b"order"))
+        second = self.session.parent / "second"
+        second.mkdir()
+        entered, release = Event(), Event()
+        calls = []
+        guard = Lock()
+        def run(args, *, timeout):
+            with guard:
+                calls.append(args[0])
+            if args[0] == "xshader":
+                entered.set()
+                if not release.wait(5):
+                    raise TimeoutError("test gate")
+                args[args.index("--hlsl-out")+1].write_text("shader")
+                args[args.index("--profile-out")+1].write_text("gs_6_0")
+            elif args[0]=="dxc":
+                args[args.index("-Fo")+1].write_bytes(portable_program(2,b"good"))
+        with patch("project_tuxbox.runtime_shaders.run_tool",side_effect=run):
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                first=pool.submit(compile_request,source,key,self.tools,self.cache,self.session)
+                try:
+                    self.assertTrue(entered.wait(5))
+                    other=pool.submit(compile_request,source,key,self.tools,self.cache,second)
+                    # Exact key isolation: unrelated keys remain available.
+                    with compile_lock(self.cache,"0"*64,timeout=.1):
+                        pass
+                    with self.assertRaises(TimeoutError):
+                        with compile_lock(self.cache,key,timeout=.05):
+                            self.fail("same key unexpectedly acquired")
+                finally:
+                    release.set()
+                self.assertTrue(first.result(timeout=5))
+                self.assertFalse(other.result(timeout=5))
+        self.assertEqual(calls,["dxv","xshader","dxc","dxv"])
+        self.assertEqual((self.session/(key+".cso")).read_bytes(),(second/(key+".cso")).read_bytes())
+
+    def test_lock_releases_after_retryable_failure(self):
+        from project_tuxbox.runtime_shaders import compile_lock, exact_marker
+        key, source = self.request(portable_program(0,b"order"))
+        with self.assertRaisesRegex(ValueError,"test failure"):
+            with compile_lock(self.cache,key):
+                raise ValueError("test failure")
+        with compile_lock(self.cache,key,timeout=.1):
+            pass
+        marker=self.cache/"marker"
+        os.mkfifo(marker)
+        self.assertFalse(exact_marker(marker,b"abc"))
+        marker.unlink()
+        marker.symlink_to(source/"pixel.cso")
+        self.assertFalse(exact_marker(marker,b"abc"))
 
     def test_rejects_native_code_non_pixel_dxil_and_non_regular_input(self):
         for program in [b"Xbox-native shader", portable_program(1, b"r0.z")]:

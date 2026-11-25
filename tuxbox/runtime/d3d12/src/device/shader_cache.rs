@@ -164,7 +164,9 @@ fn read_portable(directory: &str, source: &str, stage: Stage) -> Option<Vec<u8>>
         .join("tuxbox_shader_cache")
         .join(directory)
         .join(format!("{source}.cso"));
-    read_portable_file(&path, stage)
+    let bytes = read_portable_file(&path, stage)?;
+    crate::progress::record(source, crate::progress::Shader::Cached);
+    Some(bytes)
 }
 
 fn read_portable_file(path: &std::path::Path, stage: Stage) -> Option<Vec<u8>> {

@@ -9,6 +9,7 @@ mod exports;
 mod guids;
 mod present;
 mod private_driver;
+mod progress;
 mod proxy;
 mod survey;
 

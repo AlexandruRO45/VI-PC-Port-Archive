@@ -186,6 +186,8 @@ SUPPORTED_INSTRUCTIONS_REGEX = [
     rf"v_cmp_class_f16{PIXEL_VOPC_E32_DST},\s+{F16_PLAIN},\s+(?:-?\d+|0x[0-9a-f]{{1,8}}|[vs]\d+)",
     rf"v_cmp_class_f16_e64\s+{PIXEL_LANE_MASK},\s+{F16_MOD},\s+(?:-?\d+|0x[0-9a-f]{{1,8}}|[vs]\d+)",
     rf"v_cndmask_b32(?:_e32|_e64)?\s+v\d+,\s+[^,]+,\s+[^,]+,\s+{PIXEL_LANE_MASK}",
+    # This pattern recognizes the opcode and destination. pixel_aot.lower validates
+    # the selectors and source operands, so a scanner match can still fail lowering.
     r"v_fma_mix(?:_f32|lo_f16|hi_f16)\s+v\d+,\s+.+",
     r"v_div_fmas_f32(?:_e64)?\s+v\d+,\s+[^,\s]+,\s+[^,\s]+,\s+[^,\s]+(?:\s+clamp)?",
     r"(?:v_dot2_f32_f16|v_dot2_i32_i16|v_dot2_u32_u16|v_dot4_i32_i8|v_dot4_u32_u8|v_dot8_i32_i4|v_dot8_u32_u4)\s+v\d+,\s+.+",
@@ -432,6 +434,8 @@ KNOWN_RDNA2_BASE_OPCODES |= (
         # Decoding only: no translator lowers these binary16 VOP1/VOP2 forms.
         "v_cvt_u16_f16", "v_cvt_i16_f16", "v_fract_f16",
         "v_cvt_norm_i16_f16", "v_cvt_norm_u16_f16",
+        "v_rcp_f16", "v_sqrt_f16", "v_rsq_f16", "v_log_f16", "v_exp_f16", "v_sin_f16", "v_cos_f16",
+        "v_frexp_mant_f16", "v_frexp_exp_i16_f16",
         "v_fmac_f16", "v_max_f16", "v_min_f16", "v_ldexp_f16", "v_pk_fmac_f16",
     }
     | {name for name, _, _ in MUBUF_OPS.values()}

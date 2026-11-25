@@ -1,5 +1,6 @@
 //! Submit unprofiled console shaders to the running launcher's compiler.
 use super::{Stage, read_portable_file, source_digest};
+use crate::progress::{self, Shader};
 use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
@@ -135,6 +136,7 @@ fn request(
     let dir = session()?;
     let result = dir.join(format!("{key}.cso"));
     if let Some(bytes) = read_portable_file(&result, stage) {
+        progress::record(key, Shader::Cached);
         return Some(bytes);
     }
     // Serialize the exact digest, not a hash bucket. Unrelated programs
@@ -143,6 +145,7 @@ fn request(
     let lock = LOCKS.for_key(key);
     let _guard = lock.lock().unwrap_or_else(|error| error.into_inner());
     if let Some(bytes) = read_portable_file(&result, stage) {
+        progress::record(key, Shader::Cached);
         return Some(bytes);
     }
     let failed = dir.join(format!("{key}.failed"));
@@ -156,9 +159,11 @@ fn request(
             {
                 let _ = fs::remove_file(&pending);
             }
+            progress::record(key, Shader::Cached);
             return Some(bytes);
         }
         if cached_refusal(cache, key) {
+            progress::record(key, Shader::Unsupported);
             return None;
         }
     }
@@ -172,6 +177,7 @@ fn request(
         // A successful worker may have completed between the first read
         // and the existence check. Avoid compiling that request twice.
         if let Some(bytes) = read_portable_file(&result, stage) {
+            progress::record(key, Shader::Translated);
             return Some(bytes);
         }
         let _ = fs::remove_file(&failed);
@@ -181,12 +187,20 @@ fn request(
             return None;
         }
     }
+    // The title is now waiting on the host worker; the progress panel counts it.
+    let _waiting = progress::waiting();
     let start = Instant::now();
     loop {
         if let Some(bytes) = read_portable_file(&result, stage) {
+            progress::record(key, Shader::Translated);
             return Some(bytes);
         }
-        if failed.exists() || start.elapsed() >= Duration::from_secs(90) {
+        if failed.exists() {
+            progress::record(key, Shader::Unsupported);
+            return None;
+        }
+        if start.elapsed() >= Duration::from_secs(90) {
+            progress::record(key, Shader::TimedOut);
             return None;
         }
         std::thread::sleep(Duration::from_millis(25));

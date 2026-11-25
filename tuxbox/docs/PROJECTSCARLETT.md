@@ -82,6 +82,46 @@ Add `--mangohud` before the package path to record frame times. The prefix defau
 
 The first launch records each shader the game requests in the prefix. Before later launches, the launcher compiles the recorded requests and shows its progress, so the game reuses those translations instead of compiling them during play. Pass `--prepare-only` to prepare without starting the game, or `--no-shader-prep` to skip preparation for one launch. Place either option before the package path. [Preparation results](../evidence/projectscarlett-shader-preparation.json)
 
+### In-game progress panel
+
+TuxBox draws a small panel over the presented frame while the game is translating
+shaders or building pipelines. It shows how many translations are being waited
+on and pipelines are being built, how many distinct shaders the game has received
+in compiled form (and how many of those were translated during this run), how
+many were unsupported or timed out, and how many pipelines were built, failed or
+given an empty stand-in. It appears during that work, stays for four seconds
+afterwards, and then hides. It is drawn by the runtime itself with GDI
+and one D3D12 copy, so it needs no overlay software and works on Windows and
+Linux. It never modifies the game's own image.
+
+- `TUXBOX_PROGRESS_OVERLAY=always` keeps the panel on, `0` turns it off, and the
+  default shows it only while that work is happening.
+- `TUXBOX_PROGRESS_OVERLAY_POS` sets the corner: `tr` (default), `tl`, `bl` or `br`.
+
+### Preparation speed and coverage
+
+Launch-time preparation runs one compiler job per available core, up to 8. Set
+`TUXBOX_SHADER_PREP_JOBS` to a value from 1 to 32 to change it; more jobs use
+more memory.
+
+A translator update starts a new runtime cache, but most shaders still translate
+to the same HLSL. TuxBox keeps each validated DXIL under
+`tuxbox_shader_cache/dxil`, keyed by the HLSL, the target profile and the DXC
+and validator in use, and copies it instead of running DXC again. This applies
+to preparation and to translation during play. A DXC or validator change starts
+over. A shader whose optimised compile timed out goes straight to `-O0` after
+that. Deleting the `dxil` folder is safe.
+
+Set `TUXBOX_SCARLETT_SEED_PACK=1` to add every shader stored in the package's
+`shaders.rpf` to the preparation list before compiling, so the first launch
+does not depend on which scenes earlier runs reached. The launcher reads the
+plain shader records after the archive's table of contents; it does not
+decrypt anything. Linked vertex/pixel pairs, stencil variants and programs
+that receive their root signature at pipeline creation are still recorded
+during play. On the 1.0.2.1 `shaders.rpf` (412 MB) the reader found 25,889
+distinct DXBC programs in 4.4 s; 5,527 of them are byte-identical to requests
+the game recorded at run time.
+
 ### Live compilation workload
 
 During gameplay, unrelated shader requests can compile concurrently rather

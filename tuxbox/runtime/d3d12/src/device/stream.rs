@@ -540,6 +540,20 @@ pub(super) unsafe extern "system" fn create_pipeline(
     iid: *const GUID,
     out: Out,
 ) -> HRESULT {
+    // The progress panel counts one pipeline per call from the title.
+    let building = crate::progress::building();
+    // SAFETY: the arguments are passed through unchanged.
+    let status = unsafe { create_pipeline_inner(device, desc, iid, out) };
+    building.finish(status.is_ok());
+    status
+}
+
+unsafe fn create_pipeline_inner(
+    device: &Device,
+    desc: *const D3D12_PIPELINE_STATE_STREAM_DESC,
+    iid: *const GUID,
+    out: Out,
+) -> HRESULT {
     let status = unsafe { check_output::<ID3D12PipelineState>(iid, out) };
     if status.is_err() {
         return status;

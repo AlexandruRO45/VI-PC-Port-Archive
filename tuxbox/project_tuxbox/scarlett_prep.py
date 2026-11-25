@@ -1,7 +1,8 @@
 """Compile ProjectScarlett's recorded shader requests before launching the title."""
 from collections import Counter
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 import os
+from itertools import islice
 import json
 from pathlib import Path
 import re
@@ -9,11 +10,13 @@ import subprocess
 from tempfile import TemporaryDirectory
 from time import monotonic
 
+from . import dxil_store
 from .inspect import digest
 from .prep_progress import PrepPhase, desktop_progress, report_progress
 from .runtime_shaders import REQUEST_PATTERNS, ShaderRefused, compile_request, snapshot_compiler_cache
 from .shader_prep import SOURCE_CACHE
 from .shader_diagnostics import normalize_refusal
+from .shader_pack import seed_requests
 from .scarlett_report import aggregate, refusal_bucket, failure_bucket
 
 
@@ -21,6 +24,68 @@ def scarlett_requests(executable, cache):
     if executable.name.casefold() != "game_scarlett_master.exe" or not executable.with_name("shaders.rpf").is_file():
         return None
     return cache / "projectscarlett" / digest(executable) / "requests"
+
+
+PREP_JOBS_LIMIT = 32
+
+
+def prep_jobs(env, report=report_progress):
+    """Compiler jobs for launch-time preparation.
+
+    Preparation runs before the game starts, so it can use more of the CPU
+    than live compilation (TUXBOX_RUNTIME_SHADER_JOBS). Default to the
+    available cores, at most 8; TUXBOX_SHADER_PREP_JOBS chooses 1 to 32.
+    """
+    try:
+        cpus = len(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        cpus = os.cpu_count() or 1
+    default = max(1, min(8, cpus))
+    value = env.get("TUXBOX_SHADER_PREP_JOBS")
+    if value is None:
+        return default
+    try:
+        jobs = int(value)
+        if not 1 <= jobs <= PREP_JOBS_LIMIT:
+            raise ValueError
+    except ValueError:
+        report(None, f"Invalid TUXBOX_SHADER_PREP_JOBS={value!r}; using {default}")
+        return default
+    return jobs
+
+
+def seed_from_pack(executable, archive, env):
+    """With TUXBOX_SCARLETT_SEED_PACK=1, add every shader in shaders.rpf to the
+    request archive so the first launch prepares more than earlier runs saw."""
+    if env.get("TUXBOX_SCARLETT_SEED_PACK") != "1":
+        return
+    report_progress(None, "Reading ProjectScarlett's shader pack")
+    started = monotonic()
+    try:
+        found, added = seed_requests(executable.with_name("shaders.rpf"), archive,
+                                     lambda message: report_progress(None, message))
+    except OSError as exc:
+        report_progress(None, f"Could not read ProjectScarlett's shader pack: {exc}")
+        return
+    report_progress(None, f"Shader pack: {found} shaders found, {added} added to preparation "
+                    f"in {monotonic() - started:.1f}s.")
+
+
+def bounded_results(executor, compile_one, sources, jobs):
+    """Keep at most twice the worker count in flight, including queued jobs."""
+    if jobs < 1:
+        raise ValueError("at least one preparation worker required")
+    remaining = iter(sources)
+    pending = {executor.submit(compile_one, source) for source in islice(remaining, jobs * 2)}
+    while pending:
+        done, pending = wait(pending, return_when=FIRST_COMPLETED)
+        # Drop the completed futures as they are consumed; never enqueue an
+        # entire title's request archive. Refill only as capacity is freed.
+        while done:
+            result = done.pop().result()
+            for source in islice(remaining, 1):
+                pending.add(executor.submit(compile_one, source))
+            yield result
 
 
 def prepare_scarlett(executable, host):
@@ -31,6 +96,7 @@ def prepare_scarlett(executable, host):
     archive = scarlett_requests(executable, cache_root)
     if archive is None:
         return False
+    seed_from_pack(executable, archive, host.env)
     sources = sorted(
         path for path in archive.iterdir()
         if path.suffix in REQUEST_PATTERNS and re.fullmatch(REQUEST_PATTERNS[path.suffix], path.stem)
@@ -40,6 +106,7 @@ def prepare_scarlett(executable, host):
         return True
 
     started = monotonic()
+    reused_before = dxil_store.reused["dxil"]
     totals = Counter()
     reasons = Counter()
     refusal_counts, failure_counts, request_counts = Counter(), Counter(), Counter()
@@ -60,11 +127,11 @@ def prepare_scarlett(executable, host):
             except (OSError, ValueError, subprocess.SubprocessError) as exc:
                 return "failed", f"{source.name}: {exc}", failure_bucket(exc), source.suffix, None
 
-        workers = ThreadPoolExecutor(max_workers=min(4, os.cpu_count() or 1))
+        jobs = prep_jobs(host.env)
+        workers = ThreadPoolExecutor(max_workers=jobs)
         try:
-            pending = [workers.submit(compile_one, source) for source in sources]
-            for completed, result in enumerate(as_completed(pending), 1):
-                category, error, bucket, suffix, reason = result.result()
+            for completed, result in enumerate(bounded_results(workers, compile_one, sources, jobs), 1):
+                category, error, bucket, suffix, reason = result
                 totals[category] += 1
                 request_counts[suffix] += 1
                 if category == "unsupported":
@@ -85,6 +152,10 @@ def prepare_scarlett(executable, host):
         report_progress(progress, f"ProjectScarlett shader preparation took {elapsed:.1f}s. "
                         f"{totals['compiled']} compiled, {totals['cached']} cached, "
                         f"{totals['unsupported']} unsupported, {totals['failed']} failed.", 1, 1)
+        reused = dxil_store.reused["dxil"] - reused_before
+        if reused:
+            report_progress(None, f"ProjectScarlett DXIL reused for {reused} of the compiled shaders "
+                            "(unchanged since an earlier translator).")
         receipt = aggregate(totals, refusal_counts, failure_counts, request_counts)
         report_progress(None, "ProjectScarlett preparation aggregate: " +
                         json.dumps(receipt, sort_keys=True, separators=(",", ":")))

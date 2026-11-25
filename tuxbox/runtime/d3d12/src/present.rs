@@ -1,6 +1,8 @@
 //! Present one RGBA8 or RGB10A2 guest texture through a double-buffered DXGI swap chain.
 
+mod overlay;
 mod window;
+use overlay::Overlay;
 use window::OutputWindow;
 
 use std::mem::{ManuallyDrop, swap};
@@ -101,6 +103,8 @@ struct SwapChain {
     chain: IDXGISwapChain3,
     fence: ID3D12Fence,
     frames: [Frame; 2],
+    device: ID3D12Device,
+    overlay: Overlay,
     window: OutputWindow,
     width: u32,
     height: u32,
@@ -142,6 +146,8 @@ impl SwapChain {
                 chain: base.cast()?,
                 fence: device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?,
                 frames: [Frame::new(device)?, Frame::new(device)?],
+                device: device.clone(),
+                overlay: Overlay::new(params.Format, params.Width, params.Height),
                 window,
                 width: params.Width,
                 height: params.Height,
@@ -182,9 +188,12 @@ impl SwapChain {
                 .ok_or(DXGI_ERROR_INVALID_CALL)?;
             wait_for(&self.fence, frame.retire)?;
             let buffer = self.chain.GetBuffer(index)?;
+            // This frame's previous use has retired, so its panel upload
+            // buffer is free to rewrite.
+            let panel = self.overlay.prepare(&self.device, index as usize);
             frame.allocator.Reset()?;
             frame.list.Reset(&frame.allocator, None)?;
-            record_copy(&frame.list, source, &buffer);
+            record_copy(&frame.list, source, &buffer, panel.as_ref());
             let sample = sampler::due().then(|| sampler::record(&frame.list, source, D3D12_RESOURCE_STATE_COMMON)).flatten();
             frame.list.Close()?;
             frame.source = Some(source.clone());
@@ -254,7 +263,12 @@ fn wait_for(fence: &ID3D12Fence, value: u64) -> Result<()> {
     Ok(())
 }
 
-fn record_copy(list: &ID3D12GraphicsCommandList, source: &ID3D12Resource, buffer: &ID3D12Resource) {
+fn record_copy(
+    list: &ID3D12GraphicsCommandList,
+    source: &ID3D12Resource,
+    buffer: &ID3D12Resource,
+    panel: Option<&overlay::Placement>,
+) {
     let transition = |resource: &ID3D12Resource, before, after| D3D12_RESOURCE_BARRIER {
         Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
         Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
@@ -285,6 +299,9 @@ fn record_copy(list: &ID3D12GraphicsCommandList, source: &ID3D12Resource, buffer
     unsafe {
         list.ResourceBarrier(&barriers);
         list.CopyResource(buffer, source);
+        if let Some(panel) = panel {
+            overlay::record(list, buffer, panel);
+        }
         for barrier in &mut barriers {
             let transition = &mut *barrier.Anonymous.Transition;
             swap(&mut transition.StateBefore, &mut transition.StateAfter);

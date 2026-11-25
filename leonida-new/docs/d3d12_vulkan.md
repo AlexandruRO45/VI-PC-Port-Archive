@@ -90,7 +90,13 @@ enough for the bundled middleware's `d3d12_xs` calls, not for the game. The laye
   desktop order, but also an extra texture-creation method at slot 76, a `CreateComputePipelineState` call at
   slot 62 where the PC interface it forwarded to presents `CreateStateObject` (different arity), and descriptor-heap
   start handles returned in RAX at heap slots 9/10. Implement the public chain plus those measured overrides
-  explicitly; do not assume every slot. Device 11 adds `CreateSampler2`; command list 8 adds
+  explicitly; do not assume every slot. On the retail executable's higher device slots (`runtime/shims/d3d12_xs_device.cpp`),
+  slot 86 routes `CreatePipelineState(desc, riid, out)` to PC slot 47 (`ID3D12Device2::CreatePipelineState`),
+  slot 101 routes `CreateStateObject(desc, riid, out)` to PC slot 62 (`ID3D12Device5::CreateStateObject`), and
+  slot 108 routes `GetResourceAllocationInfo2` (accepting the console C-ABI struct return with the return buffer in
+  `RCX` and the device in `RDX`, expanding 56-byte `D3D12_RESOURCE_DESC` entries to `D3D12_RESOURCE_DESC1` and
+  normalizing Xbox layout words and flag bits on the copy) to PC
+  slot 68 (`ID3D12Device8::GetResourceAllocationInfo2`). Device 11 adds `CreateSampler2`; command list 8 adds
   `OMSetFrontAndBackStencilRef` (public SDK).
 - **Unknown IIDs and slots.** `QueryInterface` must log the IID and return `E_NOINTERFACE` if it is not in the
   public chain. If the game then fails, the IID and the call site identify the Xbox-specific interface to reverse.
@@ -146,7 +152,8 @@ The design is therefore an **IR per command list**:
 - `Close` freezes the IR. `ExecuteBundle` is accepted only on a direct list, with an already-closed bundle as its callee; the bundle's recorded commands and calls are replayed at the call site, so the source can be reused or reset without changing the parent. Command-list creation and reset require an allocator of the same type. A bundle cannot be submitted directly to a command queue.
 - Bundle restrictions are checked while recording for the IR operations currently implemented here (barriers, clears, copies, resolves, `SetPredication`, `DiscardResource`, the atomic copies, `RSSetViewports`, `RSSetScissorRects`, `OMSetRenderTargets` and `ClearState`; `WriteBufferImmediate` is allowed in a bundle); those calls are not legal inside a D3D12 bundle and make `Close` return `E_INVALIDARG`. `d3d12_bundle_forbidden_test` measured the last four on the PC runtime without the debug layer: the bundle's `Close` fails (`E_FAIL`, where this layer gives `E_INVALIDARG`) on the default adapter and on WARP, and executing a bundle whose `Close` failed crashes the runtime, so the layer refuses it in `ExecuteBundle` instead. A bundle has no render targets, viewport or root signature of its own, so its state calls (pipeline state, root signature and arguments, vertex and index buffers, topology, blend factor, stencil references) and its draws and dispatches are kept as they were called, and `ExecuteBundle` plays them on the parent through the same members the application would have called. A draw then snapshots the parent's state plus what the bundle set, and what the bundle set stays on the parent afterwards. Commands that need no state (markers, immediate writes) are copied between them in order. `d3d12_bundle_test` measured the rule on the PC runtime, where the default adapter (an RTX 4060 Ti) and WARP drew the same picture in every case it ran. A bundle's draws see the parent's render targets, viewport and scissor, root signature and arguments (also when the bundle sets the same root signature first, so those arguments stay), and vertex and index buffers. A bundle starts with the pipeline state it was created or reset with, not the parent's. After `ExecuteBundle` the parent has that pipeline state and whatever else the bundle set: topology, root arguments, vertex and index buffers, and a different root signature with the bundle's arguments in place of the parent's. Topology: the default adapter takes the parent's when the bundle sets none. That is more lenient than Microsoft's stated rule (topology is undefined when a bundle begins), and WARP follows the rule by removing the device when a bundle draws or hands back without one, so a bundle should set it; the layer follows the default adapter. A bundle that sets a root argument before any root signature crashes the NVIDIA driver (the layer applies it to the parent's signature). The deferred calls are checked when they play, against the parent's root signature, so a bad one makes the parent's `Close` fail, not the bundle's. A per-list state setter must go through the deferred path (`defer()` in `d3d12_com.cpp`, replaying through a private member that does not trace) to work in a bundle. Not deferred yet: `ExecuteIndirect` in a bundle, and bundle `Dispatch` has no GPU test.
 - What `Close` returns after one recorded call is compared with the PC runtime over WARP (no debug layer) by
-  `d3d12_close_parity_test`, 113 cases on fresh lists, nothing executed. 82 agree; the other 31 are listed in the
+  `d3d12_close_parity_test`, 116 cases on fresh lists, nothing executed. 85 agree (three of them enhanced texture
+  barriers, two into `LAYOUT_UNDEFINED`: section 4.3); the other 31 are listed in the
   test as known differences. In 16 the layer fails a list WARP closes: draws and dispatches with no pipeline,
   root arguments before a root signature, a `CopyTextureRegion` box that is empty or inverted, footprint to
   footprint or at an unaligned footprint offset or pitch, `CopyResource` of a resource onto itself,
@@ -962,7 +969,8 @@ The compute path, end to end:
   - With `VK_EXT_conditional_rendering`, the arena is created with the conditional-rendering usage, and
     `SetPredication` on a default-heap buffer reads at the buffer's offset in the arena plus the call's offset.
   - `CreateHeap` reserves the requested size in the arena at 64 KiB, and a buffer placed in it gets the heap's
-    place plus the placed offset as its console VA. A placed texture keeps its own `VkDeviceMemory` and a null VA,
+    place plus the placed offset as its console VA. A placed texture has memory of its own (a range of a
+    shared block or its own `VkDeviceMemory`, section 3.3) and a null VA,
     1D, 2D and 3D alike (arrays and mips included), and a dimension outside the enum is `E_INVALIDARG`, as on the
     host (RTX 2080 Ti and WARP, `d3d12_placed_dimensions_test`);
     tiled (`64KB_UNDEFINED_SWIZZLE` and Xbox `0x101`) 2D/3D placed textures are backed the same way with
@@ -1479,8 +1487,8 @@ The layer therefore owns the console VAs. It returns them from `ID3D12Resource::
 |---|---|
 | Address space | Two ranges. A **BDA arena** holds buffers, descriptor heaps and shader code; its device address is `heap_base`. A separate **image key range** supplies unique console VAs for images; those keys are never added to `heap_base`. The arena's `VkBuffer` is created with all buffer usages the game can bind (uniform, storage, vertex, index, indirect, transfer) plus `SHADER_DEVICE_ADDRESS`, and its memory with `VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT`. |
 | Buffers | A buffer resource is a range in the arena's single `VkBuffer`: offset = its console VA, size = the resource size. Buffer commands bind the arena buffer with that offset, so its device address is exactly `arena_bda + offset`; no per-resource `VkBuffer` object is needed. |
-| Images | Each image gets a unique console VA key and lives in its own `VkDeviceMemory` (or a suballocated device-local image heap) with optimal tiling. Shader image access goes through the T#/hash table, so nothing dereferences the key. Keeping images out of the arena avoids forcing optimal-tiled images into the arena's memory type and keeps the arena sized by buffers, not textures. |
-| Heaps and placed resources | `CreateHeap` reserves the requested size in the arena, so a buffer placed at a 64 KiB-aligned offset is that offset into the arena and its console VA is the heap's place plus the offset. A placed texture (1D, 2D or 3D) gets its own `VkDeviceMemory`; one the title placed at its own address through the console's `CreatePlacedResourceX` (Xbox device slot 133) reports that title address from `GetGPUVirtualAddress`, as the console does — a title turns it into the CPU pointer it clears the texture through — while its pixels do not alias the title's pages yet. Any other texture answers a null VA, as on D3D12. Tiled (`64KB_UNDEFINED_SWIZZLE` and Xbox `0x101`) 2D/3D placed textures (D3D-191) and multisampled 2D placed textures (D3D-222) share that backing, answer `GetResourceAllocationInfo` and `GetResourceTiling`, and check heap/offset alignments. Reserved buffers can use heap tile mappings (section 4.2). |
+| Images | Each image gets a unique console VA key and has device-local memory with optimal tiling: a range of a 64 MiB block that other textures share (`runtime/src/image_memory.h`, `VK-IMAGE-MEMORY-POOL`), or its own `VkDeviceMemory` when it is a render target, a depth buffer, a CPU-visible texture or larger than an eighth of a block, or when device-local memory has no room for another block. A range goes back to its block when the last submission that could use the image has completed. One reused from an earlier texture is zeroed before the next submission that runs shaders, as a committed resource reads as zero. Blocks hold only optimal-tiled images, so `bufferImageGranularity` does not apply. Shader image access goes through the T#/hash table, so nothing dereferences the key. Keeping images out of the arena avoids forcing optimal-tiled images into the arena's memory type and keeps the arena sized by buffers, not textures. |
+| Heaps and placed resources | `CreateHeap` reserves the requested size in the arena, so a buffer placed at a 64 KiB-aligned offset is that offset into the arena and its console VA is the heap's place plus the offset. A placed texture (1D, 2D or 3D) gets its own memory (a range of a shared block or its own `VkDeviceMemory`, above); one the title placed at its own address through the console's `CreatePlacedResourceX` (Xbox device slot 133) reports that title address from `GetGPUVirtualAddress`, as the console does — a title turns it into the CPU pointer it clears the texture through — while its pixels do not alias the title's pages yet. Any other texture answers a null VA, as on D3D12. Tiled (`64KB_UNDEFINED_SWIZZLE` and Xbox `0x101`) 2D/3D placed textures (D3D-191) and multisampled 2D placed textures (D3D-222) share that backing, answer `GetResourceAllocationInfo` and `GetResourceTiling`, and check heap/offset alignments. Reserved buffers can use heap tile mappings (section 4.2). |
 | Descriptor heaps | Shader-visible CBV/SRV/UAV and sampler heaps are allocated in the low 4 GB of the arena. RTV/DSV heaps are host-side only. |
 | Shader code | Each FSSM blob is uploaded to the arena; its console VA is the code base. |
 | Upload/readback | `D3D12_HEAP_TYPE_UPLOAD`/`READBACK` resources are separate host-visible buffers outside the arena. Their console VAs are only used by copy APIs; if the game binds one as a vertex/index buffer or reads it in a shader, the layer biases the view/descriptor by `-heap_base` so the shader's addition lands on the host BDA (**ASSUMPTION**; **measured to fail for a V#**, see below). |
@@ -2146,7 +2154,7 @@ The trace will enumerate them.
 | `ID3D12PipelineState` | `VkPipeline` + a `PipelineInfo` | Shader hash → SPIR-V + index entry; PSO state → Vulkan state; dynamic state where possible. The BVH builder's compute PSOs arrive at device slot 62 with a plain `D3D12_COMPUTE_PIPELINE_STATE_DESC`. |
 | `ID3D12DescriptorHeap` | `DescriptorHeap` (shadow + optional arena range) | CBV/SRV/UAV and sampler heaps can be shader-visible; RTV/DSV are host-only. Start handles use the measured RAX return at heap slots 9/10. Increments are layer-chosen (32/32) pending the console value. |
 | `ID3D12Resource` | `Resource` (a range in the arena buffer; a separate `VkImage` for textures) | Committed, placed and reserved. Reserved buffers use sparse memory where supported (section 4.2). Xbox textures may arrive through device slot 76. `GetGPUVirtualAddress` returns a console VA (a buffer offset or an image key). |
-| `ID3D12Heap` | `Heap` (a reserved VA range) | Buffer ranges are backed by the arena; images get their own `VkDeviceMemory`. Residency calls are no-ops. True buffer/image aliasing inside a heap is **Open**. |
+| `ID3D12Heap` | `Heap` (a reserved VA range) | Buffer ranges are backed by the arena; images get ranges of shared blocks or their own `VkDeviceMemory` (section 3.3). Residency calls are no-ops. True buffer/image aliasing inside a heap is **Open**. |
 | `ID3D12Fence` / `ID3D12Fence1` | `Fence` over a timeline `VkSemaphore` | `GetCompletedValue` = counter value; `SetEventOnCompletion` = wait thread + Win32 event; CPU `Signal` = host signal. |
 | Resource barriers (legacy) | `vkCmdPipelineBarrier` | Per-subresource state tracking; `BEGIN_ONLY`/`END_ONLY` become conservative full barriers at the begin point. |
 | Enhanced barriers (`ID3D12GraphicsCommandList7::Barrier`) | `vkCmdPipelineBarrier2` | Direct mapping of sync/access/layout; prefer it when the game uses it. |
@@ -2346,8 +2354,8 @@ The trace will enumerate them.
   layout enum. The FidelityFX upscaler creates 10 default-heap resources through this slot, so it is not optional
   for middleware. The console tiled data layout is GFX10 `SW_64KB_D` (Mesa addrlib `GFX10_SW_64K_D_RBPLUS_PATINFO`),
   and the detile and tile path is implemented in `resource_detile.h` and verified by `resource_detile_test` (D3D-316).
-- `CreateCommittedResource`: allocate an aligned range in the arena for a buffer, or a separate `VkDeviceMemory`
-  for an image; record the initial state. Map `D3D12_HEAP_TYPE_DEFAULT` to device-local memory, `UPLOAD`/`READBACK`
+- `CreateCommittedResource`: allocate an aligned range in the arena for a buffer, or a range of a shared block
+  or a separate `VkDeviceMemory` for an image (section 3.3); record the initial state. Map `D3D12_HEAP_TYPE_DEFAULT` to device-local memory, `UPLOAD`/`READBACK`
   to separate host-visible buffers. This remains the path for buffers and for any PC-style committed resource.
 - `ID3D12Resource::GetDesc` returns the description with its defaults filled in, as the PC runtime does: `MipLevels`
   0 becomes the full chain, and `Alignment` 0 becomes the placement alignment, 64 KiB, or 4 MiB for a multisampled
@@ -2514,6 +2522,12 @@ The trace will enumerate them.
   or 0) are copied in order. Not compared: null data, which the host faults on (the layer answers `E_INVALIDARG`);
   which bytes win when a read's rows overlap, which is the driver's copy order; and a default-heap texture, which
   the host refuses and the layer copies on purpose.
+  - A driver can report `VK_FORMAT_FEATURE_2_HOST_IMAGE_TRANSFER_BIT_EXT` for a format, create the image with
+    host-transfer usage, and then give it no memory type (`memoryTypeBits = 0`). This was measured on a GTX 1050 Ti
+    with NVIDIA 582.78, and the validation layer of Vulkan SDK 1.4.363 reports nothing. Such a texture is made again
+    without host-transfer usage before it is bound, and takes the staging path. `d3d12_vulkan_device_test` and
+    `d3d12_subresource_copy_test` force this branch on any GPU with `VulkanDeviceInfo::force_host_transfer_retry`
+    (their third CPU-copy path; the second compares it with the host runtime).
 - 96-bit textures (`R32G32B32_FLOAT`/`_UINT`/`_SINT`/`_TYPELESS`, D3D-62) are `R32G32B32A32` images
   (`ResourceBinding::rgb96`), on every GPU. Most GPUs have no optimal-tiling RGB32 image (an RX 9070 XT reports
   no optimal features for `R32G32B32_SFLOAT`), and one that has would not avoid the repack: D3D12 places
@@ -2694,6 +2708,9 @@ The trace will enumerate them.
 
 ### 4.3 Barriers and layouts
 
+Plain buffer copies order earlier transfer writes on the same queue before reading or writing the next range.
+Set `LEONIDA_ORDER_BUFFER_COPIES=0` to omit this dependency when comparing replay behavior.
+
 Track a current state/layout per subresource. D3D12 states are bitmasks; a combined state takes the union of the
 mapped stages/accesses, and if no single layout serves all uses, use `GENERAL` and log it. Legacy
 `D3D12_RESOURCE_STATE_*` maps to a (stage, access, layout) triple:
@@ -2730,6 +2747,23 @@ mapped stages/accesses, and if no single layout serves all uses, use `GENERAL` a
   `ResolveQueryData`'s never-written queries as `vkCmdFillBuffer`, which synchronization2 runs in the `CLEAR` stage
   (D3D-838; `vk_command_replay_test` part K is a read-after-write hazard under synchronization validation without
   it).
+- `LayoutAfter = UNDEFINED` from a defined layout (D3D-BARRIER-INTO-UNDEFINED) releases the subresources: their
+  contents are no longer needed, as before their memory is aliased. Vulkan has no transition into `UNDEFINED`
+  (VUID-VkImageMemoryBarrier2-newLayout-01198), so each piece gets a barrier with `oldLayout = newLayout`, the
+  layout the tracker has for it: the accesses are ordered and nothing in the image changes. The tracker keeps those
+  layouts. A piece never used yet gets no barrier and is not zero-filled for it. The next barrier on these
+  subresources has to start from `UNDEFINED`, which discards from whatever layout they are in, as before. The list
+  closes, as it does on WARP (measured on Windows 11 26340 in #984). #984 also reports that the retail title ends a
+  depth buffer's use this way and takes a failed `Close` as fatal; the layer failed such a list's `Close` until
+  this change. `UNDEFINED` to `UNDEFINED` is a separate case (#600).
+  - **Tests:** `command_list_test` and `replay_texture_barrier_test` (CPU: the barriers recorded, the kept layouts,
+    an unused image, the barrier that follows); three rows of `d3d12_close_parity_test`; `vk_command_replay_test`
+    part L (a colour target, a depth buffer whose planes are in two layouts and an unused image released, the target
+    used again and read back); and `d3d12_com_test`, where a depth buffer is cleared, released, taken from
+    `UNDEFINED` again, cleared and read back through the D3D12 list and queue (16 depth and 16 stencil texels
+    exact). Run on an RTX 4070 Ti (NVIDIA 620.70.06, Linux): part L natively with the validation layer 1.4.363 and
+    no error, where the same barriers with `newLayout = UNDEFINED` give VUID-VkImageMemoryBarrier2-newLayout-01198
+    four times; the D3D12 tests under Wine.
 - `DiscardResource` (D3D-26): each discarded image subresource gets a barrier from `oldLayout = UNDEFINED` to the
   layout the tracker already has for it, so the driver may drop the contents while later commands see no layout
   change. The other cases are no-ops, which "contents undefined" allows: buffers, discards with rectangles (only
@@ -3274,7 +3308,11 @@ Implemented (`QueryHeap` in `runtime/shims/d3d12_vulkan_device.cpp`, the query c
 - **Heaps.** One `VkQueryPool` per `ID3D12QueryHeap`, registered with the `VulkanContext` by its pointer, as
   resources are. `OCCLUSION` heaps are `VK_QUERY_TYPE_OCCLUSION` pools and hold both `OCCLUSION` and
   `BINARY_OCCLUSION` queries, as in D3D12. `TIMESTAMP` and `COPY_QUEUE_TIMESTAMP` heaps are
-  `VK_QUERY_TYPE_TIMESTAMP` pools; they are refused when the queue family's `timestampValidBits` is 0.
+  `VK_QUERY_TYPE_TIMESTAMP` pools. `OPTIONS3.CopyQueueTimestampQueriesSupported` and copy timestamp heap creation
+  agree: both require timestamp bits and graphics or compute support in every family a copy queue can use (its
+  dedicated family, if configured, and the graphics fallback). Transfer-only families can write timestamps on some
+  devices but cannot reset or resolve their queries. Query commands and `GetTimestampFrequency` also check the
+  queue's actual family.
   `PIPELINE_STATISTICS` heaps count all eleven Vulkan statistics (`0x7ff`), whose result order is the field order
   of `D3D12_QUERY_DATA_PIPELINE_STATISTICS` (IA vertices, IA primitives, VS, GS invocations, GS primitives,
   clipper invocations and primitives, PS, HS, DS, CS), so one 88-byte result per query is copied as is. They need
@@ -3577,6 +3615,8 @@ to be recovered from call sites (or the NDA GDK headers, if a developer has acce
 | Device slots 48/73/78/79/80 | Public HLE `Freminet`/`ScarlettX` (third-party, not Microsoft documentation) | `d3d12_xs_device.cpp` routes `CreateCommandQueueX` (48), `CreateCommandListX` (73), `SetFrameIntervalX` (78), `ScheduleFrameEventX` (79) and `WaitFrameEventX` (80) before it indexes the PC vtable. Queue and list creation use the existing create paths. The frame-event calls are a per-device token counter: `WaitFrameEventX` returns at once with a fresh non-zero token, because there is no vblank source before a presenter exists. The five indices can be moved with `LEONIDA_XS_QUEUE_X_SLOT`, `LEONIDA_XS_LIST_X_SLOT`, `LEONIDA_XS_FRAME_INTERVAL_SLOT`, `LEONIDA_XS_SCHEDULE_EVENT_SLOT` and `LEONIDA_XS_WAIT_EVENT_SLOT` (3..127; a value that names a slot the proxy already handles keeps that slot's handler); a trace that disagrees wins. |
 | Indirect argument type 105 | The retail title's startup creates five one-argument command signatures (device slot 41) with no root signature; one has type 105 and a 12-byte stride. Its two `ExecuteIndirect` sites, read statically, set the compute state first, as the `DISPATCH` sites do, and pass one command from the same argument buffer, on a second command list | `d3d12_xs_device.cpp` creates it as `DISPATCH` (`D3D12_DISPATCH_ARGUMENTS`). What the console does differently for it is **Open**. |
 | Device slot 61 | The retail title's boot under `gta6rt --run` (stop 20 of the RT-5 measurements in #6910): called as `(desc, dest handle)` once per sampler | `d3d12_xs_device.cpp` routes it to the PC `CreateSampler` (slot 22) with the description's PC `D3D12_SAMPLER_DESC` prefix, for a caller in an image the guest loader mapped; the PC slot 61 is `CreateMetaCommand`, which any other caller (a host test driving the device through the proxy) still gets. The layout of the description beyond the PC fields is **Open**. |
+| Device slot 74 | The retail title's boot under `gta6rt --run`: called as `(pointer, u32, pointer)` | **Stand-in.** `d3d12_xs_device.cpp` answers `S_OK` and does nothing, for a caller in an image the guest loader mapped; the PC slot 74 is `ShaderCacheControl`, which the call does not fit and which any other caller still gets. What the console method is, and what it should do, is **Open**. |
+| Command-allocator slot 9 | The retail title's boot under `gta6rt --run`: called past the 9-slot PC allocator, as `(function pointer, context, ...)`; `SetAllocatorCallbackX` is the name the commit that added it uses | **Stand-in.** The allocator proxy records the callback and its context (`allocator_proxy_callback`, `allocator_proxy_callback_context`) and answers `S_OK`. **Nothing calls the callback**: the Vulkan layer backs command buffers itself. Whether the title depends on being called back is **Open**. |
 | Device slot 81, queue `PresentX`/`SuspendX`/`ResumeX` | XCL (GPL-2.0-only, third-party): `GetFrameStatisticsX` at device slot 81, `PresentX` at queue slot 30 (older runtime layout) or 32 (newer); `SuspendX`/`ResumeX` slots unmeasured | `set_presentation_handler` forwards 78-81 and the queue routes to a presenter (`attach_xbox_presentation`; `gta6rt` creates no `XboxPresentation` yet). Without one, slot 81 answers `S_FALSE` with a zero count (no statistics yet) and the queue slots stay refused. Moved with `LEONIDA_XS_FRAME_STATISTICS_SLOT` (3..127) and `LEONIDA_XS_PRESENT_X_SLOT` (default 30); `SuspendX` and `ResumeX` are routed only when `LEONIDA_XS_SUSPEND_X_SLOT` / `LEONIDA_XS_RESUME_X_SLOT` are set (queue slots 19..127; two routes on one slot are refused with a log). |
 | VRS | Public `D3D12_SHADING_RATE` / `D3D12_AXIS_SHADING_RATE` | `VK_KHR_fragment_shading_rate`; `RSSetShadingRate`/image-based rate map to `vkCmdSetFragmentShadingRateKHR`. |
 | Mesh shader tier | Public `D3D12_MESH_SHADER_TIER` | `VK_EXT_mesh_shader`; the 9,282 translated mesh shaders make this a hard requirement for any content that uses them. |

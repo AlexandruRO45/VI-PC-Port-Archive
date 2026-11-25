@@ -500,6 +500,19 @@ target_include_directories(startup_gameinput_script_syntax PRIVATE src)
 target_compile_features(startup_gameinput_script_syntax PRIVATE cxx_std_17)
 add_test(NAME startup_gameinput_script_syntax COMMAND startup_gameinput_script_syntax "$<TARGET_FILE:startup_stub_gameinput>")
 set_tests_properties(startup_gameinput_script_syntax PROPERTIES RUN_SERIAL TRUE SKIP_RETURN_CODE 77)
+add_executable(startup_present_signature tests/startup_present_signature.cpp)
+target_include_directories(startup_present_signature PRIVATE src)
+target_compile_features(startup_present_signature PRIVATE cxx_std_17)
+target_link_libraries(startup_present_signature PRIVATE d3d12 dxgi)
+add_test(NAME startup_present_signature_warp COMMAND startup_present_signature)
+set_tests_properties(startup_present_signature_warp PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+# The sampler holds the presented surface until its copy has finished: a stalled queue, the caller's
+# release after the present, then the signature, all under the debug layer. The control repeats the
+# stall with a copy that does not hold its source and passes only if the debug layer reports it.
+add_test(NAME startup_present_signature_held_source_warp COMMAND startup_present_signature held_source)
+set_tests_properties(startup_present_signature_held_source_warp PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+add_test(NAME startup_present_signature_unheld_source_control_warp COMMAND startup_present_signature unheld_control)
+set_tests_properties(startup_present_signature_unheld_source_control_warp PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
 add_executable(startup_placement_alloc tests/startup_placement_alloc.cpp)
 target_compile_features(startup_placement_alloc PRIVATE cxx_std_17)
 target_include_directories(startup_placement_alloc PRIVATE src)
@@ -738,6 +751,9 @@ target_compile_features(startup_launch_probe PRIVATE cxx_std_17)
 # Input for the startup debugger's diagnostics check (tests/startup_debug_check.py).
 add_executable(startup_debug_probe tests/startup_debug_probe.cpp)
 target_compile_features(startup_debug_probe PRIVATE cxx_std_17)
+# The DLL the probe calls for the debugger's call-hook case (--trace-calls).
+add_library(startup_debug_calls SHARED tests/startup_debug_calls.cpp)
+add_dependencies(startup_debug_probe startup_debug_calls)
 # Input for tests/startup_inflate_check.py: the DirectStorage stand-in's zlib decoder on one stream.
 add_executable(startup_inflate_probe tests/startup_inflate_probe.cpp)
 target_compile_features(startup_inflate_probe PRIVATE cxx_std_17)
@@ -867,6 +883,16 @@ target_link_libraries(startup_upload_arena PRIVATE d3d12 dxgi)
 foreach(backend IN ITEMS warp hardware)
     add_test(NAME startup_upload_arena_${backend} COMMAND startup_upload_arena ${backend})
     set_tests_properties(startup_upload_arena_${backend} PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77)
+endforeach()
+
+# Upload arena payloads must survive an arena reset while the GPU waits on a fence (Refs #1758).
+add_executable(startup_upload_lifetime tests/startup_upload_lifetime.cpp)
+target_compile_features(startup_upload_lifetime PRIVATE cxx_std_17)
+target_include_directories(startup_upload_lifetime PRIVATE src)
+target_link_libraries(startup_upload_lifetime PRIVATE d3d12 dxgi)
+foreach(backend IN ITEMS warp hardware)
+    add_test(NAME startup_upload_lifetime_${backend} COMMAND startup_upload_lifetime ${backend})
+    set_tests_properties(startup_upload_lifetime_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
 endforeach()
 
 # GPU writes the dispatch record that the desktop command processor consumes (Refs #1412).
@@ -1184,6 +1210,26 @@ target_compile_features(startup_plane_size_check PRIVATE cxx_std_17)
 add_test(NAME startup_plane_size COMMAND startup_plane_size_check)
 add_test(NAME startup_plane_size_packed_control COMMAND startup_plane_size_check --mutate packed)
 set_tests_properties(startup_plane_size_packed_control PROPERTIES WILL_FAIL TRUE)
+# Device slot 41: the indirect argument types desktop D3D12 cannot create
+# (src/startup_stubs/command_signature_filter.h); the mutated runs are negative controls.
+add_executable(startup_command_signature_filter_check tests/startup_command_signature_filter_check.cpp)
+target_include_directories(startup_command_signature_filter_check PRIVATE src)
+target_compile_features(startup_command_signature_filter_check PRIVATE cxx_std_17)
+add_test(NAME startup_command_signature_filter COMMAND startup_command_signature_filter_check)
+foreach(mutation IN ITEMS off-by-one first-only)
+    add_test(NAME startup_command_signature_filter_${mutation}_control COMMAND startup_command_signature_filter_check --mutate ${mutation})
+    set_tests_properties(startup_command_signature_filter_${mutation}_control PROPERTIES WILL_FAIL TRUE)
+endforeach()
+# Device slot 41 through the startup device wrapper with the debug layer on: a desktop-valid argument
+# list is created, a console type gets the placeholder, and the debug layer reports no error for either.
+add_executable(startup_command_signature tests/startup_command_signature.cpp)
+target_compile_features(startup_command_signature PRIVATE cxx_std_17)
+target_link_libraries(startup_command_signature PRIVATE d3d12_xs_shim d3d12 dxgi)
+foreach(backend IN ITEMS warp hardware)
+    add_test(NAME startup_command_signature_${backend} COMMAND startup_command_signature ${backend})
+    set_tests_properties(startup_command_signature_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+        ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_DEBUG=1")
+endforeach()
 # GameInput stand-in timestamps: a performance-counter reading in microseconds without a product
 # that wraps (src/startup_stubs/qpc_microseconds.h); the mutated run is the negative control.
 add_executable(startup_qpc_microseconds_check tests/startup_qpc_microseconds_check.cpp)
@@ -1318,6 +1364,14 @@ target_compile_features(startup_cb_blend_check PRIVATE cxx_std_17)
 add_test(NAME startup_cb_blend_decode COMMAND startup_cb_blend_check)
 add_test(NAME startup_cb_blend_decode_dest_alpha_control COMMAND startup_cb_blend_check --mutate dest-alpha-colour)
 set_tests_properties(startup_cb_blend_decode_dest_alpha_control PROPERTIES WILL_FAIL TRUE)
+# Export write masks from a translated manifest (#1674), without a device. The mutated run applies the
+# masks to a shared blend state without expanding it, so a mask on target 1 is lost.
+add_executable(startup_export_write_mask_check tests/startup_export_write_mask_check.cpp)
+target_include_directories(startup_export_write_mask_check PRIVATE src)
+target_compile_features(startup_export_write_mask_check PRIVATE cxx_std_17)
+add_test(NAME startup_export_write_mask COMMAND startup_export_write_mask_check)
+add_test(NAME startup_export_write_mask_shared_blend_control COMMAND startup_export_write_mask_check --mutate shared-blend)
+set_tests_properties(startup_export_write_mask_shared_blend_control PROPERTIES WILL_FAIL TRUE)
 # Composite provenance (#1628): one VS and two pixel shaders from one HLSL file.
 set(startup_composite_provenance_headers "")
 foreach(stage IN ITEMS "vs_6_0;vs_main;vs" "ps_6_0;ps_fill;fill" "ps_6_0;ps_composite;composite")
@@ -1992,6 +2046,11 @@ foreach(adapter IN ITEMS hardware warp)
     add_test(NAME startup_cb_blend_swapped_${adapter} COMMAND offscreen_check ${adapter} --startup-cb-blend-swapped)
     set_tests_properties(startup_cb_blend_${adapter} startup_cb_blend_swapped_${adapter}
         PROPERTIES TIMEOUT 60)
+    # Export write masks (#1674): the channels outside a manifest 'wmask' keep the target's value.
+    add_test(NAME startup_export_write_mask_${adapter} COMMAND offscreen_check ${adapter} --startup-export-write-mask)
+    add_test(NAME startup_export_write_mask_unmasked_${adapter} COMMAND offscreen_check ${adapter} --startup-export-write-mask-unmasked)
+    set_tests_properties(startup_export_write_mask_${adapter} startup_export_write_mask_unmasked_${adapter}
+        PROPERTIES TIMEOUT 60)
     add_test(NAME startup_composite_provenance_${adapter} COMMAND offscreen_check ${adapter} --startup-composite-provenance)
     set_tests_properties(startup_composite_provenance_${adapter} PROPERTIES TIMEOUT 60)
     add_test(NAME startup_range_provenance_${adapter} COMMAND offscreen_check ${adapter} --startup-range-provenance)
@@ -2144,6 +2203,9 @@ if(EXISTS "${INTAKE_PYTHON}")
     # gfx2hlsl lowers v_swap_b32 (VOP1): CPU evaluation of the translated text, refusals of every form llvm-mc rejects.
     add_test(NAME startup_gfx2hlsl_swap COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_swap_check.py")
+    # gfx2hlsl lowers s_bitcmp1_b32 and s_bitcmp0_b32 (SOPC): CPU evaluation of the translated SCC test.
+    add_test(NAME startup_gfx2hlsl_s_bitcmp COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_s_bitcmp_check.py")
     # VOP1/VOP2 sub-dword addressing (SDWA) in the translator (#1141), checked against the pixel AOT
     # lowering of the same selections.
     add_test(NAME startup_gfx2hlsl_sdwa COMMAND "${INTAKE_PYTHON}" -B
@@ -2157,6 +2219,9 @@ if(EXISTS "${INTAKE_PYTHON}")
     # The 64-bit vector shifts (#1815).
     add_test(NAME startup_gfx2hlsl_b64_shift COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_b64_shift_check.py")
+    # The scalar shift-and-add forms s_lshl1..4_add_u32 (Run 20 census #16).
+    add_test(NAME startup_gfx2hlsl_s_lshl_add COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_s_lshl_add_check.py")
     # SDWA forms of the float-result conversions (#1727).
     add_test(NAME startup_gfx2hlsl_sdwa_cvt COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_sdwa_cvt_check.py")
@@ -2258,6 +2323,15 @@ if(EXISTS "${INTAKE_PYTHON}")
             "$<TARGET_FILE:offscreen_check>" ${adapter} $<$<BOOL:${STARTUP_FXC}>:${STARTUP_FXC}>)
         set_tests_properties(startup_image_2d_array_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
     endforeach()
+    # gfx2hlsl packed 2D A16 image_sample / image_sample_lz coordinates and modifier validation.
+    add_test(NAME startup_image_sample_a16_controls COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/startup_image_sample_a16_check.py")
+    foreach(adapter IN ITEMS warp hardware)
+        add_test(NAME startup_image_sample_a16_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/startup_image_sample_a16_check.py" draw "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter} $<$<BOOL:${STARTUP_FXC}>:${STARTUP_FXC}>)
+        set_tests_properties(startup_image_sample_a16_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+    endforeach()
     # gfx2hlsl flat parameters keep the exported words (#1259): translation controls, then a desktop
     # draw of the translated pair with FXC 5_1 (the --pending path) and DXC 6_0.
     add_test(NAME startup_flat_param_controls COMMAND "${INTAKE_PYTHON}" -B
@@ -2289,6 +2363,10 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_vopc_sdwa_check.py" draw "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter} $<$<BOOL:${STARTUP_FXC}>:${STARTUP_FXC}>)
         set_tests_properties(startup_gfx2hlsl_vopc_sdwa_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+        add_test(NAME startup_gfx2hlsl_sdwa_cvt_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_sdwa_cvt_check.py" draw "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter} $<$<BOOL:${STARTUP_FXC}>:${STARTUP_FXC}>)
+        set_tests_properties(startup_gfx2hlsl_sdwa_cvt_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
     endforeach()
     # gfx2hlsl v_cmp/v_cmpx lg and nlg f32 over every pair of +-0, denormal, +-1, +-max, +-inf and NaN words decide
     # 16 x 16 pixels, checked pixel by pixel (#1920); the old != lowering must fail the same draws.
@@ -2358,8 +2436,12 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME startup_launch COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_launch_check.py" "$<TARGET_FILE:startup_launch_probe>")
     set_tests_properties(startup_launch PROPERTIES TIMEOUT 120)
+    add_test(NAME startup_launch_cli_check COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_launch_cli_check.py")
+    set_tests_properties(startup_launch_cli_check PROPERTIES TIMEOUT 30)
     add_test(NAME startup_debug COMMAND "${INTAKE_PYTHON}" -B
-        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_debug_check.py" "$<TARGET_FILE:startup_debug_probe>")
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_debug_check.py" "$<TARGET_FILE:startup_debug_probe>"
+        "$<TARGET_FILE:startup_debug_calls>")
     set_tests_properties(startup_debug PROPERTIES TIMEOUT 300)
 
     add_test(NAME startup_stream_request_warp COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
@@ -2460,9 +2542,18 @@ if(EXISTS "${INTAKE_PYTHON}")
     # Startup shader translator: the SMEM offset 'off' is the literal 0; m0 and other operands keep their handling (#1674).
     add_test(NAME startup_gfx2hlsl_smem_offset COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_smem_offset_check.py")
+    # Startup shader translator: uniform sources of v_readfirstlane_b32 in straight-line code (#1723).
+    add_test(NAME startup_gfx2hlsl_readfirstlane_uniform COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_readfirstlane_uniform_check.py")
     # Startup shader translator: read-only census of every refusal site (--refusals).
     add_test(NAME startup_gfx2hlsl_refusals COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_refusals_check.py")
+    # Partial colour exports carry their channel mask to the manifest; compressed exports of whole pairs lower (#1674).
+    add_test(NAME startup_gfx2hlsl_export_mask COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_export_mask_check.py")
+    add_test(NAME startup_gfx2hlsl_export_mask_drop_control COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_export_mask_check.py" --mutate drop-mask)
+    set_tests_properties(startup_gfx2hlsl_export_mask_drop_control PROPERTIES WILL_FAIL TRUE)
     add_test(NAME startup_triage_run COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_triage_run_check.py")
     add_test(NAME startup_run_ps1 COMMAND "${INTAKE_PYTHON}" -B
@@ -3147,6 +3238,12 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME cpu_aot_switch_bit_tests COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/cpu/switch_bit_tests_check.py" "$<TARGET_FILE:cpu_register_probe>"
         "$<TARGET_FILE:cpu_switch_bit_tests>" "$<TARGET_FILE:cpu_switch_bit_tests_lifted>")
+    cpu_asm_fixture(cpu_switch_bit_string switch_bit_string)
+    cpu_translation(cpu_switch_bit_string cpu_switch_aot
+        bt16_string,bt32_string,bt64_string,bts16_string,bts32_string,bts64_string,btr16_string,btr32_string,btr64_string,btc16_string,btc32_string,btc64_string,bt64_dead,btc64_alias)
+    add_test(NAME cpu_aot_switch_bit_string COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/switch_bit_string_check.py"
+        "$<TARGET_FILE:cpu_switch_bit_string>" "$<TARGET_FILE:cpu_switch_bit_string_lifted>")
     cpu_asm_fixture(cpu_switch_bit_counts switch_bit_counts)
     cpu_translation(cpu_switch_bit_counts cpu_switch_aot
         popcnt16_reg,popcnt16_mem,popcnt32_reg,popcnt32_mem,popcnt64_reg,popcnt64_mem,lzcnt16_reg,lzcnt16_mem,lzcnt32_reg,lzcnt32_mem,lzcnt64_reg,lzcnt64_mem,tzcnt16_reg,tzcnt16_mem,tzcnt32_reg,tzcnt32_mem,tzcnt64_reg,tzcnt64_mem,jcc_tzcnt_b,jcc_lzcnt_e,jcc_popcnt_ne,cmov_counts)
@@ -3931,6 +4028,27 @@ if(EXISTS "${INTAKE_PYTHON}")
         "$<TARGET_FILE:cpu_vex_words_original>" "$<TARGET_FILE:cpu_vex_words_original_lifted>"
         "$<TARGET_FILE:cpu_vex_words_altered>" "$<TARGET_FILE:cpu_vex_words_altered_lifted>")
     set_tests_properties(cpu_aot_vex_words PROPERTIES SKIP_RETURN_CODE 77)
+    set(cpu_seg_inspect_exports
+        "lar_reg16,lar_reg32,lar_reg64,lar_mem16,lar_mem32_disp,lar_mem64_disp,"
+        "lsl_reg16,lsl_reg32,lsl_reg64,lsl_mem16,lsl_mem32_disp,lsl_mem64_disp,"
+        "verr_reg,verw_reg,verr_mem_disp,verw_mem_disp,"
+        "seg_imm_select,seg_flags_preserve,seg_cmov32,seg_discarded_read")
+    string(CONCAT cpu_seg_inspect_exports ${cpu_seg_inspect_exports})
+    foreach(variant IN ITEMS original altered)
+        cpu_asm_fixture(cpu_seg_inspect_${variant} seg_inspect)
+        cpu_translation(cpu_seg_inspect_${variant} cpu_seg_inspect_aot "${cpu_seg_inspect_exports}")
+    endforeach()
+    target_compile_definitions(cpu_seg_inspect_altered PRIVATE ALTER_IMM)
+    add_test(NAME cpu_aot_seg_inspect COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/seg_inspect_check.py"
+        "$<TARGET_FILE:cpu_seg_inspect_original>"
+        "$<TARGET_FILE:cpu_seg_inspect_original_lifted>"
+        "$<TARGET_FILE:cpu_seg_inspect_altered>"
+        "$<TARGET_FILE:cpu_seg_inspect_altered_lifted>"
+        "${CMAKE_CXX_COMPILER}")
+    set_tests_properties(cpu_aot_seg_inspect PROPERTIES
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/cpu_aot_seg_inspect.txt")
     cpu_asm_fixture(cpu_bink_heap bink_heap)
     add_library(cpu_bink_heap_provider SHARED tests/cpu/bink_heap_provider.cpp src/era_heap.cpp)
     target_include_directories(cpu_bink_heap_provider PRIVATE src)
@@ -6664,10 +6782,18 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${CMAKE_SOURCE_DIR}/tests/compute_store_check.py" draw-ff1-exec "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
         set_tests_properties(compute_store_aot_ff1_exec_${adapter} PROPERTIES TIMEOUT 45)
+        add_test(NAME compute_store_aot_ff1_scalar_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/compute_store_check.py" draw-ff1-scalar "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(compute_store_aot_ff1_scalar_${adapter} PROPERTIES TIMEOUT 45)
         add_test(NAME compute_store_aot_vadd_nc_i32_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/compute_store_check.py" draw-vadd_nc_i32 "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
         set_tests_properties(compute_store_aot_vadd_nc_i32_${adapter} PROPERTIES TIMEOUT 45)
+        add_test(NAME compute_store_aot_salu_i32_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/compute_store_check.py" draw-salu_i32 "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(compute_store_aot_salu_i32_${adapter} PROPERTIES TIMEOUT 45)
         add_test(NAME compute_store_aot_mubuf_reduction_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/compute_store_check.py" draw-mubuf-reduction "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
@@ -6777,6 +6903,11 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${CMAKE_SOURCE_DIR}/tests/compute_mimg_float_store_check.py" --draw "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
         set_tests_properties(compute_store_aot_gfx1013_image_store_${adapter} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
+        add_test(NAME compute_store_aot_gfx1013_image_atomics_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/compute_image_atomics_gfx1013_check.py" --draw "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(compute_store_aot_gfx1013_image_atomics_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77
+            ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/compute_store_aot_gfx1013_image_atomics_${adapter}.txt")
         add_test(NAME compute_store_aot_mimg_store_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/compute_store_check.py" draw-mimg-store "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
@@ -6867,6 +6998,11 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${CMAKE_SOURCE_DIR}/tests/compute_store_check.py" draw-mubuf-format-store-xyz "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
         set_tests_properties(compute_store_aot_mubuf_store_format_xyz_${adapter} PROPERTIES TIMEOUT 45 SKIP_RETURN_CODE 77)
+        add_test(NAME compute_store_aot_descriptor_store_format_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/compute_store_check.py" draw-descriptor-store-format "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(compute_store_aot_descriptor_store_format_${adapter} PROPERTIES TIMEOUT 60
+            SKIP_RETURN_CODE 77)
         add_test(NAME compute_store_aot_mtbuf_store_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/compute_store_check.py" draw-mtbuf-store "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})

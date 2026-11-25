@@ -16,13 +16,17 @@ from tools.frosty_gpu_guest import run_gpu_guest
 def sha(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
+def signed(value):
+    return value if value < 0x80000000 else value - 0x100000000
+
 def reference(width, op, selectors, lane, bias, rhs):
     values=[]
     for i in range(width):
         source=(i//8)*8+selectors[i%8]
         a=source ^ bias
         value={"add":lambda:(a+rhs)&0xffffffff,
-               "and":lambda:a&rhs,"or":lambda:a|rhs,
+               "and":lambda:a&rhs,"or":lambda:a|rhs,"xor":lambda:a^rhs,
+               "smin":lambda:min(a,rhs,key=signed),"smax":lambda:max(a,rhs,key=signed),
                "min":lambda:min(a,rhs),"max":lambda:max(a,rhs)}[op]()
         values.append(value)
     if lane>=0:
@@ -36,11 +40,12 @@ def cases():
     controls=[(1,0,3,2,5,4,7,6),(7,6,5,4,3,2,1,0),
               (0,0,0,0,7,7,7,7),tuple(rng.randrange(8) for _ in range(8))]
     for width,lane in ((32,-1),(32,31),(64,-1)):
-        for op in ("add","and","or","min","max"):
+        for op in ("add","and","or","min","max","smin","smax","xor"):
             for i,sel in enumerate(controls):
                 bias=(0,0xfffffff0,0x80000000,0x55555555)[i]
                 rhs=(16,0xfffffff0,0x7fffffff,0x5555555a)[i]
-                yield width,op,sel,lane,bias,rhs
+                for fi in (0,1):
+                    yield width,op,sel,lane,bias,rhs,fi
 
 def main(argv=None):
     ap=argparse.ArgumentParser(description=__doc__)
@@ -54,16 +59,16 @@ def main(argv=None):
     rows=[];expected={}
     with TemporaryDirectory(dir=a.work) as tmp:
         trial=Path(tmp)
-        for i,(width,op,sel,lane,bias,rhs) in enumerate(cases()):
+        for i,(width,op,sel,lane,bias,rhs,fi) in enumerate(cases()):
             name=f"dpp{i:03}"
             control=sum(v<<(3*j) for j,v in enumerate(sel))
-            source=subprocess.check_output([a.emitter,str(width),op,f"{control:x}",str(lane),f"{bias:x}",f"{rhs:x}"],text=True,timeout=15)
+            source=subprocess.check_output([a.emitter,str(width),op,f"{control:x}",str(lane),f"{bias:x}",f"{rhs:x}",str(fi)],text=True,timeout=15)
             hlsl=trial/(name+".hlsl");hlsl.write_text(source)
             blob=trial/(name+".cso")
             subprocess.run([a.dxc,"-T","cs_6_0","-E","main","-O3","-Fo",blob,hlsl],check=True,capture_output=True,timeout=30)
             subprocess.run([a.dxv,blob],check=True,capture_output=True,timeout=30)
             expected[name]=reference(width,op,sel,lane,bias,rhs)
-            rows.append(dict(case=name,width=width,operation=op,selectors=sel,lane=lane,bias=bias,rhs=rhs,dxil_sha256=sha(blob)))
+            rows.append(dict(case=name,width=width,operation=op,selectors=sel,lane=lane,bias=bias,rhs=rhs,fi=fi,dxil_sha256=sha(blob)))
         (trial/"cases.txt").write_text("".join(f"{n} 0 raw 1\n" for n in expected))
         exe,status,fields=run_gpu_guest(ROOT/"tools/reference/independent-shaders/compute.cpp",
                 "dpp8-exchange.exe",trial,a.work,a.proton,a.prefix,a.provider,a.compiler_dir,

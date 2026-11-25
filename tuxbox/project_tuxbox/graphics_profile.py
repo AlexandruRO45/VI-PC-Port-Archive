@@ -34,7 +34,10 @@ def choose_profile(env):
     if not sys.stdin.isatty():
         raise ValueError("Use --graphics-profile in a non-interactive session")
     print(f"1. {PROFILES['packaged']}\n2. {PROFILES['series-s']} using a temporary prefix")
-    answer = input("Graphics profile [1, 2, or q] ").strip().lower()
+    try:
+        answer = input("Graphics profile [1, 2, or q] ").strip().lower()
+    except EOFError:
+        return None
     if answer == "q":
         return None
     if answer in ("", "1", "2"):

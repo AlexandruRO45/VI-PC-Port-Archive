@@ -4,11 +4,22 @@
 
 Ce guide explique comment installer et lancer le projet, et tout ce qu'il faut installer pour refaire nos essais sur le build Xbox Series 1.0.2.1 de GTA VI, jusqu'au point où nous en sommes : la première cinématique. Il ne fournit pas le jeu et n'explique pas comment l'obtenir : vous apportez votre propre copie. Ne mettez jamais de fichier du jeu dans ce dépôt et ne les joignez à aucune issue.
 
-Le lancement passe par [VIctory](https://github.com/Marvisak/VIctory) (Marvisak, GPL-3.0 ou ultérieure), suivi ici comme sous-module `third_party/victory`, épinglé sur la branche `anyxboxx/fork-7b0-lot8` du fork du mainteneur [LooperSalty/victory](https://github.com/LooperSalty/victory), qui assemble le fork [fxceless/victory-fork](https://github.com/fxceless/victory-fork) (GPL-3.0) au commit `7b0f736` et huit de ses pull requests (voir plus bas), au commit `d138351`. Le script `tools/lancer_victory.ps1` le compile et le lance sur votre dossier du jeu.
+Le lancement passe par [VIctory](https://github.com/Marvisak/VIctory) (Marvisak, GPL-3.0 ou ultérieure), suivi ici comme sous-module `third_party/victory`, épinglé sur la branche `anyxboxx/fork-7b0-lot8-xg` du fork du mainteneur [LooperSalty/victory](https://github.com/LooperSalty/victory), qui assemble le fork [fxceless/victory-fork](https://github.com/fxceless/victory-fork) (GPL-3.0) au commit `7b0f736` et huit de ses pull requests plus un commit à nous (disposition optionnelle des textures par la bibliothèque de Microsoft, voir plus bas), au commit `19feca8`. Le script `tools/lancer_victory.ps1` le compile et le lance sur votre dossier du jeu.
 
-## Branche épinglée : lot 5 plus une pull request (25 novembre)
+## Branche épinglée : lot 8 plus la bibliothèque de disposition des textures de Microsoft (25 novembre)
 
-`third_party/victory` pointe maintenant sur la branche `anyxboxx/fork-7b0-lot8` du fork VIctory du mainteneur [LooperSalty/victory](https://github.com/LooperSalty/victory), au commit `d138351de32f860ab9df1aa1aa736fce0a40365e`. C'est le lot 5 (plus bas) plus une pull request du fork [fxceless/victory-fork](https://github.com/fxceless/victory-fork), reprise avec `cherry-pick -x` :
+`third_party/victory` pointe maintenant sur la branche `anyxboxx/fork-7b0-lot8-xg` de [LooperSalty/victory](https://github.com/LooperSalty/victory), au commit `19feca8650c934913063076b612e87739d8d1912` : le lot 8 (plus bas) plus un commit à nous, `xg: serve or check the title from Microsoft's own xg_xs.dll (local copy)`. Sans `VICTORY_XG_DLL`, le code tourne exactement comme le lot 8.
+
+Le jeu demande à la bibliothèque de disposition des textures de la console (`xg_xs.dll` : `XGSuggestSwizzleMode`, `XGCreateTextureComputer`) où se trouvent chaque mip et chaque tranche. VIctory répond avec sa propre réimplémentation. Le GDK fournit une version PC hors ligne de cette bibliothèque ; avec votre propre copie, `tools/lancer_victory.ps1 -XgDll <chemin de xg_xs.dll>` la laisse répondre à la place. La DLL est un fichier du GDK : elle n'entre jamais dans ce dépôt, le lanceur ne transmet que son chemin.
+
+Mesuré ou observé par le mainteneur (Windows 11, RTX 4070 Super, journaux VIctory, 25 novembre, vers 00:37 et 00:42), réglages du lanceur de `main` :
+
+- `-XgMode compare` (dispositions de VIctory, chaque écart journalisé une fois) : 84 descriptions de textures diffèrent, toutes des textures 64 Kio D (`layout` `0x10a`, quelques `0x105`). La bibliothèque annonce les mips de queue dans le mode parent (10) avec une position dans la queue ; VIctory annonce `256B_D` (2) sans position. Tailles, offsets et pas identiques. Le tuilage 64 Kio liste toutes les tranches d'un tableau avec queue de mips (VIctory s'arrête à deux). Aucun écart sur les modes suggérés ni sur les octets tuilés des copies CPU. Mesuré.
+- `-XgMode real` (par défaut avec `-XgDll`) : 5,4 à 7,1 fps en fin d'essai contre 5,1 à 5,6, environ 6 080 draws par image, pas de perte du périphérique en environ 3 min 40 ; jugé par le mainteneur comme le meilleur essai à ce jour. Mesuré, puis observé.
+
+## Épinglage précédent : lot 5 plus une pull request (25 novembre)
+
+`third_party/victory` pointait sur la branche `anyxboxx/fork-7b0-lot8` du fork VIctory du mainteneur [LooperSalty/victory](https://github.com/LooperSalty/victory), au commit `d138351de32f860ab9df1aa1aa736fce0a40365e`. C'est le lot 5 (plus bas) plus une pull request du fork [fxceless/victory-fork](https://github.com/fxceless/victory-fork), reprise avec `cherry-pick -x` :
 
 | Pull request du fork | Auteur | Effet | Commit |
 | --- | --- | --- | --- |
@@ -190,6 +201,8 @@ Le script règle les variables ci-dessous (sauf avec `-NoTunedSettings`, qui ne 
 Les anciennes valeurs par défaut `VICTORY_RT_MISS`, `VICTORY_WAVE32_READFIRSTLANE`, `VICTORY_WAVE32_CROSSLANE`, `VICTORY_SKIP_BVH_BUILDER` et `VICTORY_CAPPED_DYNAMIC` sont retirées : aucun fichier du commit épinglé ne les lit (le constructeur BVH est coupé sauf avec `VICTORY_BVH_BUILDER=1`). `tests/test_lanceur_victory.py` vérifie maintenant que VIctory lit chaque variable posée par le lanceur.
 
 `-Dred` pose `VICTORY_D3D12_DRED=1` (données de périphérique perdu) pour diagnostiquer une perte du périphérique. Il est coupé par défaut : VIctory l'active dès que la variable existe, et il note chaque opération des listes de commandes, ce qui ralentit chaque image.
+
+`-XgDll <chemin de xg_xs.dll>` pose `VICTORY_XG_DLL` : votre propre copie de la bibliothèque PC hors ligne de disposition des textures du GDK dispose les textures du jeu (voir la branche épinglée plus haut). `-XgMode compare` (`VICTORY_XG_MODE`) garde à la place les dispositions de VIctory et journalise chaque écart avec la bibliothèque ; `real` est la valeur par défaut. Ne copiez jamais la DLL dans ce dépôt.
 
 Le premier lancement à froid peut planter pendant la compilation des pipelines : relancez une fois le cache rempli.
 

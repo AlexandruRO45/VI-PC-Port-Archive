@@ -13,7 +13,9 @@ pub(super) const DPP8_EXCHANGE: u32 = 0x7fe7;
 /// No branch, EXEC modification, early return, LDS or unknown operands.
 /// Static descriptor loads and a single terminal store can be admitted;
 /// the main emitter still resolves their resource and address metadata.
-/// Each DPP8 source lane remains inside the group; constant readlane is
+/// DPP8 FI=0 and FI=1 are equivalent here: every selected source lane
+/// is active, and no instruction may change EXEC. Each source stays within
+/// its octet. Constant readlane is
 /// only allowed at 32 threads where wave32/wave64 agree for lanes 0..31.
 pub(super) fn straight_exchange(insns: &mut [Insn], group: [u32; 3]) -> bool {
     if !matches!(group, [32, 1, 1] | [64, 1, 1]) || insns.len() > 4096
@@ -28,11 +30,12 @@ pub(super) fn straight_exchange(insns: &mut [Insn], group: [u32; 3]) -> bool {
         if stored && !matches!(i.mnemonic.as_str(), "s_waitcnt" | "s_nop" | "s_endpgm") {
             return false;
         }
-        if i.enc == Enc::Vop2 && i.src.first() == Some(&Opnd::Raw(233)) {
+        if i.enc == Enc::Vop2 && matches!(i.src.first(), Some(Opnd::Raw(233 | 234))) {
             if !matches!(i.mnemonic.as_str(), "v_add_nc_u32" | "v_and_b32" |
-                "v_or_b32" | "v_min_u32" | "v_max_u32")
+                "v_or_b32" | "v_xor_b32" | "v_min_u32" | "v_max_u32" |
+                "v_min_i32" | "v_max_i32")
                 || !matches!(i.dst[..], [Opnd::Vgpr(_)])
-                || !matches!(i.src[..], [Opnd::Raw(233), Opnd::Vgpr(_)])
+                || !matches!(i.src[..], [Opnd::Raw(233 | 234), Opnd::Vgpr(_)])
                 || i.raw.len() != 2 { return false; }
             found = true;
         } else if i.mnemonic == "v_readlane_b32" {
@@ -63,7 +66,7 @@ pub(super) fn straight_exchange(insns: &mut [Insn], group: [u32; 3]) -> bool {
     }
     if !found { return false; }
     for i in insns {
-        if i.enc == Enc::Vop2 && i.src.first() == Some(&Opnd::Raw(233)) {
+        if i.enc == Enc::Vop2 && matches!(i.src.first(), Some(Opnd::Raw(233 | 234))) {
             let control = i.raw[1];
             i.op = DPP8_EXCHANGE;
             i.src[0] = Opnd::Vgpr(control as u8);
@@ -450,6 +453,65 @@ fn uniform_forward_guard(
 /// The branch emitter predicates regions per host invocation. HLSL lane reads
 /// require the source invocation to participate, including lane zero when guest
 /// EXEC has masked it. A branch around or into the region can violate that.
+/// Whole-wave forward skip. Either a proven scalar/unconditional skip, or
+/// an EXEC-empty skip of a masked full-mask region. The EXEC-empty case is
+/// only sound when the region's prologue actually verified itself as a
+/// masked (self-contained) full-mask reduction; otherwise the region would
+/// run with a partial mask and stale values.
+fn execz_forward_guard(
+    insns: &[Insn],
+    branch_index: usize,
+    region_start: usize,
+    reduction_end: usize,
+    first: usize,
+    operation: &str,
+    verified_reads: &[usize],
+) -> bool {
+    let branch = &insns[branch_index];
+    if branch.op == 8 {
+        let masked = masked_identity(operation)
+            .map(|id| masked_prologue(insns, first, id).is_some())
+            .unwrap_or(false);
+        if !masked {
+            return false;
+        }
+        let pc = branch.offset as i64;
+        let target = pc + 4 + 4 * branch.aux.imm;
+        if target <= reduction_end as i64 {
+            return false;
+        }
+        // Branches between the guard and the region whose edges skip or
+        // enter the region (or lands exactly at the region start) are
+        // non-uniform and would make the whole-wave reduction execute
+        // partially. Anything else in the window is a local conditional that
+        // cannot skip the region; branches after the region are independent
+        // of its execution (the guard skips it wholesale). Indirect edges
+        // are never statically bounded.
+        for (index, op) in insns.iter().enumerate() {
+            if index == branch_index {
+                continue;
+            }
+            if matches!(op.mnemonic.as_str(),
+                "s_setpc_b64" | "s_swappc_b64" | "s_call_b64" | "s_rfe_b64" | "s_trap")
+            {
+                return false;
+            }
+            if op.enc == Enc::Sopp && (Emitter::branch_cond(op.op).is_some() || op.op == 1) {
+                let from = op.offset as i64;
+                if from < pc || from >= region_start as i64 {
+                    continue;
+                }
+                let target_edge = from + 4 + 4 * op.aux.imm;
+                if target_edge >= region_start as i64 {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+    uniform_forward_guard(insns, branch_index, reduction_end, verified_reads)
+}
+
 pub(super) fn check_control_flow(insns: &[Insn], width: u32) -> Result<(), String> {
     let mut verified_reads = Vec::new();
     for (first, ins) in insns.iter().enumerate() {
@@ -481,9 +543,9 @@ pub(super) fn check_control_flow(insns: &[Insn], width: u32) -> Result<(), Strin
             }
             if Emitter::branch_cond(branch.op).is_some() {
                 let target = pc + 4 + 4 * branch.aux.imm;
-                if ((pc < start && target > start) || (pc > end && target <= end)
+                if ((pc < start && target >= start) || (pc > end && target <= end)
                     || (pc >= start && pc <= end))
-                    && !(pc < start && uniform_forward_guard(insns, branch_index, end as usize, &verified_reads))
+                    && !(pc < start && execz_forward_guard(insns, branch_index, start as usize, end as usize, first, &ins.mnemonic, &verified_reads))
                 {
                     return Err(format!(
                         "wave reduction at {start:#x} may execute in divergent control flow"
@@ -655,6 +717,46 @@ mod tests {
 
     fn compare(src: Vec<Opnd>) -> Insn {
         insn("s_cmp_eq_u32", Enc::Sopc, 6, vec![], src)
+    }
+
+    // Synthetic self-contained masked reduction: save EXEC, force the full
+    // mask, CNDMASK-neutralize inactive lanes, DPP shape, readlane, restore.
+    // Mirrors the shape lower() accepts but is only control-flow shaped
+    // enough for check_control_flow.
+    fn masked_reduction(width: u32, result: u8) -> Vec<Insn> {
+        let save_mnemonic = if width == 32 {
+            "s_or_saveexec_b32"
+        } else {
+            "s_or_saveexec_b64"
+        };
+        let and_mnemonic = if width == 32 { "s_and_b32" } else { "s_and_b64" };
+        let mut ops = vec![
+            insn(save_mnemonic, Enc::Sop1, 0, vec![Opnd::Sgpr(8)], vec![Opnd::ConstInt(-1)]),
+            insn(and_mnemonic, Enc::Sop1, 0, vec![Opnd::Sgpr(9)], vec![Opnd::Sgpr(7), Opnd::Sgpr(8)]),
+            insn("v_cndmask_b32", Enc::Vop2, 0, vec![Opnd::Vgpr(1)], vec![Opnd::ConstInt(0), Opnd::Vgpr(1), Opnd::Sgpr(9)]),
+            insn("v_or_b32", Enc::Vop2, DPP_REDUCE, vec![Opnd::Vgpr(1)], vec![Opnd::Vgpr(1)]),
+            insn("v_or_b32", Enc::Vop2, DPP_REDUCE, vec![Opnd::Vgpr(1)], vec![Opnd::Vgpr(1)]),
+            insn("v_or_b32", Enc::Vop2, DPP_REDUCE, vec![Opnd::Vgpr(1)], vec![Opnd::Vgpr(1)]),
+            insn("v_or_b32", Enc::Vop2, DPP_REDUCE, vec![Opnd::Vgpr(1)], vec![Opnd::Vgpr(1)]),
+            insn("v_permlanex16_b32", Enc::Vop1, 0, vec![Opnd::Vgpr(2)], vec![Opnd::Vgpr(1), Opnd::ConstInt(0), Opnd::ConstInt(0)]),
+            insn("v_or_b32", Enc::Vop2, 0, vec![Opnd::Vgpr(1)], vec![Opnd::Vgpr(2), Opnd::Vgpr(1)]),
+        ];
+        for (index, step) in [(4, 1), (5, 2), (6, 3)] {
+            ops[index].aux.imm = step;
+        }
+        if width == 32 {
+            ops.push(insn("v_readlane_b32", Enc::Vop3, READ_LANE,
+                          vec![Opnd::Sgpr(result)], vec![Opnd::Vgpr(1), Opnd::ConstInt(0)]));
+            ops.push(insn("s_mov_b32", Enc::Sop1, 0, vec![Opnd::ExecLo], vec![Opnd::Sgpr(8)]));
+        } else {
+            ops.push(insn("v_readlane_b32", Enc::Vop3, READ_LANE,
+                          vec![Opnd::Sgpr(result)], vec![Opnd::Vgpr(1), Opnd::ConstInt(32)]));
+            ops.push(insn("v_or_b32", Enc::Vop2, 0, vec![Opnd::Vgpr(1)], vec![Opnd::Sgpr(result), Opnd::Vgpr(1)]));
+            ops.push(insn("v_readlane_b32", Enc::Vop3, READ_LANE,
+                          vec![Opnd::Sgpr(result)], vec![Opnd::Vgpr(1), Opnd::ConstInt(0)]));
+            ops.push(insn("s_mov_b64", Enc::Sop1, 0, vec![Opnd::ExecLo], vec![Opnd::Sgpr(8)]));
+        }
+        ops
     }
 
     // Synthetic input to the control-flow pass, after the exact DPP
@@ -925,6 +1027,105 @@ mod tests {
     }
 
     #[test]
+    fn execz_forward_skip_accepts_self_contained_region() {
+        // EXEC-empty skip: every lane takes the skip and the region never
+        // runs; otherwise the region forces the full mask via its saved-EXEC
+        // prologue, so the reduction runs cooperatively for the whole wave.
+        for width in [32, 64] {
+            let mut ops = vec![nop(), branch(8)];
+            ops.extend(masked_reduction(width, 7));
+            let after = ops.len();
+            ops.push(nop());
+            edge(&mut ops, 1, after, 8);
+            assert!(check_control_flow(&ops, width).is_ok());
+        }
+    }
+
+    #[test]
+    fn execz_forward_skip_rejects_bypass_and_reentry() {
+        for width in [32, 64] {
+            let mut ops = vec![nop(), branch(8)];
+            ops.extend(masked_reduction(width, 7));
+            let after = ops.len();
+            ops.push(nop());
+            edge(&mut ops, 1, after, 8);
+            assert!(check_control_flow(&ops, width).is_ok());
+            // Another branch enters the skipped interval after the guard.
+            edge(&mut ops, 0, 2, 8);
+            assert!(check_control_flow(&ops, width).is_err());
+            // A backward edge from after the region re-enters it.
+            let mut ops = vec![nop(), branch(8)];
+            ops.extend(masked_reduction(width, 7));
+            let after = ops.len();
+            ops.push(nop());
+            edge(&mut ops, 1, after, 8);
+            edge(&mut ops, after, 2, 8);
+            assert!(check_control_flow(&ops, width).is_err());
+        }
+    }
+
+    #[test]
+    fn execz_forward_skip_rejects_indirect_edges() {
+        let mut ops = vec![nop(), branch(8)];
+        ops.extend(masked_reduction(32, 7));
+        let after = ops.len();
+        ops.push(nop());
+        edge(&mut ops, 1, after, 8);
+        assert!(check_control_flow(&ops, 32).is_ok());
+        // An indirect edge is never statically bounded.
+        ops[2] = insn("s_setpc_b64", Enc::Sop1, 0, vec![], vec![]);
+        assert!(check_control_flow(&ops, 32).is_err());
+    }
+
+    #[test]
+    fn execz_forward_skip_rejects_unmasked_region() {
+        // Only the masked full-mask form is convergent under partial EXEC;
+        // a region without the saved-EXEC CNDMASK prologue must be refused
+        // even with an execz skip guard.
+        for width in [32, 64] {
+            let mut ops = vec![nop(), branch(8)];
+            ops.extend(reduction(width, 7));
+            let after = ops.len();
+            ops.push(nop());
+            edge(&mut ops, 1, after, 8);
+            assert!(check_control_flow(&ops, width).is_err());
+        }
+    }
+
+    #[test]
+    fn execz_forward_skip_accepts_tail_branch_after_region() {
+        // A local forward branch inside the skip window that starts and
+        // resolves after the region cannot bypass or enter the region; the
+        // region itself is convergent because it forces the full mask.
+        for width in [32, 64] {
+            let mut ops = vec![nop(), branch(8)];
+            ops.extend(masked_reduction(width, 7));
+            let tail = ops.len();
+            ops.push(insn("s_cbranch_scc0", Enc::Sopp, 4, vec![], vec![]));
+            ops.push(nop());
+            ops.push(nop());
+            let end = ops.len();
+            edge(&mut ops, 1, end, 8);
+            edge(&mut ops, tail, tail + 2, 4);
+            assert!(check_control_flow(&ops, width).is_ok());
+        }
+    }
+
+    #[test]
+    fn execz_forward_skip_rejects_branch_skipping_the_region() {
+        // A second branch inside the skip interval that skips (or lands on)
+        // the region would bypass its whole-wave execution.
+        for width in [32, 64] {
+            let mut ops = vec![nop(), branch(8), nop()];
+            ops.extend(masked_reduction(width, 7));
+            let end = ops.len();
+            edge(&mut ops, 1, end, 8);
+            edge(&mut ops, 2, 3, 4);
+            assert!(check_control_flow(&ops, width).is_err());
+        }
+    }
+
+    #[test]
     fn alternate_entry_and_loop_edges_invalidate_uniform_guard() {
         let mut ops = vec![nop(), compare(vec![Opnd::ConstInt(0), Opnd::ConstInt(0)]), branch(5)];
         ops.extend(reduction(64, 7));
@@ -947,3 +1148,4 @@ mod tests {
         assert!(check_control_flow(&ops, 64).is_err());
     }
 }
+

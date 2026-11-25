@@ -8,7 +8,7 @@ from project_tuxbox.runtime_shaders import shader_session
 from project_tuxbox.shader_prep import SOURCE_CACHE
 
 
-def run_gpu_guest(source, name, trial, work, proton, prefix_source, provider, compiler_dir, *, vkd3d_dir=None, link_libraries=(), extra_env=None):
+def run_gpu_guest(source, name, trial, work, proton, prefix_source, provider, compiler_dir, *, vkd3d_dir=None, link_libraries=(), extra_env=None, fresh_shader_cache=False, warm_shader_cache=None):
     files = proton / "files"
     tools = Toolchain()
     obj = tools.compile(source, trial, "/W4", "/WX", f"/I{ROOT / 'runtime/d3d12'}")
@@ -16,6 +16,15 @@ def run_gpu_guest(source, name, trial, work, proton, prefix_source, provider, co
     tools.link(exe, obj, "d3d12.lib", "dxgi.lib", "kernel32.lib", *link_libraries)
     prefix = trial / "prefix"
     subprocess.run(["cp", "-a", "--reflink=auto", prefix_source.resolve(), prefix], check=True)
+    if fresh_shader_cache or warm_shader_cache is not None:
+        # Only touch the disposable prefix. Never traverse a linked cache.
+        shader_cache = prefix / SOURCE_CACHE.parent
+        if not shader_cache.resolve().is_relative_to(prefix.resolve()):
+            raise ValueError("shader cache is outside the disposable prefix")
+        if shader_cache.exists():
+            shutil.rmtree(shader_cache)
+        if warm_shader_cache is not None:
+            shutil.copytree(warm_shader_cache, shader_cache / "runtime")
     shutil.copyfile(provider, trial / "d3d12_xs.dll")
     for lib in ("dxcompiler.dll", "dxil.dll"):
         shutil.copyfile(compiler_dir / lib, trial / lib)

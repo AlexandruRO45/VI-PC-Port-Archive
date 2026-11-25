@@ -642,11 +642,20 @@ VOP1_OPS = {
     0x51: ("v_cvt_f16_i16_e32", "Convert int16 to float16"),
     0x52: ("v_cvt_u16_f16_e32", "Convert float16 to uint16"),
     0x53: ("v_cvt_i16_f16_e32", "Convert float16 to int16"),
+    0x54: ("v_rcp_f16_e32", "Reciprocal 1/x float16"),
+    0x55: ("v_sqrt_f16_e32", "Square root sqrt(x) float16"),
+    0x56: ("v_rsq_f16_e32", "Reciprocal square root 1/sqrt(x) float16"),
+    0x57: ("v_log_f16_e32", "Logarithm log2(x) float16"),
+    0x58: ("v_exp_f16_e32", "Exponent 2^x float16"),
+    0x59: ("v_frexp_mant_f16_e32", "Mantissa of float16"),
+    0x5a: ("v_frexp_exp_i16_f16_e32", "Exponent of float16 as int16"),
     0x5b: ("v_floor_f16_e32", "Floor float16"),
     0x5c: ("v_ceil_f16_e32", "Ceiling float16"),
     0x5d: ("v_trunc_f16_e32", "Truncate toward zero float16"),
     0x5e: ("v_rndne_f16_e32", "Round to nearest even float16"),
     0x5f: ("v_fract_f16_e32", "Fractional part float16"),
+    0x60: ("v_sin_f16_e32", "Sine float16"),
+    0x61: ("v_cos_f16_e32", "Cosine float16"),
     0x62: ("v_sat_pk_u8_i16_e32", "Saturate int16 pair to packed uint8"),
     0x63: ("v_cvt_norm_i16_f16_e32", "Convert float16 to normalized int16"),
     0x64: ("v_cvt_norm_u16_f16_e32", "Convert float16 to normalized uint16"),
@@ -2741,9 +2750,13 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
             deriv_addrs = 0
         addr_count = base_addrs + extra_addrs + deriv_addrs
         a16 = (w1 >> 30) & 1
-        packed_load_2d = a16 and op_name == "image_load" and dim_name == "SQ_RSRC_IMG_2D"
-        if packed_load_2d:
-            addr_count = 1  # The two unsigned coordinates share a VGPR.
+        packed_2d = (
+            a16
+            and op_name in ("image_load", "image_sample", "image_sample_lz")
+            and dim_name == "SQ_RSRC_IMG_2D"
+        )
+        if packed_2d:
+            addr_count = 1  # Two 16-bit 2D coordinates share one VGPR.
         d16 = (w1 >> 31) & 1
         # A gather returns the four texels of the selected component whatever the one-hot mask is.
         n_data = 4 if op_name.startswith("image_gather4") else max(1, bin(dmask).count("1"))
@@ -2786,7 +2799,7 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
             mods.append("a16")
         if d16:
             mods.append("d16")
-        if packed_load_2d and nsize:
+        if packed_2d and nsize:
             mods.append("invalid_nsa")  # A single address VGPR requires no NSA extension.
         # Word 0 bits 6 and 14 and word 1 bits 29:26 are reserved on gfx10: LLVM assembles none of them and
         # ignores them when disassembling, so a set bit is surfaced instead of vanishing from the listing.
