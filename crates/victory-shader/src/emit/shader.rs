@@ -10,6 +10,89 @@ mod wave32_tests {
     use super::super::bitcode::Term;
     use super::*;
 
+    #[test]
+    fn default_rescue_builtin_names() {
+        use super::super::bitcode::opt::allows_default_wave32;
+
+        let cases: &[(&[&str], bool)] = &[
+            (&["dx.op.waveGetLaneIndex"], false),
+            (&["dx.op.barrier"], false),
+            (&["dx.op.quadReadLaneAt"], false),
+            (&[], true),
+            (&["dx.op.threadId.i32"], true),
+            (&["dx.op.threadId.i32", "dx.op.waveGetLaneIndex"], false),
+            (&["dx.op.barrier", "dx.op.threadId.i32"], false),
+            (&["quadReadLaneAt.i32"], false),
+            (&["dx.op.waveFutureOp"], false),
+            (&["dx.op.barrierByMemoryType"], false),
+        ];
+        for &(names, allowed) in cases {
+            assert_eq!(
+                allows_default_wave32(names.iter().copied()),
+                allowed,
+                "{names:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn default_rescue_wave_size_and_psv() {
+        // Keep return values live so optimisation cannot erase the tested call.
+        for (name, opcode, expected) in [
+            (Some("waveGetLaneIndex"), 111, 64),
+            (Some("barrier"), 80, 64),
+            (Some("quadReadLaneAt.i32"), 122, 64),
+            (None, 0, 32),
+            (Some("threadId.i32"), 93, 32),
+        ] {
+            let mut s = shader(None, false);
+            let zero = s.m.i32(0);
+            match name {
+                Some("barrier") => {
+                    let mode = s.m.i32(9);
+                    s.op(
+                        s.entry,
+                        "barrier",
+                        Attr::NoDuplicate,
+                        s.t.void,
+                        opcode,
+                        &[mode],
+                    );
+                }
+                Some(name) => {
+                    let args: &[_] = match opcode {
+                        122 => &[zero, zero],
+                        93 => &[zero],
+                        _ => &[],
+                    };
+                    let v = s.op(s.entry, name, Attr::ReadNone, s.t.i32, opcode, args);
+                    let sink = s.m.global("sink", s.t.i32, 3);
+                    s.m.store(s.entry, sink, v);
+                    if expected == 64 {
+                        s.flags |= flags::WAVE_OPS;
+                    }
+                }
+                None => {}
+            }
+            let (dxil, wave, reason) = s.finish_wave(false, false);
+            assert_eq!(wave, Some(expected), "{name:?}");
+            assert_eq!(
+                reason,
+                (expected == 32).then_some("no-wave-intrinsic"),
+                "{name:?}"
+            );
+            let c = crate::dxbc::Container::parse(&dxil).unwrap();
+            let psv = c.part(crate::dxbc::FourCC::PSV0).unwrap().data;
+            for offset in [20, 24] {
+                assert_eq!(
+                    crate::dxbc::u32_at(psv, offset).unwrap(),
+                    expected,
+                    "{name:?}"
+                );
+            }
+        }
+    }
+
     fn shader(call: Option<&str>, live: bool) -> Shader {
         let mut s = Shader::new(false);
         s.threads = Some([64, 1, 1]);
@@ -562,6 +645,17 @@ impl Shader {
     }
 
     /// Decide only after optimisation, before writing both DXIL and PSV metadata.
+    /// Default rescue requires wave64, no indirect exit, and no remaining call
+    /// whose name (after `dx.op.`) starts with `wave`, `quad`, or `barrier`.
+    /// Without wave/quad operations, lane-local work cannot observe wave width;
+    /// splitting it into two waves preserves thread IDs and the thread-group size.
+    /// This assumes no implicit dependence on wave64 lockstep or lane layout.
+    /// LDS barriers (indeed all barriers) and indirect exits block rescue: this
+    /// check cannot establish cross-wave ordering or unseen control-flow effects.
+    /// Barrier-free LDS communication can still rely on lockstep, and derivatives
+    /// can rely on neighbouring/helper lanes. Such assumptions are unsafe to infer
+    /// away from builtin names; this is not a proof of race freedom or derivative
+    /// equivalence, and no additional derivative check is performed here.
     /// The opt-in changes the scope of broadcasts/votes; it does not emulate wave64.
     pub fn finish_wave(
         mut self,
