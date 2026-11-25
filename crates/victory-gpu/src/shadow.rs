@@ -115,6 +115,11 @@ pub(crate) fn copy_compare() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_COPY_COMPARE").is_some_and(|v| v == "1"))
 }
 
+/// Since the last frame-rate line (diagnostics): the 64 KiB pages refreshes
+/// copied from title memory, each once, and the bytes copied in all.
+#[cfg(feature = "diagnostics")]
+pub(crate) static COPIED_PAGES: Mutex<Option<(std::collections::HashSet<usize>, u64)>> = Mutex::new(None);
+
 /// Since the last frame-rate line, with [`copy_compare`]: bytes the title
 /// wrote that a refresh compared, and of them those that held what the
 /// copy held (not put in, not sent up).
@@ -2021,6 +2026,8 @@ impl Shadow {
                 if differs != 0 {
                     crate::watch::writing(start + at, n);
                     crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+                    #[cfg(feature = "diagnostics")]
+                    crate::watch::ours(start + at, n);
                     written += n;
                 }
             }
@@ -2110,6 +2117,8 @@ impl Shadow {
         }
         crate::watch::writing(start + at, n);
         crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+        #[cfg(feature = "diagnostics")]
+        crate::watch::ours(start + at, n);
         n
     }
 
@@ -2521,6 +2530,13 @@ impl Shadow {
     fn copy(&self, from: usize, to: usize) -> usize {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (from.max(start), to.min(end));
+        #[cfg(feature = "diagnostics")]
+        if from < to {
+            let mut c = COPIED_PAGES.lock().unwrap_or_else(|e| e.into_inner());
+            let (pages, bytes) = c.get_or_insert_with(|| (std::collections::HashSet::new(), 0));
+            pages.extend(from / crate::watch::PAGE..to.div_ceil(crate::watch::PAGE));
+            *bytes += (to - from) as u64;
+        }
         if from < to && copy_compare() {
             return self.copy_compared(from, to);
         }
@@ -2682,6 +2698,8 @@ impl Shadow {
             if differs != 0 {
                 crate::watch::writing(start + at, n);
                 crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+                #[cfg(feature = "diagnostics")]
+                crate::watch::ours(start + at, n);
                 written = n;
             }
         } else {
@@ -2767,6 +2785,8 @@ impl Shadow {
         }
         crate::watch::writing(start + at, n);
         crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+        #[cfg(feature = "diagnostics")]
+        crate::watch::ours(start + at, n);
         n
     }
 }
