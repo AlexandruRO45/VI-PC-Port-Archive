@@ -290,12 +290,14 @@ extern "system" fn present(
         && let Some(host) = crate::host::host()
     {
         const COPY_SOURCE: u32 = 0x800;
-        let state = crate::resource::host_transition(resource, COPY_SOURCE)
-            .map_or(COPY_SOURCE, |(_, before)| before);
-        let shown = host.present(texture, state, frame);
-        crate::resource::host_transition(resource, state);
+        // `None`: already in COPY_SOURCE, nothing to move.
+        let before = crate::resource::host_transition(resource, COPY_SOURCE).map(|(_, b)| b);
+        let shown = host.present(texture, before, frame);
+        if let Some(before) = before {
+            crate::resource::host_transition(resource, before);
+        }
         #[cfg(feature = "diagnostics")]
-        blinks(frame, resource, state, shown);
+        blinks(frame, resource, before.unwrap_or(COPY_SOURCE), shown);
         #[cfg(not(feature = "diagnostics"))]
         let _ = shown;
     }
