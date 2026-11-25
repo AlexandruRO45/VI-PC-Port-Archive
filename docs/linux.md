@@ -27,7 +27,14 @@ the views in a tree instead. On an RTX 5080 with proton-cachyos 11.0 a
 world frame took about 4.0 s with the stock server and about 1.0 s with
 the patched one; testers in #340 report similar gains.
 
-`tools/wine/` builds it and makes a Proton copy that uses it:
+ajsem1337 has proposed the change to Wine itself
+([Wine bug 60868](https://bugs.winehq.org/show_bug.cgi?id=60868)) and to
+wine-cachyos ([CachyOS/wine-cachyos#50](https://github.com/CachyOS/wine-cachyos/pull/50)).
+Once a Proton release ships it (for proton-cachyos, a release after that
+pull request is merged; check its release notes), that Proton's own
+wineserver already keeps views in a tree and none of the following is
+needed. Until then, `tools/wine/` builds the patched server and makes a
+Proton copy that uses it:
 
 ```sh
 # The Wine source of the exact Proton release you run (here: proton-cachyos 11.0).
