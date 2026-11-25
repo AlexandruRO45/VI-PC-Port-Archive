@@ -20,6 +20,9 @@ use crate::object::{HRESULT, S_FALSE, S_OK, This};
 const TIMEOUT: HRESULT = S_FALSE;
 /// The frame-origin event: the one that starts frames and makes tokens.
 const ORIGIN: u32 = 0;
+/// The event a title can wait for before presenting.
+#[cfg(any(windows, test))]
+const FLIP: u32 = 2;
 /// Make the frame's token even if the wait times out (the title starts the
 /// frame early).
 const TOKEN_ON_TIMEOUT: u32 = 2;
@@ -30,6 +33,15 @@ struct Clock {
     interval: Duration,
     /// The tick number at `start` (ticks go on across interval changes).
     first: u64,
+    #[cfg(any(windows, test))]
+    flip_wait: FlipWait,
+}
+
+#[cfg(any(windows, test))]
+enum FlipWait {
+    Unused,
+    Ready,
+    Consumed,
 }
 
 static CLOCK: Mutex<Option<Clock>> = Mutex::new(None);
@@ -64,6 +76,8 @@ pub(crate) extern "system" fn set_interval(
         start: Instant::now(),
         interval,
         first,
+        #[cfg(any(windows, test))]
+        flip_wait: FlipWait::Unused,
     });
     S_OK
 }
@@ -103,7 +117,13 @@ fn next_tick(kind: u32, limit: Duration) -> (u64, Duration) {
         start: Instant::now(),
         interval: SIXTIETH,
         first: 0,
+        #[cfg(any(windows, test))]
+        flip_wait: FlipWait::Unused,
     });
+    take_tick(c, kind, limit)
+}
+
+fn take_tick(c: &Clock, kind: u32, limit: Duration) -> (u64, Duration) {
     let elapsed = c.start.elapsed().as_nanos();
     let interval = c.interval.as_nanos().max(1);
     let tick =
@@ -138,6 +158,12 @@ pub(crate) extern "system" fn wait(
         TIMEOUT
     } else {
         std::thread::sleep(wait);
+        #[cfg(any(windows, test))]
+        if kind == FLIP
+            && let Some(c) = clock().as_mut()
+        {
+            c.flip_wait = FlipWait::Ready;
+        }
         S_OK
     };
     // A frame begun on a time-out takes no tick: its flip still does.
@@ -161,6 +187,26 @@ pub(crate) extern "system" fn wait(
         "frame wait"
     );
     hr
+}
+
+/// Pace catch-up presents in a title that has used a blocking flip wait.
+/// With no new wait, reserve the next flip tick under the same lock as
+/// an explicit wait, then release the lock before sleeping.
+#[cfg(any(windows, test))]
+pub(crate) fn before_present() {
+    let wait = {
+        let mut clock = clock();
+        let Some(c) = clock.as_mut() else { return };
+        match c.flip_wait {
+            FlipWait::Unused => return,
+            FlipWait::Ready => {
+                c.flip_wait = FlipWait::Consumed;
+                return;
+            }
+            FlipWait::Consumed => take_tick(c, FLIP, Duration::MAX).1,
+        }
+    };
+    std::thread::sleep(wait);
 }
 
 /// Device method: no statistics are kept, so none are returned.
@@ -209,10 +255,17 @@ mod tests {
         // The title's loop (the clock is global, so in the same test): an
         // origin poll that times out (and starts the frame), then a
         // blocking flip wait. Each flip takes its own tick.
-        const FLIP: u32 = 2;
         // 50 ms ticks: a thread woken 15-30 ms late on a busy host (seen with
         // 5 ms ticks) still makes its tick.
         assert_eq!(set_interval(null, null, 50_000, 3, 0), S_OK);
+        // Titles without flip waits continue to present without taking a tick.
+        let unpaced = last(FLIP).load(Ordering::Relaxed);
+        assert_eq!(
+            wait(null, FLIP, 0, std::ptr::null(), 0, &mut early),
+            TIMEOUT
+        );
+        before_present();
+        assert_eq!(last(FLIP).load(Ordering::Relaxed), unpaced);
         let mut token = 0;
         let flips: Vec<u64> = (0..4)
             .map(|_| {
@@ -228,6 +281,19 @@ mod tests {
         // Even when a flip wait begins on the tick another just ended on.
         let (tick, _) = next_tick(FLIP, Duration::ZERO);
         assert!(tick > flips[3]);
+
+        // A successful wait covers one present. The next present must
+        // reserve a new tick, and a later explicit wait cannot reuse it.
+        before_present();
+        assert_eq!(last(FLIP).load(Ordering::Relaxed), flips[3]);
+        before_present();
+        let held = last(FLIP).load(Ordering::Relaxed);
+        assert!(held > flips[3]);
+        assert_eq!(
+            wait(null, FLIP, u32::MAX, std::ptr::null(), 0, &mut token),
+            S_OK
+        );
+        assert!(last(FLIP).load(Ordering::Relaxed) > held);
     }
 
     /// Two waits for one kind that begin together (two threads) take two
