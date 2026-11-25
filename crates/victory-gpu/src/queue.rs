@@ -411,11 +411,12 @@ extern "system" fn copy_page_mappings(
     S_OK
 }
 
-extern "system" fn desc(this: This, out: *mut QueueDesc) {
+extern "system" fn desc(this: This, out: *mut QueueDesc) -> *mut QueueDesc {
     if !out.is_null() {
         // SAFETY: checked non-null; the title passes room for a description.
         unsafe { out.write(queue(this).desc) };
     }
+    out
 }
 
 /// The queue methods by their slot in older titles' queues (the 2020-era
@@ -546,5 +547,38 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(2));
         Written::GpuTimestamp.write(at[1..].as_mut_ptr().cast(), 8);
         assert!(at[1] > first);
+    }
+
+    #[test]
+    fn queue_get_desc_returns_its_output_pointer() {
+        type GetDesc = extern "system" fn(This, *mut QueueDesc) -> *mut QueueDesc;
+
+        let expected = QueueDesc {
+            kind: 2,
+            priority: 100,
+            flags: 1,
+            nodes: 1,
+        };
+        let mut q = std::ptr::null();
+        assert_eq!(create(std::ptr::null(), &expected, &QUEUE_IIDS[0], &mut q), S_OK);
+        // SAFETY: `q` is our queue; its first field points to `FUNCTIONS` or `NEWER_FUNCTIONS`.
+        let table = unsafe { *q.cast::<*const *const ()>() };
+        let offset = if table == NEWER_FUNCTIONS.0.as_ptr() {
+            0xe0
+        } else {
+            0xd0
+        };
+        let get_desc = slot::<GetDesc>(q, offset);
+        let mut out = std::mem::MaybeUninit::<QueueDesc>::uninit();
+        let ret = get_desc(q, out.as_mut_ptr());
+        assert_eq!(ret, out.as_mut_ptr());
+        // SAFETY: `get_desc` initialised `out`.
+        let got = unsafe { out.assume_init() };
+        assert_eq!(
+            (got.kind, got.priority, got.flags, got.nodes),
+            (expected.kind, expected.priority, expected.flags, expected.nodes)
+        );
+        assert!(get_desc(q, std::ptr::null_mut()).is_null());
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(q, 0x10)(q), 0);
     }
 }
