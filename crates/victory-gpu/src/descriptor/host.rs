@@ -847,9 +847,11 @@ impl Bindless {
     }
 
     fn plan_dirty(&self) -> bool {
+        // No submission uses `plan.writes` outside tests (`Batch::prepare_bindless`),
+        // so write-only slot changes do not trigger a plan rebuild in production.
         self.plan.is_none()
             || self.reads_dirty
-            || self.writes_dirty
+            || (cfg!(test) && self.writes_dirty)
             || self.bounces_dirty
             || self.retained_dirty
     }
@@ -2856,8 +2858,11 @@ impl HostHeap {
                     let lacks = match (new, &planned) {
                         (_, None) => true,
                         (Some(new), Some(reads)) => {
+                            // No submission uses the plan's writes outside
+                            // tests (`Batch::prepare_bindless`), so another
+                            // write alone leaves the plan as good as it was.
                             let lacking = [
-                                !same_range(&new.write, wrote),
+                                cfg!(test) && !same_range(&new.write, wrote),
                                 new.bounce != bounced,
                                 !covered(reads, &new.read),
                             ];
@@ -2870,9 +2875,10 @@ impl HostHeap {
                             lacking.contains(&true)
                         }
                         (None, Some(_)) => {
-                            let gone = wrote.is_some() || bounced.is_some();
+                            let wrote = cfg!(test) && wrote.is_some();
+                            let gone = wrote || bounced.is_some();
                             why[3] += usize::from(gone);
-                            bits |= u8::from(wrote.is_some()) | u8::from(bounced.is_some()) << 1;
+                            bits |= u8::from(wrote) | u8::from(bounced.is_some()) << 1;
                             gone
                         }
                     };
@@ -3847,7 +3853,42 @@ fn largest_mip(resource: &[u32; 14], desc: &[u32; 16]) -> u32 {
     }
     let (width, height) = (resource[4], resource[6]);
     let (format, mips) = (resource[8], resource[7] >> 16);
-    let mut first = desc[4].min(mips.saturating_sub(1));
+    // The view may also say so with a least level of detail while it
+    // starts at mip 0: the title streams the larger mips in later, and their
+    // memory holds nothing yet (`VICTORY_LOD_CLAMP=0`: as before, when the
+    // host texture was made whole for such a view).
+    let clamp = {
+        let words: &[u32; 10] = desc[..10].try_into().unwrap_or(&[0; 10]);
+        let d = srv_desc(words);
+        // SAFETY: the member the dimension names.
+        let clamp = unsafe {
+            match d.ViewDimension {
+                D3D12_SRV_DIMENSION_TEXTURE2D => d.Anonymous.Texture2D.ResourceMinLODClamp,
+                D3D12_SRV_DIMENSION_TEXTURE2DARRAY => d.Anonymous.Texture2DArray.ResourceMinLODClamp,
+                D3D12_SRV_DIMENSION_TEXTURECUBE => d.Anonymous.TextureCube.ResourceMinLODClamp,
+                D3D12_SRV_DIMENSION_TEXTURECUBEARRAY => d.Anonymous.TextureCubeArray.ResourceMinLODClamp,
+                _ => 0.0,
+            }
+        };
+        if clamp.is_finite() && clamp >= 1.0 { clamp.floor().min(32.0) as u32 } else { 0 }
+    };
+    static CLAMPED: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let on = *ON.get_or_init(|| std::env::var_os("VICTORY_LOD_CLAMP").is_none_or(|v| v != "0"));
+    let n = CLAMPED[usize::from(clamp > desc[4])].fetch_add(1, Ordering::Relaxed);
+    if clamp > desc[4] && n.is_power_of_two() {
+        tracing::info!(
+            views = n + 1,
+            others = CLAMPED[0].load(Ordering::Relaxed),
+            clamp,
+            first = desc[4],
+            width,
+            height,
+            on,
+            "a placed texture's view holds its detail back"
+        );
+    }
+    let mut first = desc[4].max(if on { clamp } else { 0 }).min(mips.saturating_sub(1));
     let block = (70..=84).contains(&format) || (94..=99).contains(&format);
     let fits = |k: u32| {
         (width >> k) > 0
@@ -5350,8 +5391,16 @@ void main(uint3 id : SV_DispatchThreadID) {
 
         let placed_victim_addr = m + 0x100000;
         let placed_survivor_addr = m + 0x120000;
+        let placed_lod_addr = m + 0x140000;
         let (pv_res, pv_view) = make_placed_tex_descs(placed_victim_addr);
         let (ps_res, ps_view) = make_placed_tex_descs(placed_survivor_addr);
+        // LOD-clamped 16x16 4-mip placed texture view (`ResourceMinLODClamp = 2.0`).
+        let (mut plod_res, mut plod_view) = make_placed_tex_descs(placed_lod_addr);
+        plod_res[4] = 16;
+        plod_res[6] = 16;
+        plod_res[7] = (4u32 << 16) | 1;
+        plod_view[5] = 4; // MipLevels
+        plod_view[7] = 2.0f32.to_bits(); // ResourceMinLODClamp
 
         let both_srv = |slot: u64, res: This| {
             create_srv(std::ptr::null(), res, &srv_words, at_inc(slot));
@@ -5385,6 +5434,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         both_placed(10, &pv_res, &pv_view); // placed texture victim
         both_placed(11, &ps_res, &ps_view); // placed texture survivor
         both_cbv(12, 0, 256); // unmapped slot
+        both_placed(16, &plod_res, &plod_view); // LOD-clamped placed texture view
 
         let p_inc = drain_bindless(&h_inc, true);
         let p_full = drain_bindless(&h_full, false);
@@ -5474,10 +5524,37 @@ void main(uint3 id : SV_DispatchThreadID) {
             "evicted placed texture slot must be re-resolved"
         );
 
+        // Pure write-only mutation: keep read/retained refcounts on both UAV buffers
+        // via SRV slots 17/18 so switching UAV slot 15 from `buf_uav_b` to `buf_uav_a`
+        // changes ONLY `writes` (`plan.reads` Arc is reused untouched).
+        crate::queue::pass_frame();
+        both_srv(17, buf_uav_a);
+        both_srv(18, buf_uav_b);
+        let p_inc_pre_write = drain_bindless(&h_inc, true);
+        let p_full_pre_write = drain_bindless(&h_full, false);
+        assert_heap_invariants_and_oracle(&h_inc, &p_inc_pre_write, "pre_write_only");
+        assert_plans_cross_heap_equal(&p_inc_pre_write, &p_full_pre_write, "pre_write_only");
+
+        crate::queue::pass_frame();
+        both_uav(15, buf_uav_a);
+        let p_inc = drain_bindless(&h_inc, true);
+        let p_full = drain_bindless(&h_full, false);
+        assert_heap_invariants_and_oracle(&h_inc, &p_inc, "write_only_change");
+        assert_plans_cross_heap_equal(&p_inc, &p_full, "write_only_change");
+        assert!(
+            Arc::ptr_eq(&p_inc_pre_write.reads, &p_inc.reads),
+            "write-only change must reuse plan.reads Arc"
+        );
+        assert!(
+            Arc::ptr_eq(&p_inc_pre_write.bounces, &p_inc.bounces),
+            "write-only change must reuse plan.bounces Arc"
+        );
+
         // Cleanup.
         crate::shadow::test_unregister_direct(direct_survivor_addr);
         crate::watch::title_memory_remapped(placed_victim_addr as usize, 64 << 10);
         crate::watch::title_memory_remapped(placed_survivor_addr as usize, 64 << 10);
+        crate::watch::title_memory_remapped(placed_lod_addr as usize, 64 << 10);
         assert_eq!(release(buf_srv_a), 0);
         assert_eq!(release(buf_srv_b), 0);
         assert_eq!(release(buf_uav_a), 0);
