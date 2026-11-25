@@ -220,10 +220,19 @@ fn page_table(view: u32, null: u32) -> Vec<u32> {
 
 #[test]
 fn title_memory_is_read_and_written_at_computed_addresses() {
-    let shader = program();
+    check_title_memory(false);
+}
+
+#[test]
+fn dirty_page_bitmap_is_zeroed_before_dispatch() {
+    check_title_memory(true);
+}
+
+fn check_title_memory(seed_bitmap: bool) {
     let _one = super::valu_tests::ONE_AT_A_TIME
         .lock()
         .unwrap_or_else(|e| e.into_inner());
+    let shader = program();
     let mut memory = vec![0u32; 256];
     memory[0] = 0x1111_1111;
     let pointer = TITLE + 0x100;
@@ -261,6 +270,11 @@ fn title_memory_is_read_and_written_at_computed_addresses() {
                     _ => 0,
                 };
             }
+            let bitmap = if seed_bitmap {
+                Root::SeededUav(256, 1)
+            } else {
+                Root::Uav(256)
+            };
             let out = host
                 .dispatch(
                     &root,
@@ -269,7 +283,7 @@ fn title_memory_is_read_and_written_at_computed_addresses() {
                         roots: vec![
                             (0, Root::Constants(ud)),
                             (1, Root::View { srv: true, data: page_table(1, 3) }),
-                            (2, Root::Uav(2 * 4096 / 32)),
+                            (2, bitmap),
                             (3, Root::View { srv: true, data: view_addresses.clone() }),
                         ],
                         views: &[
@@ -296,11 +310,14 @@ fn title_memory_is_read_and_written_at_computed_addresses() {
             assert_eq!(floats, want, "{label}: float min and max");
             // The far region by its level-1 index, the page written, the
             // page missed after it; nothing else.
-            let entry = 4096 + (TITLE as u32 >> 16 & 0xFFF) as usize;
             let marked: Vec<usize> = (0..out[2].len() * 32)
                 .filter(|&b| out[2][b / 32] >> (b % 32) & 1 != 0)
                 .collect();
-            assert_eq!(marked, [(far >> 28) as usize, entry, entry + 1], "{label}: pages");
+            assert_eq!(marked.len(), 3, "{label}: dirty page count");
+            assert_eq!(marked, [1360, 5200, 5201], "{label}: pages");
+        }
+        if seed_bitmap {
+            eprintln!("{label}: seeded dirty bitmap verified");
         }
         ran += 1;
     }

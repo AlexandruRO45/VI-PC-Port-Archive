@@ -816,6 +816,8 @@ pub enum Root {
     /// A root raw UAV of this many dwords, zeroed, read back after the
     /// heap's UAVs ([`Host::dispatch`] only).
     Uav(u32),
+    /// A root UAV seeded with a repeated dword before the usual zeroing.
+    SeededUav(u32, u32),
 }
 
 /// Bindings for [`Host::draw`]: root arguments and the heap contents.
@@ -1053,7 +1055,9 @@ impl Host {
                         at.ptr += (index * size) as u64;
                         list.SetGraphicsRootDescriptorTable(*param, at);
                     }
-                    Root::View { .. } | Root::Uav(_) => return Err("root views in a draw".into()),
+                    Root::View { .. } | Root::Uav(_) | Root::SeededUav(..) => {
+                        return Err("root views in a draw".into());
+                    }
                 }
             }
             list.OMSetRenderTargets(1, Some(&rtv), false, None);
@@ -1762,13 +1766,39 @@ impl Host {
                         }
                         keep.push(b);
                     }
-                    &Root::Uav(n) => {
+                    &Root::Uav(n) | &Root::SeededUav(n, _) => {
                         let bytes = u64::from(n) * 4;
                         let b = make(
                             D3D12_HEAP_TYPE_DEFAULT,
                             &buffer(bytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS),
-                            D3D12_RESOURCE_STATE_COMMON,
+                            D3D12_RESOURCE_STATE_COPY_DEST,
                         )?;
+                        if let &Root::SeededUav(_, seed) = arg {
+                            let seed = upload(&vec![seed; n as usize])?;
+                            list.CopyBufferRegion(&b, 0, &seed, 0, bytes);
+                            keep.push(seed);
+                            // Order the seed write before the zero copy to the same buffer.
+                            list.ResourceBarrier(&[
+                                transition(
+                                    &b,
+                                    D3D12_RESOURCE_STATE_COPY_DEST,
+                                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                ),
+                                transition(
+                                    &b,
+                                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                    D3D12_RESOURCE_STATE_COPY_DEST,
+                                ),
+                            ]);
+                        }
+                        let zeroes = upload(&vec![0; n as usize])?;
+                        list.CopyBufferRegion(&b, 0, &zeroes, 0, bytes);
+                        keep.push(zeroes);
+                        list.ResourceBarrier(&[transition(
+                            &b,
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                        )]);
                         list.SetComputeRootUnorderedAccessView(*param, b.GetGPUVirtualAddress());
                         let rb = make(
                             D3D12_HEAP_TYPE_READBACK,
@@ -1782,7 +1812,6 @@ impl Host {
             let [x, y, z] = d.groups;
             list.Dispatch(x, y, z);
             for (r, size, n, rb) in &uavs {
-                // (Buffers were promoted from the common state by the dispatch.)
                 list.ResourceBarrier(&[transition(
                     r,
                     D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
@@ -1801,8 +1830,8 @@ impl Host {
                 }
             }
             list.Close().map_err(err)?;
-            queue.ExecuteCommandLists(&[Some(list.cast().map_err(err)?)]);
             let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(err)?;
+            queue.ExecuteCommandLists(&[Some(list.cast().map_err(err)?)]);
             queue.Signal(&fence, 1).map_err(err)?;
             while fence.GetCompletedValue() < 1 {
                 if let Err(e) = dev.GetDeviceRemovedReason() {
