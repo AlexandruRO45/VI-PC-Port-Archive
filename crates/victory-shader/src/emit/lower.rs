@@ -592,6 +592,10 @@ struct Lower<'a> {
     finals: HashMap<Value, (Val, usize)>,
     /// The block a loop stopped by [`LOOP_LIMIT`] leaves the program from.
     abort: Option<usize>,
+    /// The single block every lane exit returns from: several `ret` blocks
+    /// make vkd3d-proton 3.1's helper-demotion loop emit SPIR-V whose exit
+    /// bypasses the loop merge, which RADV then refuses to compile.
+    end: Option<usize>,
     /// Per-lane descriptor joins being lowered: IR block and the heap index
     /// phi there (what [`Source::Carried`] reads).
     lane_paths: Vec<(usize, V)>,
@@ -1363,6 +1367,7 @@ impl<'a> Lower<'a> {
             loop_bodies: HashMap::new(),
             finals: HashMap::new(),
             abort: None,
+            end: None,
             lane_paths: Vec::new(),
             pending_paths: Vec::new(),
             dead,
@@ -12464,7 +12469,7 @@ impl<'a> Lower<'a> {
                     self.s
                         .op(self.cur, "discard", Attr::NoUnwind, self.s.t.void, 82, &[t]);
                 }
-                Term::Ret
+                Term::Br(self.end_block())
             }
             LaneExit::Indirect => return Err(unsupported(offset, "an indirect jump")),
         };
@@ -12720,6 +12725,17 @@ impl<'a> Lower<'a> {
         self.s.m.cmp(c, p, next, limit)
     }
 
+    /// The block every lane exit returns from, so the program has one `ret`.
+    fn end_block(&mut self) -> usize {
+        if let Some(e) = self.end {
+            return e;
+        }
+        let e = self.s.m.new_block();
+        self.s.m.terminate(e, Term::Ret);
+        self.end = Some(e);
+        e
+    }
+
     /// The block a lane stopped by [`LOOP_LIMIT`] leaves through.
     fn abort_block(&mut self) -> usize {
         if let Some(a) = self.abort {
@@ -12731,7 +12747,8 @@ impl<'a> Lower<'a> {
             self.s
                 .op(a, "discard", Attr::NoUnwind, self.s.t.void, 82, &[t]);
         }
-        self.s.m.terminate(a, Term::Ret);
+        let e = self.end_block();
+        self.s.m.terminate(a, Term::Br(e));
         self.abort = Some(a);
         a
     }
