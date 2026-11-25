@@ -140,6 +140,7 @@ fn try_build_valu_cs(body: &[u32]) -> Result<HostShader, crate::ShaderError> {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        view_marks: false,
     })?;
 
     let shader = HostShader {
@@ -156,6 +157,7 @@ fn try_build_valu_cs(body: &[u32]) -> Result<HostShader, crate::ShaderError> {
         view_addresses: lowered.view_addresses,
         heap: lowered.heap,
         heap_writes: lowered.heap_writes,
+        view_marks: lowered.view_marks,
     };
 
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
@@ -1223,6 +1225,7 @@ fn lower_cs32(words: &[u32], used: &[(u8, ResourceType, u32, u8)], validate: boo
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        view_marks: false,
     })
     .expect("lower");
     let shader = HostShader {
@@ -1239,6 +1242,7 @@ fn lower_cs32(words: &[u32], used: &[(u8, ResourceType, u32, u8)], validate: boo
         view_addresses: lowered.view_addresses,
         heap: lowered.heap,
         heap_writes: lowered.heap_writes,
+        view_marks: lowered.view_marks,
     };
     if let (true, Ok(mut v)) = (
         validate,
@@ -1588,7 +1592,7 @@ fn fspx_cs(body: &[u32]) -> HostShader {
         &[fspx_resource(3, 3, 0, 0, 4, 1)],
     );
     let container = crate::dxbc::build(&[(crate::FourCC::ACCC, &part)]);
-    let (shader, used) = super::translate_with_resources(&container).expect("translate");
+    let (shader, used) = super::translate_with_resources(&container, super::Options::default()).expect("translate");
     assert_eq!(used.len(), 1);
     assert_eq!(used[0].kind, ResourceType::Uav);
     assert_eq!(used[0].root, crate::RootType::Table);

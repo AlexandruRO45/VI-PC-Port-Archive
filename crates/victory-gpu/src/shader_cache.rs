@@ -94,8 +94,10 @@ pub fn host_shader(container: &[u8]) -> (Result<HostShader, String>, bool) {
 }
 
 pub(crate) fn translation(container: &[u8]) -> (Result<Translated, String>, bool) {
+    // Writes through views mark their pages: copy-backs compare only those.
+    let options = victory_shader::emit::Options { view_marks: true };
     let translate = |c: &[u8]| {
-        victory_shader::emit::translate_with_resources(c)
+        victory_shader::emit::translate_with_resources(c, options)
             .map(|(host, used)| Translated { host, used })
             .map_err(|e| e.to_string())
     };
@@ -224,6 +226,7 @@ fn encode(translation: &Result<Translated, String>) -> Vec<u8> {
         view_addresses,
         heap,
         heap_writes,
+        view_marks,
     } = &s.host;
     let mut out = MAGIC.to_vec();
     let word = |out: &mut Vec<u8>, v: u32| out.extend(v.to_le_bytes());
@@ -272,7 +275,8 @@ fn encode(translation: &Result<Translated, String>) -> Vec<u8> {
             | u32::from(*memory_writes) << 1
             | u32::from(*view_addresses) << 2
             | u32::from(*heap) << 3
-            | u32::from(*heap_writes) << 4,
+            | u32::from(*heap_writes) << 4
+            | u32::from(*view_marks) << 5,
     );
     word(&mut out, s.used.len() as u32);
     for u in &s.used {
@@ -413,6 +417,7 @@ fn decode(bytes: &[u8]) -> Option<Result<Translated, String>> {
         view_addresses: memory & 4 != 0,
         heap: memory & 8 != 0,
         heap_writes: memory & 16 != 0,
+        view_marks: memory & 32 != 0,
     };
     Some(Ok(Translated { host, used }))
 }
@@ -446,6 +451,7 @@ mod tests {
             view_addresses: true,
             heap: true,
             heap_writes: true,
+            view_marks: true,
         };
         let srv = UsedResource {
             kind: ResourceType::Srv,
