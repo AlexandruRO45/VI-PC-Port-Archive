@@ -580,6 +580,8 @@ impl Shader {
             (flags::SAMPLER_HEAP, uses.sampler_heap),
             (flags::WAVE_OPS, uses.wave),
             (flags::INT64, uses.int64),
+            (flags::ATOMIC64_TYPED, uses.atomic64_typed),
+            (flags::ATOMIC64_HEAP, uses.atomic64_heap),
         ] {
             self.flags = if used { self.flags | flag } else { self.flags & !flag };
         }
@@ -1086,6 +1088,38 @@ mod tests {
                 v.validate(&mut dxil)
                     .unwrap_or_else(|e| panic!("{name}: {e}"));
             }
+        }
+    }
+
+    /// The 64-bit atomic features follow the written atomics: lowering sets
+    /// them where it makes one, and one on a path no lane takes is not
+    /// written, so the container declares none of them (and the validator,
+    /// where there is one, accepts it).
+    #[test]
+    fn a_64_bit_atomic_on_an_untaken_path_declares_no_atomic64_features() {
+        let mut s = Shader::new(false);
+        s.threads = Some([1, 1, 1]);
+        let (entry, live, dead) = (s.entry, s.m.new_block(), s.m.new_block());
+        let yes = s.m.bool(true);
+        s.m.terminate(entry, Term::CondBr(yes, live, dead));
+        s.m.terminate(live, Term::Ret);
+        s.flags |= flags::INT64 | flags::ATOMIC64_TYPED | flags::ATOMIC64_HEAP;
+        let index = s.m.i32(0);
+        let h = s.heap_handle(dead, index, false, false, (2 | 0x1000, 0x105));
+        let i64t = s.m.int(64);
+        let (or, undef, value) = (s.m.i32(2), s.m.undef(s.t.i32), s.m.int_const(i64t, 1));
+        s.op(dead, "atomicBinOp.i64", Attr::NoUnwind, i64t, 78, &[h, or, undef, undef, undef, value]);
+        s.m.terminate(dead, Term::Ret);
+        let mut dxil = s.finish();
+        // The SFI0 part: its name, its size, then the feature bits.
+        let at = dxil.windows(4).position(|w| w == b"SFI0").expect("an SFI0 part");
+        let features = u64::from_le_bytes(dxil[at + 8..at + 16].try_into().unwrap());
+        let (atomic64_typed, atomic64_heap, int64) = (0x40_0000, 0x1000_0000, 0x8000);
+        assert_eq!(features & (atomic64_typed | atomic64_heap | int64), 0, "{features:#x}");
+        if let Ok(mut v) = super::super::validator::Validator::load(
+            super::super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut dxil).unwrap_or_else(|e| panic!("{e}"));
         }
     }
 }
