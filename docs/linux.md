@@ -18,6 +18,16 @@ platform. These notes are what has worked for testers.
   `WINEDLLOVERRIDES="d3d12,d3d12core,dxgi=n,b"`, with vkd3d-proton's
   `d3d12.dll` and `d3d12core.dll` next to `victory.exe`. Wine's builtin
   `libvkd3d-1.dll` takes a different path and is not what has been tested.
+- Use Microsoft's `d3dcompiler_47.dll`, not Wine's. VIctory compiles a few
+  helper shaders of its own at run time with `D3DCompile`. Wine's builtin
+  compiler refuses them (`E5005: Method 'Load' is not defined on type
+  'RWByteAddressBuffer'`), and the log shows `no argument clamp: indirect
+  execution dropped`: every indirect draw and dispatch is skipped, and most
+  of the world is drawn that way. Put a 64-bit `d3dcompiler_47.dll` from
+  Microsoft (for example from `winetricks d3dcompiler_47`, or the Windows
+  SDK) next to `victory.exe` and add `d3dcompiler_47=n,b`:
+  `WINEDLLOVERRIDES="d3d12,d3d12core,dxgi,d3dcompiler_47=n,b"`. Wine's own
+  copy is about 400 KB; Microsoft's is about 4 MB.
 - NVIDIA: compute `72f552f4553fb5f9` (first run at the start of the first
   mission, around frame 950) does not finish with vkd3d-proton's raw access
   chains: the kernel logs `NVRM: Xid 109 ... CTX SWITCH TIMEOUT`, the
