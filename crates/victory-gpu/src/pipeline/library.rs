@@ -20,6 +20,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
+use windows::Win32::Foundation::E_FAIL;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::{HSTRING, Interface, PCWSTR};
 
@@ -355,6 +356,16 @@ unsafe extern "system" fn compiler_crashed(
     }
 }
 
+/// The error for a pipeline the driver's compiler crashed on before: still
+/// E_FAIL, but saying why and how to try it again.
+fn left_out() -> windows::core::Error {
+    windows::core::Error::new(
+        E_FAIL,
+        "the driver's compiler crashed on this pipeline in an earlier run: it is left out \
+         (delete crashed.txt in the pipeline library directory to try it again)",
+    )
+}
+
 /// The pipeline named `name`: loaded from the library by `load` if it is
 /// there with the same description, else made by `create` and stored.
 pub(crate) fn pipeline(
@@ -364,8 +375,7 @@ pub(crate) fn pipeline(
 ) -> windows::core::Result<ID3D12PipelineState> {
     let wide = HSTRING::from(name);
     if crashed(name) {
-        // E_FAIL.
-        return Err(windows::core::Error::from_hresult(windows::core::HRESULT(0x8000_4005_u32 as i32)));
+        return Err(left_out());
     }
     let create = || {
         let _making = Making::new(name);
@@ -505,6 +515,17 @@ pub(crate) fn note_used(key: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_left_out_pipeline_error_mentions_crashed_file() {
+        let error = left_out();
+        assert_eq!(error.code(), E_FAIL);
+        let message = error.message();
+        assert!(
+            message.contains("crashed.txt"),
+            "unexpected message: {message}"
+        );
+    }
 
     #[test]
     fn names_change_with_what_goes_into_the_pipeline() {
