@@ -6216,6 +6216,56 @@ impl<'a> Lower<'a> {
             }
             Source::Phi { block, args } => {
                 let join = self.block[*block].ok_or("a descriptor chosen by control flow")?;
+                // A descriptor word can be a phi while another word is
+                // selected by an s_cselect in the join itself. Do not emit
+                // that select in each predecessor: its SCC is defined only
+                // after those edges meet. Merge the true and false sampler
+                // indices separately, then select in the current block.
+                let scc = args.iter().flatten().find_map(|arg| match arg {
+                    Source::Select { scc, .. } => Some(*scc),
+                    _ => None,
+                });
+                if let Some(scc) = scc
+                    && args.iter().flatten().all(|arg| {
+                        matches!(arg, Source::Select { scc: c, args } if *c == scc && args.len() == 2)
+                    })
+                {
+                    let mut incoming: [Vec<(V, usize)>; 2] = Default::default();
+                    let zero = self.s.m.i32(0);
+                    for (&q, arg) in self.x.p.blocks[*block].preds.iter().zip(args) {
+                        if self.block[q].is_none() {
+                            continue;
+                        }
+                        let Some(tail) = self.tail[q] else {
+                            return Err("a descriptor chosen by control flow");
+                        };
+                        let at = self.edges.get(&(q, *block)).copied().unwrap_or(tail);
+                        match arg {
+                            Some(Source::Select { args, .. }) => {
+                                for (side, src) in args.iter().enumerate() {
+                                    let here = std::mem::replace(&mut self.cur, at);
+                                    let idx = self.const_sampler_index(src, cmp, slots);
+                                    self.cur = here;
+                                    incoming[side].push((idx?, at));
+                                }
+                            }
+                            None => {
+                                incoming[0].push((zero, at));
+                                incoming[1].push((zero, at));
+                            }
+                            Some(_) => unreachable!("factored sampler select changed"),
+                        }
+                    }
+                    let set = self.s.m.phi(join, self.s.t.i32);
+                    let clear = self.s.m.phi(join, self.s.t.i32);
+                    self.s.m.set_phi(set, std::mem::take(&mut incoming[0]));
+                    self.s.m.set_phi(clear, std::mem::take(&mut incoming[1]));
+                    let cond = match self.get(scc)? {
+                        Val::Bit(x) => x,
+                        _ => return Err("SCC without a value"),
+                    };
+                    return Ok(self.s.m.select(self.cur, cond, set, clear));
+                }
                 let mut incoming = Vec::new();
                 for (&q, arg) in self.x.p.blocks[*block].preds.iter().zip(args) {
                     if self.block[q].is_none() {
@@ -11889,16 +11939,21 @@ mod tests {
             0xBE91_0380, // 16: s_mov_b32 s17, 0
             0xBE92_0380, // 20: s_mov_b32 s18, 0
             0xBE93_0380, // 24: s_mov_b32 s19, 0
-            0xBF06_8001, // 28: s_cmp_eq_u32 s1, 0
-            0xBF85_0002, // 32: s_cbranch_scc1 -> 44
-            0xBE90_0380, // 36: s_mov_b32 s16, 0 (point clamp sampler)
-            0xBF82_0002, // 40: s_branch -> 52
+            0xBE94_0380, // 28: s_mov_b32 s20, 0
+            0xBE95_03FF,
+            0x0800_0000, // 32: s_mov_b32 s21, sampler linear mip filter
+            0xBF06_8001, // 36: s_cmp_eq_u32 s1, 0
+            0xBF85_0002, // 40: s_cbranch_scc1 -> 52
+            0xBE90_0380, // 44: s_mov_b32 s16, 0 (point clamp sampler)
+            0xBF82_0002, // 48: s_branch -> 60
             0xBE90_03FF,
-            0x0000_0001, // 44: s_mov_b32 s16, 1 (different immediate sampler)
+            0x0000_0001, // 52: s_mov_b32 s16, 1 (different immediate sampler)
+            0xBF06_8101, // 60: s_cmp_eq_u32 s1, 1 (a new SCC at the phi join)
+            0x8512_1415, // 64: s_cselect_b32 s18, s21, s20
             0xF09C_0F08,
-            0x0082_0402, // 52: image_sample_lz v[4:7], v[2:3], s[8:15], s[16:19]
+            0x0082_0402, // 68: image_sample_lz v[4:7], v[2:3], s[8:15], s[16:19]
             0xD834_0000,
-            0x0000_0400, // 60: ds_write_b32 v0, v4
+            0x0000_0400, // 76: ds_write_b32 v0, v4
             S_ENDPGM,
         ];
         let out = lower_with(
@@ -11916,6 +11971,26 @@ mod tests {
             }],
         )
         .expect("Source::Phi of immediate constant samplers");
-        assert_eq!(out.samplers.len(), 2);
+        assert_eq!(out.samplers.len(), 4);
+        if let Ok(host) = super::super::host::Host::new(false) {
+            let shader = super::super::HostShader {
+                stage: HwStage::Cs,
+                dxil: out.dxil.clone(),
+                user_data: out.user_data.clone(),
+                static_samplers: out
+                    .samplers
+                    .iter()
+                    .copied()
+                    .map(super::super::StaticSampler::from_words)
+                    .collect(),
+                samplers: out.samplers.clone(),
+                root_cbvs: out.root_cbvs.clone(),
+                root_srvs: out.root_srvs.clone(),
+                root_uavs: out.root_uavs.clone(),
+                root_indexed_views: vec![],
+            };
+            host.compute_pipeline(&shader)
+                .expect("nested sampler select pipeline");
+        }
     }
 }

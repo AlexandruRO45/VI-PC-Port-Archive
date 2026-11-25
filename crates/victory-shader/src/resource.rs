@@ -1117,6 +1117,30 @@ impl<'a> Tracer<'a> {
         self.address(lo, hi, extra)
     }
 
+    /// A source that still names the same descriptor on every edge reaching
+    /// the access, so a one-live-edge phi can be replaced by it directly.
+    fn anywhere(&self, source: &Source) -> bool {
+        match source {
+            Source::Constant(_) => true,
+            Source::Built { address, .. } => address.dynamic.is_none(),
+            Source::Loaded { load, .. } => {
+                let inst = self.inst(*load);
+                match &inst.fields {
+                    Fields::Smem {
+                        base,
+                        offset,
+                        soffset,
+                        ..
+                    } => self
+                        .smem_address(inst, base, *offset, soffset)
+                        .is_ok_and(|address| address.dynamic.is_none()),
+                    _ => false,
+                }
+            }
+            _ => false,
+        }
+    }
+
     /// The source of the descriptor operand `op` of `inst`, in block `at`.
     fn descriptor(&self, inst: &Inst, op: &Operand, at: usize) -> Result<Source, &'static str> {
         let Operand::Scalar { code, dwords } = *op else {
@@ -1355,14 +1379,7 @@ impl<'a> Tracer<'a> {
                     if failed.is_none() && live_count > 0 {
                         if live_count == 1
                             && let Some(only) = parsed.iter().flatten().next()
-                            && matches!(
-                                only,
-                                Source::Constant(_)
-                                    | Source::Built {
-                                        address: Address { dynamic: None, .. },
-                                        ..
-                                    }
-                            )
+                            && self.anywhere(only)
                         {
                             Ok(parsed.into_iter().flatten().next().unwrap())
                         } else {
@@ -3886,7 +3903,7 @@ pub(crate) mod tests {
     fn dead_incoming_phi_edge_is_skipped_for_scalar_descriptor() {
         // B0 sets an unrelated non-descriptor value in s[4:7], branches to B2
         // with s_cbranch_execz (provably false because EXEC is TRUE), and
-        // falls through to B1 which loads a table descriptor into s[4:7].
+        // falls through to B1 which loads a heap descriptor into s[4:7].
         let r = track_words(
             &[
                 0xBE84_0301, // 0:  s_mov_b32 s4, s1 (not a descriptor)
@@ -3902,18 +3919,13 @@ pub(crate) mod tests {
                 0xFA00_0000, // 36: s_buffer_load_dword s8, s[4:7], null
                 S_ENDPGM,
             ],
-            &[param(Table, 9, 1)],
+            &[param(ResourceHeap, 9, 1)],
             HwStage::Ps,
         );
-        let Source::Phi { args, .. } = &r.descriptors[0].source else {
-            panic!("{:?}", r.descriptors)
-        };
-        assert_eq!(args.len(), 2);
-        assert!(args.iter().any(|a| a.is_none()), "{args:?}");
         assert!(
-            args.iter()
-                .any(|a| matches!(a, Some(Source::Loaded { .. }))),
-            "{args:?}"
+            matches!(r.descriptors[0].source, Source::Loaded { .. }),
+            "{:?}",
+            r.descriptors
         );
     }
 }
