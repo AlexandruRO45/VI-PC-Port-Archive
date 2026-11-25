@@ -229,7 +229,7 @@ fn run_cases(
 fn scalar_quad_masks_pack_nibbles_and_set_scc() {
     let pack_words = |opcode: u32| {
         [
-            0xBE90_0000 | opcode << 8,   // s_quadmask s16, s0 (pairs for b64)
+            0xBE90_0000 | opcode << 8, // s_quadmask s16, s0 (pairs for b64)
             sop2(0x0a, 18, 129, 128),  // s_cselect_b32 s18, 1, 0
             sop2(0x1e, 18, 18, 144),   // s_lshl_b32 s18, s18, 16
             sop2(0x10, 16, 16, 18),    // s_or_b32 s16, s16, s18
@@ -265,12 +265,12 @@ fn is_f16_nan(bits: u16) -> bool {
 #[test]
 fn a_branch_to_fallthrough_keeps_both_values_at_a_join() {
     let shader = build_valu_cs(&[
-        0xBF06_0100,            // s_cmp_eq_u32 s0, s1
-        0xBF85_0002,            // s_cbranch_scc1 -> the s2 = 1 path
-        s_mov_b32(2, 128),      // s2 = 0
-        0xBF82_0002,            // s_branch -> the join
-        s_mov_b32(2, 129),      // s2 = 1
-        0xBF85_0000,            // s_cbranch_scc1 -> the following instruction
+        0xBF06_0100,             // s_cmp_eq_u32 s0, s1
+        0xBF85_0002,             // s_cbranch_scc1 -> the s2 = 1 path
+        s_mov_b32(2, 128),       // s2 = 0
+        0xBF82_0002,             // s_branch -> the join
+        s_mov_b32(2, 129),       // s2 = 1
+        0xBF85_0000,             // s_cbranch_scc1 -> the following instruction
         vop1(0x001, 0, sgpr(2)), // join: v0 = s2
     ]);
     run_cases(
@@ -645,12 +645,19 @@ fn v_cvt_off_f32_i4_uses_the_signed_low_nibble() {
 
     let mut cases: Vec<u32> = (0..16).collect();
     // Bits above the low nibble are ignored.
-    cases.extend([0xABCD_EF05, 0xFFFF_FFF8, 0x1234_5670, 0x8000_000F, 0x0000_00F7]);
+    cases.extend([
+        0xABCD_EF05,
+        0xFFFF_FFF8,
+        0x1234_5670,
+        0x8000_000F,
+        0x0000_00F7,
+    ]);
     let inputs: Vec<[u32; 4]> = cases.iter().map(|&x| [x, 0, 0, 0]).collect();
     run_cases(&shader, &inputs, |backend, i, inp, got| {
         let want = nibble(cases[i]).to_bits();
         assert_eq!(
-            got, want,
+            got,
+            want,
             "{backend}: v_cvt_off_f32_i4({:#010x}) = {got:#010x} ({:?}), want {want:#010x}",
             inp[0],
             f32::from_bits(got),
@@ -1164,6 +1171,255 @@ fn bfe_signed_and_unsigned_match_rdna2() {
             got, want,
             "{backend}: v_bfe_u32({:#010x}, {}, {}) = {got:#010x}, want {want:#010x}",
             inp[0], inp[1], inp[2],
+        );
+    });
+}
+
+/// SMEM `s_load_dwordx8 s[dst:dst+7], s[base:base+1], off` (soffset = null);
+/// a descriptor must come from one load, so an image descriptor is 8 dwords.
+const fn s_load_dwordx8(dst: u8, base: u8, off: u16) -> [u32; 2] {
+    [
+        0x3D << 26 | 0x03 << 18 | (dst as u32) << 6 | (base as u32 >> 1),
+        125 << 25 | off as u32,
+    ]
+}
+
+/// SMEM `s_load_dwordx4 s[dst:dst+3], s[base:base+1], off` (soffset = null).
+const fn s_load_dwordx4_at(dst: u8, base: u8, off: u16) -> [u32; 2] {
+    [
+        0x3D << 26 | 0x02 << 18 | (dst as u32) << 6 | (base as u32 >> 1),
+        125 << 25 | off as u32,
+    ]
+}
+
+/// MIMG `op v[data:data+n-1], v[addr:addr+1], s[rsrc:rsrc+7]`: a 2D image
+/// atomic of `dmask` dwords, the old value returning with `glc`.
+const fn image_atomic64(op: u16, data: u8, addr: u8, rsrc: u8, dmask: u8, glc: bool) -> [u32; 2] {
+    [
+        0x3C << 26 | (op as u32 & 0x7F) << 18 | 1 << 3 | (dmask as u32) << 8 | (glc as u32) << 13,
+        ((rsrc as u32 / 4) & 0x1F) << 16 | (data as u32) << 8 | addr as u32,
+    ]
+}
+
+/// Builds and lowers a 1-thread synthetic RDNA2 compute shader with 4 root
+/// constants (`x`, `y`, a 64-bit value's two dwords) that runs the image
+/// atomic `a`, then the `glc` atomic `b` at the same texel of the R32G32
+/// texture UAV at heap index 0, and stores the old value `b` returned (its
+/// data register `old`, two dwords) to dwords 0..1 of the raw UAV at heap
+/// index 1. Both atomics see the value in `v2:v3` (`a`) and `v8:v9` (`b`),
+/// their comparison/source registers zeroed.
+fn build_atomic_cs(a: [u32; 2], b: [u32; 2], old: u8) -> HostShader {
+    let mut words = Vec::new();
+    // s[4:5] = the descriptor table's address.
+    words.push(s_mov_b32(5, 0x80)); // inline constant 0
+    words.extend_from_slice(&s_load_dwordx8(8, 4, 0)); // the texture UAV
+    words.extend_from_slice(&s_load_dwordx4_at(16, 4, 32)); // the raw UAV
+    for i in 0..4u8 {
+        words.push(vop1(0x001, i, sgpr(i))); // v_mov_b32 v[i], s[i]
+    }
+    // v4:v5 and v10:v11 are the compare of a cmpswap; v8:v9 the second value.
+    for i in 4..6u8 {
+        words.push(vop1(0x001, i, 128)); // v_mov_b32 v[i], 0
+    }
+    for i in 8..12u8 {
+        words.push(vop1(0x001, i, 128));
+    }
+    for i in 8..10u8 {
+        words.push(vop1(0x001, i, sgpr(i - 6)));
+    }
+    words.extend_from_slice(&a);
+    words.extend_from_slice(&b);
+    words.extend_from_slice(&buffer_store_dword(old, 16, 0));
+    words.extend_from_slice(&buffer_store_dword(old + 1, 16, 4));
+    words.push(S_ENDPGM);
+
+    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 12,
+        layout: vec![
+            RootParam {
+                root: RootType::Constants,
+                table_offset_dwords: 0,
+                sgprs: 4,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            },
+            RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 4,
+                slot: 1,
+            },
+        ],
+        used: vec![
+            UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 8,
+                user_data: 4,
+                slot: 1,
+            },
+            UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Table,
+                table_offset_dwords: 8,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 4,
+                slot: 1,
+            },
+        ],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 5 << 1, // 5 user SGPRs: s0..s4
+            threads: [1, 1, 1],
+        }),
+        code,
+    };
+
+    let (p, st) = range::build(&native.code, native.wave64, native.vgprs).expect("range::build");
+    let st = st.expect("structure");
+    let res =
+        resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let lowered = lower::lower(&lower::Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+        view_marks: false,
+    })
+    .expect("lower");
+
+    let shader = HostShader {
+        stage: HwStage::Cs,
+        dxil: lowered.dxil,
+        user_data: lowered.user_data,
+        samplers: lowered.samplers,
+        static_samplers: Vec::new(),
+        root_cbvs: lowered.root_cbvs,
+        root_srvs: lowered.root_srvs,
+        root_uavs: lowered.root_uavs,
+        memory: lowered.memory,
+        memory_writes: lowered.memory_writes,
+        view_addresses: lowered.view_addresses,
+        heap: lowered.heap,
+        heap_writes: lowered.heap_writes,
+        view_marks: lowered.view_marks,
+    };
+
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        let ours = copy[4..20].to_vec();
+        v.validate(&mut copy).expect("DXIL validation failed");
+        assert_eq!(copy[4..20], ours[..], "container hash mismatch");
+    }
+
+    shader
+}
+
+/// Runs one atomic shader per 4-dword input set on every available SM 6.6
+/// host, passing the texture's dwords and the raw UAV's (the old value).
+fn run_atomic_cases(
+    shader: &HostShader,
+    cases: &[[u32; 4]],
+    check: impl Fn(&str, usize, [u32; 4], &[u32], &[u32]),
+) {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host
+            .compute_pipeline(shader)
+            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+        for (i, &inputs) in cases.iter().enumerate() {
+            let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+            for u in &shader.user_data {
+                ud[u.index as usize] = match (u.root, u.slot) {
+                    (RootType::Constants, 0) => inputs[u.dword as usize],
+                    (RootType::Table, 1) => 0,
+                    other => panic!("unexpected user data {other:?}"),
+                };
+            }
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(ud))],
+                        views: &[View::Uint2TextureUav(4, 1), View::RawUav(2)],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+            check(label, i, inputs, &out[0], &out[1]);
+        }
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
+
+/// A 64-bit texture atomic: the R32G32 view's two dwords are one i64, so an
+/// add of 0xFFFFFFFF carries into the high dword instead of staying in each.
+#[test]
+fn wide_image_atomic_add() {
+    let shader = build_atomic_cs(
+        image_atomic64(0x011, 2, 0, 8, 3, false), // image_atomic_add
+        image_atomic64(0x011, 8, 0, 8, 3, true),  // with glc
+        8,
+    );
+    let cases = [[0, 0, 1, 0], [1, 0, 0xFFFF_FFFF, 0], [2, 0, 3, 5]];
+    run_atomic_cases(&shader, &cases, |backend, i, inputs, texels, old| {
+        let (lo, hi) = (inputs[2], inputs[3]);
+        let sum = (u64::from(lo) | u64::from(hi) << 32) * 2;
+        let at = 2 * inputs[0] as usize;
+        assert_eq!(
+            [texels[at], texels[at + 1]],
+            [sum as u32, (sum >> 32) as u32],
+            "{backend}: case {i} texel"
+        );
+        assert_eq!([old[0], old[1]], [lo, hi], "{backend}: case {i} old");
+    });
+}
+
+/// A 64-bit cmpswap: the first swaps in the value (the zeroed texel matches),
+/// the second compares against zero, mismatches, and returns the value.
+#[test]
+fn wide_image_atomic_cmpswap() {
+    let shader = build_atomic_cs(
+        image_atomic64(0x010, 2, 0, 8, 0xF, false), // image_atomic_cmpswap
+        image_atomic64(0x010, 8, 0, 8, 0xF, true),
+        8,
+    );
+    let cases = [[0, 0, 4, 3], [1, 0, 0xFFFF_FFFF, 0xFFFF_FFFF]];
+    run_atomic_cases(&shader, &cases, |backend, i, inputs, texels, old| {
+        let at = 2 * inputs[0] as usize;
+        assert_eq!(
+            [texels[at], texels[at + 1]],
+            [inputs[2], inputs[3]],
+            "{backend}: case {i} texel"
+        );
+        assert_eq!(
+            [old[0], old[1]],
+            [inputs[2], inputs[3]],
+            "{backend}: case {i} old"
         );
     });
 }
