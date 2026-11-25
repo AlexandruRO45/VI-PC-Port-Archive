@@ -1731,12 +1731,9 @@ impl<'a> Lower<'a> {
             None => (v, false),
         };
         let &m = self.x.st.masks.get(&lo).ok_or(LANE_MASK)?;
-        if !self.x.st.active.contains(&lo) && !self.ballots.contains_key(&lo) {
-            let xy = self.mask_number(lo)?;
-            self.ballots.insert(lo, xy);
-        }
         let (x, y) = match self.ballots.get(&lo) {
             Some(&xy) => xy,
+            None if !self.x.st.active.contains(&lo) => self.mask_number(lo)?,
             None => {
                 let at = match self.def_block.get(&lo) {
                     // Program inputs (EXEC on entry).
@@ -1768,7 +1765,89 @@ impl<'a> Lower<'a> {
     /// writing it (a complement, a copy made where EXEC is not known), so
     /// no ballot there gives it: with console lanes, the scalar operation
     /// that writes it applied to its operands' numbers, as the console does.
-    fn mask_number(&mut self, lo: Value) -> Result<(V, V), Why> {
+    ///
+    /// Evaluates unballoted non-active mask operands iteratively in
+    /// post-order while tracking active frames in `self.balloting`, so deep
+    /// chains cannot overflow the stack and any cycle fails cleanly.
+    fn mask_number(&mut self, root: Value) -> Result<(V, V), Why> {
+        if !self.balloting.insert(root) {
+            return Err("a lane mask whose lanes depend on its own value");
+        }
+        let mut stack = vec![(root, 0usize)];
+        let res = self.mask_number_walk(&mut stack);
+        for (v, _) in stack {
+            self.balloting.remove(&v);
+        }
+        res
+    }
+
+    fn mask_number_walk(&mut self, stack: &mut Vec<(Value, usize)>) -> Result<(V, V), Why> {
+        while let Some(&(lo, next_dep)) = stack.last() {
+            if let Some(&xy) = self.ballots.get(&lo) {
+                self.balloting.remove(&lo);
+                stack.pop();
+                if stack.is_empty() {
+                    return Ok(xy);
+                }
+                continue;
+            }
+            let (inst, src, op, _) = self.mask_number_inst(lo)?;
+            let mut deps = [None; 4];
+            let count = usize::from(!matches!(op, "mov" | "not")) + 1;
+            let mut n = 0;
+            for h in 0..1 + u8::from(self.x.native.wave64) {
+                for k in 0..count {
+                    if let Some(&Operand::Scalar { code, .. }) = src.get(k)
+                        && code != NULL
+                    {
+                        deps[n] = inst.read(Reg::S(code + h));
+                    }
+                    n += 1;
+                }
+            }
+            if let Some((idx, dep_lo)) = deps[..n]
+                .iter()
+                .enumerate()
+                .skip(next_dep)
+                .find_map(|(i, v)| self.unballoted_mask((*v)?).map(|d| (i, d)))
+            {
+                if !self.balloting.insert(dep_lo) {
+                    return Err("a lane mask whose lanes depend on its own value");
+                }
+                stack.last_mut().expect("non-empty").1 = idx + 1;
+                stack.push((dep_lo, 0));
+                continue;
+            }
+            let xy = self.mask_number_one(lo)?;
+            self.ballots.insert(lo, xy);
+            self.balloting.remove(&lo);
+            stack.pop();
+            if stack.is_empty() {
+                return Ok(xy);
+            }
+        }
+        unreachable!()
+    }
+
+    fn unballoted_mask(&self, v: Value) -> Option<Value> {
+        let is_mask = self.x.st.masks.contains_key(&v) || self.x.st.highs.contains_key(&v);
+        if !self.mask_ok || !is_mask {
+            return None;
+        }
+        if !matches!(self.vals.get(&v), None | Some(Val::Missing(_))) {
+            return None;
+        }
+        let lo = self.x.st.highs.get(&v).copied().unwrap_or(v);
+        (self.x.st.masks.contains_key(&lo)
+            && !self.x.st.active.contains(&lo)
+            && !self.ballots.contains_key(&lo))
+        .then_some(lo)
+    }
+
+    fn mask_number_inst(
+        &self,
+        lo: Value,
+    ) -> Result<(&'a Inst, &'a [Operand], &'a str, usize), Why> {
         const ELSEWHERE: Why = "a lane mask holding lanes elsewhere read as data";
         if self.mask_data != MaskData::Console {
             return Err(ELSEWHERE);
@@ -1797,8 +1876,7 @@ impl<'a> Lower<'a> {
         else {
             return Err(ELSEWHERE);
         };
-        let wave64 = self.x.native.wave64;
-        let width = if wave64 { "_b64" } else { "_b32" };
+        let width = if self.x.native.wave64 { "_b64" } else { "_b32" };
         let op = inst
             .name()
             .strip_prefix("s_")
@@ -1812,6 +1890,13 @@ impl<'a> Lower<'a> {
         } else {
             self.tail[b].ok_or("a lane mask written after its use")?
         };
+        Ok((inst, src, op, at))
+    }
+
+    fn mask_number_one(&mut self, lo: Value) -> Result<(V, V), Why> {
+        const ELSEWHERE: Why = "a lane mask holding lanes elsewhere read as data";
+        let (inst, src, op, at) = self.mask_number_inst(lo)?;
+        let wave64 = self.x.native.wave64;
         // Dword `h` of source `k` (inline constants sign-extend).
         let word = |l: &mut Self, k: usize, h: u8| -> Result<V, Why> {
             let x = match src.get(k) {
@@ -10469,6 +10554,84 @@ mod tests {
             let words: Vec<u32> = head.iter().chain(&tail).copied().collect();
             lowers(&words, 0).unwrap();
         }
+    }
+
+    #[test]
+    fn deep_scalar_mask_chain_does_not_overflow_the_stack() {
+        let mut words = vec![
+            0x7D84_0080u32, // v_cmp_eq_u32 vcc_lo, 0, v0
+            0xBE84_3C6A,    // s_and_saveexec_b32 s4, vcc_lo
+            0xBE82_077E,    // s_not_b32 s2, exec_lo
+        ];
+        words.extend(std::iter::repeat_n(0x8902_8102u32, 4000)); // s_xor_b32 s2, s2, 1
+        words.extend([
+            0xD765_0000,
+            0x0001_0002, // v_mbcnt_lo_u32_b32 v0, s2, 0
+            S_ENDPGM,
+        ]);
+        std::thread::Builder::new()
+            .stack_size(1024 * 1024)
+            .spawn(move || lowers(&words, 0))
+            .unwrap()
+            .join()
+            .unwrap()
+            .unwrap();
+    }
+
+    #[test]
+    fn non_active_mask_cycle_returns_error() {
+        let words = [
+            0x7D84_0080u32, // v_cmp_eq_u32 vcc_lo, 0, v0
+            0xBE84_3C6A,    // s_and_saveexec_b32 s4, vcc_lo
+            0xBE82_077E,    // s_not_b32 s2, exec_lo
+            0x8902_8102,    // s_xor_b32 s2, s2, 1
+            S_ENDPGM,
+        ];
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 2,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 0,
+                threads: [32, 1, 1],
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let p = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let parts = Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+            view_marks: false,
+        };
+        let bad = std::collections::HashMap::new();
+        let mut l = super::Lower::new(&parts, &bad);
+        l.mask_ok = true;
+        let lo0 = p.blocks[0].insts[2].writes[0].1;
+        let lo1 = p.blocks[0].insts[3].writes[0].1;
+        assert!(!st.active.contains(&lo0) && !st.active.contains(&lo1));
+        assert!(l.balloting.insert(lo0));
+        assert_eq!(
+            l.mask_dword(lo0),
+            Err("a lane mask whose lanes depend on its own value")
+        );
+        assert_eq!(
+            l.mask_dword(lo1),
+            Err("a lane mask whose lanes depend on its own value")
+        );
+        assert_eq!(l.balloting.len(), 1);
+        assert!(l.balloting.contains(&lo0));
     }
 
     #[test]
