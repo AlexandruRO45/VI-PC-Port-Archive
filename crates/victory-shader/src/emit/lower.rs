@@ -12224,6 +12224,7 @@ mod tests {
             lowers(&words, 0),
             Err(crate::ShaderError::Unsupported { what: "GDS", .. })
         ));
+    }
 
     /// A compute shader cannot sample with implicit derivatives: the stage
     /// has none, and DXIL has no `dx.op.sample` for it (#1987).
