@@ -18,6 +18,8 @@
 
 use std::collections::HashMap;
 use std::mem::offset_of;
+#[cfg(windows)]
+use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::object::{self, E_INVALIDARG, HRESULT, Iid, Object, PIPELINE, Table, This, guid};
@@ -139,12 +141,12 @@ impl Shader {
                 // `VICTORY_SHADER_SAVE=<dir>`: each shader as the title gave it (`.cdxil`) and as
                 // translated (`.dxil`), by the hash crash reports name it with
                 if let Some(dir) = std::env::var_os("VICTORY_SHADER_SAVE") {
-                    let dir = std::path::PathBuf::from(dir);
-                    let _ = std::fs::create_dir_all(&dir);
                     let stem = format!("{}.{}", self.hash, self.stage);
-                    let _ = std::fs::write(dir.join(format!("{stem}.cdxil")), &self.container);
-                    if let Ok(t) = &done {
-                        let _ = std::fs::write(dir.join(format!("{stem}.dxil")), &t.host.dxil);
+                    let dxil = done.as_ref().ok().map(|t| t.host.dxil.as_slice());
+                    if let Err(error) =
+                        save_shader_dump(Path::new(&dir), &stem, &self.container, dxil)
+                    {
+                        tracing::warn!(%error, "VICTORY_SHADER_SAVE ignored");
                     }
                 }
                 if let Ok(t) = &done {
@@ -170,6 +172,28 @@ impl Shader {
             })
             .as_ref()
     }
+}
+
+#[cfg(windows)]
+fn save_shader_dump(
+    dir: &Path,
+    stem: &str,
+    container: &[u8],
+    dxil: Option<&[u8]>,
+) -> anyhow::Result<()> {
+    // Resolve relative input once so the guard and the writes use the same directory.
+    let dir = if dir.as_os_str().is_empty() {
+        std::env::current_dir()?
+    } else {
+        std::path::absolute(dir)?
+    };
+    victory_core::ensure_outside_repo(&dir)?;
+    let _ = std::fs::create_dir_all(&dir);
+    let _ = std::fs::write(dir.join(format!("{stem}.cdxil")), container);
+    if let Some(dxil) = dxil {
+        let _ = std::fs::write(dir.join(format!("{stem}.dxil")), dxil);
+    }
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -736,6 +760,56 @@ mod tests {
 
     use super::*;
     use crate::object::{S_OK, slot};
+
+    #[cfg(windows)]
+    #[test]
+    fn shader_save_respects_repo_policy() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        std::fs::write(repo.join(".victory-root"), b"").unwrap();
+        let internal = repo.join("dumps").join("new");
+
+        // Use a relative input without changing the process-wide working directory.
+        let relative_root = tempfile::tempdir_in(".").unwrap();
+        std::fs::write(relative_root.path().join(".victory-root"), b"").unwrap();
+        let relative = Path::new(relative_root.path().file_name().unwrap())
+            .join("dumps")
+            .join("new");
+
+        let container = b"synthetic console shader";
+        let dxil = b"synthetic host shader";
+        let stem = "synthetic.compute";
+        let cdxil_name = "synthetic.compute.cdxil";
+        let dxil_name = "synthetic.compute.dxil";
+
+        let outside = temp.path().join("outside").join("dumps");
+        assert!(!outside.exists());
+        let success = outside.join("success");
+        save_shader_dump(&success, stem, container, Some(dxil)).unwrap();
+        assert_eq!(std::fs::read(success.join(cdxil_name)).unwrap(), container);
+        assert_eq!(std::fs::read(success.join(dxil_name)).unwrap(), dxil);
+
+        let failure = outside.join("failure");
+        assert!(!failure.exists());
+        save_shader_dump(&failure, stem, container, None).unwrap();
+        assert_eq!(std::fs::read(failure.join(cdxil_name)).unwrap(), container);
+        assert!(!failure.join(dxil_name).exists());
+
+        let outcomes = [&internal, &relative].map(|dir| {
+            let parent = dir.parent().unwrap();
+            assert!(!parent.exists());
+            let refused = save_shader_dump(dir, stem, container, Some(dxil)).is_err();
+            let wrote_container =
+                std::fs::read(dir.join(cdxil_name)).is_ok_and(|bytes| bytes == container);
+            (refused, parent.exists(), wrote_container)
+        });
+        assert_eq!(
+            outcomes,
+            [(true, false, false); 2],
+            "(refused, created parent, wrote container) for absolute and relative repo paths"
+        );
+    }
 
     fn shaders(p: This) -> Vec<(&'static str, Vec<u8>)> {
         pipeline(p)
