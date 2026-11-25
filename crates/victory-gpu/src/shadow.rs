@@ -796,6 +796,12 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
         *used = now;
         return Some(shadow.clone());
     }
+    // A new window: first give back those over memory the title freed
+    // (`VICTORY_SWEEP_TILES=2`), so that the cap below does not throw out
+    // windows still in use instead.
+    drop(map);
+    sweep_loose_now();
+    let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
     let total: u64 = map.entries.keys().map(|&(_, n)| n).sum();
     let released = if map.entries.len() >= LOOSE_MAX_COUNT || total.saturating_add(len) > LOOSE_MAX_BYTES {
         map.trim(48, (192u64 << 20).min(LOOSE_MAX_BYTES.saturating_sub(len)))
@@ -821,6 +827,111 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     map.entries.insert((start, len), (now, shadow.clone()));
     changed();
     Some(shadow)
+}
+
+/// Which copies of memory outside buffer objects are given back before
+/// the cap asks (`VICTORY_SWEEP_TILES`): 0 none (default); 2 windows no
+/// list, heap slot or submission holds whose title memory is all freed
+/// (`MEM_FREE`), at most once a second. Port of Belobug 0a32e89/e11fb06,
+/// whose sparse tiles this tree does not have: its loose windows are what
+/// grows with title memory here. Mode 1 there (by age alone) stopped the
+/// host GPU and is not ported. Reserved memory never counts as freed: a
+/// lazily committed reservation (`crate::watch::lazy_covers`) is still the
+/// title's and its copy may hold GPU-only results (the zero-fill of
+/// 7a91fe8).
+fn sweep_mode() -> u8 {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| {
+        let mode = std::env::var("VICTORY_SWEEP_TILES").ok().and_then(|v| v.trim().parse::<u8>().ok()).unwrap_or(0);
+        match mode {
+            0 => 0,
+            2 => {
+                tracing::info!("VICTORY_SWEEP_TILES=2: copies of freed title memory are given back");
+                2
+            }
+            other => {
+                tracing::warn!(mode = other, "VICTORY_SWEEP_TILES: only 0 and 2 are known; off");
+                0
+            }
+        }
+    })
+}
+
+/// [`sweep_loose`] if `VICTORY_SWEEP_TILES=2`, at most once a second,
+/// whoever asks.
+fn sweep_loose_now() {
+    if sweep_mode() != 2 {
+        return;
+    }
+    static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+    {
+        let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+        if last.is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(1)) {
+            return;
+        }
+        *last = Some(std::time::Instant::now());
+    }
+    let started = std::time::Instant::now();
+    let (windows, bytes) = sweep_loose(freed);
+    let took = started.elapsed();
+    if windows > 0 || took > std::time::Duration::from_millis(20) {
+        tracing::info!(windows, megabytes = bytes >> 20, ms = took.as_millis() as u64, "copies of freed title memory given back");
+    }
+}
+
+/// Whether all of `[start, start + len)` is free address space: nothing of
+/// the title's is there any more (reserved or committed memory is not).
+fn freed(start: u64, len: u64) -> bool {
+    use windows_sys::Win32::System::Memory::{MEM_FREE, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    let end = start.saturating_add(len) as usize;
+    let mut at = start as usize;
+    while at < end {
+        let mut info = MEMORY_BASIC_INFORMATION::default();
+        // SAFETY: only querying address metadata; `info` is writable.
+        let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+        if n == 0 || info.State != MEM_FREE || info.RegionSize == 0 {
+            return false;
+        }
+        at = (info.BaseAddress as usize).saturating_add(info.RegionSize);
+    }
+    true
+}
+
+/// Gives back the loose windows only the cache holds whose title memory
+/// `gone` says is no longer there. Which ones is decided under the cache's
+/// lock, `gone` asked outside it (it asks the system, e11fb06), and a
+/// window looked up or taken meanwhile is kept. Returns the windows and
+/// bytes given back.
+fn sweep_loose(gone: impl Fn(u64, u64) -> bool) -> (usize, u64) {
+    let candidates: Vec<((u64, u64), u64)> = LOOSE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entries
+        .iter()
+        .filter(|(_, (_, s))| Arc::strong_count(s) == 1)
+        .map(|(&key, &(used, _))| (key, used))
+        .collect();
+    let gone: Vec<((u64, u64), u64)> = candidates.into_iter().filter(|&((a, n), _)| gone(a, n)).collect();
+    if gone.is_empty() {
+        return (0, 0);
+    }
+    let mut released = Vec::new();
+    {
+        let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+        for (key, used) in gone {
+            if map.entries.get(&key).is_some_and(|(u, s)| *u == used && Arc::strong_count(s) == 1)
+                && let Some((_, copy)) = map.entries.remove(&key)
+            {
+                released.push((key.1, copy));
+            }
+        }
+        if !released.is_empty() {
+            changed();
+        }
+    }
+    let bytes = released.iter().map(|(n, _)| n).sum();
+    // Dropped outside the cache's lock: their trackers take the journal's.
+    (released.len(), bytes)
 }
 
 /// The copy a buffer view of `len` bytes at `address`, whose elements are
@@ -1188,6 +1299,122 @@ mod tests {
             2 * a + 2 * PAGE + (len - a) + 200,
             many.3
         );
+    }
+
+    /// A committed allocation holding one whole loose window: (window
+    /// start, allocation base).
+    fn window_alloc() -> (usize, usize) {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE};
+        window_alloc_as(MEM_RESERVE | MEM_COMMIT)
+    }
+
+    fn window_alloc_as(kind: u32) -> (usize, usize) {
+        use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualAlloc};
+        let n = 3 * WINDOW as usize;
+        // SAFETY: a fresh allocation, freed by the test.
+        let base = unsafe { VirtualAlloc(std::ptr::null(), n, kind, PAGE_READWRITE) } as usize;
+        assert_ne!(base, 0);
+        let at = base.next_multiple_of(WINDOW as usize);
+        // A window left by an earlier user of these addresses is not ours.
+        evict_loose(at, WINDOW as usize);
+        (at, base)
+    }
+
+    /// The sweep tests share the loose cache: one at a time.
+    static SWEEP_TESTS: Mutex<()> = Mutex::new(());
+
+    fn free_alloc(base: usize) {
+        use windows_sys::Win32::System::Memory::{MEM_RELEASE, VirtualFree};
+        // SAFETY: an allocation of ours.
+        assert_ne!(unsafe { VirtualFree(base as _, 0, MEM_RELEASE) }, 0);
+    }
+
+    /// The shader value at a loose window's third page, if the cache still
+    /// has the window.
+    fn loose_value(at: usize) -> Option<u32> {
+        LOOSE
+            .lock()
+            .unwrap()
+            .entries
+            .get(&(at as u64, WINDOW))
+            .map(|(_, s)| s.read_host((at + 2 * PAGE) as u64, 1)[0])
+    }
+
+    /// (a): the sweep is off unless asked for, and off it leaves every
+    /// copy, even one over freed memory.
+    #[test]
+    fn sweep_is_off_by_default() {
+        let _one = SWEEP_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        if std::env::var_os("VICTORY_SWEEP_TILES").is_some() || host().is_none() {
+            return;
+        }
+        assert_eq!(sweep_mode(), 0);
+        let (at, base) = window_alloc();
+        let copy = find(at as u64, 16).expect("loose copy");
+        copy.write_host((at + 2 * PAGE) as u64, &0x1234_5678u32.to_le_bytes());
+        drop(copy);
+        free_alloc(base);
+        sweep_loose_now();
+        assert_eq!(loose_value(at), Some(0x1234_5678), "nothing given back with the sweep off");
+        evict_loose(at, WINDOW as usize);
+    }
+
+    /// (c): the sweep gives back a copy of freed title memory nothing
+    /// holds, and keeps, bytes and all: a copy of live memory, of reserved
+    /// (lazily committed) memory, of freed memory a list still holds, and
+    /// one looked up while the system was asked.
+    #[test]
+    fn sweep_gives_back_only_freed_unheld_copies_and_keeps_shadow_bytes() {
+        let _one = SWEEP_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        use windows_sys::Win32::System::Memory::MEM_RESERVE;
+        if host().is_none() {
+            return;
+        }
+        let gpu = 0x1234_5678u32;
+        let made = |at: usize| {
+            let copy = find(at as u64, 16).expect("loose copy");
+            copy.write_host((at + 2 * PAGE) as u64, &gpu.to_le_bytes());
+            copy
+        };
+        let (gone, gone_base) = window_alloc();
+        let (live, live_base) = window_alloc();
+        let (reserved, reserved_base) = window_alloc_as(MEM_RESERVE);
+        let (held, held_base) = window_alloc();
+        let (asked, asked_base) = window_alloc();
+        drop(made(gone));
+        drop(made(live));
+        drop(made(reserved));
+        let held_copy = made(held);
+        drop(made(asked));
+        for base in [gone_base, held_base, asked_base] {
+            free_alloc(base);
+        }
+        assert!(freed(gone as u64, WINDOW), "released memory is free");
+        assert!(!freed(live as u64, WINDOW), "committed memory is not");
+        assert!(!freed(reserved as u64, WINDOW), "reserved memory is not");
+        let ours = [gone, live, reserved, held, asked].map(|a| a as u64);
+        let (windows, bytes) = sweep_loose(|a, n| {
+            if a == asked as u64 {
+                // Looked up while the system is asked: kept.
+                drop(find(a, 16));
+            }
+            ours.contains(&a) && freed(a, n)
+        });
+        assert_eq!(loose_value(gone), None, "the copy of freed memory is given back");
+        assert_eq!((windows, bytes), (1, WINDOW));
+        for at in [live, reserved, held, asked] {
+            assert_eq!(loose_value(at), Some(gpu), "kept with the shader's bytes at {at:#x}");
+        }
+        assert_eq!(held_copy.read_host((held + 2 * PAGE) as u64, 1), [gpu]);
+        drop(held_copy);
+        // Freed and held by nothing now: the next sweep takes it.
+        let (windows, _) = sweep_loose(|a, n| a == held as u64 && freed(a, n));
+        assert_eq!((windows, loose_value(held)), (1, None));
+        for at in [live, reserved, asked] {
+            evict_loose(at, WINDOW as usize);
+        }
+        free_alloc(live_base);
+        free_alloc(reserved_base);
     }
 
     /// The A/B opt-out: `VICTORY_SERIAL_COPIES=1` wins, one thread as
