@@ -1,6 +1,8 @@
 # Lazy copy-back: merge only what the CPU touches
 
-Status: design, step 0 (measurement) done. Nothing below is built yet.
+Status: **stopped after step 2** (2026-11-25). Steps 1 and 2 are in the
+code behind `VICTORY_LAZY_BACK=1`/`2`, off by default. Step 2 crashes the
+game (see "What step 2 showed"); do not turn it on for play.
 
 ## Why
 
@@ -98,3 +100,35 @@ every frame).
 4. **On by default**, after runs past the first rooms, a save, a load.
 
 `VICTORY_LAZY_BACK=1` turns it on at every step until step 4.
+
+## What step 2 showed (RTX 4070 / Ryzen 5 7500F)
+
+Step 1 measured 575-612 of about 1,360 fetched pieces a frame lying wholly
+on candidates (35-38 MB), and our own touches of candidates at 0.3-5 a
+frame. Step 2 then made pages card-only as predicted, and:
+
+- **Every give-back went through the kernel** (`way="kernel"`), never
+  through our own view: `inplace::write_own` needs the runtime's mapping
+  lock (`watch::title_memory_reading_now`, a try-lock), which is taken
+  whenever a touch happens, while the world streams. The kernel way gives
+  the views their protection back *before* the bytes are in: a title
+  thread can read the page unmerged in that window. The game crashed
+  every time (a write to 0 in its own code, `+0x23cf683`), within a
+  second of the first pages going card-only; never with
+  `VICTORY_LAZY_BACK=1` or without the switch.
+- **Pages were given back 1-3 frames after they went card-only**, all for
+  our own access (refreshes, fills, textures reading title memory): each
+  new card-only page is touched almost at once, so pages churn between
+  card-only and back, paying two protection changes each time, and the
+  merges skipped would be few.
+
+Two faults were found and fixed on the way (a page went card-only at its
+first fetch; a give-back wrote the card's piece whole over title bytes the
+card had not received). Neither was the last crash.
+
+What it would take: find which of our own reads touch these pages every
+few frames and whether they need to (step 1's "touches of other noted
+pages", about 1,240 a frame, is the same question for the rest), and a
+give-back that never opens the views before the bytes are in (waiting for
+the mapping lock outside the fault handler, or a write path that needs
+no lock).
