@@ -77,6 +77,14 @@ unsafe impl Sync for SharedDevice {}
 fn create_device(warp: bool) -> Result<ID3D12Device, String> {
     // SAFETY: plain D3D12/DXGI calls with valid out pointers.
     unsafe {
+        if debug_enabled() {
+            let mut layer: Option<ID3D12Debug> = None;
+            if D3D12GetDebugInterface(&mut layer).is_ok()
+                && let Some(layer) = layer
+            {
+                layer.EnableDebugLayer();
+            }
+        }
         let mut device: Option<ID3D12Device> = None;
         let factory: IDXGIFactory4 =
             CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(err)?;
@@ -157,6 +165,42 @@ fn hardware_adapter(factory: &IDXGIFactory4) -> windows::core::Result<IDXGIAdapt
 /// Serializes WARP (`d3d10warp.dll`) operations across threads: concurrent
 /// WARP pipeline compiles / dispatches crash with `0xC0000005` on Windows 11.
 static WARP_LOCK: Mutex<()> = Mutex::new(());
+
+fn debug_enabled() -> bool {
+    std::env::var("VICTORY_D3D12_DEBUG").is_ok_and(|v| v == "1")
+}
+
+/// Drains stored D3D12 debug messages, returning the first error (or first
+/// message if none is error-level) and clearing the queue.
+fn drain_debug_message(queue: &ID3D12InfoQueue) -> Option<String> {
+    let mut first = None;
+    let mut first_error = None;
+    // SAFETY: each message is read into a buffer of the size the queue reports,
+    // then the queue is cleared.
+    unsafe {
+        for i in 0..queue.GetNumStoredMessages() {
+            let mut size = 0;
+            if queue.GetMessage(i, None, &mut size).is_err() || size == 0 {
+                continue;
+            }
+            let mut buffer = vec![0u64; size.div_ceil(8)];
+            let message = buffer.as_mut_ptr().cast::<D3D12_MESSAGE>();
+            if queue.GetMessage(i, Some(message), &mut size).is_ok() {
+                let m = &*message;
+                let text = std::slice::from_raw_parts(m.pDescription, m.DescriptionByteLength);
+                let text = String::from_utf8_lossy(text).trim_end_matches('\0').to_owned();
+                if first.is_none() {
+                    first = Some(text.clone());
+                }
+                if m.Severity.0 <= D3D12_MESSAGE_SEVERITY_ERROR.0 && first_error.is_none() {
+                    first_error = Some(text);
+                }
+            }
+        }
+        queue.ClearStoredMessages();
+    }
+    first_error.or(first)
+}
 
 impl Host {
     fn lock_warp(&self) -> Option<MutexGuard<'static, ()>> {
@@ -373,7 +417,45 @@ impl Host {
         };
         let _guard = self.lock_warp();
         // SAFETY: the description points at live data.
-        unsafe { self.device.CreateComputePipelineState(&desc) }.map_err(err)
+        self.create_pipeline(|| unsafe { self.device.CreateComputePipelineState(&desc) })
+    }
+
+    /// Runs a pipeline-creation call; when `VICTORY_D3D12_DEBUG=1`, serializes
+    /// the shared adapter `ID3D12InfoQueue` so concurrent census workers do not
+    /// clear or steal each other's driver diagnostics.
+    fn create_pipeline<T>(
+        &self,
+        f: impl FnOnce() -> windows::core::Result<T>,
+    ) -> Result<T, String> {
+        if !debug_enabled() {
+            return f().map_err(err);
+        }
+        static DEBUG_QUEUE: Mutex<()> = Mutex::new(());
+        let _guard = DEBUG_QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+        let queue = self.device.cast::<ID3D12InfoQueue>().ok();
+        if let Some(q) = &queue {
+            // SAFETY: serialized by `DEBUG_QUEUE`.
+            unsafe { q.ClearStoredMessages() };
+        }
+        match f() {
+            Ok(v) => {
+                if let Some(q) = &queue {
+                    // SAFETY: serialized by `DEBUG_QUEUE`.
+                    unsafe { q.ClearStoredMessages() };
+                }
+                Ok(v)
+            }
+            Err(e) => {
+                let mut msg = err(e);
+                if let Some(q) = &queue
+                    && let Some(detail) = drain_debug_message(q)
+                {
+                    msg.push_str(": ");
+                    msg.push_str(&detail);
+                }
+                Err(msg)
+            }
+        }
     }
 
     /// A graphics pipeline from a vertex and a pixel shader, with float or
@@ -480,8 +562,7 @@ impl Host {
         }
         let _guard = self.lock_warp();
         // SAFETY: the description points at live data.
-        let pso = unsafe { self.device.CreateGraphicsPipelineState(&desc) };
-        pso.map_err(err)
+        self.create_pipeline(|| unsafe { self.device.CreateGraphicsPipelineState(&desc) })
     }
 
     /// A mesh pipeline from a mesh and a pixel shader (user data of the mesh
@@ -592,7 +673,7 @@ impl Host {
         let _guard = self.lock_warp();
         let device: ID3D12Device2 = self.device.cast().map_err(err)?;
         // SAFETY: the stream points at live data and outlives the call.
-        unsafe { device.CreatePipelineState(&desc) }.map_err(err)
+        self.create_pipeline(|| unsafe { device.CreatePipelineState(&desc) })
     }
 
     /// Whether this device fuses DXIL `FMad`, which the lowering emits for
@@ -2070,5 +2151,36 @@ mod tests {
                 });
             }
         });
+    }
+
+    #[test]
+    fn debug_pipeline_creation_drains_info_queue_on_failure() {
+        // Test `create_pipeline` InfoQueue attribution on WARP when
+        // `VICTORY_D3D12_DEBUG=1` is active; skip if no WARP SM 6.6 device.
+        let Ok(host) = Host::new(true) else {
+            return;
+        };
+        let Ok(queue) = host.device.cast::<ID3D12InfoQueue>() else {
+            // Debug layer not enabled in this process (e.g. already created
+            // without debug layer or SDK layers absent): still verify invalid
+            // pipeline creation fails cleanly without panicking.
+            let root = host.root_signature_for(&[]).unwrap();
+            assert!(host.compute_pipeline_with(&root, b"DXBC").is_err());
+            return;
+        };
+        let note = c"synthetic pipeline refusal reason";
+        // SAFETY: valid null-terminated ASCII description on a live queue.
+        unsafe {
+            queue.ClearStoredMessages();
+            queue
+                .AddApplicationMessage(D3D12_MESSAGE_SEVERITY_ERROR, PCSTR(note.as_ptr().cast()))
+                .unwrap();
+        }
+        assert_eq!(
+            drain_debug_message(&queue).as_deref(),
+            Some("synthetic pipeline refusal reason")
+        );
+        // Queue must be empty after draining.
+        assert_eq!(drain_debug_message(&queue), None);
     }
 }
