@@ -1235,8 +1235,8 @@ impl PlanePass {
 /// plane of `depth`, into that plane: `depth` in the depth-write state,
 /// `plane` readable by pixel shaders. The pass sets the list's descriptor
 /// heap, graphics root signature, pipeline, depth target, viewport,
-/// scissor and topology and puts none of them back: it is for a list that
-/// records nothing of the title's after it.
+/// scissor and topology and puts none of them back: the caller sets the
+/// title's again, or the list records nothing of the title's after it.
 fn record_plane_pass(
     list: &ID3D12GraphicsCommandList,
     depth: &ID3D12Resource,
@@ -8374,13 +8374,37 @@ impl HostList {
         colour: bool,
         write: bool,
     ) -> bool {
+        self.twin_use_inner(resource, colour, write, false).0
+    }
+
+    /// For the depth target of a draw about to be bound (before
+    /// `State::bind`): [`HostList::twin_use`] as a write of the depth side,
+    /// and if the depth plane's twin holds what the plane lacks, the pass
+    /// that draws it into the plane is recorded here, before the draw that
+    /// tests the plane. True if it was: the list's heap, root signature,
+    /// pipeline, targets, viewport, scissor and topology are then the
+    /// pass's, and the caller sets its own again (`State::replay`).
+    pub(crate) fn twin_use_now(&self, resource: crate::object::This) -> bool {
+        self.twin_use_inner(resource, false, true, true).1
+    }
+
+    /// [`HostList::twin_use`], and with `now` the depth plane's pass
+    /// recorded at once ([`HostList::twin_use_now`]): whether the texture
+    /// has a twin, and whether the pass was recorded.
+    fn twin_use_inner(
+        &self,
+        resource: crate::object::This,
+        colour: bool,
+        write: bool,
+        now: bool,
+    ) -> (bool, bool) {
         const UNORDERED_ACCESS: u32 = 0x8;
         // Asked for every texture a draw reads: most have no twin.
         let Some(twin) = crate::resource::twin(resource) else {
-            return false;
+            return (false, false);
         };
         let Some(depth) = crate::resource::host_copy(resource) else {
-            return false;
+            return (false, false);
         };
         let side = usize::from(colour);
         let mut twins = self.twins.lock().unwrap_or_else(|e| e.into_inner());
@@ -8410,12 +8434,18 @@ impl HostList {
             (true, false) => u.behind[1] = Some(true),
             (false, _) => {}
         }
-        // shortcut: the depth plane's twin is not drawn into the plane
-        // here: the pass sets a pipeline and a target of ours, which a list
-        // still recording the title's commands cannot take. This use sees
-        // the plane as it was; the pass runs when the list closes
-        // (`twins_to_depth`). Counted.
-        if copy && !colour && twin.plane.is_some() {
+        // The depth plane's twin drawn into the plane: before a draw binds
+        // the depth texture (`now`), so that the title's class draws, which
+        // test the plane with "equal", see this frame's classes. Elsewhere
+        // (copies, clears, shader reads) it is not: the pass sets a pipeline
+        // and a target of ours, which the title's state there would not get
+        // back. That use sees the plane as it was; the pass runs at the next
+        // such bind or when the list closes (`twins_to_depth`). Counted.
+        let behind_plane = !colour && twin.plane.is_some() && (copy || u.late);
+        let pass_now = now && behind_plane;
+        if pass_now {
+            u.late = false;
+        } else if copy && !colour && twin.plane.is_some() {
             u.late = true;
             crate::resource::PLANES[2].fetch_add(1, Ordering::Relaxed);
         }
@@ -8429,14 +8459,18 @@ impl HostList {
         if colour && let Some(plane) = &twin.plane {
             self.settle(plane, UNORDERED_ACCESS);
         }
-        true
+        if pass_now {
+            self.pass_plane(&depth, &twin);
+        }
+        (true, pass_now)
     }
 
     /// Records the pass that draws the twin of the depth plane of `depth`
     /// into the plane, if `twin` has one, with the moves to the states the
-    /// pass needs; the twin is left in the unordered access state. Only
-    /// for a list that records nothing of the title's afterwards
-    /// (`record_plane_pass`).
+    /// pass needs; the twin is left in the unordered access state. The
+    /// pass leaves its own state set (`record_plane_pass`): the title's is
+    /// set again after it (`State::replay`), or nothing of the title's
+    /// follows (the list closes).
     fn pass_plane(
         &self,
         depth: &std::sync::Arc<crate::resource::HostTexture>,

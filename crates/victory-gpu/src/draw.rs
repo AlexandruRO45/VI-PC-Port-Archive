@@ -890,6 +890,13 @@ impl State {
             // Its geometry stage would turn each triangle into a rectangle.
             once!("a rectangle pipeline drawn with another topology");
         }
+        // A depth texture shaders also write: what they wrote, first, and
+        // the depth plane drawn from its twin before a draw tests it.
+        if self.depth != 0 && list.twin_use_now(self.depth as This) {
+            // The plane's pass set its own heap, root signature, pipeline,
+            // target, viewport, scissor and topology.
+            self.replay(list);
+        }
         if !self.bind(list, p, false) {
             return false;
         }
@@ -940,8 +947,7 @@ impl State {
             crate::list::ensure_state(list, t as This, RENDER_TARGET);
         }
         if self.depth != 0 {
-            // A depth texture shaders also write: what they wrote, first.
-            list.twin_use(self.depth as This, false, true);
+            // (what shaders wrote of it is in: `twin_use_now` above)
             // A view that writes neither plane keeps the texture readable:
             // the depth read state, together with the shader read states
             // if this draw's shaders read the same texture (the write state
