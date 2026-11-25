@@ -273,23 +273,29 @@ fn queue(p: Arc<Pending>, now: bool) {
     work.notify_one();
 }
 
-/// How many workers make pipelines: `VICTORY_PIPELINE_THREADS` when set
-/// (0 makes them on the calling thread, as when no worker starts), else
-/// half the logical processors, 2 to 8. On some host/driver pairs the
-/// driver's compiler is not safe to call from several threads at once
-/// (AMD RDNA4 crashes in amdxc64 while pipelines compile in parallel;
-/// one worker avoids it), so the count is configurable.
-fn workers() -> usize {
-    let Ok(v) = std::env::var("VICTORY_PIPELINE_THREADS") else {
-        return default_workers();
-    };
+/// `VICTORY_PIPELINE_THREADS` when it holds a count, else `None`: how many
+/// threads may compile pipelines at once. On some host/driver pairs the
+/// driver's compiler is not safe to call from several threads at once (AMD
+/// RDNA4 crashes in amdxc64 while pipelines compile in parallel; one worker
+/// avoids it). Callers that make pipelines on threads of their own
+/// (`victory translate` sizes its `--jobs` default by it) read the same
+/// value so one setting covers both.
+pub fn env_workers() -> Option<usize> {
+    let v = std::env::var("VICTORY_PIPELINE_THREADS").ok()?;
     match v.parse() {
-        Ok(n) => n,
+        Ok(n) => Some(n),
         Err(e) => {
             tracing::warn!(value = %v, error = %e, "VICTORY_PIPELINE_THREADS not a number");
-            default_workers()
+            None
         }
     }
+}
+
+/// How many workers make pipelines: `VICTORY_PIPELINE_THREADS` when set
+/// (0 makes them on the calling thread, as when no worker starts), else
+/// half the logical processors, 2 to 8.
+fn workers() -> usize {
+    env_workers().unwrap_or_else(default_workers)
 }
 
 /// Half the logical processors, 2 to 8.
