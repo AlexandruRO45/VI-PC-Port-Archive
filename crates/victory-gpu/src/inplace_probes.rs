@@ -123,7 +123,7 @@ fn compile(device: &ID3D12Device, source: &str, target: &str) -> windows::core::
     }
 }
 
-fn compute(device: &ID3D12Device, source: &str) -> windows::core::Result<(ID3D12RootSignature, ID3D12PipelineState)> {
+pub(crate) fn compute(device: &ID3D12Device, source: &str) -> windows::core::Result<(ID3D12RootSignature, ID3D12PipelineState)> {
     let (root, bytes) = compile(device, source, "cs_5_1")?;
     // SAFETY: the bytecode lives through the call; the root signature is
     // borrowed for it.

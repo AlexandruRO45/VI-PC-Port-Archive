@@ -75,7 +75,11 @@ pub(crate) fn probe_level() -> u8 {
 /// memory the runtime reported committed, parts of at most 4 GiB - 64 KiB
 /// every 2 GiB; and one per committed section of physical pages, for view
 /// memory that is one run of a section), not a heap of its own; the
-/// budget is the arenas' bytes ([`crate::arena::most`]).
+/// budget is the arenas' bytes ([`crate::arena::most`]). 4: as 3, and the
+/// big title buffers that got a copy in the card's memory are residents
+/// where their memory lies in an arena (`crate::resident`: a buffer in the
+/// card's memory fed from the arena and merged back into it by the card,
+/// with no copying, hashing or copy-back on the CPU).
 ///
 /// What stage 1 covers is private memory (`XMemVirtualAlloc`'s). View
 /// memory (the page pool) is turned down here: its section is made

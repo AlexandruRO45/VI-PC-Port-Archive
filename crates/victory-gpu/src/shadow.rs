@@ -83,6 +83,11 @@ pub(crate) struct Shadow {
     /// ([`still_good`]).
     section: Option<usize>,
     remapped: std::sync::atomic::AtomicBool,
+    /// With `crate::resident` (`VICTORY_INPLACE=4`): not a copy of ours
+    /// either. `buffer` is a resident's buffer in the card's memory, which
+    /// the card alone keeps in step with the title's memory in its arena,
+    /// and the bytes from its first byte to `start`.
+    resident: Option<(Arc<crate::resident::Resident>, u64)>,
 }
 
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
@@ -1499,8 +1504,9 @@ pub(crate) fn placement_line() {
     // [resident, in place, card copy, system copy, in place < 64 KiB] x (count, bytes)
     let mut census = [[[0u64; 2]; 5]; 2];
     let add = |at: &mut [[u64; 2]; 5], s: &Shadow| {
-        // Kind 0, in a resident, is Stage 2's (`VICTORY_INPLACE=4`).
-        let kind = if s.place.is_some() {
+        let kind = if s.resident.is_some() {
+            0
+        } else if s.place.is_some() {
             1
         } else if s.card.is_some() {
             2
@@ -1869,6 +1875,10 @@ impl Drop for Shadow {
             crate::inplace::gone(self.window, self.len);
             return;
         }
+        if self.resident.is_some() {
+            // Never counted with the copies (`Shadow::resident`).
+            return;
+        }
         LIVE[0].fetch_sub(1, Ordering::Relaxed);
         LIVE[1].fetch_sub(self.len, Ordering::Relaxed);
         if self.kept.get_mut().unwrap_or_else(|e| e.into_inner()).1 {
@@ -2192,7 +2202,12 @@ impl Shadow {
 
     /// Offset of a title address from the buffer's start.
     pub(crate) fn offset(&self, address: u64) -> u64 {
-        address - self.start + self.place.as_ref().map_or(0, |place| place.1)
+        let bias = match (&self.place, &self.resident) {
+            (Some(place), _) => place.1,
+            (None, Some((_, bias))) => *bias,
+            (None, None) => 0,
+        };
+        address - self.start + bias
     }
 
     /// Title memory `[start, start + len)` in place: `placed` is a buffer
@@ -2248,7 +2263,36 @@ impl Shadow {
             place: None,
             section: None,
             remapped: std::sync::atomic::AtomicBool::new(false),
+            resident: None,
         }
+    }
+
+    /// Title memory `[start, start + len)` in `resident`, `bias` bytes from
+    /// its first byte. Shaped as a copy, as a placement is; nothing is
+    /// copied for it on the CPU ([`Shadow::update`] notes the pages that go
+    /// up, `crate::resident::prepare` sends them).
+    fn resident(resident: Arc<crate::resident::Resident>, bias: u64, start: u64, len: u64) -> Shadow {
+        let mut shadow = Shadow::new(resident.buffer.clone(), start as *mut u8, resident.gpu() + bias, start, len);
+        // Not a copy: not counted with them.
+        LIVE[0].fetch_sub(1, Ordering::Relaxed);
+        LIVE[1].fetch_sub(len, Ordering::Relaxed);
+        shadow.section = resident.section_at(bias).map(|(section, _)| section);
+        shadow.resident = Some((resident, bias));
+        shadow
+    }
+
+    /// The resident it is in (`crate::resident`), if it is.
+    pub(crate) fn in_resident(&self) -> Option<&Arc<crate::resident::Resident>> {
+        self.resident.as_ref().map(|(r, _)| r)
+    }
+
+    /// In view memory in place: the section, and the offset in it of the
+    /// title memory's first byte.
+    fn section_place(&self) -> Option<(usize, u64)> {
+        if let Some((r, bias)) = &self.resident {
+            return r.section_at(*bias);
+        }
+        Some((self.section?, self.place.as_ref()?.1))
     }
 
     /// `[address, address + len)` cut to the buffer, as offsets in the copy.
@@ -2282,9 +2326,12 @@ impl Shadow {
         list.defer_gpu_write(self, address as usize, len as usize);
     }
 
-    /// Whether this is title memory in place (`crate::inplace`), not a copy.
+    /// Whether this is title memory in place (`crate::inplace`) or in a
+    /// resident (`crate::resident`), not a copy: what shaders write reaches
+    /// the title's memory by the end of their submission, and nothing is
+    /// copied back on the CPU.
     pub(crate) fn in_place(&self) -> bool {
-        self.place.is_some()
+        self.place.is_some() || self.resident.is_some()
     }
 
     /// For tests: title memory `[start, start + len)` in place over `placed`.
@@ -2312,7 +2359,7 @@ impl Shadow {
     /// memory (fresh snapshots cost ~2.3 million page faults per world
     /// frame).
     pub(crate) fn writing(&self, address: usize, len: usize) {
-        if self.place.is_some() {
+        if self.in_place() {
             return;
         }
         let range = (address, address + len);
@@ -2430,7 +2477,7 @@ impl Shadow {
     /// [`Shadow::copy_back`]; `found`, if given, is the pieces of the range
     /// that differ from the snapshot, found beforehand ([`find_all`]).
     pub(crate) fn copy_back_with(&self, address: usize, len: usize, found: Option<Vec<(usize, usize)>>) -> usize {
-        if self.place.is_some() {
+        if self.in_place() {
             return 0;
         }
         let snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
@@ -2642,7 +2689,7 @@ impl Shadow {
     /// those of one of them (each once), and a range is done with when the
     /// last submission that declared it is ([`Flights`]).
     pub(crate) fn copy_back_done(&self, ranges: &[(usize, usize)]) {
-        if self.place.is_some() {
+        if self.in_place() {
             return;
         }
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
@@ -2885,6 +2932,14 @@ impl Shadow {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (address.max(start), (address + len).min(end));
         if from >= to {
+            return 0;
+        }
+        // In a resident: the pages the title wrote are noted, and go up on
+        // the card before the lists. Whatever flights may be writing:
+        // their merges run on the queue before that upload does.
+        if let Some((resident, _)) = &self.resident {
+            let watched = resident.refresh(from as u64, to as u64);
+            self.watched.store(if watched { 1 } else { NOT_WATCHED }, Ordering::Relaxed);
             return 0;
         }
         let mut busy: Vec<(usize, usize)> = self
@@ -3358,6 +3413,17 @@ pub(crate) fn in_place_let_go(at: u64, len: u64, remap: bool) -> u64 {
                 gone.extend(entry.shadow.take());
             }
         }
+        // Residents over it (`crate::resident`) are big, and may start
+        // further below than the buffers looked at above: every buffer in
+        // one is let go, if one was over it.
+        if crate::resident::forget(at, end, remap) {
+            for entry in map.values_mut() {
+                let over = |s: &Shadow| s.resident.as_ref().is_some_and(|(r, _)| r.overlaps(at, end)) && !marked(s);
+                if entry.shadow.as_deref().is_some_and(over) {
+                    gone.extend(entry.shadow.take());
+                }
+            }
+        }
     }
     let n = gone.len() as u64;
     for shadow in gone {
@@ -3378,10 +3444,10 @@ fn still_good(shadow: &Shadow) -> bool {
     if !shadow.remapped.load(Ordering::Relaxed) {
         return true;
     }
-    let (Some(section), Some((_, offset))) = (shadow.section, shadow.place.as_ref()) else {
+    let Some((section, offset)) = shadow.section_place() else {
         return true;
     };
-    let good = crate::inplace::still_run(shadow.start, shadow.len, section, *offset);
+    let good = crate::inplace::still_run(shadow.start, shadow.len, section, offset);
     if good {
         shadow.remapped.store(false, Ordering::Relaxed);
     }
@@ -3406,7 +3472,7 @@ fn in_place_upgrade() -> u64 {
         for (key, entry) in map.iter_mut() {
             let len = entry.end - key.0;
             let Some(s) = &entry.shadow else { continue };
-            if s.place.is_some()
+            if s.in_place()
                 || s.card.is_some()
                 || big(len)
                 || Arc::strong_count(s) != 1
@@ -3500,6 +3566,13 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         // memory. Not the big ones `cards` puts in the card's memory: those
         // are read too often to stay in the PC's.
         let big = cards() && size >= card_limits().0;
+        // With residents (`crate::resident`, `VICTORY_INPLACE=4`): a buffer
+        // in a resident's pages is that resident, whatever its size; a big
+        // one whose memory lies in an arena is made one.
+        if let Some((resident, bias)) = crate::resident::find(key.0, len, big) {
+            entry.shadow = Some(Arc::new(Shadow::resident(resident, bias, key.0, len)));
+            return entry.shadow.clone();
+        }
         // Small buffers stay copies below `VICTORY_INPLACE_MIN_KB` (T1).
         let small = len < crate::inplace::min_bytes();
         if small && crate::inplace::level() >= 2 {

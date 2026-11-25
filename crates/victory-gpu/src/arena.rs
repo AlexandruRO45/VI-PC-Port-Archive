@@ -854,6 +854,27 @@ pub(crate) fn resolve(at: u64, len: u64) -> Option<Resolved> {
     resolved
 }
 
+/// [`resolve`] for a resident (`crate::resident`, `VICTORY_INPLACE=4`):
+/// the arena is opened on this thread if it is not open yet, and one the
+/// arenas' thread is opening is waited for (five seconds at most). A big
+/// title buffer is made a resident or a card copy once, at its first use,
+/// which is often the first use of its region; without the wait it would
+/// keep a card copy for the run.
+pub(crate) fn resolve_waiting(at: u64, len: u64) -> Option<Resolved> {
+    let host = crate::host::host()?;
+    let asked = std::time::Instant::now();
+    loop {
+        match with(|a| a.resolve_why(&host.device, at, len, u64::MAX, most(), &mut |_| ())) {
+            Ok(resolved) => return Some(resolved),
+            Err(Why::Opening) if asked.elapsed() < std::time::Duration::from_secs(5) => std::thread::sleep(std::time::Duration::from_millis(2)),
+            Err(why) => {
+                TURNED[why as usize].fetch_add(1, Ordering::Relaxed);
+                return None;
+            }
+        }
+    }
+}
+
 /// Whether `[at, at + len)` is in an open arena now.
 pub(crate) fn ready(at: u64, len: u64) -> bool {
     with(|a| a.ready(at, len))

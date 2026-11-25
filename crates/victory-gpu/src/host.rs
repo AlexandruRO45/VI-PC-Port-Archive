@@ -2737,6 +2737,26 @@ fn in_place_writes(runs: &[&HostList]) -> Vec<(usize, usize)> {
     ranges
 }
 
+/// With residents (`crate::resident`): the ranges the shaders of `runs`
+/// may write in residents, each with its resident, and the title memory
+/// they may write in arenas directly (buffers and windows in place).
+fn resident_writes(runs: &[&HostList]) -> (Vec<(std::sync::Arc<crate::resident::Resident>, u64, u64)>, Vec<(u64, u64)>) {
+    let (mut declared, mut in_place) = (Vec::new(), Vec::new());
+    for list in runs {
+        for step in &list.deferred().copies {
+            if let Step::GpuWrite(shadow, address, len) = step {
+                let range = (*address as u64, (*address + *len) as u64);
+                match shadow.in_resident() {
+                    Some(resident) => declared.push((resident.clone(), range.0, range.1)),
+                    None if shadow.in_place() => in_place.push(range),
+                    None => {}
+                }
+            }
+        }
+    }
+    (declared, in_place)
+}
+
 /// Of `steps`, the ranges declared written in place, in order, joined.
 fn in_place_ranges<'a>(steps: impl IntoIterator<Item = &'a Step>) -> Vec<(usize, usize)> {
     let mut ranges: Vec<(usize, usize)> = steps
@@ -4194,14 +4214,33 @@ impl Host {
         if let Some(check) = card.as_ref().and_then(|c| c.check.clone()) {
             lists.push(Some(check));
         }
+        // Residents (`crate::resident`): the pages that go up to them run
+        // ahead of the lists, the merge of what the lists' shaders write in
+        // them after the lists, both on this queue before the fence's signal.
+        let resident = if crate::resident::on() {
+            let (declared, in_place) = resident_writes(runs);
+            // SAFETY: a plain query.
+            let completed = unsafe { self.fence.GetCompletedValue() };
+            crate::resident::prepare(&self.device, completed, &declared, &in_place)
+        } else {
+            crate::resident::Prepared::default()
+        };
+        if let Some(upload) = &resident.upload {
+            // SAFETY: a closed list of ours.
+            unsafe { self.queue.ExecuteCommandLists(&[Some(upload.clone())]) };
+        }
         let prepared = std::time::Instant::now();
         if late {
             *submitted += 1;
             // SAFETY: closed lists; the fence is ours.
             let signalled = unsafe {
                 self.queue.ExecuteCommandLists(&lists);
+                if let Some(merge) = &resident.merge {
+                    self.queue.ExecuteCommandLists(&[Some(merge.clone())]);
+                }
                 self.queue.Signal(&self.fence, *submitted)
             };
+            crate::resident::sent(*submitted);
             self.card_sent();
             if let Err(e) = signalled {
                 fail(format_args!("a submission sent ahead could not be followed by a signal ({e})"));
@@ -4243,6 +4282,11 @@ impl Host {
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
                 self.queue.ExecuteCommandLists(group);
+                if i + 1 == groups.len()
+                    && let Some(merge) = &resident.merge
+                {
+                    self.queue.ExecuteCommandLists(&[Some(merge.clone())]);
+                }
                 self.card_sent();
                 let waited = self
                     .queue
@@ -4284,6 +4328,7 @@ impl Host {
             }
             let _ = (i, started);
         }
+        crate::resident::sent(*submitted);
         let _ = &firsts;
         FINISHED.store(this_submission, Ordering::Release);
         bury(this_submission);
@@ -5917,6 +5962,7 @@ impl Meter {
         crate::descriptor::sync_line(frames);
         late_line(frames);
         card_clock_line(frames, ms);
+        crate::resident::line(frames);
         crate::shadow::back_line(frames);
         crate::shadow::placement_line();
         {

@@ -37,6 +37,8 @@ mod arena;
 mod inplace;
 #[cfg(windows)]
 mod inplace_probes;
+#[cfg(windows)]
+mod resident;
 pub mod list;
 pub mod object;
 pub mod pipeline;
