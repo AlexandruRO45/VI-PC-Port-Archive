@@ -1,13 +1,14 @@
 //! The console's rectangle lists on the host. A rectangle comes as three
 //! corners in any order (the blits put the right angle at `v1`, the tiled
 //! lighting at `v0`), and the hardware adds the fourth opposite the right
-//! angle `vc`, at `va + vb - vc`, for the position and every interpolated
-//! attribute. The host has no such primitive; a geometry shader made for the
-//! vertex shader that feeds it takes each triangle `(v0, v1, v2)`, finds the
-//! right angle opposite its longest side, and emits the triangle with its
-//! completion `(va, vb, v3)` (`va` before `vc`, `vb` after it), both turning
-//! the same way. Flat outputs keep `v0`'s value across the rectangle, and
-//! channels the vertex shader leaves unwritten stay unwritten.
+//! angle `vc`, at `va + vb - vc`, for the position and every attribute. The
+//! host has no such primitive; a geometry shader made for the vertex shader
+//! that feeds it takes each triangle `(v0, v1, v2)`, finds the right angle
+//! opposite its longest side, and emits the triangle with its completion
+//! `(va, vb, v3)` (`va` before `vc`, `vb` after it), both turning the same
+//! way. Integer outputs (which can only be flat) keep `va`'s value at the
+//! fourth corner, and channels the vertex shader leaves unwritten stay
+//! unwritten.
 
 use super::bitcode::{Attr, Bin, Term, V, pred};
 use super::shader::Shader;
@@ -126,15 +127,18 @@ pub fn rectangle_gs(vs: &[u8]) -> Result<Vec<u8>, ShaderError> {
         let [c0, c1, c2] = [0, 1, 2].map(|k| &corners[k][id]);
         for ((&v0, &v1), &v2) in c0.iter().zip(c1).zip(c2) {
             let triple = match (v0, v1, v2) {
-                (Some(v0), Some(v1), Some(v2)) if e.comp == 9 && e.interp != 1 => {
+                (Some(v0), Some(v1), Some(v2)) => {
                     let va = pick(&mut s, [v2, v0, v1]);
                     let vb = pick(&mut s, [v1, v2, v0]);
-                    let vc = pick(&mut s, [v0, v1, v2]);
-                    let sum = s.m.bin(b, Bin::Add, va, vb);
-                    let v3 = s.m.bin(b, Bin::Sub, sum, vc);
+                    let v3 = if e.comp == 9 {
+                        let vc = pick(&mut s, [v0, v1, v2]);
+                        let sum = s.m.bin(b, Bin::Add, va, vb);
+                        s.m.bin(b, Bin::Sub, sum, vc)
+                    } else {
+                        va
+                    };
                     [Some(va), Some(vb), Some(v3)]
                 }
-                (Some(v0), _, _) => [Some(v0); 3],
                 _ => [None; 3],
             };
             for (k, v) in triple.into_iter().enumerate() {
@@ -434,12 +438,16 @@ mod tests {
 
         let corner = |[x, y]: [f32; 2], flat_f: f32, flat_u: f32| [x, y, 0.5, 1.0, x, y, flat_f, flat_u];
         let (tl, bl, br, tr) = ([-0.5, 0.5], [-0.5, -0.5], [0.5, -0.5], [0.5, 0.5]);
-        let orders = [[tl, bl, br], [tl, bl, tr], [bl, tr, tl]];
+        let orders = [
+            ([tl, bl, br], [0.25, 3.0]),
+            ([tl, bl, tr], [0.75, 9.0]),
+            ([bl, tr, tl], [0.50, 5.0]),
+        ];
         for warp in [false, true] {
             let Ok(host) = Host::new(warp) else { continue };
             let root = host.root_signature_for(&[]).unwrap();
             let pso = host.pipeline_gs(&root, &vs, &gs, &ps).unwrap();
-            for (n, &[p0, p1, p2]) in orders.iter().enumerate() {
+            for (n, &([p0, p1, p2], second_flat)) in orders.iter().enumerate() {
                 let vertices = [
                     corner(p0, 0.25, 3.0),
                     corner(p1, 0.50, 5.0),
@@ -460,7 +468,27 @@ mod tests {
                     let (x, y) = ((i % 32) as f32, (i / 32) as f32);
                     let (u, v) = ((x + 0.5) / 16.0 - 1.0, 1.0 - (y + 0.5) / 16.0);
                     let inside = u.abs() < 0.5 && v.abs() < 0.5;
-                    let want = if inside { [u, v, 0.25, 3.0] } else { [0.0; 4] };
+                    if !inside {
+                        assert!(t.iter().all(|a| a.abs() < 1e-4), "outside ({x}, {y}): {t:?}");
+                        continue;
+                    }
+                    let flat = if n == 0 || u < v - 1e-4 {
+                        [0.25, 3.0]
+                    } else if u > v + 1e-4 {
+                        second_flat
+                    } else {
+                        assert!(
+                            ([0.25, 3.0], second_flat)
+                                .0
+                                .iter()
+                                .zip(&t[2..])
+                                .all(|(a, b)| (a - b).abs() < 1e-4)
+                                || second_flat.iter().zip(&t[2..]).all(|(a, b)| (a - b).abs() < 1e-4),
+                            "diagonal ({x}, {y}): {t:?}"
+                        );
+                        [t[2], t[3]]
+                    };
+                    let want = [u, v, flat[0], flat[1]];
                     let near = t.iter().zip(want).all(|(a, b)| (a - b).abs() < 1e-4);
                     assert!(near, "warp {warp} order {n} pixel ({x}, {y}): {t:?}, want {want:?}");
                 }
