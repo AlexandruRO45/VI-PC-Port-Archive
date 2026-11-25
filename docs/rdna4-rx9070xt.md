@@ -65,11 +65,12 @@ here and what remains is the compiler path — the area PR #2 isolates.
 
 ## Getting past the setup screens
 
-`VICTORY_KEYS` reaches the first pad's buttons, but a wireless receiver answering for a
-switched-off pad occupies XInput slot 0 with an all-zero report, which suppresses the keyboard
-stand-in and makes scripted keys unreachable. Making a slot a pad only after its first non-rest
-report (cleared on disconnect) is enough; with that, the wizard is drivable from the keyboard.
-This may be worth carrying over independently of the crash.
+The wizard is drivable from the keyboard with `VICTORY_KEYS`, because no XInput pad was attached
+during this run (`XInputGetState(0)` returns 1167, no pad), so the keyboard's stand-in pad exists
+and carries the scripted keys. Note that this is not always the case: a wireless receiver
+answering for a switched-off pad occupies slot 0 with an all-zero report, which suppresses the
+stand-in. Treating a slot as a pad only after its first non-rest report (cleared on disconnect)
+covers that case; it was not needed for the run below and is not part of this document.
 
 ## Not tested
 
