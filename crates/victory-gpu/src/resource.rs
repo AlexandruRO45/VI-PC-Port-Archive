@@ -645,8 +645,7 @@ impl Memory {
         let Some(&(alloc, _)) = ALLOCATOR.get() else {
             return Memory::new(info);
         };
-        let layout = Layout::from_size_align(info.size as usize, info.alignment as usize)
-            .map_err(|_| E_INVALIDARG)?;
+        let layout = Self::layout(info)?;
         let attributes = resource_attributes(info, heap_kind);
         let ptr =
             NonNull::new(alloc(layout.size(), attributes).cast::<u8>()).ok_or(E_OUTOFMEMORY)?;
@@ -668,13 +667,17 @@ impl Memory {
         self.ptr.as_ptr() as u64
     }
 
-    fn new(info: AllocationInfo) -> Result<Memory, HRESULT> {
-        let layout = usize::try_from(info.size)
+    fn layout(info: AllocationInfo) -> Result<Layout, HRESULT> {
+        usize::try_from(info.size)
             .ok()
             .zip(usize::try_from(info.alignment).ok())
             .filter(|&(size, _)| size > 0)
             .and_then(|(size, align)| Layout::from_size_align(size, align).ok())
-            .ok_or(E_INVALIDARG)?;
+            .ok_or(E_INVALIDARG)
+    }
+
+    fn new(info: AllocationInfo) -> Result<Memory, HRESULT> {
+        let layout = Self::layout(info)?;
         // SAFETY: the size is non-zero.
         let ptr = NonNull::new(unsafe { alloc_zeroed(layout) }).ok_or(E_OUTOFMEMORY)?;
         Ok(Memory {
@@ -1871,6 +1874,13 @@ pub(crate) extern "system" fn create_committed(
         tracing::warn!(?desc, "no size for this resource");
         return E_INVALIDARG;
     };
+    if out.is_null() && object::is(iid, &RESOURCE_IIDS) {
+        // A capability check validates the storage shape without allocating.
+        return match Memory::layout(info) {
+            Ok(_) => object::S_FALSE,
+            Err(hr) => hr,
+        };
+    }
     tracing::debug!(
         dimension = desc.dimension,
         size = info.size,
@@ -2352,6 +2362,102 @@ mod tests {
             layout: 0,
             ..buffer(0)
         }
+    }
+
+    #[test]
+    fn committed_resource_probe_does_not_call_the_allocator() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        const TEST: &str = "resource::tests::committed_resource_probe_does_not_call_the_allocator";
+        const CHILD: &str = "VICTORY_TEST_RESOURCE_PROBE";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--nocapture"])
+                .env(CHILD, "1")
+                .env("VICTORY_D3D12_WARP", "1")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success(),
+                "{stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            print!("{stdout}");
+            return;
+        }
+
+        #[cfg(all(windows, feature = "diagnostics"))]
+        if let Some(host) = crate::host::host() {
+            use windows::Win32::Graphics::Direct3D12::*;
+            use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
+            use windows::core::Interface;
+
+            let heap = D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_DEFAULT,
+                CreationNodeMask: 1,
+                VisibleNodeMask: 1,
+                ..Default::default()
+            };
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: 64,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                ..Default::default()
+            };
+            // SAFETY: live device, valid descriptions and a null result pointer for validation.
+            let hr = unsafe {
+                (host.device.vtable().CreateCommittedResource)(
+                    host.device.as_raw(),
+                    &heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &desc,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    std::ptr::null(),
+                    &ID3D12Resource::IID,
+                    std::ptr::null_mut(),
+                )
+            };
+            assert_eq!(hr.0, object::S_FALSE);
+            println!("Native WARP returned S_FALSE for the buffer probe");
+        }
+
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+        extern "system" fn deny(_: usize, _: u64) -> *mut c_void {
+            CALLS.fetch_add(1, Ordering::Relaxed);
+            std::ptr::null_mut()
+        }
+        extern "system" fn free(_: *mut c_void, _: u64) {
+            unreachable!("the test allocator always refuses");
+        }
+        use_allocator(deny, free);
+        let create = |width, out| {
+            create_committed(
+                std::ptr::null(),
+                &PROPERTIES,
+                0,
+                &buffer(width),
+                0,
+                std::ptr::null(),
+                &RESOURCE_IIDS[0],
+                out,
+            )
+        };
+
+        let mut resource = std::ptr::null();
+        assert_eq!(create(64, &mut resource), E_OUTOFMEMORY);
+        assert_eq!(CALLS.load(Ordering::Relaxed), 1);
+        assert_eq!(create(0, std::ptr::null_mut()), E_INVALIDARG);
+        assert_eq!(CALLS.load(Ordering::Relaxed), 1);
+        let probe = create(64, std::ptr::null_mut());
+        assert_eq!((probe, CALLS.load(Ordering::Relaxed)), (object::S_FALSE, 1));
     }
 
     fn heap(size: u64) -> This {
