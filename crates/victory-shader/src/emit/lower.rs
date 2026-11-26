@@ -127,8 +127,8 @@ pub(crate) fn lower_with(
     }
 }
 
-// Approximate loops stop after `super::wave64_approx_loops` iterations
-// (the other half they may wait for never comes; shortcut: real ones too).
+// Approximate loops stop at `super::wave64_approx_loops` iterations
+// (shortcut: real ones too).
 
 thread_local! {
     /// A lower iteration limit for programs lowered on this thread now
@@ -303,7 +303,7 @@ struct Lower<'a> {
     heap: [bool; 2],
     /// src0 of the current instruction as DPP fetched it.
     src0: Option<V>,
-    /// EXEC's lanes for the VALU op (`v_readfirstlane`'s, scalar too).
+    /// EXEC's lanes for `v_readfirstlane`.
     exec_lanes: Option<V>,
     /// Compute code that reads other lanes: thread ids follow the host
     /// lanes, so lane n is console lane n.
@@ -5904,11 +5904,9 @@ impl<'a> Lower<'a> {
         }
         // A scalar result (`v_readlane`, `v_readfirstlane`) is written
         // whatever EXEC holds.
-        let lanes = self.guard(b, i)?;
-        let mut guard = match v.dst {
-            Some(Operand::Scalar { .. }) => None,
-            _ => lanes,
-        };
+        let scalar = matches!(v.dst, Some(Operand::Scalar { .. }));
+        let lanes = if !scalar || inst.name() == "v_readfirstlane_b32" { self.guard(b, i)? } else { None };
+        let mut guard = if scalar { None } else { lanes };
         if let Some(d) = v.dpp {
             let (x, enable) = self.dpp(inst, d, guard)?;
             guard = match (guard, enable) {

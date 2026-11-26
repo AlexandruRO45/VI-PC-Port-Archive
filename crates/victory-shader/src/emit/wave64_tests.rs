@@ -647,7 +647,7 @@ fn permute_model(threads: u32) -> Vec<u32> {
     for wave in waves(threads) {
         let odd = mask(&wave, |t| data(t) & 1 != 0);
         for t in wave.clone() {
-            let from = (t % 64 & 32) | ((t % 64 + 37) & 31);
+            let from = ((t % 64) & 32) | ((t % 64 + 37) & 31);
             let src = wave.start + from;
             let all = if src < wave.end { data(src) } else { 0 };
             want[t as usize] = all;
