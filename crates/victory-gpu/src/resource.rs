@@ -599,6 +599,12 @@ pub type AllocRoutine = extern "system" fn(usize, u64) -> *mut c_void;
 pub type FreeRoutine = extern "system" fn(*mut c_void, u64);
 static ALLOCATOR: std::sync::OnceLock<(AllocRoutine, FreeRoutine)> = std::sync::OnceLock::new();
 
+#[cfg(test)]
+thread_local! {
+    // This allocator only refuses allocations, so there is nothing to free.
+    static TEST_ALLOCATOR: std::cell::Cell<Option<AllocRoutine>> = const { std::cell::Cell::new(None) };
+}
+
 /// Committed resources get their memory from the title's general
 /// allocator, as on the console, where titles hook it to place graphics
 /// memory themselves (Grand Theft Auto VI places its back buffers in a
@@ -642,7 +648,10 @@ impl Memory {
     /// A committed resource's memory: from the title's allocator if the
     /// runtime named one, else our own; zeroed either way.
     fn for_resource(info: AllocationInfo, heap_kind: u32) -> Result<Memory, HRESULT> {
-        let Some(&(alloc, _)) = ALLOCATOR.get() else {
+        let alloc = ALLOCATOR.get().map(|&(alloc, _)| alloc);
+        #[cfg(test)]
+        let alloc = TEST_ALLOCATOR.get().or(alloc);
+        let Some(alloc) = alloc else {
             return Memory::new(info);
         };
         let layout = Self::layout(info)?;
@@ -2381,24 +2390,6 @@ mod tests {
     fn committed_resource_probe_does_not_call_the_allocator() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
-        const TEST: &str = "resource::tests::committed_resource_probe_does_not_call_the_allocator";
-        const CHILD: &str = "VICTORY_TEST_RESOURCE_PROBE";
-        if std::env::var_os(CHILD).is_none() {
-            let output = std::process::Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", TEST, "--nocapture"])
-                .env(CHILD, "1")
-                .output()
-                .unwrap();
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            assert!(
-                output.status.success(),
-                "{stdout}\n{}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-            print!("{stdout}");
-            return;
-        }
-
         #[cfg(windows)]
         if let Some(device) = crate::host::test_warp_device() {
             use windows::Win32::Graphics::Direct3D12::*;
@@ -2448,10 +2439,15 @@ mod tests {
             CALLS.fetch_add(1, Ordering::Relaxed);
             std::ptr::null_mut()
         }
-        extern "system" fn free(_: *mut c_void, _: u64) {
-            unreachable!("the test allocator always refuses");
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                TEST_ALLOCATOR.set(None);
+            }
         }
-        use_allocator(deny, free);
+        assert!(TEST_ALLOCATOR.get().is_none());
+        TEST_ALLOCATOR.set(Some(deny));
+        let _reset = Reset;
         let create = |width, out| {
             create_committed(
                 std::ptr::null(),
