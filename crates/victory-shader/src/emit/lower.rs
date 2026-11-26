@@ -2294,6 +2294,19 @@ impl<'a> Lower<'a> {
         self.s.m.bin(c, Bin::Or, r, sign)
     }
 
+    /// Saturates an FMA result with ordered comparisons. This avoids losing
+    /// the clamp on AMD when the sum went through an integer correction,
+    /// and maps NaN and negative zero to positive zero.
+    fn clamp01_ordered(&mut self, value: V) -> V {
+        let c = self.cur;
+        let m = &mut self.s.m;
+        let (zero, one) = (m.f32(0), m.f32(0x3F80_0000));
+        let positive = m.cmp(c, pred::OGT, value, zero);
+        let low = m.select(c, positive, value, zero);
+        let below_one = m.cmp(c, pred::OLT, low, one);
+        m.select(c, below_one, low, one)
+    }
+
     /// Fused f16 multiply-add with one rounding. Two finite f16s have an
     /// exact product in f32. TwoSum recovers the error in the f32 sum to
     /// resolve f16 midpoints or correct the direction of truncation.
@@ -2324,10 +2337,10 @@ impl<'a> Lower<'a> {
             let step = m.cast(c, Cast::ZExt, inward, self.s.t.i32);
             let bits = m.bin(c, Bin::Sub, bits, step);
             let adjusted = self.as_float(bits);
-            let adjusted = if clamp { self.unary(7, adjusted) } else { adjusted };
+            let adjusted = if clamp { self.clamp01_ordered(adjusted) } else { adjusted };
             return self.narrow16(adjusted);
         }
-        let sum = if clamp { self.unary(7, sum) } else { sum };
+        let sum = if clamp { self.clamp01_ordered(sum) } else { sum };
         let bits = self.as_int(sum);
         let error_bits = self.as_int(error);
         let m = &mut self.s.m;

@@ -746,20 +746,31 @@ fn half_fused_nonfinite_results_survive_rounding() {
 }
 
 #[test]
-fn half_fma_toward_zero_clamps_after_correcting_the_sum() {
+fn half_fma_clamps_in_both_rounding_modes() {
     let [op, src] = vop3(0x34b, 0, vgpr(1), vgpr(2), vgpr(3));
-    let shader = build_valu_cs(&[0xba80_0881, 3, op | 1 << 15, src]);
+    // Expected results in nearest-even and toward-zero order.
     let cases = [
-        ([0x0001, 0x8001, 0x3c00, 0], 0x3bff), // 1 - 2^-48
-        ([0x3c01, 0x3c00, 0x8001, 0], 0x3c00), // 1 + 2^-10 - 2^-24
-        ([0x3c00, 0x3c00, 0, 0], 0x3c00),      // exactly 1
-        ([0x7c00, 0x3c00, 0x3c00, 0], 0x3c00), // +inf
-        ([0xfc00, 0x3c00, 0x3c00, 0], 0),      // -inf
+        ([0x0001, 0x8001, 0x3c00, 0], [0x3c00, 0x3bff]), // 1 - 2^-48
+        ([0x3c01, 0x3c00, 0x8001, 0], [0x3c00; 2]),      // 1 + 2^-10 - 2^-24
+        ([0x3c00, 0x3c00, 0, 0], [0x3c00; 2]),           // exactly 1
+        ([0x4000, 0x3c00, 0, 0], [0x3c00; 2]),           // 2.0
+        ([0x7bff, 0x3c00, 0, 0], [0x3c00; 2]),           // 65504.0
+        ([0xbc00, 0x3c00, 0, 0], [0; 2]),                // -1.0
+        ([0x7c00, 0x3c00, 0x3c00, 0], [0x3c00; 2]),      // +inf
+        ([0xfc00, 0x3c00, 0x3c00, 0], [0; 2]),           // -inf
+        ([0x7e00, 0x3c00, 0, 0], [0; 2]),                // NaN
     ];
     let inputs = cases.map(|(input, _)| input);
-    run_cases(&shader, &inputs, |backend, i, _, got| {
-        assert_eq!(got & 0xffff, cases[i].1, "{backend}: clamped case {i}");
-    });
+    for (i, (label, mode)) in [("nearest-even", 0), ("toward zero", 3)].into_iter().enumerate() {
+        let shader = build_valu_cs(&[0xba80_0881, mode, op | 1 << 15, src]);
+        run_cases(&shader, &inputs, |backend, case, input, got| {
+            assert_eq!(
+                got & 0xffff,
+                cases[case].1[i],
+                "{backend}: {label} clamped case {case}, inputs {input:x?}"
+            );
+        });
+    }
 }
 
 /// RDNA2 orders -0 below +0 in its maximums and minimums; DXIL's FMax and
