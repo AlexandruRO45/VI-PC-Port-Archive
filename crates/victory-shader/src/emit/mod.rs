@@ -1919,9 +1919,9 @@ mod barycentric_tests {
             0xbf90_0007, // s_sendmsg ORDERED_PS_DONE
             0xbf9e_0000, // s_endpgm_ordered_ps_done
         ] {
-            let error = pixel(&[0xbf80_0000, marker, 0xbf90_0007, 0xbf81_0000], 0)
-                .err()
-                .expect("POPS requires rasterizer ordering");
+            let Err(error) = pixel(&[0xbf80_0000, marker, 0xbf90_0007, 0xbf81_0000], 0) else {
+                panic!("POPS requires rasterizer ordering");
+            };
             assert!(
                 matches!(
                     error,
@@ -1945,7 +1945,9 @@ mod barycentric_tests {
             0xbf81_0000, // s_endpgm
             0xbf81_0000, // s_endpgm on the edge that bypasses completion
         ];
-        let error = pixel(&words, 0).err().expect("ordered scope is unsupported");
+        let Err(error) = pixel(&words, 0) else {
+            panic!("ordered scope is unsupported");
+        };
         assert!(matches!(
             error,
             ShaderError::Unsupported {
