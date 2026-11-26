@@ -496,7 +496,8 @@ fn cmp_flags(a: u64, b: u64) -> u32 {
 const CMP_FLAGS: u32 = 0x8d5;
 
 /// SSE4a's `extrq`/`insertq` (register forms, the only ones there are) on
-/// the saved XMM registers; returns the instruction's length.
+/// the saved XMM registers; returns the instruction's length. The result's
+/// high half is zeroed, as AMD's CPUs do and as `sse4a::replace`'s SSE2 does.
 unsafe fn sse4a(code: *const u8, xmm: &mut [M128A; 16]) -> Option<usize> {
     // SAFETY: the caller's code bytes are readable up to the instruction's end.
     let b = |i: usize| unsafe { code.add(i).read() };
@@ -533,20 +534,27 @@ unsafe fn sse4a(code: *const u8, xmm: &mut [M128A; 16]) -> Option<usize> {
         }
         let target = if immediate { src } else { dst };
         xmm[target].Low = (xmm[target].Low >> at_bit) & mask;
+        xmm[target].High = 0;
     } else {
         let value = (xmm[src].Low & mask) << at_bit;
         xmm[dst].Low = xmm[dst].Low & !(mask << at_bit) | value;
+        xmm[dst].High = 0;
     }
     Some(len)
 }
 
 unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
     // SAFETY: the system passes valid exception pointers.
+    let (code, at) =
+        unsafe { ((*(*info).ExceptionRecord).ExceptionCode, (*(*info).ContextRecord).Rip) };
+    // SAFETY: as above.
     if unsafe { emulate_amd_only(info) } {
+        if code == EXCEPTION_ILLEGAL_INSTRUCTION {
+            // SAFETY: the title's code, at the instruction that faulted.
+            unsafe { crate::sse4a::replace(at as usize) };
+        }
         return -1; // EXCEPTION_CONTINUE_EXECUTION
     }
-    // SAFETY: as above.
-    let code = unsafe { (*(*info).ExceptionRecord).ExceptionCode };
     if FATAL.contains(&code) {
         let to_file =
             code == EXCEPTION_BREAKPOINT && LOG_FIRST_CHANCE_BREAKPOINTS.load(Ordering::Relaxed);
