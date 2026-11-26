@@ -2829,7 +2829,18 @@ impl<'a> Lower<'a> {
         if v.clamp {
             f = self.unary(7, f);
         }
-        let Some(Operand::Vector { reg, .. }) = v.dst else {
+        self.store_float(inst, v.dst, f, guard)
+    }
+
+    /// Store a float after its instruction's output modifiers have been applied.
+    fn store_float(
+        &mut self,
+        inst: &Inst,
+        dst: Option<Operand>,
+        f: V,
+        guard: Option<V>,
+    ) -> Result<(), Why> {
+        let Some(Operand::Vector { reg, .. }) = dst else {
             return Err("a float result outside a VGPR");
         };
         let x = self.as_int(f);
@@ -6114,7 +6125,20 @@ impl<'a> Lower<'a> {
                         self.as_float(bits)
                     }
                 };
-                float(self, r)
+                if v.clamp && v.omod == 0 && matches!(name, "v_cubesc_f32" | "v_cubetc_f32") {
+                    // A selected positive subnormal survives cube clamp on RDNA2.
+                    // For the other bit patterns use the ordinary float clamp.
+                    let bits = self.as_int(r);
+                    let min_normal = self.s.m.i32(0x0080_0000);
+                    let keep = self.s.m.cmp(c, pred::IULT, bits, min_normal);
+                    let saturated = self.unary(7, r);
+                    let clipped = self.as_int(saturated);
+                    let bits = self.s.m.select(c, keep, bits, clipped);
+                    let result = self.as_float(bits);
+                    self.store_float(inst, v.dst, result, guard)
+                } else {
+                    float(self, r)
+                }
             }
             "v_movrels_b32" | "v_movreld_b32" | "v_movrelsd_b32" => {
                 // M0 indexes the source (movrels), the destination (movreld)
