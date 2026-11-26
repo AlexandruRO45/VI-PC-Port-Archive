@@ -94,6 +94,7 @@ mod intersect_tests;
 pub mod host;
 mod lower;
 mod own_bits;
+mod pops;
 mod rect;
 mod sampler;
 mod shader;
@@ -424,6 +425,9 @@ pub fn emit(
     io: &io::Io,
     res: &resource::Resources,
 ) -> Result<HostShader, ShaderError> {
+    if native.stage == HwStage::Ps && !pops::active(native) {
+        pops::check(p)?;
+    }
     // (what an earlier program's lowering on this thread left behind)
     lower::take_needs();
     let original = emit_program(c, native, p, st, io, res);
@@ -1905,6 +1909,107 @@ mod barycentric_tests {
     /// enables and one float4 TEXCOORD0 attribute (attr 0, row 0).
     fn pixel(words: &[u32], input_addr: u32) -> Result<HostShader, ShaderError> {
         pixel_with_inputs(words, input_addr, &[element("TEXCOORD", 0, 0)])
+    }
+
+    #[test]
+    fn pixel_ordering_requires_native_pops_support() {
+        for marker in [
+            0xb982_0019, // s_setreg_b32 hwreg(POPS_PACKER, 0, 1), s2
+            0x8100_80ef, // s_add_i32 s0, src_pops_exiting_wave_id, 0
+            0xbf90_0007, // s_sendmsg ORDERED_PS_DONE
+            0xbf9e_0000, // s_endpgm_ordered_ps_done
+        ] {
+            let error = pixel(&[0xbf80_0000, marker, 0xbf90_0007, 0xbf81_0000], 0)
+                .err()
+                .expect("POPS requires rasterizer ordering");
+            assert!(
+                matches!(
+                    error,
+                    ShaderError::Unsupported {
+                        offset: 4,
+                        what: "primitive-ordered pixel shading (POPS)",
+                    }
+                ),
+                "{marker:#x}: {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn pixel_ordering_checks_the_branch_around_completion() {
+        let words = [
+            0xb982_0019, // s_setreg_b32 hwreg(POPS_PACKER, 0, 1), s2
+            0xbf06_8000, // s_cmp_eq_u32 s0, 0
+            0xbf85_0002, // s_cbranch_scc1 to the second end
+            0xbf90_0007, // s_sendmsg ORDERED_PS_DONE
+            0xbf81_0000, // s_endpgm
+            0xbf81_0000, // s_endpgm on the edge that bypasses completion
+        ];
+        let error = pixel(&words, 0).err().expect("ordered scope is unsupported");
+        assert!(matches!(
+            error,
+            ShaderError::Unsupported {
+                offset: 20,
+                what: "primitive-ordered pixel shading (POPS) with a path that bypasses explicit completion",
+            }
+        ));
+    }
+
+    #[test]
+    fn pixel_can_clear_the_inactive_pops_packer() {
+        let tail = [exp_mrt0(0).as_slice(), &[0xbf81_0000]].concat();
+        let baseline = pixel(&tail, 0).unwrap();
+        // s_setreg_imm32_b32 hwreg(POPS_PACKER, 0, 3), 0
+        let words = [&[0xba80_1019, 0][..], &tail].concat();
+        let cleared = pixel(&words, 0).unwrap();
+        assert_eq!(cleared.dxil, baseline.dxil);
+    }
+
+    #[test]
+    fn active_pops_texture_store_declares_rasterizer_ordering() {
+        use crate::native::{RootParam, RootType};
+
+        let words: [u32; 10] = [
+            0xb982_0019, // s_setreg_b32 hwreg(POPS_PACKER, 0, 1), s2
+            0xbe81_0380, // s_mov_b32 s1, 0 (table address high half)
+            0xf40c_0200,
+            0xfa00_0000, // s_load_dwordx8 s[8:15], s[0:1], 0
+            0x7e00_0280,
+            0x7e02_0280, // v0 and v1 = 0 (coordinate)
+            0xf020_0f08,
+            0x0002_0000, // image_store v[0:3], v[0:1], s[8:15], 2D
+            0xbf90_0007, // s_sendmsg ORDERED_PS_DONE
+            0xbf81_0000, // s_endpgm
+        ];
+        let native = NativeProgram {
+            stage: HwStage::Ps,
+            wave64: false,
+            vgprs: 8,
+            layout: vec![RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            }],
+            used: vec![],
+            io: StageIo::Ps {
+                inputs: vec![],
+                input_addr: 0,
+                db_shader_control: 1 << 16,
+                patches: vec![],
+            },
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let program = ir::build(&native.code, false, native.vgprs).unwrap();
+        let structured = structure::structure(&program).unwrap();
+        let resources = resource::track(&program, &native.layout, native.stage, Some(&structured)).unwrap();
+        let io = io::raise(&program, &native).unwrap();
+        let bytes = crate::dxbc::build(&[]);
+        let container = Container::parse(&bytes).unwrap();
+        let shader = emit(&container, &native, &program, &structured, &io, &resources).unwrap();
+        assert_ne!(parts(&shader).0 & 0x1000, 0);
     }
 
     pub(super) fn pixel_with_inputs(
