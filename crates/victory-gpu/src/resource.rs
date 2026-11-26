@@ -2418,100 +2418,85 @@ mod tests {
         use windows::Win32::Graphics::Direct3D12::*;
         use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM;
 
-        const TEST: &str = "resource::tests::multisampled_color_targets_are_captured";
-        const CHILD: &str = "VICTORY_TEST_MSAA_CAPTURE";
-        const UNAVAILABLE: &str = "4x WARP color target unavailable";
-        if std::env::var_os(CHILD).is_some() {
-            let Some(host) = crate::host::host() else {
-                println!("{UNAVAILABLE}");
-                return;
-            };
-            let mut levels = D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS {
-                Format: DXGI_FORMAT_R8G8B8A8_UNORM,
-                SampleCount: 4,
-                ..Default::default()
-            };
-            // SAFETY: valid storage for a D3D12 multisample capabilities query.
-            let queried = unsafe {
-                host.device.CheckFeatureSupport(
-                    D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS,
-                    (&raw mut levels).cast(),
-                    std::mem::size_of_val(&levels) as u32,
-                )
-            };
-            if queried.is_err() || levels.NumQualityLevels == 0 {
-                println!("{UNAVAILABLE}");
-                return;
+        let Some(host) = crate::host::host() else {
+            eprintln!("4x color target unavailable; skipped");
+            return;
+        };
+        let mut levels = D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS {
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            SampleCount: 4,
+            ..Default::default()
+        };
+        // SAFETY: valid storage for a D3D12 multisample capabilities query.
+        let queried = unsafe {
+            host.device.CheckFeatureSupport(
+                D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS,
+                (&raw mut levels).cast(),
+                std::mem::size_of_val(&levels) as u32,
+            )
+        };
+        if queried.is_err() || levels.NumQualityLevels == 0 {
+            eprintln!("4x color target unavailable; skipped");
+            return;
+        }
+        let desc = ResourceDesc {
+            flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET.0 as u32,
+            sample_count: 4,
+            ..texture(4, 4, DXGI_FORMAT_R8G8B8A8_UNORM.0 as u32, 1)
+        };
+        let null = std::ptr::null();
+        let mut resource = null;
+        assert_eq!(
+            create_committed(null, &PROPERTIES, 0, &desc, 0, null.cast(), &RESOURCE_IIDS[0], &mut resource),
+            S_OK,
+        );
+        let target = host_copy(resource).expect("host 4x render target");
+        // SAFETY: the reference keeps the texture alive during the query.
+        assert_eq!(unsafe { target.texture.GetDesc() }.SampleDesc.Count, 4);
+        let state = D3D12_RESOURCE_STATES(target.state.load(std::sync::atomic::Ordering::Relaxed) as i32);
+        let render = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        let clear = |color: [f32; 4], note: bool| {
+            let list = host.new_list().unwrap();
+            let rtv = host.rtv(&target.texture, None);
+            // SAFETY: a live render target and an open list, with both transitions paired.
+            unsafe {
+                if state != render {
+                    list.list.ResourceBarrier(&[crate::host::transition(&target.texture, state, render)]);
+                }
+                list.list.ClearRenderTargetView(rtv, &color, None);
+                if state != render {
+                    list.list.ResourceBarrier(&[crate::host::transition(&target.texture, render, state)]);
+                }
             }
-            let desc = ResourceDesc {
-                flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET.0 as u32,
-                sample_count: 4,
-                ..texture(4, 4, DXGI_FORMAT_R8G8B8A8_UNORM.0 as u32, 1)
-            };
-            let null = std::ptr::null();
-            let mut resource = null;
-            assert_eq!(
-                create_committed(null, &PROPERTIES, 0, &desc, 0, null.cast(), &RESOURCE_IIDS[0], &mut resource),
-                S_OK,
-            );
-            let target = host_copy(resource).expect("host 4x render target");
-            // SAFETY: the reference keeps the texture alive during the query.
-            assert_eq!(unsafe { target.texture.GetDesc() }.SampleDesc.Count, 4);
-            let state = D3D12_RESOURCE_STATES(target.state.load(std::sync::atomic::Ordering::Relaxed) as i32);
-            let render = D3D12_RESOURCE_STATE_RENDER_TARGET;
-            let clear = |color: [f32; 4], note: bool| {
-                let list = host.new_list().unwrap();
-                let rtv = host.rtv(&target.texture, None);
-                // SAFETY: a live render target and an open list, with both transitions paired.
-                unsafe {
-                    if state != render {
-                        list.list.ResourceBarrier(&[crate::host::transition(&target.texture, state, render)]);
-                    }
-                    list.list.ClearRenderTargetView(rtv, &color, None);
-                    if state != render {
-                        list.list.ResourceBarrier(&[crate::host::transition(&target.texture, render, state)]);
-                    }
-                }
-                if note {
-                    crate::capture::note_target(&list, resource);
-                }
-                list.close();
-                host.execute(&[&list]);
-            };
-            clear([1.0, 0.0, 0.0, 1.0], true);
-            crate::capture::dump_targets(1);
-            clear([0.0, 1.0, 0.0, 1.0], false);
-            crate::capture::dump_submission(1, &[(resource as usize, String::new())]);
-            assert_eq!(slot::<Release>(resource, 0x10)(resource), 0);
-            return;
-        }
-
+            if note {
+                crate::capture::note_target(&list, resource);
+            }
+            list.close();
+            host.execute(&[&list]);
+        };
         let dir = tempfile::tempdir().unwrap();
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", TEST, "--nocapture"])
-            .env(CHILD, "1")
-            .env("VICTORY_D3D12_WARP", "1")
-            .env("VICTORY_D3D12_DEBUG", "0")
-            .env("VICTORY_CAPTURE", dir.path())
-            .env("VICTORY_CAPTURE_FRAMES", "1")
-            .env("VICTORY_DUMP_TARGETS", "1")
-            .output()
-            .unwrap();
-        let message = String::from_utf8_lossy(&output.stdout);
-        assert!(output.status.success(), "{message}\n{}", String::from_utf8_lossy(&output.stderr));
-        if message.contains(UNAVAILABLE) {
-            eprintln!("{UNAVAILABLE}; skipped");
-            return;
-        }
+        crate::capture::with_test_capture(dir.path(), || {
+            // The first clear is recorded and dumped by the submission.
+            clear([0.0, 1.0, 0.0, 1.0], true);
+            // The present dump reads the same target after the second clear.
+            clear([1.0, 0.0, 0.0, 1.0], false);
+            crate::capture::dump_targets(crate::queue::presented() + 1);
+        });
+        assert_eq!(slot::<Release>(resource, 0x10)(resource), 0);
+
         let mut pngs: Vec<_> = std::fs::read_dir(dir.path())
             .unwrap()
             .map(|entry| entry.unwrap().path())
             .filter(|path| path.extension().is_some_and(|ext| ext == "png"))
             .collect();
-        pngs.sort_unstable();
-        println!("4x WARP color target produced {} PNGs", pngs.len());
+        let is_submission = |path: &std::path::Path| {
+            path.file_name().unwrap().to_str().unwrap().split('-').nth(2).unwrap().starts_with('s')
+        };
+        pngs.sort_by_key(|path| is_submission(path));
+        println!("4x color target produced {} PNGs", pngs.len());
         assert_eq!(pngs.len(), 2, "expected one present PNG and one submission PNG");
-        for (path, [r, g, b]) in pngs.iter().zip([[255, 0, 0], [0, 255, 0]]) {
+        for (index, (path, [r, g, b])) in pngs.iter().zip([[255, 0, 0], [0, 255, 0]]).enumerate() {
+            assert_eq!(is_submission(path), index == 1);
             let png = std::fs::read(path).unwrap();
             let word = |at| u32::from_be_bytes(png[at..at + 4].try_into().unwrap());
             assert_eq!([word(16), word(20)], [2, 2]);
