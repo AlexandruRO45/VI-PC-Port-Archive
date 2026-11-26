@@ -132,9 +132,16 @@ fn loopback(ip: IpAddr) -> bool {
     ip.to_canonical().is_loopback()
 }
 
+/// Strips matching `[...]` around a bracketed IPv6 literal.
+fn bare_host(name: &str) -> &str {
+    name.strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(name)
+}
+
 /// `localhost` or a loopback literal (bracketed IPv6 too).
 fn loopback_name(name: &str) -> bool {
-    let bare = name.trim_start_matches('[').trim_end_matches(']');
+    let bare = bare_host(name);
     bare.eq_ignore_ascii_case("localhost") || bare.parse().is_ok_and(loopback)
 }
 
@@ -160,7 +167,7 @@ fn reachable(what: &'static str, addr: *const u8, len: i32) -> bool {
 fn reachable_name(name: Option<String>) -> bool {
     match name {
         Some(name) if !loopback_name(&name) => {
-            let literal = name.parse::<IpAddr>().is_ok();
+            let literal = bare_host(&name).parse::<IpAddr>().is_ok();
             once("network connect blocked", name);
             wsa_error(if literal {
                 WSAENETUNREACH
@@ -1118,5 +1125,16 @@ mod tests {
             }
             assert!(present, "{dll} lacks {}", e.name);
         }
+    }
+
+    #[test]
+    fn bracketed_ipv6_literal_fails_with_netunreach_not_host_not_found() {
+        let _listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let last_error = host!("ws2_32.dll", "WSAGetLastError": extern "system" fn() -> i32);
+        assert!(loopback_name("[::1]"));
+        assert!(!loopback_name("[::1"));
+        assert!(!loopback_name("[[::1]]"));
+        assert!(!reachable_name(Some("[2001:db8::1]".into())));
+        assert_eq!(last_error(), WSAENETUNREACH);
     }
 }
