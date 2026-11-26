@@ -105,14 +105,6 @@ fn dedicated_video_memory() -> Option<usize> {
     }
 }
 
-/// The mode the console's display lists (`dxgi`): size that matches it.
-pub(crate) fn mode_size(console: Console) -> (u32, u32) {
-    match console {
-        Console::SeriesX => (3840, 2160),
-        Console::SeriesS => (2560, 1440),
-    }
-}
-
 static SERIES_S: AtomicBool = AtomicBool::new(false);
 
 /// Set before the title starts.
@@ -152,13 +144,5 @@ mod tests {
         );
         assert_eq!(profile_for(Some(16 * gib)), Console::SeriesX);
         assert_eq!(profile_for(Some(24 * gib)), Console::SeriesX);
-    }
-
-    /// The listed display mode matches the console: 4K on Series X,
-    /// the Series S target of 2560×1440 on it.
-    #[test]
-    fn the_mode_matches_the_console() {
-        assert_eq!(mode_size(Console::SeriesX), (3840, 2160));
-        assert_eq!(mode_size(Console::SeriesS), (2560, 1440));
     }
 }
