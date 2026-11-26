@@ -1514,12 +1514,12 @@ fn clamped_cube_coordinates_match_rdna2_oracle() {
         ([7, 7, 0x8000_0007], [7, 0]),
         ([0xbf00_0000, 0xbf00_0000, 0x3f00_0000], [0, 0x3f00_0000]),
     ];
-    let inputs: Vec<_> = CASES
-        .iter()
-        .map(|&([x, y, z], _)| [x, y, z, OLD])
-        .collect();
+    let inputs: Vec<_> = CASES.iter().map(|&([x, y, z], _)| [x, y, z, OLD]).collect();
     let probes = [0x145, 0x146].map(|op| {
-        let clamp = M { clamp: true, ..NONE };
+        let clamp = M {
+            clamp: true,
+            ..NONE
+        };
         probe(
             vop3(op, 5, [v(1), v(2), v(3)], clamp),
             inputs.clone(),
