@@ -2492,7 +2492,10 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     if len == 0 {
         return;
     }
-    // The kernel writes the destination: it must not be guarded meanwhile.
+    // The kernel reads the source and writes the destination: an armed
+    // page on either side would be read by the kernel without faulting
+    // into our handler, so the source's go back first.
+    crate::watch::will_read(src as usize, len);
     let _writing = title_dst.then(|| crate::watch::writing(dst as usize, len));
     #[cfg(feature = "diagnostics")]
     let moved = std::time::Instant::now();

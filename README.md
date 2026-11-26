@@ -217,7 +217,7 @@ The on/off switches below (`...=1`) are off when unset or set to `0`.
 | `VICTORY_SHADER_LOOP_LIMIT=<n>` | translated shader loops stop after `n` iterations per lane instead of 2^20 (own shader cache entries); if a lower `n` makes world frames much faster, loops hitting the limit are what makes them slow |
 | `VICTORY_AUDIO_CAPTURE=<file.wav>` | records what the title plays (our process only) |
 | `VICTORY_XMA_DUMP=<dir>` | saves the first 32 XMA voices' context and input |
-| `VICTORY_LAZY_COPY_BACK=1` | the pages shaders marked as written leave the submission sealed and go back into title memory at the first access to them (a read or write faults the one page back); what nothing touched is written by the next submission's copy-back. Copy-back after a submission is mostly waiting (the fetched snapshot's pages and the waits around them), and a page the title never reads needs none of it |
+| `VICTORY_LAZY_COPY_BACK=1` | pages shaders marked as written go back into title memory at their first access (a faulting read or write brings that page back); the rest is written by the next submission's copy-back |
 
 Every build appends unhandled exceptions, panics, and host GPU failures to
 `crashes.log` in the title's data folder.

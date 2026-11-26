@@ -926,24 +926,34 @@ fn drain_lazy(address: usize, len: usize) {
     service_lazy(crate::watch::take_lazy(first, last));
 }
 
-/// Pages that waited for their reader ([`crate::watch::take_lazy`]) go
-/// back now, one page at a time, as [`copy_back_marks_with`] would have
-/// copied them, and the seal returns to the read-only guard the wait
-/// arming made of it ([`crate::watch::repaged`]). They are page numbers;
-/// the copy-back works with the page's address.
+/// Claimed pages ([`crate::watch::take_lazy`], each a page number) go
+/// back one at a time, as [`copy_back_marks_with`] would have copied them.
 pub(crate) fn service_lazy(pages: Vec<(Arc<Shadow>, usize)>) {
     for (copy, page) in pages {
-        copy_back_one(&copy, page * PAGE, true);
+        service_lazy_one(copy, page);
     }
 }
 
-/// One marked page's copy-back with its counters; `lazy`, that it waited
-/// sealed behind a no-access block whose read of the page's own bytes
-/// needs the guard made again first ([`crate::watch::repaged`]).
-fn copy_back_one(copy: &Arc<Shadow>, page: usize, lazy: bool) {
-    if lazy {
-        crate::watch::repaged(page / PAGE);
-    }
+/// One claimed page's copy-back (the page a number, its bytes the address's
+/// whole 64 KiB): the page opens for the merge ([`crate::watch::open_lazy`]),
+/// the tracker guards it again as the eager copy-back does, and the claim
+/// ends ([`crate::watch::done_lazy`]) — the pages that waited it re-run
+/// their access.
+pub(crate) fn service_lazy_one(copy: Arc<Shadow>, page: usize) {
+    crate::watch::open_lazy(page);
+    let written = copy.copy_back_marked(page * PAGE);
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(crate::copystat::C::MarkedPages, 1);
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(crate::copystat::C::MarkedBytes, written as u64);
+    #[cfg(not(feature = "diagnostics"))]
+    let _ = written;
+    crate::watch::done_lazy(page);
+}
+
+/// One marked page's copy-back with its counters, as the switch-off
+/// copy-back runs it (the page an address here).
+fn copy_back_eager(copy: &Arc<Shadow>, page: usize) {
     let written = copy.copy_back_marked(page);
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::MarkedPages, 1);
@@ -1027,7 +1037,7 @@ fn copy_back_marks_with(
         if lazy && held_whole {
             armed.push((copy, page / PAGE));
         } else {
-            copy_back_one(&copy, page, false);
+            copy_back_eager(&copy, page);
         }
     }
     if lazy {
@@ -1035,7 +1045,7 @@ fn copy_back_marks_with(
         // copies' bytes waiting for a reader; the ones a view of the same
         // pages shows elsewhere cannot wait and go back now.
         for (copy, page) in crate::watch::arm_lazy(&armed) {
-            copy_back_one(&copy, page * PAGE, false);
+            copy_back_eager(&copy, page * PAGE);
         }
     }
 }

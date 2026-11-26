@@ -448,6 +448,9 @@ pub extern "system" fn sendto(
     if !to.is_null() && !stream(s) && !reachable("network datagram blocked", to, to_len) {
         return SOCKET_ERROR;
     }
+    // The kernel reads the buffer, which a lazy copy-back may hold sealed
+    // (the kernel does not fault into its handler).
+    victory_gpu::kernel_will_read(buf as usize, len.max(0) as usize);
     host!("ws2_32.dll", "sendto": extern "system" fn(Socket, *const u8, i32, i32, *const u8, i32) -> i32)(
         s, buf, len, flags, to, to_len,
     )
@@ -467,9 +470,28 @@ pub extern "system" fn WSASendTo(
     if !to.is_null() && !stream(s) && !reachable("network datagram blocked", to, to_len) {
         return SOCKET_ERROR;
     }
+    // The kernel reads each buffer, which a lazy copy-back may hold sealed
+    // (the kernel does not fault into its handler); reading the
+    // descriptor array first faults any sealed descriptor page back.
+    // SAFETY: the title passes `count` `WSABUF` descriptors.
+    if !buffers.is_null() {
+        let buffers = unsafe {
+            std::slice::from_raw_parts(buffers.cast::<Wsabuf>(), count.min(1024) as usize)
+        };
+        for buffer in buffers {
+            victory_gpu::kernel_will_read(buffer.buf as usize, buffer.len as usize);
+        }
+    }
     host!("ws2_32.dll", "WSASendTo": extern "system" fn(Socket, *const c_void, u32, *mut u32, u32, *const u8, i32, *mut c_void, *const c_void) -> i32)(
         s, buffers, count, sent, flags, to, to_len, overlapped, completion,
     )
+}
+
+/// A Winsock buffer descriptor: `WSABUF`, the length then the buffer.
+#[repr(C)]
+struct Wsabuf {
+    len: u32,
+    buf: *const u8,
 }
 
 /// A connection-oriented socket, whose sends go to the peer `connect` vetted.
