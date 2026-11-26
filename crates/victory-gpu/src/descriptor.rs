@@ -179,21 +179,48 @@ pub(crate) fn sync_heaps() {
         };
         let step = u64::from(step);
         let page_size = crate::watch::PAGE;
-        let limit = u64::from(heap.desc.count);
-        let mut ranges: Vec<(u32, u32)> = Vec::new();
+        let mut pages: Vec<(usize, usize)> = Vec::new();
         for (from, to) in written.take(start as usize, usize::MAX) {
             // By page: one with nothing mapped (the title unmaps heap pages
             // too) holds no records.
             for page in (from & !(page_size - 1)..to).step_by(page_size) {
-                let (page, end) = (page.max(from), (page + page_size).min(to));
-                if !crate::host::read_into(page as *const u8, &mut [0u8; 4]) {
-                    continue;
+                pages.push((page.max(from), (page + page_size).min(to)));
+            }
+        }
+        if pages.is_empty() {
+            continue;
+        }
+        let mapped: Vec<std::sync::atomic::AtomicBool> =
+            (0..pages.len()).map(|_| std::sync::atomic::AtomicBool::new(false)).collect();
+        if pages.len() >= 16 {
+            let chunks = (pages.len() / 8).clamp(2, 4);
+            let chunk = pages.len().div_ceil(chunks);
+            crate::texture::in_parallel(chunks, |c| {
+                let s = c * chunk;
+                let e = ((c + 1) * chunk).min(pages.len());
+                for i in s..e {
+                    let ok = crate::host::read_into(pages[i].0 as *const u8, &mut [0u8; 4]);
+                    mapped[i].store(ok, std::sync::atomic::Ordering::Relaxed);
                 }
-                let first = ((page as u64 - start) / step).min(limit) as u32;
-                let last = (end as u64 - start).div_ceil(step).min(limit) as u32;
-                if first < last {
-                    ranges.push((first, last));
-                }
+            });
+        } else {
+            for (&(page, _), ok) in pages.iter().zip(&mapped) {
+                ok.store(
+                    crate::host::read_into(page as *const u8, &mut [0u8; 4]),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+            }
+        }
+        let limit = u64::from(heap.desc.count);
+        let mut ranges: Vec<(u32, u32)> = Vec::new();
+        for (&(page, end), ok) in pages.iter().zip(&mapped) {
+            if !ok.load(std::sync::atomic::Ordering::Relaxed) {
+                continue;
+            }
+            let first = ((page as u64 - start) / step).min(limit) as u32;
+            let last = (end as u64 - start).div_ceil(step).min(limit) as u32;
+            if first < last {
+                ranges.push((first, last));
             }
         }
         if ranges.is_empty() {

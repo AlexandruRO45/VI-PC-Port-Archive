@@ -727,8 +727,17 @@ impl HostHeap {
                 _ => clamped.push((a, b)),
             }
         }
+        let total: usize = clamped.iter().map(|&(a, b)| (b - a) as usize).sum();
+
+        // Phase 1: diff dirty slots directly against title memory, `self.made`,
+        // and `VIEWS` under a single lock of each (preserving lock order
+        // `made` -> `VIEWS`), in parallel across disjoint slot chunks via
+        // `texture::in_parallel` with zero intermediate record buffer.
         enum StaleSlot {
-            Null(u32),
+            Null {
+                index: u32,
+                raw: [u32; 3],
+            },
             Set {
                 index: u32,
                 raw: [u32; 3],
@@ -737,55 +746,102 @@ impl HostHeap {
                 later: bool,
             },
         }
-        let stale: Vec<StaleSlot> = {
-            let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
-            with_views(|views| {
-                let mut out = Vec::new();
-                for &(first, last) in &clamped {
-                    for i in first..last {
-                        // SAFETY: records in title heap memory the caller found mapped.
-                        let raw @ [tag, id, generation] =
-                            unsafe { (at(i) as *const [u32; 3]).read_unaligned() };
-                        let cur_made = made[i as usize];
-                        if tag != VIEW_TAG {
-                            if cur_made != 0 {
-                                out.push(StaleSlot::Null(i));
-                            }
-                            continue;
+        let mut offsets = Vec::with_capacity(clamped.len());
+        let mut off = 0usize;
+        for &(a, b) in &clamped {
+            offsets.push((a, b, off));
+            off += (b - a) as usize;
+        }
+        let diff_slice = |start_pos: usize,
+                          end_pos: usize,
+                          made: &[u64],
+                          views: &[(View, u32)]|
+         -> Vec<StaleSlot> {
+            let mut out = Vec::new();
+            let mut r = offsets.partition_point(|&(a, b, o)| o + (b - a) as usize <= start_pos);
+            let mut pos = start_pos;
+            while pos < end_pos && r < offsets.len() {
+                let (a, b, o) = offsets[r];
+                let r_end = o + (b - a) as usize;
+                let take_end = end_pos.min(r_end);
+                let slot_start = a + (pos - o) as u32;
+                let count = (take_end - pos) as u32;
+                for k in 0..count {
+                    let i = slot_start + k;
+                    let addr = start + u64::from(i) * step;
+                    // SAFETY: slot lies in a title heap page the caller probed mapped.
+                    let raw @ [tag, id, generation] =
+                        unsafe { (addr as *const [u32; 3]).read_unaligned() };
+                    let cur_made = made[i as usize];
+                    if tag != VIEW_TAG {
+                        if cur_made != 0 {
+                            out.push(StaleSlot::Null { index: i, raw });
                         }
-                        match views.get(id as usize) {
-                            Some((view, cur_gen)) if *cur_gen == generation => {
-                                let key = u64::from(generation) << 32 | u64::from(id);
-                                if cur_made != key {
-                                    out.push(StaleSlot::Set {
-                                        index: i,
-                                        raw,
-                                        key,
-                                        view: view.clone(),
-                                        later: is_placed_texture(view),
-                                    });
-                                }
+                        continue;
+                    }
+                    match views.get(id as usize) {
+                        Some((view, cur_gen)) if *cur_gen == generation => {
+                            let key = u64::from(generation) << 32 | u64::from(id);
+                            if cur_made != key {
+                                out.push(StaleSlot::Set {
+                                    index: i,
+                                    raw,
+                                    key,
+                                    view: view.clone(),
+                                    later: is_placed_texture(view),
+                                });
                             }
-                            _ => {
-                                if cur_made != 0 {
-                                    out.push(StaleSlot::Null(i));
-                                }
+                        }
+                        _ => {
+                            if cur_made != 0 {
+                                out.push(StaleSlot::Null { index: i, raw });
                             }
                         }
                     }
                 }
-                out
+                pos = take_end;
+                r += 1;
+            }
+            out
+        };
+        let stale: Vec<StaleSlot> = {
+            let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+            with_views(|views| {
+                let diff_chunks = (total / 16_384).min(4);
+                if diff_chunks >= 2 {
+                    let chunk = total.div_ceil(diff_chunks);
+                    let parts: Vec<Mutex<Vec<StaleSlot>>> =
+                        (0..diff_chunks).map(|_| Mutex::new(Vec::new())).collect();
+                    let made_slice = made.as_slice();
+                    crate::texture::in_parallel(diff_chunks, |c| {
+                        let s = c * chunk;
+                        let e = ((c + 1) * chunk).min(total);
+                        if s < e {
+                            *parts[c].lock().unwrap_or_else(|err| err.into_inner()) =
+                                diff_slice(s, e, made_slice, views);
+                        }
+                    });
+                    let mut merged = Vec::new();
+                    for p in parts {
+                        merged.extend(p.into_inner().unwrap_or_else(|err| err.into_inner()));
+                    }
+                    merged
+                } else {
+                    diff_slice(0, total, made.as_slice(), views)
+                }
             })
         };
         if stale.is_empty() {
             return;
         }
 
-        // Batch-resolve existing host buffer copies under one `BUFFERS` lock
-        // outside `self.made` so each buffer descriptor reuses its resolved
-        // copy across view creation and `bindless::Viewed`.
+        // Phase 2: prepare missing host textures / buffer copies outside
+        // `self.made`. Buffer copies are resolved in one batched `BUFFERS`
+        // lookup to avoid cross-thread mutex contention; textures prepare in
+        // parallel.
         let mut prepared: Vec<Option<PreparedBuffer>> = (0..stale.len()).map(|_| None).collect();
         let mut buf_slots: Vec<(usize, u64, u64, u64, bool)> = Vec::new();
+        let mut tex_slots: Vec<usize> = Vec::new();
         for (idx, slot) in stale.iter().enumerate() {
             let StaleSlot::Set { view, later: false, .. } = slot else {
                 continue;
@@ -793,9 +849,12 @@ impl HostHeap {
             #[cfg(test)]
             tests::while_preparing();
             match view {
-                View::Placed(..) if is_placed_texture(view) => {}
+                View::Placed(..) if is_placed_texture(view) => tex_slots.push(idx),
                 View::Shader(r, _) | View::Unordered(r, _, _)
-                    if crate::resource::texture_memory(*r as crate::object::This).is_some() => {}
+                    if crate::resource::texture_memory(*r as crate::object::This).is_some() =>
+                {
+                    tex_slots.push(idx);
+                }
                 &View::Constant(address, size) => {
                     buf_slots.push((idx, address, u64::from(size), 4, true));
                 }
@@ -824,76 +883,199 @@ impl HostHeap {
                 prepared[idx] = Some(PreparedBuffer { shadow, own, address, len });
             }
         }
-
-        for (slot, prep) in stale.into_iter().zip(prepared) {
-            match slot {
-                StaleSlot::Null(i) => {
-                    self.mirror(i, at(i), false);
-                }
-                StaleSlot::Set { index, raw, key, view, later } => {
-                    if !later && prep.is_none() {
-                        self.mirror(index, at(index), false);
-                    } else {
-                        self.mirror_prepared(index, at(index), raw, key, view, later, prep);
+        if !tex_slots.is_empty() {
+            crate::texture::in_parallel(tex_slots.len(), |k| {
+                let StaleSlot::Set { view, .. } = &stale[tex_slots[k]] else { return };
+                match view {
+                    View::Placed(..) if is_placed_texture(view) => {
+                        let _ = placed_texture(view);
                     }
+                    View::Shader(r, _) | View::Unordered(r, _, _) => {
+                        let _ = crate::resource::host_resource(*r as crate::object::This);
+                    }
+                    _ => {}
+                }
+            });
+        }
+
+        // Phase 3: lock `self.made` once, confirm no concurrent title rewrite
+        // or view release raced with Phase 2 (re-checking `VIEWS` under lock
+        // order `made` -> `VIEWS`), then create D3D12 views and write per-slot
+        // tables in parallel on strictly disjoint title slots.
+        enum ReadySlot {
+            Null(u32),
+            Set {
+                index: u32,
+                view: View,
+                later: bool,
+                prepared: Option<PreparedBuffer>,
+            },
+        }
+        struct BuiltSlot {
+            index: u32,
+            kept: Kept,
+            seen: Option<crate::bindless::Seen>,
+            forget_read: bool,
+        }
+        let mut retry: Vec<u32> = Vec::new();
+        {
+            let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+            let mut ready: Vec<ReadySlot> = Vec::with_capacity(stale.len());
+            with_views(|views| {
+                for (slot, prep) in stale.into_iter().zip(prepared) {
+                    match slot {
+                        StaleSlot::Null { index, raw } => {
+                            // SAFETY: title slot verified mapped in Phase 1.
+                            let now = unsafe { (at(index) as *const [u32; 3]).read_unaligned() };
+                            if now != raw {
+                                retry.push(index);
+                                continue;
+                            }
+                            if made[index as usize] != 0 {
+                                made[index as usize] = 0;
+                                ready.push(ReadySlot::Null(index));
+                            }
+                        }
+                        StaleSlot::Set { index, raw, key, view, later } => {
+                            // SAFETY: title slot verified mapped in Phase 1.
+                            let now = unsafe { (at(index) as *const [u32; 3]).read_unaligned() };
+                            let current = now == raw
+                                && views
+                                    .get(raw[1] as usize)
+                                    .is_some_and(|(_, cur_gen)| *cur_gen == raw[2]);
+                            if !current {
+                                retry.push(index);
+                                continue;
+                            }
+                            if made[index as usize] != key {
+                                made[index as usize] = key;
+                                ready.push(ReadySlot::Set { index, view, later, prepared: prep });
+                            }
+                        }
+                    }
+                }
+            });
+            if !ready.is_empty() {
+                let build_slot = |slot: &ReadySlot| -> BuiltSlot {
+                    match slot {
+                        ReadySlot::Null(index) => {
+                            let index = *index;
+                            if self.sampler {
+                                self.null_sampler(index);
+                            } else {
+                                null_view(self.cpu(index));
+                            }
+                            self.set_stride(index, None);
+                            self.set_mark(index, None);
+                            self.note_address(index, None);
+                            BuiltSlot { index, kept: None, seen: None, forget_read: false }
+                        }
+                        ReadySlot::Set { index, view, later, prepared } => {
+                            let index = *index;
+                            self.set_stride(index, Some(view));
+                            self.note_address(index, Some(view));
+                            let (kept, mark) = if *later {
+                                (None, None)
+                            } else {
+                                make_marked_with(view, prepared.as_ref(), self.cpu(index))
+                            };
+                            self.set_mark(index, mark);
+                            if kept.is_none() && !self.sampler {
+                                null_for(view, self.cpu(index));
+                            }
+                            let seen = if self.sampler {
+                                None
+                            } else {
+                                let buf = prepared
+                                    .as_ref()
+                                    .map(|p| (p.shadow.clone(), p.address, p.len));
+                                crate::bindless::seen_entry(Some(view), kept.is_some(), buf)
+                            };
+                            BuiltSlot {
+                                index,
+                                kept: kept.flatten(),
+                                seen,
+                                forget_read: *later,
+                            }
+                        }
+                    }
+                };
+
+                let built: Vec<BuiltSlot> = {
+                    let make_chunks = (ready.len() / 32).min(4);
+                    if make_chunks >= 2 {
+                        let chunk = ready.len().div_ceil(make_chunks);
+                        let parts: Vec<Mutex<Vec<BuiltSlot>>> =
+                            (0..make_chunks).map(|_| Mutex::new(Vec::new())).collect();
+                        crate::texture::in_parallel(make_chunks, |c| {
+                            let s = c * chunk;
+                            let e = ((c + 1) * chunk).min(ready.len());
+                            if s < e {
+                                let out: Vec<BuiltSlot> =
+                                    ready[s..e].iter().map(build_slot).collect();
+                                *parts[c].lock().unwrap_or_else(|err| err.into_inner()) = out;
+                            }
+                        });
+                        let mut merged = Vec::with_capacity(ready.len());
+                        for p in parts {
+                            merged.extend(p.into_inner().unwrap_or_else(|err| err.into_inner()));
+                        }
+                        merged
+                    } else {
+                        ready.iter().map(build_slot).collect()
+                    }
+                };
+
+                // Apply `forget_read`, `self.kept`, and `self.viewed` in one
+                // lock each (still under `self.made`).
+                let mut retired = Vec::new();
+                let mut seen_updates =
+                    if self.sampler { Vec::new() } else { Vec::with_capacity(built.len()) };
+                {
+                    let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
+                    for entry in built {
+                        if entry.forget_read {
+                            crate::shadow::forget_read(entry.index);
+                        }
+                        if let Some(slot) = kept.get_mut(entry.index as usize) {
+                            let old = std::mem::replace(slot, entry.kept);
+                            #[cfg(feature = "diagnostics")]
+                            if let Some((old, _)) = &old
+                                && !self.sampler
+                                && slot.as_ref().map(|s| windows::core::Interface::as_raw(&s.0))
+                                    != Some(windows::core::Interface::as_raw(old))
+                                // SAFETY: a live resource.
+                                && unsafe { old.GetDesc() }.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER
+                            {
+                                use windows::core::Interface;
+                                let left = crate::resource::life::holders(old);
+                                crate::resource::life::note(
+                                    old.as_raw() as usize,
+                                    crate::resource::life::SLOT,
+                                    u64::from(entry.index),
+                                    left,
+                                );
+                            }
+                            if let Some((old, _)) = old {
+                                retired.push(old);
+                            }
+                        }
+                        if !self.sampler {
+                            seen_updates.push((entry.index, entry.seen));
+                        }
+                    }
+                }
+                if !retired.is_empty() {
+                    crate::host::retire_all(retired);
+                }
+                if !self.sampler {
+                    self.viewed.set_batch(seen_updates);
                 }
             }
         }
-    }
-
-    /// Mirrors a single title slot using a buffer copy already resolved by
-    /// [`HostHeap::sync_ranges`], falling back to [`HostHeap::mirror`] if the
-    /// slot's title bytes or recorded view generation changed meanwhile.
-    #[allow(clippy::too_many_arguments)]
-    fn mirror_prepared(
-        &self,
-        index: u32,
-        handle: u64,
-        raw: [u32; 3],
-        key: u64,
-        view: View,
-        later: bool,
-        prepared: Option<PreparedBuffer>,
-    ) {
-        let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
-        // SAFETY: title slot verified mapped by `sync_ranges`.
-        let unchanged = unsafe { (handle as *const [u32; 3]).read_unaligned() } == raw
-            && with_views(|views| {
-                views
-                    .get(raw[1] as usize)
-                    .is_some_and(|(_, cur_gen)| *cur_gen == raw[2])
-            });
-        if !unchanged {
-            drop(made);
-            self.mirror(index, handle, false);
-            return;
+        for index in retry {
+            self.mirror(index, at(index), false);
         }
-        if made[index as usize] == key {
-            return;
-        }
-        self.set_stride(index, Some(&view));
-        self.note_address(index, Some(&view));
-        if later {
-            // Made once a shader reads it (`crate::shadow::take_reads`).
-            crate::shadow::forget_read(index);
-        }
-        made[index as usize] = key;
-        let (kept, mark) = if later {
-            (None, None)
-        } else {
-            make_marked_with(&view, prepared.as_ref(), self.cpu(index))
-        };
-        self.set_mark(index, mark);
-        if kept.is_none() && !self.sampler {
-            null_for(&view, self.cpu(index));
-        }
-        if !self.sampler {
-            let buf = prepared
-                .as_ref()
-                .map(|p| (p.shadow.clone(), p.address, p.len));
-            self.viewed.set_with(index, Some(&view), kept.is_some(), buf);
-        }
-        self.keep(index, kept.flatten());
     }
 
     /// Makes host slot `index` from the record the title has at `handle`
@@ -2805,5 +2987,238 @@ mod tests {
 
         crate::shadow::unregister(pool, base);
         crate::watch::tests::free(pool);
+    }
+
+    /// World-scale heap sync benchmark: ~700,000 slots across 342 dirty 64 KiB
+    /// pages (step 32), measuring scan-only (0 changed), typical (6,000
+    /// changed), and heavy (14,000 changed) frames.
+    /// `cargo test --release -p victory-gpu --lib world_frame_sync_heaps -- --ignored --nocapture`
+    #[test]
+    #[ignore = "benchmark: run in release with --ignored --nocapture"]
+    fn world_frame_sync_heaps() {
+        const PAGES: usize = 342;
+        const PAGE: usize = crate::watch::PAGE;
+        const STEP: u64 = 32;
+        const SLOTS_PER_PAGE: usize = PAGE / STEP as usize; // 2,048
+        const TOTAL_SLOTS: u32 = (PAGES * SLOTS_PER_PAGE) as u32; // 700,416
+        const ROUNDS: usize = 9;
+
+        let Some(host) = HostHeap::new(false, TOTAL_SLOTS) else {
+            eprintln!("no host descriptor heap; skipped");
+            return;
+        };
+        // Backing title buffer (4 MiB) for realistic SRV / UAV / CBV records.
+        let buf_len: u64 = 4 << 20;
+        let buf_mem = crate::watch::tests::pool((buf_len as usize) / PAGE);
+        crate::shadow::register(buf_mem, buf_mem as u64, buf_len);
+
+        // Backing title heap memory (342 * 64 KiB = ~21.4 MiB).
+        let heap_mem = crate::watch::tests::pool(PAGES);
+        let start = heap_mem as u64;
+
+        // Pre-record a pool of distinct buffer SRV / UAV / CBV descriptor records.
+        let make_srv = |offset_elems: u32, count: u32, stride: u32| -> [u32; 3] {
+            let mut slot = [0u32; 8];
+            let resource = [1u32, 0, 0, 0, buf_len as u32, 0, 1, 1 | (1 << 16), 0, 1, 0, 0, 0, 0];
+            let mut desc = [0u32; 16];
+            desc[0] = 0; // format UNKNOWN (structured)
+            desc[1] = 1; // BUFFER
+            desc[2] = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            desc[4] = offset_elems;
+            desc[6] = count;
+            desc[7] = stride;
+            desc[10] = buf_mem as u32;
+            desc[11] = (buf_mem >> 32) as u32;
+            crate::descriptor::create_placed_srv(
+                std::ptr::null(),
+                &resource,
+                &desc,
+                slot.as_mut_ptr() as u64,
+            );
+            [slot[0], slot[1], slot[2]]
+        };
+        let make_uav = |offset_elems: u32, count: u32| -> [u32; 3] {
+            let mut slot = [0u32; 8];
+            let resource = [1u32, 0, 0, 0, buf_len as u32, 0, 1, 1 | (1 << 16), 0, 1, 0, 0, 4, 0];
+            let mut desc = [0u32; 16];
+            desc[0] = 41; // R32_TYPELESS
+            desc[1] = 1; // BUFFER
+            desc[4] = offset_elems;
+            desc[6] = count;
+            desc[9] = 1; // RAW
+            desc[10] = buf_mem as u32;
+            desc[11] = (buf_mem >> 32) as u32;
+            crate::descriptor::create_placed_uav(
+                std::ptr::null(),
+                &resource,
+                &desc,
+                slot.as_mut_ptr() as u64,
+            );
+            [slot[0], slot[1], slot[2]]
+        };
+        let make_cbv = |offset: u64| -> [u32; 3] {
+            let mut slot = [0u32; 8];
+            let addr = buf_mem as u64 + offset;
+            let desc = [addr as u32, (addr >> 32) as u32, 256, 0];
+            crate::descriptor::create_cbv(std::ptr::null(), &desc, slot.as_mut_ptr() as u64);
+            [slot[0], slot[1], slot[2]]
+        };
+
+        let mut pool_a = Vec::with_capacity(4096);
+        let mut pool_b = Vec::with_capacity(4096);
+        for k in 0u32..4096 {
+            let rec_a = match k % 10 {
+                0..=5 => make_srv((k * 16) % 65536, 64, 16),
+                6..=7 => make_uav((k * 64) % 262144, 64),
+                8 => make_cbv((u64::from(k) * 256) % (buf_len - 256)),
+                _ => [0, 0, 0],
+            };
+            let rec_b = match (k + 3) % 10 {
+                0..=5 => make_srv(((k + 1) * 16) % 65536, 64, 16),
+                6..=7 => make_uav(((k + 1) * 64) % 262144, 64),
+                8 => make_cbv((u64::from(k + 1) * 256) % (buf_len - 256)),
+                _ => [0, 0, 0],
+            };
+            pool_a.push(rec_a);
+            pool_b.push(rec_b);
+        }
+
+        let write_slot = |idx: usize, rec: [u32; 3]| {
+            let dst = (start + (idx as u64) * STEP) as *mut [u32; 3];
+            // SAFETY: inside `heap_mem` pool.
+            unsafe { dst.write_unaligned(rec) };
+        };
+
+        // Populate ~200,000 initial live slots across the 700,416-slot span.
+        for i in (0..TOTAL_SLOTS as usize).step_by(3) {
+            write_slot(i, pool_a[i % pool_a.len()]);
+        }
+
+        let run_sync = |host: &HostHeap| {
+            let mut ranges = Vec::with_capacity(PAGES);
+            for p in 0..PAGES {
+                let page_addr = start + (p * PAGE) as u64;
+                let ok = crate::host::read_into(page_addr as *const u8, &mut [0u8; 4]);
+                if ok {
+                    let first = (p * SLOTS_PER_PAGE) as u32;
+                    let last = ((p + 1) * SLOTS_PER_PAGE) as u32;
+                    ranges.push((first, last));
+                }
+            }
+            host.sync_ranges(&ranges, start, STEP);
+        };
+
+        // Warmup sync (populates host copies and initial descriptors).
+        run_sync(&host);
+
+        for (label, changed) in [
+            ("scan-only (0 changed / 700k scanned)", 0usize),
+            ("typical (6,000 changed / 700k scanned)", 6_000usize),
+            ("heavy (14,000 changed / 700k scanned)", 14_000usize),
+        ] {
+            let mut times = Vec::with_capacity(ROUNDS);
+            for r in 0..ROUNDS {
+                let src = if r % 2 == 0 { &pool_b } else { &pool_a };
+                for k in 0..changed {
+                    let page = k % PAGES;
+                    let slot_in_page = (k / PAGES) % SLOTS_PER_PAGE;
+                    let idx = page * SLOTS_PER_PAGE + slot_in_page;
+                    write_slot(idx, src[k % src.len()]);
+                }
+                let t0 = std::time::Instant::now();
+                run_sync(&host);
+                times.push(t0.elapsed().as_secs_f64() * 1e3);
+            }
+            times.sort_by(f64::total_cmp);
+            let med = times[ROUNDS / 2];
+            let min = times[0];
+            let max = times[ROUNDS - 1];
+            eprintln!("{label}: median {med:.2} ms (min {min:.2}, max {max:.2})");
+        }
+        crate::shadow::unregister(buf_mem, buf_mem as u64);
+    }
+
+    #[test]
+    fn sync_ranges_mirrors_and_clears_many_slots_in_parallel() {
+        const COUNT: u32 = 512;
+        const STEP: u64 = 32;
+        let Some(host) = HostHeap::new(false, COUNT) else {
+            return;
+        };
+        let buf_len: u64 = 256 << 10;
+        let buf_mem = crate::watch::tests::pool((buf_len as usize) / crate::watch::PAGE);
+        crate::shadow::register(buf_mem, buf_mem as u64, buf_len);
+
+        let mut heap_mem = vec![[0u32; 8]; COUNT as usize];
+        let start = heap_mem.as_mut_ptr() as u64;
+
+        // Populate 256 slots (above the parallel threshold of 64) with CBV / SRV / UAV records.
+        for i in 0..256u32 {
+            let slot_addr = start + u64::from(i) * STEP;
+            match i % 3 {
+                0 => {
+                    let addr = buf_mem as u64 + u64::from(i) * 256;
+                    let desc = [addr as u32, (addr >> 32) as u32, 256, 0];
+                    crate::descriptor::create_cbv(std::ptr::null(), &desc, slot_addr);
+                }
+                1 => {
+                    let resource = [1u32, 0, 0, 0, buf_len as u32, 0, 1, 1 | (1 << 16), 0, 1, 0, 0, 0, 0];
+                    let mut desc = [0u32; 16];
+                    desc[1] = 1;
+                    desc[2] = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+                    desc[4] = i * 4;
+                    desc[6] = 16;
+                    desc[7] = 16;
+                    desc[10] = buf_mem as u32;
+                    desc[11] = (buf_mem >> 32) as u32;
+                    crate::descriptor::create_placed_srv(std::ptr::null(), &resource, &desc, slot_addr);
+                }
+                _ => {
+                    let resource = [1u32, 0, 0, 0, buf_len as u32, 0, 1, 1 | (1 << 16), 0, 1, 0, 0, 4, 0];
+                    let mut desc = [0u32; 16];
+                    desc[0] = 41;
+                    desc[1] = 1;
+                    desc[4] = i * 16;
+                    desc[6] = 16;
+                    desc[9] = 1;
+                    desc[10] = buf_mem as u32;
+                    desc[11] = (buf_mem >> 32) as u32;
+                    crate::descriptor::create_placed_uav(std::ptr::null(), &resource, &desc, slot_addr);
+                }
+            }
+        }
+
+        host.sync_ranges(&[(0, COUNT)], start, STEP);
+        for i in 0..256u32 {
+            assert!(host.made(i), "slot {i} should be made");
+            assert!(host.kept(i), "slot {i} should keep its host buffer");
+        }
+        for i in 256..COUNT {
+            assert!(!host.made(i), "empty slot {i} should stay unmade");
+            assert!(!host.kept(i), "empty slot {i} should keep nothing");
+        }
+
+        // Clear odd slots and rewrite even slots with fresh CBVs, then sync again.
+        for i in 0..256u32 {
+            let slot_addr = start + u64::from(i) * STEP;
+            if i % 2 == 1 {
+                heap_mem[i as usize] = [0; 8];
+            } else {
+                let addr = buf_mem as u64 + u64::from(i + 1) * 256;
+                let desc = [addr as u32, (addr >> 32) as u32, 256, 0];
+                crate::descriptor::create_cbv(std::ptr::null(), &desc, slot_addr);
+            }
+        }
+        host.sync_ranges(&[(0, 128), (128, COUNT)], start, STEP);
+        for i in 0..256u32 {
+            if i % 2 == 1 {
+                assert!(!host.made(i), "cleared slot {i} should be unmade");
+                assert!(!host.kept(i), "cleared slot {i} should be nulled");
+            } else {
+                assert!(host.made(i), "rewritten slot {i} should be made");
+                assert!(host.kept(i), "rewritten slot {i} should keep its host buffer");
+            }
+        }
+        crate::shadow::unregister(buf_mem, buf_mem as u64);
     }
 }

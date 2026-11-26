@@ -20,7 +20,7 @@ use crate::shadow::Shadow;
 
 /// What a title heap slot views that title memory feeds.
 #[derive(Clone)]
-enum Seen {
+pub(crate) enum Seen {
     /// `len` bytes at `address` of a buffer's host copy; unordered access.
     Buffer(Arc<Shadow>, u64, u64, bool),
     /// A title texture (resource object) whose contents the title writes.
@@ -153,6 +153,21 @@ impl Viewed {
         }
     }
 
+    /// Applies many `(index, seen)` slot updates under one lock
+    /// ([`seen_entry`]).
+    pub(crate) fn set_batch(&self, updates: impl IntoIterator<Item = (u32, Option<Seen>)>) {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        for (index, seen) in updates {
+            if let Some(old) = inner.slots.remove(&index) {
+                inner.count(&old, false);
+            }
+            if let Some(seen) = seen {
+                inner.count(&seen, true);
+                inner.slots.insert(index, seen);
+            }
+        }
+    }
+
     /// The buffer ranges views reach, merged per host copy and kind
     /// (shader resource, unordered access): copy, start, bytes.
     #[cfg(any(test, feature = "diagnostics"))]
@@ -163,7 +178,7 @@ impl Viewed {
 
 /// Computes the [`Seen`] entry for a slot outside [`Viewed`]'s lock, reusing
 /// an already-resolved buffer copy `(shadow, address, len)` when provided.
-fn seen_entry(
+pub(crate) fn seen_entry(
     view: Option<&View>,
     made: bool,
     buffer: Option<(Arc<Shadow>, u64, u64)>,
