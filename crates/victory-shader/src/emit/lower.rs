@@ -21,6 +21,7 @@ use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source, USER
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 mod bvh;
+mod quads;
 
 type Why = &'static str;
 
@@ -546,16 +547,6 @@ fn code_table_start(p: &crate::ir::Program, addresses: &[&crate::resource::Addre
     if fixed_below { lowest } else { lowest.max(code_end & !3) }
 }
 
-/// An image instruction that takes its level from the coordinates'
-/// derivatives: a sample without an explicit level (`_l`, `_lz`) or
-/// gradients (`_d`, `_cd`), and `image_get_lod`.
-fn implicit_level(name: &str) -> bool {
-    name == "image_get_lod"
-        || name
-            .strip_prefix("image_sample")
-            .is_some_and(|rest| !rest.split('_').any(|t| matches!(t, "l" | "lz" | "d" | "cd")))
-}
-
 impl<'a> Lower<'a> {
     fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>) -> Self {
         let p = x.p;
@@ -628,7 +619,7 @@ impl<'a> Lower<'a> {
             // as one row, where every host keeps the order.
             if !console_lanes
                 && cs.threads[1] * cs.threads[2] > 1
-                && insts().any(|i| implicit_level(i.name()))
+                && insts().any(|i| quads::implicit_level(i.name()))
             {
                 rows = Some(cs.threads);
                 s.threads = Some([cs.threads.iter().product(), 1, 1]);
@@ -2943,25 +2934,8 @@ impl<'a> Lower<'a> {
     /// plus the lane index. (A bijection while each host wave holds a
     /// wave-aligned run of flat ids, as the console's waves do.)
     fn thread_id(&mut self, c: u8) -> Val {
-        if let Some([x, y, _]) = self.rows {
-            let e = self.s.entry;
-            let f = self.s.op(
-                e,
-                "flattenedThreadIdInGroup.i32",
-                Attr::ReadNone,
-                self.s.t.i32,
-                96,
-                &[],
-            );
-            let (xk, yk, xy) = (self.s.m.i32(x), self.s.m.i32(y), self.s.m.i32(x * y));
-            return Val::I32(match c {
-                0 => self.s.m.bin(e, Bin::URem, f, xk),
-                1 => {
-                    let t = self.s.m.bin(e, Bin::UDiv, f, xk);
-                    self.s.m.bin(e, Bin::URem, t, yk)
-                }
-                _ => self.s.m.bin(e, Bin::UDiv, f, xy),
-            });
+        if let Some(rows) = self.rows {
+            return self.row_thread_id(rows, c);
         }
         if !self.console_lanes {
             return self.compute_id("threadIdInGroup.i32", 95, c);
@@ -3139,32 +3113,6 @@ impl<'a> Lower<'a> {
             .s
             .op(c, "isHelperLane.i1", Attr::ReadOnly, self.s.t.i1, 221, &[]);
         self.s.m.select(c, helper, own, first)
-    }
-
-    /// The x then y gradients (three each, undefined past `coords`) of
-    /// float coordinates `coords` across this lane's quad: lane 1 less lane
-    /// 0, lane 2 less lane 0, as the hardware's coarse derivatives.
-    fn quad_gradients(&mut self, coords: &[V]) -> Vec<V> {
-        self.s.flags |= flags::WAVE_OPS;
-        let c = self.cur;
-        let fu = self.s.m.undef(self.s.t.f32);
-        let lane = self.lane_index();
-        let (not3, one, two) = (self.s.m.i32(!3), self.s.m.i32(1), self.s.m.i32(2));
-        let base = self.s.m.bin(c, Bin::And, lane, not3);
-        let right = self.s.m.bin(c, Bin::Or, base, one);
-        let below = self.s.m.bin(c, Bin::Or, base, two);
-        let mut g = vec![fu; 6];
-        for (k, &x) in coords.iter().enumerate().take(3) {
-            let xi = self.as_int(x);
-            let at = |l: &mut Self, lane: V| {
-                let v = l.read_lane(xi, lane);
-                l.as_float(v)
-            };
-            let (x0, x1, x2) = (at(self, base), at(self, right), at(self, below));
-            g[k] = self.s.m.bin(c, Bin::Sub, x1, x0);
-            g[3 + k] = self.s.m.bin(c, Bin::Sub, x2, x0);
-        }
-        g
     }
 
     fn read_lane(&mut self, x: V, lane: V) -> V {
@@ -8888,19 +8836,7 @@ impl<'a> Lower<'a> {
             // -8..=7; the console's are 6-bit and may be computed.
             if offset_word && matches!(op, 60 | 61) {
                 let w = addr_val(self, 0)?;
-                let w = self
-                    .s
-                    .m
-                    .int_value(w)
-                    .ok_or("a sample offset that is not constant")? as u32;
-                for (k, o) in os.iter_mut().enumerate().take(offsets) {
-                    let x = (w >> (8 * k) & 0x3F) as i32;
-                    let x = if x >= 32 { x - 64 } else { x };
-                    if !(-8..=7).contains(&x) {
-                        return Err("a sample offset past -8..7");
-                    }
-                    *o = self.s.m.i32(x as u32);
-                }
+                self.sample_offsets(w, &mut os[..offsets])?;
             }
             let quad_grads = matches!(op, 60 | 61)
                 && self.s.threads.is_some()
@@ -8908,17 +8844,15 @@ impl<'a> Lower<'a> {
                 && kind != 5;
             match op {
                 60 | 61 if quad_grads => {
-                    let mut g = self.quad_gradients(&cs[..spatial]);
+                    // A bias scales the footprint by 2^bias; it follows the
+                    // offset word.
+                    let mut scale = None;
                     if op == 61 {
-                        // A bias scales the footprint by 2^bias; it follows
-                        // the offset word.
                         let bias = addr_val(self, usize::from(offset_word))?;
                         let bias = to_float(self, bias);
-                        let scale = self.unary(21, bias);
-                        for x in g.iter_mut().filter(|x| **x != fu) {
-                            *x = self.s.m.bin(c, Bin::Mul, *x, scale);
-                        }
+                        scale = Some(self.unary(21, bias));
                     }
+                    let g = self.quad_gradients(&cs[..spatial], scale);
                     args.extend(&os);
                     args.extend(g);
                     args.push(fu);
