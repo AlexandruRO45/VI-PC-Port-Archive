@@ -2829,7 +2829,18 @@ impl<'a> Lower<'a> {
         if v.clamp {
             f = self.unary(7, f);
         }
-        let Some(Operand::Vector { reg, .. }) = v.dst else {
+        self.store_float(inst, v.dst, f, guard)
+    }
+
+    /// Store a float after its instruction's output modifiers have been applied.
+    fn store_float(
+        &mut self,
+        inst: &Inst,
+        dst: Option<Operand>,
+        f: V,
+        guard: Option<V>,
+    ) -> Result<(), Why> {
+        let Some(Operand::Vector { reg, .. }) = dst else {
             return Err("a float result outside a VGPR");
         };
         let x = self.as_int(f);
@@ -6084,10 +6095,14 @@ impl<'a> Lower<'a> {
                     "v_cubesc_f32" => {
                         let (ix, iz) = (self.as_int(rx), self.as_int(rz));
                         let (nz, nx) = (neg(self, z), neg(self, x));
-                        let (mx, mz) = (neg_bits(self, ix), neg_bits(self, iz));
-                        let zf = self.s.m.select(c, nz, mx, ix);
-                        let xf = self.s.m.select(c, nx, iz, mz);
-                        let bits = pick(self, zf, ix, xf);
+                        // Select the coordinate and its sign adjustment separately, so
+                        // the selected result stays integer data even when subnormal.
+                        let (sign, keep) = (self.s.m.i32(0x8000_0000), self.s.m.i32(0));
+                        let zmask = self.s.m.select(c, nz, sign, keep);
+                        let xmask = self.s.m.select(c, nx, keep, sign);
+                        let raw = pick(self, ix, ix, iz);
+                        let mask = pick(self, zmask, keep, xmask);
+                        let bits = self.s.m.bin(c, Bin::Xor, raw, mask);
                         self.as_float(bits)
                     }
                     "v_cubetc_f32" => {
@@ -6110,7 +6125,20 @@ impl<'a> Lower<'a> {
                         self.as_float(bits)
                     }
                 };
-                float(self, r)
+                if v.clamp && v.omod == 0 && matches!(name, "v_cubesc_f32" | "v_cubetc_f32") {
+                    // A selected positive subnormal survives cube clamp on RDNA2.
+                    // For the other bit patterns use the ordinary float clamp.
+                    let bits = self.as_int(r);
+                    let min_normal = self.s.m.i32(0x0080_0000);
+                    let keep = self.s.m.cmp(c, pred::IULT, bits, min_normal);
+                    let saturated = self.unary(7, r);
+                    let clipped = self.as_int(saturated);
+                    let bits = self.s.m.select(c, keep, bits, clipped);
+                    let result = self.as_float(bits);
+                    self.store_float(inst, v.dst, result, guard)
+                } else {
+                    float(self, r)
+                }
             }
             "v_movrels_b32" | "v_movreld_b32" | "v_movrelsd_b32" => {
                 // M0 indexes the source (movrels), the destination (movreld)

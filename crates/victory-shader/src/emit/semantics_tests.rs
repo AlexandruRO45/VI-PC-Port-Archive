@@ -1390,6 +1390,22 @@ fn cube_faces_match_the_hardware() {
     assert_clean(check(&cube_probes()));
 }
 
+/// When z is the major axis, SC selects x. Only the negative-z face flips
+/// its sign; the subnormal payload must survive either choice.
+#[test]
+fn cube_sc_keeps_subnormal_x_on_both_z_faces() {
+    let inputs = [0x0000_0001, 0x8000_0001, 0x007f_ffff, 0x807f_ffff]
+        .into_iter()
+        .flat_map(|x| [0x3f80_0000, 0xbf80_0000].map(|z| [x, 0, z, OLD]))
+        .collect();
+    assert_clean(check(&[probe(
+        vop3(0x145, 5, [v(1), v(2), v(3)], NONE),
+        inputs,
+        INT,
+        |[x, _, z, _]| vec![x ^ (z & 0x8000_0000)],
+    )]));
+}
+
 /// RDNA2 hardware oracle check for `v_cubesc_f32`, `v_cubetc_f32` and
 /// `v_cubema_f32` on signed zeros and denormal coordinates: `v_cubesc_f32` and
 /// `v_cubetc_f32` preserve subnormal coordinate bits (flipping only the sign
@@ -1485,6 +1501,36 @@ fn cube_zero_and_denormals_match_rdna2_oracle() {
         probe(vop3(0x146, 5, [v(1), v(2), v(3)], NONE), inputs.clone(), F32, expected(1)),
         probe(vop3(0x147, 5, [v(1), v(2), v(3)], NONE), inputs, F32, expected(2)),
     ]));
+}
+
+/// The clamped SC/TC outputs measured in AnyPS5's Vop3CubeClamp.cpp
+/// (f457d87b, rows 6, 7, 8, 11 and 16), with no output multiplier.
+#[test]
+fn clamped_cube_coordinates_match_rdna2_oracle() {
+    const CASES: [([u32; 3], [u32; 2]); 5] = [
+        ([0xff80_0000, 0x8000_0007, 0x0000_0007], [7, 7]),
+        ([0x7fc0_0000, 0x0000_0007, 0xff80_0000], [0x3f80_0000, 0]),
+        ([0xbf00_0000, 0, 0x8000_0007], [0, 0]),
+        ([7, 7, 0x8000_0007], [7, 0]),
+        ([0xbf00_0000, 0xbf00_0000, 0x3f00_0000], [0, 0x3f00_0000]),
+    ];
+    let inputs: Vec<_> = CASES.iter().map(|&([x, y, z], _)| [x, y, z, OLD]).collect();
+    let probes = [0x145, 0x146].map(|op| {
+        let clamp = M {
+            clamp: true,
+            ..NONE
+        };
+        probe(
+            vop3(op, 5, [v(1), v(2), v(3)], clamp),
+            inputs.clone(),
+            INT,
+            move |[x, y, z, _]| {
+                let (_, output) = CASES.iter().find(|(xyz, _)| *xyz == [x, y, z]).unwrap();
+                vec![output[usize::from(op - 0x145)]]
+            },
+        )
+    });
+    assert_clean(check(&probes));
 }
 
 /// The 16 float predicates of `v_cmp_*_f32` (RDNA2 ISA: `o` ordered, `u`
