@@ -1291,7 +1291,16 @@ impl HostHeap {
             // Not for a draw: buffer data is copied only when a draw actually
             // uses the slot, so the sweep never reads a sparse title buffer
             // the title has not mapped (run 56's world-entry crash).
-            self.mirror(i, start + u64::from(i) * u64::from(step), false);
+            let handle = start + u64::from(i) * u64::from(step);
+            // Partial sweep: buffer slots stay as they are (the title's
+            // culling reads them); only texture views are mirrored, so world
+            // meshes get real descriptors without waking the entry crash.
+            // SAFETY: a descriptor slot in title memory.
+            let [tag, n, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+            if tag == VIEW_TAG && view_at(n, generation).is_some_and(|v| v.is_buffer()) {
+                continue;
+            }
+            self.mirror(i, handle, false);
         }
         self.scan_at
             .store(if end == total { 0 } else { end }, Ordering::Relaxed);
