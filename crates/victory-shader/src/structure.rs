@@ -60,6 +60,9 @@ pub enum Atom {
     Opaque(Value, Value),
     /// A constant mask other than all lanes or none.
     Constant(u64),
+    /// The register pair of an [`Atom::Opaque`] mask is not zero: the same
+    /// in every lane (`s_cbranch_vccz`/`vccnz` test VCC whole).
+    Nonzero(Value, Value),
 }
 
 /// Reduced ordered binary decision diagrams over [`Atom`]s.
@@ -430,7 +433,7 @@ impl Bools {
 pub enum LaneExit {
     Jump(usize),
     /// To `taken` in lanes where `when` holds. A condition over
-    /// [`Atom::Uniform`]s only is a uniform branch.
+    /// [`Atom::Uniform`]s and [`Atom::Nonzero`]s only is a uniform branch.
     Branch {
         when: Bool,
         taken: usize,
@@ -1357,7 +1360,27 @@ impl<'a> Lanes<'a> {
                     Some(k) => self.mask(k).0,
                     None => Bool::FALSE,
                 };
-                let any = self.b.and(vcc, exec);
+                // VCCZ is whether VCC as a whole is zero (RDNA2 ISA, 12.5),
+                // one decision for the wave. A mask held in scalars (a pair
+                // the pass cannot see into, or a constant) is tested so,
+                // whatever EXEC holds.
+                // shortcut: a mask from lane results (compares) still takes
+                // the branch in the lanes whose own bit is set; the same
+                // while the program sets VCC only in lanes of EXEC and the
+                // block it skips does nothing in lanes whose bit is clear.
+                let whole = match self.b.node(vcc) {
+                    Some((Atom::Opaque(lo, hi), Bool::FALSE, Bool::TRUE)) => {
+                        let born = self.born(lo).max(self.born(hi));
+                        Some(self.b.atom(Atom::Nonzero(lo, hi), born))
+                    }
+                    // Neither all lanes nor none, so some bit is set.
+                    Some((Atom::Constant(_), Bool::FALSE, Bool::TRUE)) => Some(Bool::TRUE),
+                    _ => None,
+                };
+                let any = match whole {
+                    Some(w) => w,
+                    None => self.b.and(vcc, exec),
+                };
                 if n.ends_with("nz") {
                     any
                 } else {
@@ -1713,6 +1736,56 @@ mod tests {
         };
         assert!(matches!(s.bools.support(when)[..], [Atom::Uniform(_)]));
         assert_eq!(guarded(&s), 0);
+    }
+
+    /// A wave64 VCC written by halves from scalars: `s_cbranch_vccz` tests
+    /// the pair as a whole, one decision for the wave (a uniform branch),
+    /// not each lane's bit; a constant VCC other than zero is always taken
+    /// by `s_cbranch_vccnz`.
+    #[test]
+    fn vcc_branches_on_scalar_masks_are_uniform() {
+        let p = build(
+            &[
+                0xBEEA_0380, // s_mov_b32 vcc_lo, 0
+                0xBEEB_0381, // s_mov_b32 vcc_hi, 1
+                0xBF86_0001, // s_cbranch_vccz -> 16
+                0x7E02_0280, // v_mov_b32 v1, 0
+                S_ENDPGM,    // 16
+            ],
+            true,
+        );
+        let s = structure(&p).unwrap();
+        let LaneExit::Branch { when, .. } = s.exits[0] else {
+            panic!("{:?}", s.exits[0])
+        };
+        assert!(
+            matches!(s.bools.support(when)[..], [Atom::Nonzero(..)]),
+            "{:?}",
+            s.bools.support(when)
+        );
+        assert_eq!(guarded(&s), 0);
+        // vcc = 0xFFFF_FFFF_0000_0000 as one constant: s_cbranch_vccnz is
+        // taken in every lane, lanes 0-31 included.
+        let p = build(
+            &[
+                0xBEEA_0380, // s_mov_b32 vcc_lo, 0
+                0xBEEB_03C1, // s_mov_b32 vcc_hi, -1
+                0xBF87_0001, // s_cbranch_vccnz -> 16
+                0x7E02_0280, // v_mov_b32 v1, 0
+                S_ENDPGM,    // 16
+            ],
+            true,
+        );
+        let s = structure(&p).unwrap();
+        match s.exits[0] {
+            LaneExit::Branch { when, .. } => assert!(
+                when == Bool::TRUE || matches!(s.bools.support(when)[..], [Atom::Nonzero(..)]),
+                "{:?}",
+                s.bools.support(when)
+            ),
+            LaneExit::Jump(_) => {}
+            ref e => panic!("{e:?}"),
+        }
     }
 
     #[test]

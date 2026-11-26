@@ -2615,6 +2615,20 @@ impl<'a> Lower<'a> {
             }
             Atom::Opaque(..) => Err("an opaque lane mask"),
             Atom::Constant(_) => Err("a constant lane mask"),
+            // The pair as a whole is not zero: one value for the wave.
+            Atom::Nonzero(lo, hi) => {
+                let word = |w: Val| match w {
+                    Val::I32(x) => Ok(x),
+                    _ => Err("an opaque lane mask"),
+                };
+                let mut x = word(self.get(lo)?)?;
+                if self.x.native.wave64 && hi != lo {
+                    let h = word(self.get(hi)?)?;
+                    x = self.s.m.bin(at, Bin::Or, x, h);
+                }
+                let z = self.s.m.i32(0);
+                Ok(self.s.m.cmp(at, pred::NE, x, z))
+            }
         }
     }
 
@@ -8221,7 +8235,10 @@ impl<'a> Lower<'a> {
         let preds = &self.x.p.blocks[b].preds;
         preds.iter().filter(|&&q| self.block[q].is_some()).all(|&q| match st.exits[q] {
             LaneExit::Branch { when, taken, not_taken } if taken != not_taken => {
-                st.bools.support(when).iter().all(|a| matches!(a, Atom::Uniform(_)))
+                st.bools
+                    .support(when)
+                    .iter()
+                    .all(|a| matches!(a, Atom::Uniform(_) | Atom::Nonzero(..)))
             }
             _ => true,
         })
@@ -10401,6 +10418,13 @@ impl<'a> Lower<'a> {
                         return true;
                     }
                     Some(lo)
+                }
+                // Not a compare of its own: both ways stay open.
+                Atom::Nonzero(lo, hi) => {
+                    if [lo, hi].iter().any(|v| tainted.contains(v)) {
+                        return true;
+                    }
+                    None
                 }
                 Atom::Constant(_) => None,
             };
