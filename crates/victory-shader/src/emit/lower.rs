@@ -286,7 +286,7 @@ struct Lower<'a> {
     mode16: Option<u8>,
 }
 
-/// The 16/64-bit round mode (MODE bits 3:2: 0 nearest even, 3 toward zero)
+/// The 16/64-bit round mode (MODE bits 3:2)
 /// after `inst`, from `mode` before it (`None`: not known).
 fn round16_after(inst: &Inst, mode: Option<u8>) -> Option<u8> {
     match (inst.name(), &inst.fields) {
@@ -2212,13 +2212,8 @@ impl<'a> Lower<'a> {
         )
     }
 
-    /// `f` as an f16 in the low bits, rounded as the program's MODE says at
-    /// this point: toward zero where it set that for 16-bit results (the
-    /// title does around its 16-bit interpolation), else to nearest even;
-    /// f32 denormals read as zero; on the bits, where the host's own
-    /// conversion rounds as it likes (toward zero on the RX 6700 XT and WARP).
-    // shortcut: rounding toward +-infinity, or a mode not known at this
-    // point (paths that set it differently join), rounds to nearest even.
+    /// `f` as an f16 in the low bits, rounded on the bits according to MODE.
+    /// f32 denormals read as zero. An unknown MODE uses nearest even.
     fn narrow16(&mut self, f: V) -> V {
         let rtz = self.mode16 == Some(3);
         let c = self.cur;
@@ -2228,12 +2223,26 @@ impl<'a> Lower<'a> {
         let t = self.s.m.bin(c, Bin::LShr, x, k16);
         let m = k(self, 0x8000);
         let sign = self.s.m.bin(c, Bin::And, t, m);
+        // A directed mode increases the magnitude only toward its own sign.
+        let away = match self.mode16 {
+            Some(mode @ (1 | 2)) => {
+                let zero = k(self, 0);
+                let p = if mode == 1 { pred::EQ } else { pred::NE };
+                Some(self.s.m.cmp(c, p, sign, zero))
+            }
+            _ => None,
+        };
         let m = k(self, 0x7FFF_FFFF);
         let a = self.s.m.bin(c, Bin::And, x, m);
         // Normal halves: the exponent rebased, the mantissa rounded.
         let bias = k(self, 0x3800_0000);
         let rebased = self.s.m.bin(c, Bin::Sub, a, bias);
-        let normal = if rtz {
+        let normal = if let Some(away) = away {
+            let (low, zero) = (k(self, 0x1FFF), k(self, 0));
+            let add = self.s.m.select(c, away, low, zero);
+            let up = self.s.m.bin(c, Bin::Add, rebased, add);
+            self.s.m.bin(c, Bin::LShr, up, k13)
+        } else if rtz {
             self.s.m.bin(c, Bin::LShr, rebased, k13)
         } else {
             let one = k(self, 1);
@@ -2244,7 +2253,15 @@ impl<'a> Lower<'a> {
             let up = self.s.m.bin(c, Bin::Add, up, lsb);
             self.s.m.bin(c, Bin::LShr, up, k13)
         };
-        let (inf, big) = (k(self, 0x7C00), k(self, if rtz { 0x7BFF } else { 0x7C00 }));
+        let inf = k(self, 0x7C00);
+        let max_finite = k(self, 0x7BFF);
+        let big = if let Some(away) = away {
+            self.s.m.select(c, away, inf, max_finite)
+        } else if rtz {
+            max_finite
+        } else {
+            inf
+        };
         let over = self.s.m.cmp(c, pred::IUGE, normal, inf);
         let normal = self.s.m.select(c, over, big, normal);
         let infinity = k(self, 0x7F80_0000);
@@ -2263,7 +2280,16 @@ impl<'a> Lower<'a> {
         let f32_denormal = self.s.m.cmp(c, pred::EQ, e, zero);
         let mant = self.s.m.select(c, f32_denormal, zero, mant);
         let q = self.s.m.bin(c, Bin::LShr, mant, s);
-        let den = if rtz {
+        let den = if let Some(away) = away {
+            let one = k(self, 1);
+            let below = self.s.m.bin(c, Bin::Shl, one, s);
+            let below = self.s.m.bin(c, Bin::Sub, below, one);
+            let rest = self.s.m.bin(c, Bin::And, mant, below);
+            let rest = self.s.m.cmp(c, pred::NE, rest, zero);
+            let up = self.s.m.bin(c, Bin::And, rest, away);
+            let up = self.s.m.cast(c, Cast::ZExt, up, self.s.t.i32);
+            self.s.m.bin(c, Bin::Add, q, up)
+        } else if rtz {
             q
         } else {
             let one = k(self, 1);
