@@ -11,7 +11,10 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use super::UserData;
 use super::bitcode::{Attr, Bin, Cast, Term, V, pred};
 use super::container::SigElement;
-use super::shader::{Shader, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, VIEW_STRIDES, flags};
+use super::shader::{
+    Shader, VIEW_INTEGER, VIEW_RAW_OFFSET_SHIFT, VIEW_SIGNED, VIEW_STRIDE_BITS, VIEW_STRIDES,
+    flags,
+};
 use crate::ShaderError;
 use crate::gfx10::{Dpp, Fields, NULL, Operand};
 use crate::io::{Barycentric, Elsewhere, Export, Input, Interp, Io, Target};
@@ -1798,6 +1801,14 @@ impl<'a> Lower<'a> {
             let h = self.handle(site, src, false, props)?;
             let off = match self.root_view_offset(src) {
                 Some(at) => self.s.m.bin(self.cur, Bin::Add, off, at),
+                None if self.is_heap_direct(src)
+                    || self.used_kind(src).is_some_and(|u| u.stride >= 4) =>
+                {
+                    match self.view_raw_bias(h) {
+                        Some(bias) => self.s.m.bin(self.cur, Bin::Add, off, bias),
+                        None => off,
+                    }
+                }
                 None => off,
             };
             return Ok((h, off));
@@ -4429,6 +4440,11 @@ impl<'a> Lower<'a> {
             }
             None => {
                 let mut records = field(self, 0);
+                if (div_stride.is_some() || self.is_heap_direct(&src))
+                    && let Some(bias) = self.view_raw_bias(h)
+                {
+                    records = self.s.m.bin(c, Bin::Sub, records, bias);
+                }
                 if let Some(stride) = div_stride {
                     let s = self.s.m.i32(stride);
                     records = self.s.m.bin(c, Bin::UDiv, records, s);
@@ -4645,6 +4661,20 @@ impl<'a> Lower<'a> {
             self.s.m.cmp(c, pred::NE, x, zero)
         });
         Some((int, signed))
+    }
+
+    /// Byte offset (`0`, `4`, `8`, or `12`) from a raw view's 16-byte-aligned
+    /// host descriptor start to the title view's actual start, stored in
+    /// [`VIEW_STRIDES`] bits 28..29; `None` if the handle's heap index is not
+    /// known.
+    fn view_raw_bias(&mut self, h: V) -> Option<V> {
+        let index = *self.s.view_index.get(&h)?;
+        let word = self.view_word(index);
+        let c = self.cur;
+        let shift = self.s.m.i32(VIEW_RAW_OFFSET_SHIFT - 2);
+        let mask = self.s.m.i32(0xC);
+        let shifted = self.s.m.bin(c, Bin::LShr, word, shift);
+        Some(self.s.m.bin(c, Bin::And, shifted, mask))
     }
 
     /// Title memory at a raw GPU address (decision 0005: the unified-memory

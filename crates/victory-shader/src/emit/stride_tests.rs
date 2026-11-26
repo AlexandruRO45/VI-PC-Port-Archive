@@ -13,7 +13,9 @@ use windows::Win32::Graphics::Dxgi::Common::{
 };
 
 use super::host::{Dispatch, Host, Root, Stride, View};
-use super::{HostShader, StaticSampler, VIEW_INTEGER, VIEW_STRIDES, lower, validator};
+use super::{
+    HostShader, StaticSampler, VIEW_INTEGER, VIEW_RAW_OFFSET_SHIFT, VIEW_STRIDES, lower, validator,
+};
 use crate::native::{
     ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
 };
@@ -419,12 +421,20 @@ fn table_bound_structured_buffer_reads_by_element_and_dimensions() {
         vec![srv_used, entry(ResourceType::Uav, 4, 2)],
         32,
     );
-    // 32 elements of 12 bytes (3 dwords each).
+    // 32 elements of 12 bytes (3 dwords each), plus a biased copy preceded by
+    // 3 dwords (12 bytes = `3 << VIEW_RAW_OFFSET_SHIFT`) simulating a raw host
+    // view rounded down to the preceding 16-byte boundary.
     let data: Vec<u32> = (0..32).flat_map(|e| [100 + e, 200 + e, 300 + e]).collect();
+    let mut biased_data = vec![0xDEAD_BEEF; 3];
+    biased_data.extend_from_slice(&data);
     let views = [
         View::RawUav(32),
         View::Buffer {
             data: &data,
+            stride: Stride::Structured(12),
+        },
+        View::Buffer {
+            data: &biased_data,
             stride: Stride::Structured(12),
         },
     ];
@@ -440,26 +450,37 @@ fn table_bound_structured_buffer_reads_by_element_and_dimensions() {
         let (root, pso) = host
             .compute_pipeline(&shader)
             .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
-        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
-        for u in &shader.user_data {
-            // The SRV's table is at heap index 1 (32 bytes in), the UAV's at 0.
-            ud[u.index as usize] = if u.slot == 0 { 32 } else { 0 };
+        for (slot, tag) in [(1u32, "aligned"), (2u32, "bias-12")] {
+            let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+            for u in &shader.user_data {
+                // The SRV's table is at heap index `slot` (32 * slot bytes in), the UAV's at 0.
+                ud[u.index as usize] = if u.slot == 0 { 32 * slot } else { 0 };
+            }
+            let words = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![
+                            (0, Root::Constants(ud)),
+                            (
+                                1,
+                                Root::View {
+                                    srv: true,
+                                    data: vec![4, 12, 12 | (3 << VIEW_RAW_OFFSET_SHIFT)],
+                                },
+                            ),
+                        ],
+                        views: &views,
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{label} ({tag}): dispatch failed: {e}"));
+            let mut want: Vec<u32> = (0..32).map(|l| 200 + l).collect();
+            want[31] = 32; // getDimensions ((bytes - bias) / 12) == 32 elements
+            assert_eq!(words[0], want, "{label} ({tag})");
         }
-        let words = host
-            .dispatch(
-                &root,
-                &pso,
-                &Dispatch {
-                    roots: vec![(0, Root::Constants(ud))],
-                    views: &views,
-                    samplers: &[],
-                    groups: [1, 1, 1],
-                },
-            )
-            .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
-        let mut want: Vec<u32> = (0..32).map(|l| 200 + l).collect();
-        want[31] = 32; // getDimensions (bytes / 12) == 32 elements
-        assert_eq!(words[0], want, "{label}");
         ran += 1;
     }
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
