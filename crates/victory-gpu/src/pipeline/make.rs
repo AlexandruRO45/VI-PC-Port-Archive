@@ -43,6 +43,9 @@ pub(crate) struct Pending {
     /// whether a draw has used it yet.
     key: String,
     used: AtomicBool,
+    /// Cumulative microseconds waited on this pipeline across frames so a
+    /// slow compile cannot burn every frame's wait budget.
+    waited_us: AtomicU64,
 }
 
 // SAFETY: D3D12 objects are free-threaded; the graphics state (whose input
@@ -68,6 +71,7 @@ impl Pending {
             lost: AtomicBool::new(false),
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
+            waited_us: AtomicU64::new(0),
         }
     }
 
@@ -157,28 +161,60 @@ pub(crate) fn early(p: &Arc<Pending>) {
     }
 }
 
-/// Waits for `p` while frame `frame` has budget of its kind left.
+/// Waits for `p` while both frame `frame` and pipeline `p` have budget of its
+/// kind left.
 fn wait(p: &Pending, frame: u64) {
     static FRAME: [AtomicU64; 2] = [const { AtomicU64::new(u64::MAX) }; 2];
     static WAITED_US: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
     let kind = usize::from(p.screen);
     let budget = [BUDGET, SCREEN_BUDGET][kind];
-    let waited = &WAITED_US[kind];
-    if FRAME[kind].swap(frame, Ordering::Relaxed) != frame {
-        waited.store(0, Ordering::Relaxed);
+    wait_with(p, frame, budget, &FRAME[kind], &WAITED_US[kind]);
+}
+
+/// Core wait bounded by both frame `frame`'s remaining budget and `p`'s
+/// cumulative allowance (`budget` total across frames). Returns `true` if the
+/// thread entered the wait, `false` if either budget was already spent.
+fn wait_with(
+    p: &Pending,
+    frame: u64,
+    budget: Duration,
+    frame_slot: &AtomicU64,
+    frame_waited_us: &AtomicU64,
+) -> bool {
+    let pipeline_left = budget.saturating_sub(Duration::from_micros(p.waited_us.load(Ordering::Relaxed)));
+    if pipeline_left.is_zero() || p.lost.load(Ordering::Relaxed) {
+        return false;
     }
-    let left = budget.saturating_sub(Duration::from_micros(waited.load(Ordering::Relaxed)));
+    if frame_slot.swap(frame, Ordering::Relaxed) != frame {
+        frame_waited_us.store(0, Ordering::Relaxed);
+    }
+    let frame_left = budget.saturating_sub(Duration::from_micros(frame_waited_us.load(Ordering::Relaxed)));
+    let left = frame_left.min(pipeline_left);
+    if left.is_zero() {
+        return false;
+    }
     let started = Instant::now();
     let (lock, done) = &DONE;
     let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
-    while p.made.get().is_none() {
+    while p.made.get().is_none() && !p.lost.load(Ordering::Relaxed) {
         let rest = left.saturating_sub(started.elapsed());
         if rest.is_zero() {
             break;
         }
         held = done.wait_timeout(held, rest).unwrap_or_else(|e| e.into_inner()).0;
     }
-    waited.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+    drop(held);
+    let elapsed = started.elapsed();
+    let waited = elapsed.min(left);
+    let charge = if p.made.get().is_none() && !p.lost.load(Ordering::Relaxed) && elapsed >= left {
+        left
+    } else {
+        waited
+    };
+    let charge_us = charge.as_micros().min(u128::from(u64::MAX)) as u64;
+    p.waited_us.fetch_add(charge_us, Ordering::Relaxed);
+    frame_waited_us.fetch_add(waited.as_micros().min(u128::from(u64::MAX)) as u64, Ordering::Relaxed);
+    true
 }
 
 /// What the workers take from: the ordinary pipelines, the screen passes.
@@ -234,6 +270,10 @@ pub(super) fn worker_lost(id: u32) {
         w.0 != id
     });
     if let Some(screen) = lost {
+        let (lock, done) = &DONE;
+        let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
+        done.notify_all();
+        drop(_held);
         WAITING.fetch_sub(1, Ordering::Relaxed);
         worker(LOST.fetch_add(1, Ordering::Relaxed), screen);
     }
@@ -299,5 +339,49 @@ mod tests {
             std::thread::yield_now();
         }
         assert!(matches!(p.made.get(), Some(None)));
+    }
+
+    #[test]
+    fn pipeline_wait_caps_total_wait_per_pipeline_across_frames() {
+        let slow = Pending::new(Vec::new(), None);
+        let fresh = Pending::new(Vec::new(), None);
+        let frame = AtomicU64::new(u64::MAX);
+        let waited_us = AtomicU64::new(0);
+        let budget = Duration::from_millis(20);
+
+        // Frame 1: `slow` uses its full cumulative allowance once.
+        assert!(wait_with(&slow, 1, budget, &frame, &waited_us));
+        assert!(Duration::from_micros(slow.waited_us.load(Ordering::Relaxed)) >= budget);
+
+        // Frame 2: `slow` skips waiting without spending frame 2's budget.
+        let started = Instant::now();
+        assert!(!wait_with(&slow, 2, budget, &frame, &waited_us));
+        assert!(started.elapsed() < Duration::from_millis(10));
+
+        // Frame 2's budget remains available for another pipeline.
+        assert!(wait_with(&fresh, 2, budget, &frame, &waited_us));
+    }
+
+    #[test]
+    fn lost_worker_wakes_waiter_immediately() {
+        let p = Arc::new(Pending::new(Vec::new(), None));
+        let waiter_p = p.clone();
+        let waiter = std::thread::spawn(move || {
+            let frame = AtomicU64::new(u64::MAX);
+            let waited_us = AtomicU64::new(0);
+            let started = Instant::now();
+            assert!(wait_with(&waiter_p, 1, Duration::from_secs(5), &frame, &waited_us));
+            started.elapsed()
+        });
+
+        std::thread::sleep(Duration::from_millis(10));
+        p.lost.store(true, Ordering::Relaxed);
+        let (lock, done) = &DONE;
+        let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
+        done.notify_all();
+        drop(_held);
+
+        let elapsed = waiter.join().expect("waiter thread must not panic");
+        assert!(elapsed < Duration::from_secs(2));
     }
 }
