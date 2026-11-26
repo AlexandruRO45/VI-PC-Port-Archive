@@ -481,15 +481,22 @@ pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
     make::ready(&pipeline(this).host)
 }
 
+/// As [`host_pipeline`], for a draw into render target and depth views of
+/// the formats `bound`: if a bound view has another format than the title's
+/// pipeline declares for its slot (`host::formats_differ`), the host
+/// pipeline of the same shaders and state made for the bound formats
+/// (`make::for_formats`). A draw whose views are as declared pays one
+/// comparison of the nine words.
 #[cfg(windows)]
-pub(crate) fn host_pipeline_r11<'a>(
-    this: This,
-    samples: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC,
-) -> Option<&'a host::HostPipeline> {
+pub(crate) fn host_pipeline_for<'a>(this: This, bound: &host::TargetFormats) -> Option<&'a host::HostPipeline> {
     if this.is_null() {
         return None;
     }
-    make::ready(make::Pending::for_r11(&pipeline(this).host, samples)?)
+    let p = &pipeline(this).host;
+    if p.formats != *bound && host::formats_differ(&p.formats, bound) {
+        return make::for_formats(p, bound);
+    }
+    make::ready(p)
 }
 
 /// Host pipelines queued and not made yet.
