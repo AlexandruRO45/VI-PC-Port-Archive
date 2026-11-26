@@ -5932,7 +5932,6 @@ impl<'a> Lower<'a> {
             None => {
                 // A raw view counts bytes; the descriptor's record count is in elements.
                 let n = field(self, 0);
-                let n = self.hoisted_size(&src, props)?.unwrap_or(n); // amd.rs
                 let stride = used.map_or(0, |u| u.stride);
                 let n = if props.0 & 0xFF == 11 && stride > 1 {
                     let k = self.s.m.i32(stride);
