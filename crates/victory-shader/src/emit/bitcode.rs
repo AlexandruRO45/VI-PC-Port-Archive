@@ -408,60 +408,6 @@ impl Module {
         }
     }
 
-    /// A groupshared-style global named `prefix` and a number no other global has.
-    pub fn fresh_global(&mut self, prefix: &str, ty: Ty, space: u32) -> V {
-        let name = format!("{prefix}{}", self.globals.len());
-        self.global(&name, ty, space)
-    }
-
-    /// `v` computed at the end of `block`: itself where `block` already has it (or it is a
-    /// constant, global or function), else a copy of its integer arithmetic and casts over
-    /// such values. `None`, with nothing emitted, where it reads anything else.
-    pub fn rematerialize(&mut self, v: V, block: usize) -> Option<V> {
-        if !self.copyable(v, block) {
-            return None;
-        }
-        Some(self.copy_into(v, block))
-    }
-
-    fn here(&self, v: V, block: usize) -> bool {
-        match v {
-            V::Inst(i) => self.blocks[block].body.contains(&i) || self.blocks[block].phis.contains(&i),
-            _ => true,
-        }
-    }
-
-    fn copyable(&self, v: V, block: usize) -> bool {
-        if self.here(v, block) {
-            return true;
-        }
-        let V::Inst(i) = v else { return true };
-        match self.insts[i as usize].op {
-            Op::Bin(_, a, b) => self.copyable(a, block) && self.copyable(b, block),
-            Op::Cast(_, a) => self.copyable(a, block),
-            _ => false,
-        }
-    }
-
-    fn copy_into(&mut self, v: V, block: usize) -> V {
-        if self.here(v, block) {
-            return v;
-        }
-        let V::Inst(i) = v else { return v };
-        let ty = self.insts[i as usize].ty;
-        match self.insts[i as usize].op {
-            Op::Bin(op, a, b) => {
-                let (a, b) = (self.copy_into(a, block), self.copy_into(b, block));
-                self.bin(block, op, a, b)
-            }
-            Op::Cast(op, a) => {
-                let a = self.copy_into(a, block);
-                self.cast(block, op, a, ty)
-            }
-            _ => unreachable!("checked by copyable"),
-        }
-    }
-
     fn push(&mut self, block: usize, ty: Ty, op: Op) -> V {
         let i = self.insts.len() as u32;
         self.insts.push(Inst { ty, op });

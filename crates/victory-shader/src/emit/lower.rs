@@ -5964,7 +5964,7 @@ impl<'a> Lower<'a> {
             }
             _ => return Err("a scalar memory read as data"),
         };
-        let h = self.handle(site, &src, false, props)?;
+        let h = self.size_view_handle(site, first, &src, props, image.is_none())?; // amd.rs
         let words: Vec<(u32, V)> = match image {
             Some(kind) => self.image_size_words(h, kind, uav),
             None => {
@@ -5977,7 +5977,6 @@ impl<'a> Lower<'a> {
                     .op(c, "getDimensions", Attr::ReadOnly, dims, 72, &[h, mip]);
                 // A raw view counts bytes; the descriptor's record count is in elements.
                 let n = self.s.m.extract(c, d, 0);
-                let n = self.hoisted_size(&src, props)?.unwrap_or(n); // amd.rs
                 let stride = used.map_or(0, |u| u.stride);
                 let n = if props.0 & 0xFF == 11 && stride > 1 {
                     let k = self.s.m.i32(stride);
