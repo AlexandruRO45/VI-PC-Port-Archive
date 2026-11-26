@@ -1399,6 +1399,11 @@ impl Host {
         for &(dst, src, len, title_dst) in &batch.late {
             copy_mapped(dst as *mut u8, src as *const u8, len, title_dst);
         }
+        // Refreshes deferred with them see their bytes now.
+        for (shadow, address, len) in batch.late_refresh.drain(..) {
+            let copied = shadow.update(address, len);
+            PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+        }
         for list in runs {
             for work in &list.deferred().after {
                 work();
@@ -2316,8 +2321,13 @@ impl HostList {
                     // submission's shaders write is still old here (it
                     // lands in title memory in the copy-back), and a
                     // destination they write would lose their bytes to
-                    // it. Either way it runs after the copy-backs.
-                    if batch.gpu_written(src, len) || batch.gpu_written(dst, len) {
+                    // it. Either way it runs after the copy-backs; a range
+                    // an earlier deferred copy writes chains the same way.
+                    if batch.gpu_written(src, len)
+                        || batch.gpu_written(dst, len)
+                        || batch.late_pending(src, len)
+                        || batch.late_pending(dst, len)
+                    {
                         batch.late.push((dst, src, len, true));
                         0
                     } else {
@@ -2331,13 +2341,11 @@ impl HostList {
                         add(C::Copies, 1);
                         add(C::CopyBytes, len as u64);
                     }
-                    if batch.gpu_written(src, len) {
-                        batch.late.push((dst, src, len, false));
-                        0
-                    } else {
-                        copy_mapped(dst as *mut u8, src as *const u8, len, false);
-                        len
-                    }
+                    // Not deferred: the destination is this list's own
+                    // upload memory, which its commands read while it runs.
+                    // A source the shaders write stays old here, as before.
+                    copy_mapped(dst as *mut u8, src as *const u8, len, false);
+                    len
                 }
                 Step::Refresh(shadow, address, len) => {
                     #[cfg(feature = "diagnostics")]
@@ -2345,7 +2353,7 @@ impl HostList {
                         add(C::Refreshes, 1);
                         add(C::RefreshBytes, *len as u64);
                     }
-                    batch.add(shadow, *address, *len);
+                    batch.add_or_late(shadow, *address, *len);
                     continue;
                 }
                 Step::Run(work) | Step::Host(work) => {
@@ -2367,17 +2375,20 @@ impl HostList {
                         batch.flush();
                     }
                     batch.gpu_write(*address, *len);
+                    // A deferred copy's bytes must not land past a write
+                    // recorded after it: the shader's stay.
+                    batch.clip_late(*address, *len);
                     shadow.writing(*address, *len, *marked);
                     continue;
                 }
                 // Brought up to date before the submission's lists were made.
                 Step::Texture(..) => continue,
                 Step::Heap(viewed) => {
-                    crate::bindless::refresh(viewed, |s, a, l| batch.add(s, a, l));
+                    crate::bindless::refresh(viewed, |s, a, l| batch.add_or_late(s, a, l));
                     continue;
                 }
                 &Step::Memory(heap) => {
-                    crate::memory::prepare(heap, |s, a, l| batch.add(s, a, l));
+                    crate::memory::prepare(heap, |s, a, l| batch.add_or_late(s, a, l));
                     continue;
                 }
             };
@@ -2417,6 +2428,9 @@ struct Batch {
     /// after the copy-backs): destination, source, bytes, whether the
     /// destination is title memory.
     late: Vec<(usize, usize, usize, bool)>,
+    /// Refreshes whose range a deferred copy's destination touches: done
+    /// after the late copies, which is where its bytes are.
+    late_refresh: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
 }
 
 impl Batch {
@@ -2463,6 +2477,49 @@ impl Batch {
         self.gpu_writes
             .iter()
             .any(|&(a, b)| a < at + len && at < b)
+    }
+
+    /// Whether `len` bytes at `at` touch a deferred copy's title
+    /// destination: it is written after the lists run, so steps recorded
+    /// later chain after it (a copy reading or overwriting it defers too,
+    /// a refresh waits for its bytes).
+    fn late_pending(&self, at: usize, len: usize) -> bool {
+        self.late
+            .iter()
+            .any(|&(d, _, l, t)| t && d < at + len && at < d + l)
+    }
+
+    /// `add`, or deferred past the submission's late copies when the range
+    /// a deferred copy's destination covers: its title bytes are new only
+    /// after they run.
+    fn add_or_late(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
+        if !shadow.clean() && self.late_pending(address, len) {
+            self.late_refresh.push((shadow.clone(), address, len));
+        } else {
+            self.add(shadow, address, len);
+        }
+    }
+
+    /// Drops the parts of pending deferred copies a write recorded later
+    /// covers: on the console the later write wins, so the copies' bytes
+    /// there must not land after it (`Step::GpuWrite`).
+    fn clip_late(&mut self, at: usize, len: usize) {
+        let (w0, w1) = (at, at + len);
+        let mut kept: Vec<(usize, usize, usize, bool)> = Vec::with_capacity(self.late.len());
+        for &(dst, src, l, t) in &self.late {
+            if !t || w1 <= dst || dst + l <= w0 {
+                kept.push((dst, src, l, t));
+                continue;
+            }
+            // The parts outside the write keep their sources' offsets.
+            if dst < w0 {
+                kept.push((dst, src, w0 - dst, t));
+            }
+            if w1 < dst + l {
+                kept.push((w1, src + (w1 - dst), dst + l - w1, t));
+            }
+        }
+        self.late = kept;
     }
 
     /// Does the refreshes; returns the bytes copied.
@@ -4210,6 +4267,71 @@ mod copy_order {
         assert_eq!(at(3), 0xCC, "an unrelated copy is copied at once");
         crate::shadow::unregister(pools[0], pools[0] as u64);
         drop(copy);
+        for &p in &pools {
+            crate::watch::tests::free(p);
+        }
+    }
+
+    /// A copy whose source or destination is an earlier deferred copy's
+    /// destination chains after it, a GPU write recorded later keeps its
+    /// bytes where a pending deferred copy's destination is, and a fill
+    /// into the list's own upload memory copies at once even when its
+    /// source is written by the submission's shaders.
+    #[test]
+    fn deferred_copies_chain_and_a_later_gpu_write_wins() {
+        use crate::watch::PAGE;
+        let Some(host) = super::host() else {
+            return; // no host GPU here
+        };
+        let pools = [
+            crate::watch::tests::pool(1),
+            crate::watch::tests::pool(1),
+            crate::watch::tests::pool(1),
+            crate::watch::tests::pool(1),
+            crate::watch::tests::pool(1),
+        ];
+        // SAFETY: our pools, not guarded yet.
+        unsafe {
+            (pools[0] as *mut u8).write_volatile(0xAA);
+            (pools[4] as *mut u8).write_volatile(0x55);
+        }
+        crate::shadow::register(pools[0], pools[0] as u64, PAGE as u64);
+        crate::shadow::register(pools[4], pools[4] as u64, PAGE as u64);
+        let copy0 = crate::shadow::find(pools[0] as u64, PAGE as u64).unwrap();
+        let copy4 = crate::shadow::find(pools[4] as u64, PAGE as u64).unwrap();
+        let list = host.new_list().unwrap();
+        // The shaders write pools[0]'s first page.
+        copy0.refresh(&list, pools[0] as u64, PAGE as u64);
+        copy0.gpu_writes(&list, pools[0] as u64, PAGE as u64, false);
+        let c0 = copy0.clone();
+        list.defer_host(move || c0.write_host(pools[0] as u64, &[0xBB]));
+        // pools 0 -> 1 defers (its source is written); 1 -> 3 chains (its
+        // source is the deferred destination).
+        list.defer_copy(pools[1] as *mut u8, pools[0] as *const u8, PAGE);
+        list.defer_copy(pools[3] as *mut u8, pools[1] as *const u8, PAGE);
+        // A fill copies at once: the destination is the list's own upload
+        // memory, which its commands read while it runs, so it cannot wait
+        // for the write's bytes.
+        list.defer_fill(pools[2] as *mut u8, pools[0] as *const u8, PAGE);
+        // pools 0 -> 4 defers, then a write recorded later covers its
+        // destination: the shader's bytes stay.
+        list.defer_copy(pools[4] as *mut u8, pools[0] as *const u8, PAGE);
+        copy4.refresh(&list, pools[4] as u64, PAGE as u64);
+        copy4.gpu_writes(&list, pools[4] as u64, PAGE as u64, false);
+        let c4 = copy4.clone();
+        list.defer_host(move || c4.write_host(pools[4] as u64, &[0xEE]));
+        list.close();
+        host.execute(&[&list]);
+        // SAFETY: bytes of our pools.
+        let at = |k: usize| unsafe { (pools[k] as *const u8).read_volatile() };
+        assert_eq!(at(1), 0xBB, "the deferred copy sees the shader's bytes");
+        assert_eq!(at(3), 0xBB, "a chained copy reads the deferred bytes");
+        assert_eq!(at(2), 0xAA, "a fill copies at once: the old source");
+        assert_eq!(at(4), 0xEE, "a later GPU write wins over the deferred copy");
+        crate::shadow::unregister(pools[0], pools[0] as u64);
+        crate::shadow::unregister(pools[4], pools[4] as u64);
+        drop(copy0);
+        drop(copy4);
         for &p in &pools {
             crate::watch::tests::free(p);
         }
