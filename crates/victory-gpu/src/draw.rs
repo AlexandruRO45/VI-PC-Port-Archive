@@ -614,6 +614,33 @@ pub(crate) fn dispatched() -> u64 {
     DISPATCHED.load(Ordering::Relaxed)
 }
 
+/// The pieces an indirect dispatch whose program reads its group id is run
+/// in (`VICTORY_GROUP_PIECES`, 2: up to 131,070 groups in x; at most
+/// `crate::indirect::MOST_PIECES`). Its count is in the card's memory, so
+/// every such execution is recorded that many times, each piece told where
+/// its groups start (`victory_shader::emit::USER_GROUP_BASE`), and the
+/// clamp gives each its share of the record's groups: a piece with none
+/// costs next to nothing. 1 with `VICTORY_GROUP_SPLIT=0`, which the
+/// translator reads too: the first 65,535 groups only, as before.
+pub(crate) fn group_pieces() -> u32 {
+    static PIECES: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *PIECES.get_or_init(|| {
+        if std::env::var_os("VICTORY_GROUP_SPLIT").is_some_and(|v| v == "0") {
+            return 1;
+        }
+        std::env::var("VICTORY_GROUP_PIECES")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .unwrap_or(2)
+            .clamp(1, crate::indirect::MOST_PIECES)
+    })
+}
+
+/// Since the last frame line: indirect dispatch executions recorded in
+/// pieces, the `ExecuteIndirect` calls they took, and direct dispatches
+/// (compute and mesh) run in pieces.
+pub(crate) static GROUP_PIECES: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
 /// The host address of a root view: its buffer's host copy, or for a
 /// constant buffer not 256-byte aligned there (the console needs 16) a
 /// copy in upload memory.
@@ -2314,6 +2341,7 @@ impl State {
                          groups start (VICTORY_GROUP_SPLIT=0: the first 65,535 groups only)"
                     );
                 });
+                GROUP_PIECES[2].fetch_add(1, Ordering::Relaxed);
                 let mut at = 0;
                 while at < x {
                     let n = (x - at).min(Self::MOST_GROUPS);
@@ -2626,6 +2654,7 @@ impl State {
                                      told where its groups start (VICTORY_GROUP_SPLIT=0: the first 65,535 groups only)"
                                 );
                             });
+                            GROUP_PIECES[2].fetch_add(1, Ordering::Relaxed);
                             let mut at = 0;
                             while at < x {
                                 let n = (x - at).min(Self::MOST_GROUPS);
@@ -3319,6 +3348,17 @@ impl State {
             .filter(|w| same(w) && offset >= w.base)
             .filter(|w| (offset - w.base) % u64::from(w.step) == 0 && (offset - w.base) / u64::from(w.step) < u64::from(w.records))
             .map(|w| (w.scratch.clone(), offset - w.base, w.step));
+        // A dispatch whose program reads its group id runs in pieces
+        // ([`group_pieces`]): its count is in the card's memory, so the
+        // execution is recorded once a piece, each told where its groups
+        // start, and the clamp writes each record once a piece with that
+        // piece's share of its groups in x. A dispatch record is always
+        // clamped where it runs (windows hold none, and only what a window
+        // could hold is gathered), the copies a record list apart.
+        let base_slot = (kind == DISPATCH).then(|| Self::group_base_slot(p)).flatten();
+        let pieces = if base_slot.is_some() { group_pieces() } else { 1 };
+        // How far apart the pieces' copies are in the clamped buffer.
+        let mut piece_step = u64::from(stride);
         // A record that misses its window: a slot the list's prelude fills,
         // if the list still gathers ([`gathers`]).
         let gathered = if hit.is_none() && windowed && gathers() {
@@ -3426,7 +3466,8 @@ impl State {
                 let bounded = if windowed && records > 1 {
                     crate::indirect::bound_ahead(list, (&args.buffer, offset), (kind, step, records))
                 } else {
-                    crate::indirect::bound(list, (&args.buffer, offset), count_arg, (kind, step, records))
+                    piece_step = u64::from(step) * u64::from(records);
+                    crate::indirect::bound(list, (&args.buffer, offset), count_arg, (kind, step, records), pieces)
                 };
                 let Some(bounded) = bounded else {
                     self.window = None;
@@ -3493,18 +3534,32 @@ impl State {
         if kind == MESH {
             self.mesh_scissor(list, true);
         }
-        // SAFETY: an open list with everything set; the scratch buffer and
-        // host copies are kept alive by the list, and the signature is cached.
-        unsafe {
-            list.list.ExecuteIndirect(
-                &signature,
-                max,
-                &bounded,
-                at,
-                counter.as_ref().map(|(s, _)| &s.buffer),
-                counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
-            )
-        };
+        // Piece p from group p * 65,535 on (a dispatch run in pieces; one
+        // piece for everything else). The base is 0 as bound.
+        for piece in 0..pieces {
+            if piece > 0
+                && let Some(slot) = base_slot
+            {
+                Self::set_group_base(list, true, slot, piece * Self::MOST_GROUPS);
+            }
+            // SAFETY: an open list with everything set; the scratch buffer
+            // and host copies are kept alive by the list, and the signature
+            // is cached. The clamp wrote every piece's copy of the records.
+            unsafe {
+                list.list.ExecuteIndirect(
+                    &signature,
+                    max,
+                    &bounded,
+                    at + u64::from(piece) * piece_step,
+                    counter.as_ref().map(|(s, _)| &s.buffer),
+                    counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
+                )
+            };
+        }
+        if pieces > 1 {
+            GROUP_PIECES[0].fetch_add(1, Ordering::Relaxed);
+            GROUP_PIECES[1].fetch_add(u64::from(pieces), Ordering::Relaxed);
+        }
         if kind == MESH {
             self.mesh_scissor(list, false);
         }

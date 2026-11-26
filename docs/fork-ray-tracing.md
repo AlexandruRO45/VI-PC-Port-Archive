@@ -44,7 +44,8 @@ shaders and emulates the one instruction.
    host runs in one dispatch is now run in pieces, each told where its groups
    start (`VICTORY_GROUP_SPLIT=0` restores the old truncation). A group count
    that arrives in GPU memory (the indirect light pass's compute
-   record of about 77,500 groups) is still clamped to 65,535.
+   record of about 75,000 groups) is run in `VICTORY_GROUP_PIECES` pieces
+   (2 by default) the same way, and cut only past those.
 2. **Title memory by raw address from shaders.** A directory with one entry per
    64 KiB of title address space leads a shader to the layer's host copy of
    that memory; loads, stores, atomic add/sub and float min/max go through it.

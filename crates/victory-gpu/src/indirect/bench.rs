@@ -61,9 +61,10 @@ fn compile(entry: &str, target: &str) -> Vec<u8> {
 
 /// The clamp as it was before it charged the budget once per group
 /// (record by record, every thread racing for the budget word), kept
-/// here to measure against.
+/// here to measure against. (Its root signature has the eight constants the
+/// clamp is given now; it reads the first six.)
 const OLD_SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=6, b0), SRV(t0), SRV(t1), UAV(u0), UAV(u1)"
+#define RS "RootConstants(num32BitConstants=8, b0), SRV(t0), SRV(t1), UAV(u0), UAV(u1)"
 cbuffer Record : register(b0) {
 uint kind;
 uint stride;

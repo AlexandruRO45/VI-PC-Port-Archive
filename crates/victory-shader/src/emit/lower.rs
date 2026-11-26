@@ -2455,18 +2455,20 @@ impl<'a> Lower<'a> {
     /// The host runs a console dispatch of more than 65,535 groups in `x` as
     /// several dispatches of at most that many (its own limit), one after the
     /// other. A later one starts at group `x` 65,535: the host says where in
-    /// [`USER_GROUP_BASE`], which this adds to the id. Every id the host
-    /// derives from the group id (`SV_DispatchThreadID`, the mesh stage's
-    /// group) is built from this op too, so all of them move with it.
+    /// [`USER_GROUP_BASE`], which this adds to a group id in `x`. The mesh
+    /// stage's group is built from this op too, so it moves with it; the
+    /// thread id in the group is the same in every piece and gets nothing
+    /// added.
     /// `VICTORY_GROUP_SPLIT=0`: the id is the console's own again (and a
     /// dispatch over the host's limit runs only its first 65,535 groups).
     fn compute_id(&mut self, name: &str, opcode: u32, c: u8) -> Val {
+        const GROUP_ID: u32 = 94;
         let (entry, component) = (self.s.entry, self.s.m.i32(u32::from(c)));
         let id = self
             .s
             .op(entry, name, Attr::ReadNone, self.s.t.i32, opcode, &[component]);
         // Only `x` is split; `y` and `z` are the console's.
-        if c != 0 || !group_split_on() {
+        if opcode != GROUP_ID || c != 0 || !group_split_on() {
             return Val::I32(id);
         }
         let base = self.host_word(RootType::Other(USER_GROUP_BASE), 0, 0);
@@ -11895,28 +11897,34 @@ mod tests {
         lowers(&words, group_ids_xy).expect("dead timestamp");
     }
 
-    /// A program that reads its group id reads the host's base too, so that a
-    /// dispatch the host runs in pieces moves its ids; `VICTORY_GROUP_SPLIT=0`
+    /// A program that reads its group id in `x` reads the host's base too,
+    /// so that a dispatch the host runs in pieces moves its ids; one that
+    /// reads only `y`, or no group id, does not; and `VICTORY_GROUP_SPLIT=0`
     /// leaves the id as the console's.
     #[test]
     fn a_program_that_reads_its_group_id_gets_the_group_base() {
-        let words = [
-            0xBF06_8000, // s_cmp_eq_u32 s0, 0 (s0 = group id X)
+        let reads_s0 = [
+            0xBF06_8000, // s_cmp_eq_u32 s0, 0 (s0: group id x, or y when only y is on)
             0xBF85_0001, // s_cbranch_scc1 -> s_endpgm
             0xBE83_0380, // s_mov_b32 s3, 0
             S_ENDPGM,
         ];
-        let group_id_x = 1 << 7;
-        let base = |l: &Lowered| {
-            l.user_data
+        let no_id = [0xBE83_0380, S_ENDPGM];
+        let (group_id_x, group_id_y) = (1 << 7, 1 << 8);
+        let base = |words: &[u32], rsrc2: u32| {
+            lowers_ids(words, rsrc2)
+                .expect("lowers")
+                .user_data
                 .iter()
                 .any(|u| u.root == RootType::Other(USER_GROUP_BASE))
         };
-        TEST_GROUP_SPLIT.set(Some(true));
-        assert!(base(&lowers_ids(&words, group_id_x).expect("group id")));
+        let was = TEST_GROUP_SPLIT.replace(Some(true));
+        assert!(base(&reads_s0, group_id_x), "a read of x adds the base");
+        assert!(!base(&reads_s0, group_id_y), "y is never split");
+        assert!(!base(&no_id, group_id_x), "a program that does not read it is unchanged");
         TEST_GROUP_SPLIT.set(Some(false));
-        assert!(!base(&lowers_ids(&words, group_id_x).expect("group id")));
-        TEST_GROUP_SPLIT.set(None);
+        assert!(!base(&reads_s0, group_id_x), "VICTORY_GROUP_SPLIT=0");
+        TEST_GROUP_SPLIT.set(was);
     }
 
     #[test]

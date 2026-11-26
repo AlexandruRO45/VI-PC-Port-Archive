@@ -561,13 +561,17 @@ What did it, on top of the list below:
   translated program adds the piece's first group to its group id (compute
   and mesh stages; `VICTORY_GROUP_SPLIT=0` gives the old truncation back).
   Built and unit-tested; not yet seen in a run of the title here.
-- Known and counted, still not fixed: a group count that arrives in GPU
-  memory is clamped instead (the indirect light pass's compute record that
-  asks for about 77,500 thread groups in x runs 65,535, and the rest is cut
-  off). Splitting one would need the host to read each record's count, or a
-  per-record group base, which the argument buffer does not carry. The clamp
-  now counts these too (the frame line reports the largest group count an
-  indirect compute record asked for), so the next run measures what is lost.
+- A group count that arrives in GPU memory (the indirect light pass's
+  compute record that asks for about 75,000 thread groups in x) is run in
+  pieces too, if its program reads its group id: the argument clamp writes
+  each record `VICTORY_GROUP_PIECES` times (2 by default, at most 16; piece
+  p holds the groups from p * 65,535 on), and the execution is recorded
+  once a piece with that piece's group base; no count is read back.
+  `VICTORY_GROUP_SPLIT=0` gives the old truncation back here as well. The
+  frame line counts the records over 65,535, those over what their pieces
+  run (still cut there), and the pieces that ran. Seen in another tree
+  (Steenax6/VIctory-NVID): a band of stale blocks along the bottom of the
+  picture is gone; on this one built and tested on WARP only.
 
 Memory sync between the title's memory and the copies on the card:
 - **A write through one view of a physical page is seen by the copies taken
