@@ -145,14 +145,15 @@ impl Lower<'_> {
                         let ptr = wide64(self, lo, node_hi.unwrap_or(zero));
                         let k3 = self.s.m.int_const(i64t, 3);
                         let off = self.s.m.bin(c, Bin::Shl, ptr, k3);
-                        // Sum the 32-bit offset pieces with 32-bit wraparound, then widen:
-                        // resource::Address::offset adds modulo 2^32 and carries into the high half.
-                        let mut sum = k;
+                        // Widen each 32-bit piece before adding, the way the
+                        // hardware's s_add_u32/s_addc_u32 pair carries out of
+                        // the low word (k + dynamic may itself overflow).
+                        let k = self.s.m.cast(c, Cast::ZExt, k, i64t);
+                        let mut at = self.s.m.bin(c, Bin::Add, off, k);
                         if let Some(d) = dynamic {
-                            sum = self.s.m.bin(c, Bin::Add, sum, d);
+                            let d = self.s.m.cast(c, Cast::ZExt, d, i64t);
+                            at = self.s.m.bin(c, Bin::Add, at, d);
                         }
-                        let sum = self.s.m.cast(c, Cast::ZExt, sum, i64t);
-                        let at = self.s.m.bin(c, Bin::Add, off, sum);
                         Nodes::Raw(self.s.m.bin(c, Bin::Add, base, at))
                     }
                     None => Nodes::Buffer(self.handle((b, i), src, false, (11, 0))?, at),
