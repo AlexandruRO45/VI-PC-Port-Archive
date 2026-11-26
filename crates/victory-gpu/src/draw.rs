@@ -459,6 +459,11 @@ fn dropped(pipeline: usize) {
 /// Dispatches run on the host so far.
 static DISPATCHED: AtomicU64 = AtomicU64::new(0);
 
+/// Whether the last pass over textures picked by index left slots due
+/// behind it: [`crate::heap_worker`] then runs another at once, and the
+/// textures read ahead go on several threads (`Host::refresh_textures_ahead`).
+pub(crate) static BACKLOG_LEFT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 pub(crate) fn dispatched() -> u64 {
     DISPATCHED.load(Ordering::Relaxed)
 }
@@ -1810,12 +1815,17 @@ impl State {
             None => (span, per_frame),
         };
         let began = std::time::Instant::now();
+        // Slots left due behind this pass ([`BACKLOG_LEFT`]): handed as many
+        // as a pass takes, or stopped below on bytes, time or making way.
+        BACKLOG_LEFT.store(due.len() >= 4096, Ordering::Relaxed);
         for (index, write) in due {
             if SPENT.load(Ordering::Relaxed) >= bytes_at_most || began.elapsed() > span {
+                BACKLOG_LEFT.store(true, Ordering::Relaxed);
                 break;
             }
             let ahead = matches!(into, Into::Ahead(_));
             if ahead && crate::heap_worker::make_way() {
+                BACKLOG_LEFT.store(true, Ordering::Relaxed);
                 break;
             }
             // The record the slot has now, and the texture it names held
