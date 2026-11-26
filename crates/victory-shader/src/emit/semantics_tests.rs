@@ -3071,6 +3071,11 @@ fn binary64_trig_preop_returns_the_argument_reduction_segment() {
         (0x7af0_0000_0000_0000, 0x1, 0x04fe_a2d7_527b_ac7e),
         (0x7b00_0000_0000_0000, 0x0, 0x1037_4f46_3f66_9e5f),
         (0x7b00_0000_0000_0000, 0x1, 0x0ced_45ae_a4f7_58fd),
+        // Model rows distinguish the measured 1184-bit table length
+        // from using all 1201 bits in the ISA pseudocode.
+        (0x7b00_0000_0000_0000, 0x5, 0x0000_180c_c118_0000),
+        (0x7d00_0000_0000_0000, 0x4, 0x00f5_d085_6033_0460),
+        (0x7ff0_0000_0000_0000, 0x4, 0x0000_0000_0008_0000),
     ];
 
     let build = |body, rows: &[(u64, u32, u64)]| {
