@@ -53,6 +53,8 @@ scripts\play.ps1 -Exe <path of your copy's executable>
 `scripts\play.ps1 -Safe` leaves out the newest, faster ways; try it first when
 something is wrong. `-RayTracing` turns the title's ray-traced indirect light on.
 
+Run `scripts\play.ps1` from a normal window, not as administrator: the driver then keeps its shader cache elsewhere.
+
 Before the first run, ahead of time (both can be stopped and go on later):
 
 ```powershell
