@@ -387,6 +387,50 @@ mod tests {
         WAITING.fetch_sub(3, Ordering::Relaxed);
     }
 
+    /// An empty draw must not move its graphics pipeline onto the demand queue.
+    #[test]
+    fn zero_count_draws_do_not_request_graphics_pipelines() {
+        use crate::object::{S_OK, This, slot};
+
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let list = host.new_list().unwrap();
+        let demanded = |indexed: bool, count, instances| {
+            // A new pipeline per draw isolates each use bit. The empty stage
+            // list makes demand measurable independently of shader build time.
+            let mut pipeline = std::ptr::null();
+            assert_eq!(
+                crate::pipeline::hand_out(
+                    Vec::new(),
+                    Some(Box::default()),
+                    &crate::pipeline::PIPELINE_IIDS[0],
+                    &mut pipeline,
+                ),
+                S_OK
+            );
+            let mut state = crate::draw::State::default();
+            state.set_pipeline(pipeline);
+            if indexed {
+                state.draw_indexed(&list, count, instances, 0, 0, 0);
+            } else {
+                state.draw(&list, count, instances, 0, 0);
+            }
+            let requested = crate::pipeline::pipeline(pipeline)
+                .host
+                .used
+                .load(Ordering::Relaxed);
+            slot::<extern "system" fn(This) -> u32>(pipeline, 0x10)(pipeline);
+            requested
+        };
+        let cases = [(0, 1), (3, 0), (3, 1)];
+        let observed = [false, true].map(|indexed| {
+            cases.map(|(count, instances)| demanded(indexed, count, instances))
+        });
+        list.close();
+        assert_eq!(observed, [[false, false, true]; 2]);
+    }
+
     /// A first use queues the pipeline and, within the budget, gets the
     /// worker's answer (here: no host pipeline for no shaders).
     #[test]
