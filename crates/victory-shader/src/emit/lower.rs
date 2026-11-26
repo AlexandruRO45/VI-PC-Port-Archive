@@ -1034,9 +1034,14 @@ static HOST_MAX_WAVE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU3
 /// lane branches can get no meeting of the two host waves runs in waves of 32 anyway, with a
 /// barrier before the LDS accesses every lane makes; only asked on hosts of 32-lane waves, where
 /// the other answer is a pipeline the driver refuses.
+/// (In tests it is off unless set to `1`, so that tests of programs that must keep
+/// `WaveSize(64)` on such a host see them kept.)
 fn lds_region_race() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_LDS_REGION_RACE").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| match std::env::var_os("VICTORY_LDS_REGION_RACE") {
+        Some(v) => v != "0",
+        None => !cfg!(test),
+    })
 }
 
 /// The host GPU's `WaveLaneCountMax`: 32 lets console wave64 compute programs whose cross-lane
