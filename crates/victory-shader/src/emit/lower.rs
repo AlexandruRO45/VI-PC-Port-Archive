@@ -2912,6 +2912,15 @@ impl<'a> Lower<'a> {
     /// the console's wave size (lanes are thread ids in group order there).
     /// Pixel lanes match only within a quad.
     fn cross_lane(&mut self, quad: bool) -> Result<(), Why> {
+        let lanes = self.wave();
+        self.cross_lanes_within(quad, lanes)
+    }
+
+    /// [`Self::cross_lane`] for an operation that reads only lanes of its own
+    /// aligned group of `lanes` (16 for a DPP row, 8 for DPP8, 32 for
+    /// `ds_bpermute_b32`): a host wave of at least that many lanes holds the
+    /// whole group, so a 32-lane host can run these for a wave64 program.
+    fn cross_lanes_within(&mut self, quad: bool, lanes: u32) -> Result<(), Why> {
         if self.s.mesh.is_some() {
             // shortcut: no wave size for mesh shaders in SM 6.6, so host
             // lanes cannot follow the console's; emulate through group-shared
@@ -2921,7 +2930,9 @@ impl<'a> Lower<'a> {
         if self.s.threads.is_none() && !(quad && self.s.pixel) {
             return Err("a cross-lane operation outside compute");
         }
-        if !quad && self.host_wave() < self.wave() {
+        // Quad operations reach their quad, but a DPP row write mask still
+        // numbers the wave's rows: their caller says how far that goes.
+        if self.host_wave() < lanes.min(self.wave()) {
             return Err("a cross-half operation on a 32-lane host");
         }
         debug_assert!(self.s.threads.is_none() || self.console_lanes);
@@ -3236,7 +3247,7 @@ impl<'a> Lower<'a> {
             // console's, so quad-local swizzles read through quad operations.
             let mesh_quad = self.s.mesh.is_some() && quad;
             if !mesh_quad {
-                self.cross_lane(quad)?;
+                self.cross_lanes_within(quad, 32)?;
             }
             // The source sits in the address field.
             let x = self.vgprs(inst, addr.as_ref().ok_or("a swizzle source")?, 1)?[0];
@@ -3284,7 +3295,7 @@ impl<'a> Lower<'a> {
             // names in dwords within its own 32-lane half (RDNA 2 ISA,
             // section 10.4.4: wave64 permutes lanes 0..31 and 32..63
             // independently); 0 from a lane EXEC leaves out.
-            self.cross_lane(false)?;
+            self.cross_lanes_within(false, 32)?;
             let a = self.vgprs(inst, addr.as_ref().ok_or("a permute address")?, 1)?[0];
             let x = self.vgprs(inst, data.first().ok_or("a permute source")?, 1)?[0];
             let k = |l: &mut Self, v: u32| l.s.m.i32(v);
@@ -5881,9 +5892,17 @@ impl<'a> Lower<'a> {
         let x = self.i32_of(inst.read(Reg::V(reg)).ok_or("a DPP operand")?)?;
         // Quad permutations and DPP8 stay in groups the pixel layout shares.
         let quad = matches!(dpp, Dpp::Row { ctrl: 0..=0xFF, .. });
+        // Rows (16 lanes) and DPP8 (8 lanes) read inside their group. The row
+        // write mask numbers the wave's four rows; a 32-lane host wave sees
+        // rows 0 and 1 of its half, right only when both halves' bits match.
+        let reach = match dpp {
+            Dpp::Lanes { .. } => 8,
+            Dpp::Row { row_mask, .. } if row_mask & 3 == row_mask >> 2 => 16,
+            Dpp::Row { .. } => self.wave(),
+        };
         let mesh_quad = self.s.mesh.is_some() && quad;
         if !mesh_quad {
-            self.cross_lane(quad)?;
+            self.cross_lanes_within(quad, reach)?;
         }
         let use_quad = mesh_quad || self.helpers_read(quad);
         let c = self.cur;
