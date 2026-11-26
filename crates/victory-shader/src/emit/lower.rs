@@ -226,6 +226,9 @@ struct Lower<'a> {
     /// Handles of descriptors chosen by control flow, made in their join
     /// block, by the choice (its `Debug` text), sampler heap and properties.
     join_handles: HashMap<(String, bool, u32), V>,
+    /// `VIEW_STRIDES` dword loaded by [`Lower::buffer_guard`], reused by
+    /// [`Lower::view_raw_bias`] to avoid a second load or OOB read at null.
+    guarded_stride: HashMap<V, V>,
     /// Blocks splitting the edge from one IR block to another.
     edges: HashMap<(usize, usize), usize>,
     /// Per IR block: a `done` export is behind every lane entering it.
@@ -686,6 +689,7 @@ impl<'a> Lower<'a> {
             handles: HashMap::new(),
             entry_handles: HashMap::new(),
             join_handles: HashMap::new(),
+            guarded_stride: HashMap::new(),
             edges: HashMap::new(),
             exported: vec![false; p.blocks.len()],
             rpo: vec![usize::MAX; p.blocks.len()],
@@ -4668,8 +4672,13 @@ impl<'a> Lower<'a> {
     /// [`VIEW_STRIDES`] bits 28..29; `None` if the handle's heap index is not
     /// known.
     fn view_raw_bias(&mut self, h: V) -> Option<V> {
-        let index = *self.s.view_index.get(&h)?;
-        let word = self.view_word(index);
+        let word = match self.guarded_stride.get(&h).copied() {
+            Some(word) => word,
+            None => {
+                let index = *self.s.view_index.get(&h)?;
+                self.view_word(index)
+            }
+        };
         let c = self.cur;
         let shift = self.s.m.i32(VIEW_RAW_OFFSET_SHIFT - 2);
         let mask = self.s.m.i32(0xC);
@@ -5413,8 +5422,7 @@ impl<'a> Lower<'a> {
                 }
                 let here = std::mem::replace(&mut self.cur, self.s.entry);
                 let index = self.entry_heap_index(address, *first, sampler);
-                let index = self.buffer_guard(src, index, sampler, props);
-                let h = self.s.heap_handle(self.cur, index, sampler, false, props);
+                let h = self.guarded_heap_handle(src, index, sampler, false, props);
                 self.cur = here;
                 self.entry_handles.insert(key, h);
                 Ok(h)
@@ -5425,13 +5433,10 @@ impl<'a> Lower<'a> {
                     return Ok(h);
                 }
                 let index = self.heap_index(*load, *first, sampler)?;
-                let index = self.buffer_guard(src, index, sampler, props);
                 // A waterfall loop's load at the first lane's offset reads
                 // each lane's own entry (see `resource::Waterfall`).
                 let per_lane = self.x.res.waterfall.loads.contains(load);
-                let h = self
-                    .s
-                    .heap_handle(self.cur, index, sampler, per_lane, props);
+                let h = self.guarded_heap_handle(src, index, sampler, per_lane, props);
                 self.handles.insert(key, h);
                 Ok(h)
             }
@@ -5536,10 +5541,8 @@ impl<'a> Lower<'a> {
                 let join = self.block[*block].ok_or("a descriptor chosen by control flow")?;
                 let here = std::mem::replace(&mut self.cur, join);
                 let index = self.uniform_heap_index(src, sampler);
-                let h = index.map(|index| {
-                    let index = self.buffer_guard(src, index, sampler, props);
-                    self.s.heap_handle(self.cur, index, sampler, false, props)
-                });
+                let h =
+                    index.map(|index| self.guarded_heap_handle(src, index, sampler, false, props));
                 self.cur = here;
                 let h = h?;
                 self.join_handles.insert(key, h);
@@ -5561,18 +5564,32 @@ impl<'a> Lower<'a> {
                 let set = self.heap_index(a, fa, sampler)?;
                 let clear = self.heap_index(b, fb, sampler)?;
                 let index = self.s.m.select(self.cur, cond, set, clear);
-                let index = self.buffer_guard(src, index, sampler, props);
-                Ok(self.s.heap_handle(self.cur, index, sampler, false, props))
+                Ok(self.guarded_heap_handle(src, index, sampler, false, props))
             }
             Source::Fetched { .. } | Source::Lanes { .. } | Source::LanePhi { .. } => {
                 // A descriptor each lane has its own of (a waterfall loop
                 // reads it from the first active lane): each lane's heap
                 // index, non-uniform.
                 let index = self.lane_heap_index(src, sampler)?;
-                let index = self.buffer_guard(src, index, sampler, props);
-                Ok(self.s.heap_handle(self.cur, index, sampler, true, props))
+                Ok(self.guarded_heap_handle(src, index, sampler, true, props))
             }
         }
+    }
+
+    fn guarded_heap_handle(
+        &mut self,
+        src: &Source,
+        index: V,
+        sampler: bool,
+        nonuniform: bool,
+        props: (u32, u32),
+    ) -> V {
+        let (index, word) = self.buffer_guard(src, index, sampler, props);
+        let h = self.s.heap_handle(self.cur, index, sampler, nonuniform, props);
+        if let Some(word) = word {
+            self.guarded_stride.insert(h, word);
+        }
+        h
     }
 
     /// The heap index to read a buffer view at, for a descriptor `src` from
@@ -5582,10 +5599,16 @@ impl<'a> Lower<'a> {
     /// from data; one naming a texture slot read a texture descriptor as a
     /// buffer one (a wild address: the texture's address shifted 8 bits
     /// down) and faulted the device.
-    fn buffer_guard(&mut self, src: &Source, index: V, sampler: bool, props: (u32, u32)) -> V {
+    fn buffer_guard(
+        &mut self,
+        src: &Source,
+        index: V,
+        sampler: bool,
+        props: (u32, u32),
+    ) -> (V, Option<V>) {
         // Typed, raw and structured buffers (DXIL resource kinds 10-12).
         if sampler || !(10..=12).contains(&(props.0 & 0xFF)) || !self.is_heap_direct(src) {
-            return index;
+            return (index, None);
         }
         let c = self.cur;
         let last = self.s.m.i32(super::HEAP_VIEWS - 1);
@@ -5603,7 +5626,7 @@ impl<'a> Lower<'a> {
         // The null unordered access view sits just below the null SRV.
         let null = super::NULL_BUFFER_VIEW - u32::from(props.0 & 0x1000 != 0);
         let null = self.s.m.i32(null);
-        self.s.m.select(c, none, null, index)
+        (self.s.m.select(c, none, null, index), Some(stride))
     }
 
     /// Whether a descriptor comes from the resource heap itself (root type
