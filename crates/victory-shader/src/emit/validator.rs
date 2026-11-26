@@ -218,8 +218,31 @@ impl Validator {
     /// rebuilds it. A verdict from a validator before 1.8 is therefore worth
     /// less than the line it prints.
     pub fn version(&self) -> Option<(u16, u16)> {
+        // The engine's own answer first: `IDxcValidator::GetVersion` is the
+        // pair `dxc -dumpbin` prints as "Validator version", and the only one
+        // that is the engine rather than the stamp the SDK put on the file.
+        let mut major = 0u32;
+        let mut minor = 0u32;
+        // SAFETY: slot 4 of `IDxcValidator` is GetVersion, which writes two
+        // u32s; the object outlives the call.
+        let get_version = unsafe {
+            method::<unsafe extern "system" fn(Object, *mut u32, *mut u32) -> Hresult>(self.object, 4)
+        };
+        // SAFETY: as above; `self.object` is a live `IDxcValidator`.
+        if unsafe { get_version(self.object, &mut major, &mut minor) } >= 0 {
+            return Some((major as u16, minor as u16));
+        }
+        // A validator whose table is short: the file stamp, with the SDK's
+        // 100-prefixed series levelled back to the engine's (#1945).
         let path = self.path.as_ref()?;
         file_version(path).map(engine_version)
+    }
+
+    /// The DLL's `VS_FIXEDFILEINFO` version, for a report that has to say
+    /// where the engine came from: the SDK stamps `1.8.2502` on a 1.7
+    /// engine, so this is not the engine version (#1945).
+    pub fn file_version(&self) -> Option<(u16, u16)> {
+        file_version(self.path.as_ref()?)
     }
 
     /// Where `dxil.dll` is looked for.
@@ -329,6 +352,23 @@ impl Drop for Validator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `IDxcValidator::GetVersion` is the engine, not the stamp the SDK put
+    /// on the file: a DLL stamped `1.8.2502` that is the 1.7 engine answers
+    /// `(1, 7)` here, which is the pair a warning has to look at (#1945).
+    #[test]
+    fn the_engine_version_is_the_validators_own_answer() {
+        let Some(v) = Validator::load(Validator::default_path().as_deref()).ok() else {
+            return; // no dxil.dll on this machine: nothing to ask.
+        };
+        let (major, minor) = v.version().expect("IDxcValidator answers GetVersion");
+        assert!(major >= 1 && major <= 9, "engine {major}.{minor}");
+        if let Some((file_major, file_minor)) = v.file_version() {
+            // The two agree on this machine's SDK; what matters is that the
+            // engine is what a report uses, and that the stamp is not lost.
+            assert!(file_major >= 1, "file {file_major}.{file_minor}");
+        }
+    }
 
     /// The Windows SDK stamps the engine series with 100: `101.7` is the 1.7
     /// engine, and a plain `>= 1` (or `>= 1.8`) gate accepts it (#1945).

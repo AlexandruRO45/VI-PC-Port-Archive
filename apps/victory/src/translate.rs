@@ -175,8 +175,14 @@ pub fn run(
             .version()
             .map(|(major, minor)| format!(" {major}.{minor}"))
             .unwrap_or_default();
+        // The file stamp is kept next to the engine version when it says
+        // something else: the SDK puts 1.8.2502 on a 1.7 engine (#1945).
+        let stamp = validator
+            .file_version()
+            .map(|(major, minor)| format!(" (file {major}.{minor})"))
+            .unwrap_or_default();
         println!(
-            "validator    {}{version}",
+            "validator    {}{version}{stamp}",
             dll.as_ref()
                 .map_or("dxil.dll".into(), |p| p.display().to_string())
         );
@@ -890,3 +896,4 @@ mod tests {
         );
     }
 }
+
