@@ -483,6 +483,13 @@ fn translate(
     t: &mut Tally,
     checks: &mut Checks,
 ) {
+    // Diagnostics: `VICTORY_ONLY=@0x<offset>` translates just that container,
+    // so one program's failures can be read in order.
+    if let Ok(only) = std::env::var("VICTORY_ONLY")
+        && !source.label().contains(&only)
+    {
+        return;
+    }
     let example = || format!("{}{}", path.display(), source.label());
     let Some(bytes) = source.bytes() else {
         return t.fail("corrupt record".into(), example);

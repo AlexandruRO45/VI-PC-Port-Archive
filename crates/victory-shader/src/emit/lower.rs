@@ -3583,6 +3583,16 @@ impl<'a> Lower<'a> {
             Ok(()) => Ok(()),
             Err(why) if effect => Err(unsupported(offset, why)),
             Err(why) => {
+                // `VICTORY_TRACE_FAILS`: every instruction the emitter gives
+                // up on, in order - a program's refusals are usually one of
+                // these, several instructions before the one that reports it.
+                if std::env::var_os("VICTORY_TRACE_FAILS").is_some() {
+                    eprintln!(
+                        "FAIL {} at {offset:#x} (block {b}): {why} reads {:?}",
+                        inst.name(),
+                        inst.reads
+                    );
+                }
                 for &(_, v) in &inst.writes {
                     self.vals.insert(v, Val::Missing(why));
                 }
