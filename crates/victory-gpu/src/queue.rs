@@ -324,8 +324,10 @@ fn worker(submitter: std::sync::Arc<Submitter>) {
                 lists.into_iter().for_each(crate::list::recycle);
             }
             Work::Signal(fence, value) => {
-                crate::fence::set(fence as This, value);
-                crate::fence::let_go(fence as This);
+                if !crate::host::late_signal(fence, value) {
+                    crate::fence::set(fence as This, value);
+                    crate::fence::let_go(fence as This);
+                }
             }
         }
         // What waited for that submission's fence or bottom-of-pipe write
@@ -365,7 +367,11 @@ fn pump(held: &mut Holding, why: Why) {
     let mut ran = std::time::Duration::ZERO;
     let mut run = |_: usize, segments: Vec<std::sync::Arc<crate::host::HostList>>| {
         let at = std::time::Instant::now();
-        if behind() {
+        if crate::host::relay() {
+            // Sent without a wait; the thread of `crate::host::relay` lands
+            // it, and the host lists are given back then.
+            host.execute_late(segments);
+        } else if behind() {
             // Prepared and sent by the thread of ours, in this order.
             send(Work::Run(segments));
         } else {
@@ -377,7 +383,10 @@ fn pump(held: &mut Holding, why: Why) {
         ran += at.elapsed();
     };
     let mut signal = |f: usize, value: u64| {
-        if behind() {
+        if crate::host::late_signal(f, value) {
+            // Set behind the flights in the air (`crate::host`); the fence
+            // was kept when the queue's Signal was taken.
+        } else if behind() {
             // Behind the submissions before it in the line.
             send(Work::Signal(f, value));
         } else {
@@ -553,13 +562,21 @@ extern "system" fn signal(this: This, fence: This, value: u64) -> HRESULT {
         if held.holds_work(this as usize) {
             crate::fence::keep(fence);
             held.push(this as usize, Item::Signal(fence as usize, value));
-        } else if behind() {
-            // Behind the submissions of this queue the thread of ours has
-            // not run yet.
-            crate::fence::keep(fence);
-            send(Work::Signal(fence as usize, value));
         } else {
-            crate::fence::set(fence, value);
+            // Kept until it is set: behind the flights in the air
+            // (`crate::host::late`), behind this queue's submissions of the
+            // thread of ours (`behind`), or now.
+            crate::fence::keep(fence);
+            if crate::host::late_signal(fence as usize, value) {
+                // Set when the flights in the air are landed.
+            } else if behind() {
+                // Behind the submissions of this queue the thread of ours
+                // has not run yet.
+                send(Work::Signal(fence as usize, value));
+            } else {
+                crate::fence::set(fence, value);
+                crate::fence::let_go(fence);
+            }
         }
         // Another queue may wait for this fence.
         pump(&mut held, Why::Signal);
@@ -664,6 +681,10 @@ extern "system" fn present(
     // shortcut: PresentX does not wait behind work the queue still holds (it
     // shows the frame as far as it ran); the frame line names such work.
     pump_held(Why::Present);
+    // And what the queues sent without a wait: the frame's draws were on the
+    // card (`crate::host::late`). Every present settles, even one with no
+    // plane: the title is told the frame is done.
+    crate::host::settle_for_present();
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
     #[cfg(windows)]
     account_frame(frame);

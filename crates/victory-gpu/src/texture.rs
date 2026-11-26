@@ -532,6 +532,13 @@ pub(crate) fn refresh_all(work: &[(Arc<Staging>, Arc<crate::resource::HostTextur
 }
 
 impl Staging {
+    /// The title memory the texture's bytes are in and their length
+    /// (0 where the texture is not mapped): what a submission that reads it
+    /// may wait for (`crate::host::late`).
+    pub(crate) fn memory(&self) -> (usize, usize) {
+        (self.memory as usize, self.layout.size as usize)
+    }
+
     /// Whether its memory may have changed since it was last detiled (an
     /// untracked texture always may).
     pub(crate) fn maybe_changed(&self) -> bool {
