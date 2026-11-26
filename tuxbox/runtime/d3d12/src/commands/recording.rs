@@ -491,6 +491,10 @@ impl Recording {
             return;
         }
         self.sample_tables::<true>();
+        if let Some(root) = self.bindings.sampler_root() {
+            unsafe { self.bindings.dispatch_with_root(&list.native, root, dispatch) };
+            return;
+        }
         let Some(root) = self.bindings.scene_root() else {
             dispatch();
             return;

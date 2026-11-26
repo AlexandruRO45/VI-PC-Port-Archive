@@ -69,7 +69,7 @@ impl SceneCheck {
 }
 
 pub(super) enum Pipeline {
-    Regular(ID3D12PipelineState, Option<SceneRoot>, Option<Arc<ComputeTable>>, Option<Arc<ComputeTable>>, Option<[u32; 3]>),
+    Regular(ID3D12PipelineState, Option<SceneRoot>, Option<Arc<ComputeTable>>, Option<Arc<ComputeTable>>, Option<[u32; 3]>, Option<ID3D12RootSignature>),
     Ray(ID3D12StateObject),
 }
 
@@ -109,7 +109,7 @@ pub(super) enum Argument {
 
 impl From<&GuestPipeline> for Pipeline {
     fn from(p: &GuestPipeline) -> Self {
-        Self::Regular(p.native.clone(), p.state.scene_root.clone(), p.state.reflected.clone(), p.state.raster_table.clone(), p.state.compute_threads)
+        Self::Regular(p.native.clone(), p.state.scene_root.clone(), p.state.reflected.clone(), p.state.raster_table.clone(), p.state.compute_threads, p.state.sampler_root.clone())
     }
 }
 
@@ -247,14 +247,14 @@ impl Bindings {
 
     pub(super) fn compute_threads(&self) -> Option<[u32; 3]> {
         match self.pipeline.as_ref() {
-            Some(Pipeline::Regular(.., threads)) => *threads,
+            Some(Pipeline::Regular(_, _, _, _, threads, _)) => *threads,
             _ => None,
         }
     }
 
     pub(super) fn reflected_table<const COMPUTE: bool>(&self) -> Option<&ComputeTable> {
         match &self.pipeline {
-            Some(Pipeline::Regular(_, _, compute, raster, _)) => if COMPUTE { compute.as_deref() } else { raster.as_deref() },
+            Some(Pipeline::Regular(_, _, compute, raster, _, _)) => if COMPUTE { compute.as_deref() } else { raster.as_deref() },
             _ => None,
         }
     }
@@ -299,12 +299,20 @@ impl Bindings {
             }
             None
         };
+        // Only paged heaps keep strides; a program that needs them cannot run on another.
+        let strides = match table.heap_strides {
+            Some(slot) => Some((slot, heap.stride_table(arena.ok_or(E_INVALIDARG)?, resources)?)),
+            None => None,
+        };
         unsafe {
             if COMPUTE {
                 list.SetComputeRootSignature(&table.native);
                 // Changing root signatures invalidates the native arguments. Replay
                 // constants and descriptors, then substitute each reflected table.
                 self.apply_compute_args(list, bases);
+                if let Some((slot, address)) = strides {
+                    list.SetComputeRootShaderResourceView(slot, address);
+                }
                 dispatch();
                 list.SetComputeRootSignature(self.compute.as_ref());
                 self.apply_compute_args(list, &[]);
@@ -341,7 +349,7 @@ impl Bindings {
 
     pub(super) fn scene_root(&self) -> Option<&SceneRoot> {
         match self.pipeline.as_ref() {
-            Some(Pipeline::Regular(_, root, _, _, _)) => root.as_ref(),
+            Some(Pipeline::Regular(_, root, _, _, _, _)) => root.as_ref(),
             _ => None,
         }
     }
@@ -494,6 +502,30 @@ impl Bindings {
         Ok(D3D12_CPU_DESCRIPTOR_HANDLE { ptr })
     }
 
+    pub(super) fn sampler_root(&self) -> Option<&ID3D12RootSignature> {
+        match self.pipeline.as_ref() {
+            Some(Pipeline::Regular(.., root)) => root.as_ref(),
+            _ => None,
+        }
+    }
+
+    /// Dispatch under a pipeline root that extends the bound guest root with
+    /// static samplers only, then restore the guest root.
+    pub(super) unsafe fn dispatch_with_root(
+        &self,
+        host: &ID3D12GraphicsCommandList,
+        root: &ID3D12RootSignature,
+        dispatch: impl FnOnce(),
+    ) {
+        unsafe {
+            host.SetComputeRootSignature(root);
+            self.apply_compute_args(host, &[]);
+            dispatch();
+            host.SetComputeRootSignature(self.compute.as_ref());
+            self.apply_compute_args(host, &[]);
+        }
+    }
+
     pub(super) unsafe fn dispatch_scene(
         &self,
         host: &ID3D12GraphicsCommandList,
@@ -540,7 +572,7 @@ impl Bindings {
                 }
             }
             match self.pipeline.as_ref() {
-                Some(Pipeline::Regular(pso, _, _, _, _)) => host.SetPipelineState(pso),
+                Some(Pipeline::Regular(pso, ..)) => host.SetPipelineState(pso),
                 Some(Pipeline::Ray(pso)) => {
                     let rt = active
                         .raytracing()
@@ -562,7 +594,7 @@ impl Bindings {
                 host.SetGraphicsRootDescriptorTable(slot, base.native);
             }
             match self.pipeline.as_ref() {
-                Some(Pipeline::Regular(pso, _, _, _, _)) => host.SetPipelineState(pso),
+                Some(Pipeline::Regular(pso, ..)) => host.SetPipelineState(pso),
                 Some(Pipeline::Ray(pso)) => host.SetPipelineState1(pso),
                 None => {}
             }
