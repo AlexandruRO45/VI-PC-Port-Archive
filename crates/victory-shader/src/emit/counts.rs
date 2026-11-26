@@ -382,7 +382,9 @@ mod tests {
     }
 
     /// Every instruction the writer has, in a loop with a phi nothing reads
-    /// (which the writer leaves out) and an empty latch (which it folds).
+    /// (which the writer leaves out) and an empty latch (which it folds);
+    /// what is computed is stored, as the writer keeps only what effects
+    /// read.
     #[test]
     fn counts_what_the_writer_wrote() {
         let mut m = Module::default();
@@ -421,7 +423,8 @@ mod tests {
         let old = m.load(body, at);
         m.store(body, at, picked);
         let _ = m.atomic(body, Rmw::Add, at, old);
-        let _ = m.cmpxchg(body, at, old, picked);
+        let swapped = m.cmpxchg(body, at, old, picked);
+        m.store(body, at, swapped);
         let next = m.bin(body, Bin::Add, i, one);
         let more = m.cmp(body, pred::IULT, next, four);
         m.terminate(body, Term::CondBr(more, latch, exit));
@@ -453,20 +456,21 @@ mod tests {
                 ("ret", 1),
                 ("select", 1),
                 ("shl", 1),
-                ("store", 1),
+                ("store", 2),
             ]
         );
         assert_eq!(c.instructions, c.kinds.values().sum::<u64>());
-        assert_eq!(c.instructions, 23);
+        assert_eq!(c.instructions, 24);
     }
 
     /// Every shared opcode the writer has in both forms, the floats typed
     /// by each record that gives a value its type, and integers read after
-    /// them, so a value id off by one names a binary op wrongly.
+    /// them, so a value id off by one names a binary op wrongly. The last
+    /// of each are stored, so the writer keeps them and what they read.
     #[test]
     fn counts_integer_and_float_binary_ops_separately() {
         let mut m = Module::default();
-        let (void, float) = (m.void(), m.float());
+        let (void, float, i32t) = (m.void(), m.float(), m.int(32));
         let pair = m.named_struct("pair", vec![float, float]);
         let load_ty = m.func_ty(pair, vec![]);
         let load = m.function("load_pair", load_ty, None, false);
@@ -474,6 +478,8 @@ mod tests {
         m.function("main", main_ty, None, true);
         let arr = m.array(4, float);
         let lds = m.global("lds", arr, 3);
+        let ints = m.array(4, i32t);
+        let lds_ints = m.global("lds_ints", ints, 3);
         let (entry, exit) = (m.new_block(), m.new_block());
 
         let i = m.i32(2);
@@ -507,8 +513,11 @@ mod tests {
         m.terminate(entry, Term::Br(exit));
         let merged = m.phi(exit, float);
         m.set_phi(merged, vec![(quotient, entry)]);
-        m.bin(exit, Bin::Mul, merged, merged);
-        m.bin(exit, Bin::Add, x, i);
+        let squared = m.bin(exit, Bin::Mul, merged, merged);
+        m.store(exit, at, squared);
+        let total = m.bin(exit, Bin::Add, x, i);
+        let at_int = m.element(exit, lds_ints, zero);
+        m.store(exit, at_int, total);
         m.terminate(exit, Term::Ret);
 
         let c = count(&m.write()).expect("counts");
@@ -523,7 +532,7 @@ mod tests {
                 ("fdiv", 1),
                 ("fmul", 2),
                 ("fsub", 1),
-                ("getelementptr", 1),
+                ("getelementptr", 2),
                 ("icmp", 1),
                 ("load", 1),
                 ("load_pair", 1),
@@ -532,6 +541,7 @@ mod tests {
                 ("ret", 1),
                 ("sdiv", 1),
                 ("select", 1),
+                ("store", 2),
                 ("sub", 1),
                 ("udiv", 1),
                 ("urem", 1),
@@ -539,7 +549,7 @@ mod tests {
         );
         // Naming by type moves no instruction between kinds' totals.
         assert_eq!(c.instructions, c.kinds.values().sum::<u64>());
-        assert_eq!((c.blocks, c.instructions), (2, 22));
+        assert_eq!((c.blocks, c.instructions), (2, 25));
     }
 
     #[test]
