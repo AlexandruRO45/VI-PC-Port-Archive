@@ -998,7 +998,14 @@ impl State {
         } else {
             SAMPLERS_OURS
         };
-        let views = if memory_heap { MEMORY_HEAP } else { title[0] };
+        // Ours too when the title binds no view heap: a signature indexing
+        // the heap directly still needs one bound (#2894, the view half of
+        // the sampler case above).
+        let views = if memory_heap || title[0] == 0 {
+            MEMORY_HEAP
+        } else {
+            title[0]
+        };
         [views, sampler]
     }
 
@@ -1013,7 +1020,7 @@ impl State {
                 .filter_map(|&h| crate::descriptor::heap(h as This).host())
                 .map(|h| Some(h.heap.clone()))
                 .collect();
-            if memory_heap && let Some(h) = crate::memory::heap() {
+            if want[0] == MEMORY_HEAP && let Some(h) = crate::memory::heap() {
                 heaps.insert(0, Some(h.heap.clone()));
             }
             if want[1] == SAMPLERS_OURS {
@@ -2048,6 +2055,13 @@ mod tests {
         );
         // A title sampler heap stays whatever the views are.
         assert_eq!(State::wanted([0, 0x20], true), [MEMORY_HEAP, 0x20]);
+        // No title view heap and no title memory read: ours still, or the
+        // signature is set with no view heap bound (#2894).
+        assert_eq!(
+            State::wanted([0, 0], false),
+            [MEMORY_HEAP, SAMPLERS_OURS]
+        );
+        assert_eq!(State::wanted([0, 0x20], false), [MEMORY_HEAP, 0x20]);
     }
 
     /// `host_state_lost` records a pair `wanted` can never make, so the next
