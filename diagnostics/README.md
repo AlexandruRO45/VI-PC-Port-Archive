@@ -1,5 +1,9 @@
 # Diagnostic logs
 
+The two full timing logs listed below exceed the repository's 512 KiB per-file
+asset-policy limit. They are not included in this checkout; the run metadata
+is retained for reference. Keep full diagnostic logs outside the repository.
+
 Logs of short diagnostics runs on the test machine (Windows 11, Intel i7-14700KF, NVIDIA RTX 4070
 12 GB, 32 GB RAM), for people who want to suggest changes from real numbers.
 

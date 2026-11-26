@@ -94,7 +94,7 @@ numbers are estimates until a run carries them.**
   frame-rate change (those passes cost under 1 ms of card time a frame on the test machine).
   Whether shadowed areas come out lit by the sky instead of black is not known until it runs.
   Also pull request #1141 (`VICTORY_WAVE_WIDE=last`, opt-in).
-- `diagnostics/timing-run-295s-2026-11-25.txt`: a 295 s timing run with breadcrumbs.
+- A 295 s timing run with breadcrumbs is documented in `diagnostics/README.md`.
 
 ### Before that (2026-11-25, night UTC)
 
@@ -148,7 +148,7 @@ Tested on the machine above, first rooms, at like draw counts (runs 274 and 275)
   gives 0 for the one outside; what the card does is not tested.
 - **The card was lost twice**: run 276 after 6 minutes (two driver events, then a hang) and run 277
   after 49 minutes (device removed with no driver event, 8 ms after a sweep let go 150 texture
-  copies). Causes not known. `diagnostics/` holds a scrubbed log of a short run with
+  copies). Causes not known. `diagnostics/README.md` documents a short run with
   `VICTORY_GPU_TIMING=1` and `VICTORY_D3D12_DRED=1` for anyone who wants real numbers.
 - **`VICTORY_ABSENT_ONCE=1|alt`** (off): a block of view memory found unmapped is not asked of
   Windows again for 100 ms. Outdoors those questions were 44 ms a frame of the submitting thread.
