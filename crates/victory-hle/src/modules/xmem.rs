@@ -443,14 +443,11 @@ fn shown_at(pages: &[usize]) -> Vec<usize> {
         .collect()
 }
 
-/// Reports writes into physical pages through our own views at every title
-/// view showing them (DirectStorage's page destinations).
-fn report_written(shown: &[usize]) {
-    for &page in shown {
-        #[cfg(test)]
-        REPORTED.with(|r| r.borrow_mut().push(page));
-        drop(victory_gpu::kernel_will_write(page, PAGE));
-    }
+/// Tells the GPU write watch that pages are about to be written through our
+/// own views. Returns write-watch guards that stay alive until dropped, so
+/// the pages stay open during the write itself.
+fn report_written(shown: &[usize]) -> Vec<victory_gpu::KernelWrite> {
+    shown.iter().map(|&page| victory_gpu::kernel_will_write(page, PAGE)).collect()
 }
 
 #[cfg(test)]
@@ -636,6 +633,9 @@ pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> boo
     let Some(runs) = runs(pages, offset, data.len()) else {
         return false;
     };
+    let shown = shown_at(pages.get(offset / PAGE..(offset + data.len()).div_ceil(PAGE)).unwrap_or(&[]));
+    // Tell the watch before writing; guards stay alive during the write.
+    let _writing = report_written(&shown);
     let (mut within, mut done) = (offset % PAGE, 0);
     for (slice, n) in &runs {
         let Some(mut view) = View::map(slice, *n) else {
@@ -645,8 +645,15 @@ pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> boo
         view.bytes()[within..within + k].copy_from_slice(&data[done..done + k]);
         (within, done) = (0, done + k);
     }
-    // Where the pages show once written (see `PageWindow`).
-    report_written(&shown_at(pages.get(offset / PAGE..(offset + data.len()).div_ceil(PAGE)).unwrap_or(&[])));
+    // Post-write: report at current views (title may have remapped during
+    // the write). Guards are dropped immediately - the write is synchronous.
+    let shown_after = shown_at(pages.get(offset / PAGE..(offset + data.len()).div_ceil(PAGE)).unwrap_or(&[]));
+    for &addr in &shown_after {
+        #[cfg(test)]
+        REPORTED.with(|r| r.borrow_mut().push(addr));
+        drop(victory_gpu::kernel_will_write(addr, PAGE));
+    }
+    // _writing dropped here, after the write.
     true
 }
 
@@ -664,11 +671,23 @@ pub(crate) struct PageWindow {
     /// the page there before the bytes landed would never hear of them. An
     /// address that stops showing a page meanwhile was told by the unmap.
     pages: Vec<usize>,
+    /// Write-watch guards held open while the window is live.
+    _writing: Vec<victory_gpu::KernelWrite>,
 }
 
 impl Drop for PageWindow {
     fn drop(&mut self) {
-        report_written(&shown_at(&self.pages));
+        // Post-write: report writes at the title views currently showing
+        // these pages (commit 29210929). A title may map a page at a new
+        // view while the window is open; that view must hear of the write.
+        let shown = shown_at(&self.pages);
+        for &addr in &shown {
+            #[cfg(test)]
+            REPORTED.with(|r| r.borrow_mut().push(addr));
+            drop(victory_gpu::kernel_will_write(addr, PAGE));
+        }
+        // Drop pre-write guards last: keep the pages open during the write itself.
+        drop(std::mem::take(&mut self._writing));
     }
 }
 
@@ -689,11 +708,13 @@ pub(crate) fn page_window(pages: &[usize], offset: usize, len: usize) -> Option<
     let [(slice, n)] = runs.as_slice() else {
         return None;
     };
+    let shown = shown_at(pages.get(offset / PAGE..(offset + len).div_ceil(PAGE)).unwrap_or(&[]));
     Some(PageWindow {
         view: View::map(slice, *n)?,
         within: offset % PAGE,
         len,
         pages: pages.get(offset / PAGE..(offset + len).div_ceil(PAGE)).unwrap_or(&[]).to_vec(),
+        _writing: report_written(&shown),
     })
 }
 
