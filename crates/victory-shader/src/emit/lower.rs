@@ -289,6 +289,9 @@ struct Lower<'a> {
     /// With `exchange`: VGPR values every lane holds alike ([`lane_uniform`]); a first-lane
     /// read of one needs nothing from the other host wave.
     uniform: HashSet<Value>,
+    /// With `exchange`: VGPR values built from scalars alone, and those a guarded write went
+    /// into ([`scalar_built`]).
+    built: (HashSet<Value>, HashSet<Value>),
     /// With `exchange`: the wave ORs that only steer a loop over each lane's own bits, which
     /// a host wave takes over its own lanes wherever they stand ([`super::own_bits`]).
     own_bits: super::own_bits::OwnBits,
@@ -533,6 +536,113 @@ fn lane_uniform(p: &Program, st: &Structured, all: &[bool]) -> HashSet<Value> {
         }
     }
     same
+}
+
+/// VGPR values built from scalars alone (`all` is [`all_lane_blocks`]): VALU results, LDS and
+/// buffer loads whose every VGPR input is such a value, and phis of them at a loop header or
+/// where every predecessor is a block all lanes run. Guards are allowed, which [`lane_uniform`]
+/// refuses: a lane that wrote the value holds what every other writing lane does. With them,
+/// the values a guarded write (or one of its inputs) made, which a lane outside that guard may
+/// still hold from before.
+///
+/// A first-lane read of such a value in a branch only some lanes take is the console
+/// compiler's scalar copy of a value it proved the same in every active lane (a prefix of
+/// per-wave totals read back from LDS in a loop, say): the host wave's own first lane is
+/// exact, with nothing asked of the other half.
+fn scalar_built(p: &Program, st: &Structured, all: &[bool]) -> (HashSet<Value>, HashSet<Value>) {
+    let is_mask = |v: Value| st.masks.contains_key(&v) || st.highs.contains_key(&v);
+    let order = crate::ir::reverse_postorder(&p.blocks);
+    let mut rank = vec![usize::MAX; p.blocks.len()];
+    for (i, &b) in order.iter().enumerate() {
+        rank[b] = i;
+    }
+    // each candidate value with the VGPR values it is made of
+    let mut deps: HashMap<Value, Vec<Value>> = HashMap::new();
+    let mut guarded: HashSet<Value> = HashSet::new();
+    for &b in &order {
+        let block = &p.blocks[b];
+        let whole = block.preds.iter().all(|&q| all.get(q).copied().unwrap_or(false));
+        let header = block.preds.iter().any(|&q| rank[q] >= rank[b]);
+        for phi in &block.phis {
+            if matches!(phi.reg, Reg::V(_)) && (whole || header) {
+                deps.insert(phi.value, phi.args.clone());
+            }
+        }
+        for (i, inst) in block.insts.iter().enumerate() {
+            let name = inst.name();
+            // the operands read (not the old value a guarded write keeps outside its lanes)
+            let ops: Vec<Operand> = match &inst.fields {
+                Fields::Valu(v)
+                    if v.dpp.is_none()
+                        && v.sdwa.is_none()
+                        && !name.starts_with("v_mbcnt")
+                        && !name.starts_with("v_cmpx")
+                        && !name.contains("lane") =>
+                {
+                    v.src.clone()
+                }
+                Fields::Ds { addr, data, .. } if name.starts_with("ds_read") || name.starts_with("ds_load") => {
+                    addr.iter().chain(data).copied().collect()
+                }
+                _ => continue,
+            };
+            let mut inputs = Vec::new();
+            let mut mask_read = false;
+            for op in &ops {
+                match *op {
+                    Operand::Vector { reg, dwords } => {
+                        for r in reg..reg.saturating_add(dwords.max(1)) {
+                            match inst.read(Reg::V(r)) {
+                                Some(x) => inputs.push(x),
+                                None => mask_read = true,
+                            }
+                        }
+                    }
+                    Operand::Scalar { code, .. } if code != NULL => {
+                        mask_read |= inst.read(Reg::S(code)).is_some_and(is_mask);
+                    }
+                    _ => {}
+                }
+            }
+            if mask_read {
+                continue;
+            }
+            for &(r, x) in &inst.writes {
+                if matches!(r, Reg::V(_)) {
+                    deps.insert(x, inputs.clone());
+                    if st.guards[b][i].is_some() {
+                        guarded.insert(x);
+                    }
+                }
+            }
+        }
+    }
+    // the largest set closed under its inputs (loop-carried values need it)
+    let mut built: HashSet<Value> = deps.keys().copied().collect();
+    loop {
+        let out: Vec<Value> =
+            built.iter().copied().filter(|v| !deps[v].iter().all(|d| built.contains(d))).collect();
+        if out.is_empty() {
+            break;
+        }
+        for v in out {
+            built.remove(&v);
+        }
+    }
+    // a guarded write anywhere in a value's making
+    loop {
+        let more: Vec<Value> = built
+            .iter()
+            .copied()
+            .filter(|v| !guarded.contains(v) && deps[v].iter().any(|d| guarded.contains(d)))
+            .collect();
+        if more.is_empty() {
+            break;
+        }
+        guarded.extend(more);
+    }
+    guarded.retain(|v| built.contains(v));
+    (built, guarded)
 }
 
 /// What a register value holds, for [`wave_local`].
@@ -1562,6 +1672,10 @@ impl<'a> Lower<'a> {
             uniform: match &exchange {
                 Some((_, false, all)) if !LOCAL_WAVES.get() => lane_uniform(p, x.st, all),
                 _ => HashSet::new(),
+            },
+            built: match &exchange {
+                Some((_, false, all)) if !LOCAL_WAVES.get() => scalar_built(p, x.st, all),
+                _ => Default::default(),
             },
             own_bits: match &exchange {
                 Some((_, false, _)) if !LOCAL_WAVES.get() && own_bits_on() => {
@@ -7685,6 +7799,16 @@ impl<'a> Lower<'a> {
                         // scalars this way, inside a loop whose exit is per console wave).
                         static OWN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
                         if *OWN.get_or_init(|| std::env::var_os("VICTORY_FIRSTLANE_OWN").is_some_and(|v| v == "1")) {
+                            return int(self, mine);
+                        }
+                        // A value built from scalars alone, the same in every lane that holds
+                        // it ([`scalar_built`]); one a guarded write made only inside a branch
+                        // (lanes past its end may hold an older one).
+                        if let Some(&Operand::Vector { reg, .. }) = v.src.first()
+                            && let Some(x) = inst.read(Reg::V(reg))
+                            && self.built.0.contains(&x)
+                            && (guard.is_some() || !self.built.1.contains(&x))
+                        {
                             return int(self, mine);
                         }
                         need(self.cur_ir);
