@@ -26,8 +26,9 @@ mod bvh;
 type Why = &'static str;
 
 /// A loop's parked lanes ([`Lower::parked`]): the header's phi, its
-/// incoming (value, DXIL block) pairs, and the loop's last block in RPO.
-type Parked = (V, Vec<(V, usize)>, usize);
+/// incoming (value, DXIL block) pairs, and per IR block whether it is in
+/// the loop (its natural body, which the header dominates).
+type Parked = (V, Vec<(V, usize)>, Vec<bool>);
 
 #[derive(Debug, Clone, Copy)]
 enum Val {

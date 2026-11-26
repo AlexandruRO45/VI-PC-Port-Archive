@@ -19,12 +19,38 @@ impl<'a> Lower<'a> {
         let loops = self.barrier_loops(order);
         let headers: Vec<usize> = self.counters.keys().copied().collect();
         for h in headers {
-            let Some(&(_, last, _)) = loops.iter().find(|l| l.0 == h) else {
+            // The natural loop: the header and every block reaching one of
+            // its latches without passing it. Only those may read the
+            // header's phi (an RPO range also holds blocks beside the loop,
+            // which the header does not dominate).
+            let mut body = vec![false; self.x.p.blocks.len()];
+            body[h] = true;
+            let mut todo: Vec<usize> = loops.iter().filter(|l| l.0 == h).map(|l| l.1).collect();
+            if todo.is_empty() {
                 continue;
-            };
+            }
+            let latches = todo.clone();
+            while let Some(x) = todo.pop() {
+                if body[x] || self.block[x].is_none() {
+                    continue;
+                }
+                body[x] = true;
+                todo.extend(self.x.p.blocks[x].preds.iter().copied());
+            }
+            // Only a loop one of whose latches parks lanes: its exit decided
+            // for the wave, the other side leaving the loop. Every other
+            // loop is lowered as before (no phi, no guard more).
+            let parks = latches.iter().any(|&l| {
+                self.wave_branches.contains_key(&l)
+                    && matches!(self.x.st.exits[l], LaneExit::Branch { taken, not_taken, .. }
+                        if (taken == h && !body[not_taken]) || (not_taken == h && !body[taken]))
+            });
+            if !parks {
+                continue;
+            }
             let blk = self.block[h].expect("reachable");
             let phi = self.s.m.phi(blk, self.s.t.i1);
-            self.parked.insert(h, (phi, Vec::new(), last));
+            self.parked.insert(h, (phi, Vec::new(), body));
         }
     }
 
@@ -34,8 +60,8 @@ impl<'a> Lower<'a> {
         let parked: Vec<V> = self
             .parked
             .iter()
-            .filter(|&(&h, &(_, _, last))| self.rpo[h] <= self.rpo[b] && self.rpo[b] <= self.rpo[last])
-            .map(|(_, &(phi, _, _))| phi)
+            .filter(|(_, p)| p.2[b])
+            .map(|(_, p)| p.0)
             .collect();
         let mut guard = guard;
         for phi in parked {
@@ -76,9 +102,23 @@ impl<'a> Lower<'a> {
             .map_err(|w| unsupported(offset, w))?;
         let i1 = self.s.t.i1;
         let (name, opcode) = if all { ("waveAllTrue", 114) } else { ("waveAnyTrue", 113) };
+        // Parked lanes (`Lower::parked`) are out of the wave's test, as the
+        // console's EXEC leaves them out: their frozen registers may still
+        // say "go on", which would keep the wave in the loop for ever. Any
+        // lane: only unparked ones count; all lanes: parked ones agree.
+        let voting = if all {
+            let c = self.cur;
+            let yes = self.s.m.bool(true);
+            let against = self.s.m.bin(c, Bin::Xor, lane, yes);
+            let against = self.unparked(b, Some(against)).expect("a guard");
+            let c = self.cur;
+            self.s.m.bin(c, Bin::Xor, against, yes)
+        } else {
+            self.unparked(b, Some(lane)).expect("a guard")
+        };
         let cond = self
             .s
-            .op(self.cur, name, Attr::NoUnwind, i1, opcode, &[lane]);
+            .op(self.cur, name, Attr::NoUnwind, i1, opcode, &[voting]);
         self.s.flags |= flags::WAVE_OPS;
         let back = |l: &Self, to: usize| l.counters.contains_key(&to) && l.rpo[to] <= l.rpo[b];
         let cond = if back(self, taken) {
@@ -96,9 +136,7 @@ impl<'a> Lower<'a> {
             .into_iter()
             .find(|&(round, out, _)| {
                 back(self, round)
-                    && self.parked.get(&round).is_some_and(|p| {
-                        !(self.rpo[round] <= self.rpo[out] && self.rpo[out] <= self.rpo[p.2])
-                    })
+                    && self.parked.get(&round).is_some_and(|p| !p.2[out])
             });
         if let Some((header, _, leaves_when_taken)) = latch {
             let c = self.cur;
