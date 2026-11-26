@@ -456,7 +456,16 @@ impl Shadow {
     /// With `marked`, nothing is kept: the pages are armed instead, so that
     /// a title write there before the copy-back keeps the page's bytes from
     /// before it ([`crate::watch::Tracked::arm`]).
-    pub(crate) fn writing(&self, address: usize, len: usize, marked: bool) {
+    ///
+    /// In video memory, the range first comes back from the GPU side
+    /// ([`bring_back`]), where it is not in a snapshot yet: earlier shaders
+    /// may have written it through views no list declared or marked (a
+    /// shader without write marks), and the copy-back takes what differs
+    /// from the snapshot for this submission's writes. Taken from the system
+    /// memory side alone, the snapshot missed such a write, and the
+    /// copy-back put it into title memory over a title write made
+    /// meanwhile, which main never does (there both sides are one buffer).
+    pub(crate) fn writing(self: &Arc<Self>, address: usize, len: usize, marked: bool) {
         self.pending
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -468,6 +477,11 @@ impl Shadow {
         let (from, to) = self.inside(address, len);
         if from >= to {
             return;
+        }
+        if self.vram.is_some() && !self.snapshotted(from, to) {
+            let runs = [(self.clone(), self.start as usize + from, to - from)];
+            count(&runs, crate::vram::Pulled::Snapshot);
+            bring_back(&runs);
         }
         // SAFETY: inside the mapping.
         let host = |a: usize, b: usize| unsafe { std::slice::from_raw_parts(self.data.add(a), b - a) };
@@ -501,6 +515,15 @@ impl Shadow {
         }
         grown.extend_from_slice(host(at, end));
         segments.insert(first, (start, grown));
+    }
+
+    /// Whether one snapshot segment holds offsets `[from, to)` already.
+    fn snapshotted(&self, from: usize, to: usize) -> bool {
+        let before = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        before
+            .0
+            .iter()
+            .any(|(at, bytes)| *at <= from && to <= at + bytes.len())
     }
 
     /// `[address, address + len)` expanded outward to 64 KiB page
@@ -2014,6 +2037,63 @@ pub(crate) mod tests {
         unregister(p, p as u64);
     }
 
+    /// A shader wrote a byte through a view no list declared or marked (a
+    /// shader without write marks); later the title writes that byte while
+    /// a submission whose shaders write another byte of the range declares
+    /// it unmarked. At its copy-back the title's byte stays, as where both
+    /// sides are one buffer: the snapshot holds the earlier shader's byte,
+    /// so it is not taken for this submission's write. In video memory
+    /// (`=2`) and without it (`0`) alike.
+    fn an_old_unmarked_write_does_not_reach_title_memory_late(level: &str) {
+        if !in_child(
+            &format!(
+                "shadow::tests::an_old_unmarked_write_does_not_reach_title_memory_late_at_{level}"
+            ),
+            level,
+        ) {
+            return;
+        }
+        let host = host().expect("a host GPU");
+        *FAKE.lock().unwrap() = Some((1 << 30, 0));
+        let len = 2 * PAGE;
+        let p = crate::watch::tests::pool(2);
+        register(p, p as u64, len as u64);
+        let copy = find(p as u64, len as u64).unwrap();
+        let class = if level == "2" {
+            Class::VramWritten
+        } else {
+            Class::System
+        };
+        assert_eq!(copy.class(), class);
+        copy.update(p, len);
+        // The earlier shader's write: on the GPU side only, nothing declared.
+        copy.write_gpu(p as u64 + 10, &[0xaa]);
+        let list = host.new_list().unwrap();
+        copy.refresh(&list, p as u64, len as u64);
+        copy.gpu_writes(&list, p as u64, PAGE as u64, false);
+        let c = copy.clone();
+        list.defer_host(move || {
+            // The title writes the byte, this submission's shader another.
+            write_title(p + 10, 0x77);
+            c.write_gpu(p as u64 + 20, &[0xbb]);
+        });
+        list.close();
+        host.execute(&[&list]);
+        assert_eq!(title(p + 10), 0x77, "the title's byte stays");
+        assert_eq!(title(p + 20), 0xbb, "this submission's write goes back");
+        unregister(p, p as u64);
+    }
+
+    #[test]
+    fn an_old_unmarked_write_does_not_reach_title_memory_late_at_2() {
+        an_old_unmarked_write_does_not_reach_title_memory_late("2");
+    }
+
+    #[test]
+    fn an_old_unmarked_write_does_not_reach_title_memory_late_at_0() {
+        an_old_unmarked_write_does_not_reach_title_memory_late("0");
+    }
+
     /// With main's `VICTORY_COPIES_IN_VIDEO_MEMORY` (diagnostics) set too
     /// (review of #2993): the system memory side of a copy in video memory,
     /// and a copy the budget refused, are in system memory (write-back),
@@ -2063,8 +2143,8 @@ pub(crate) mod tests {
     /// What comes back from video memory after a submission: of a range
     /// declared written and marked, its marked pages alone, not the whole
     /// range (the CPU reads nothing else of it); of a range declared
-    /// unmarked, the whole range, once. Counted by why (the diagnostics
-    /// line's split).
+    /// unmarked, the whole range, once, and once before its snapshot.
+    /// Counted by why (the diagnostics line's split).
     #[test]
     fn marked_ranges_of_copies_in_video_memory_come_back_by_their_marked_pages() {
         use crate::vram::{PULLED, PULLED_BY, Pulled};
@@ -2088,6 +2168,7 @@ pub(crate) mod tests {
                 PULLED[0].load(Relaxed),
                 PULLED_BY[Pulled::Declared as usize].load(Relaxed),
                 PULLED_BY[Pulled::Marked as usize].load(Relaxed),
+                PULLED_BY[Pulled::Snapshot as usize].load(Relaxed),
             ]
         };
         let run = |marked: bool, at: usize, byte: u8| {
@@ -2104,18 +2185,18 @@ pub(crate) mod tests {
             host.execute(&[&list]);
             assert_eq!(title(at), byte, "the shader's byte reached title memory");
             let after = pulled();
-            [0, 1, 2].map(|i| after[i] - before[i])
+            [0, 1, 2, 3].map(|i| after[i] - before[i])
         };
         let (page, all) = (PAGE as u64, len as u64);
         assert_eq!(
             run(true, p + PAGE + 10, 0x5a),
-            [page, 0, page],
+            [page, 0, page, 0],
             "the marked page alone, not the 4 pages declared"
         );
         assert_eq!(
             run(false, p + 2 * PAGE + 3, 0x6b),
-            [all, all, 0],
-            "an unmarked range whole, once"
+            [2 * all, all, 0, all],
+            "an unmarked range whole, once, and before its snapshot"
         );
         unregister(p, p as u64);
     }
