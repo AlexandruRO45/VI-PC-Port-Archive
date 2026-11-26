@@ -99,7 +99,8 @@ impl Drop for Changed {
 /// Pages (page numbers) whose bytes a tracker keeps when they are first
 /// written after it took them, and those bytes: while shaders may be
 /// writing its copy of them, what it held before (`crate::shadow`'s
-/// copy-back of marked pages).
+/// copy-back of marked pages), with what the copy took of the page since
+/// laid over them ([`Tracked::refreshed`]).
 #[derive(Default)]
 struct Saved {
     /// The armed pages as runs `[first, last)`, sorted, apart and not
@@ -293,10 +294,19 @@ fn aliases(g: &Guards, pages: &[usize]) -> Vec<(usize, usize)> {
         .collect()
 }
 
-/// Guards the other mappings of taken pages.
-fn guard_aliases(g: &mut Guards, pairs: &[(usize, usize)]) {
+/// Guards the other mappings of taken pages, returning those that still
+/// have an unguarded mapping (cannot be taken yet).
+fn guard_aliases(g: &mut Guards, pairs: &[(usize, usize)]) -> BTreeSet<usize> {
+    if pairs.is_empty() {
+        return BTreeSet::new();
+    }
     let others: Vec<usize> = pairs.iter().map(|&(_, a)| a).collect();
-    protect(g, &others);
+    let guarded: BTreeSet<usize> = protect(g, &others).into_iter().collect();
+    pairs
+        .iter()
+        .filter(|(_, a)| !guarded.contains(a))
+        .map(|&(p, _)| p)
+        .collect()
 }
 
 /// Tracks `[start, start + len)` if it is the runtime's GPU memory (every
@@ -481,7 +491,7 @@ impl Tracked {
         if pages.is_empty() {
             return (Vec::new(), Vec::new());
         }
-        let whole: Vec<usize> = pages
+        let mut whole: Vec<usize> = pages
             .iter()
             .copied()
             .filter(|&p| (p * PAGE).max(self.start) >= from && ((p + 1) * PAGE).min(self.end) <= to)
@@ -497,9 +507,10 @@ impl Tracked {
         #[cfg(feature = "diagnostics")]
         let asked = Timed(std::time::Instant::now(), crate::copystat::C::AliasUs);
         let others = aliases(&g, &whole);
-        guard_aliases(&mut g, &others);
+        let unguarded = guard_aliases(&mut g, &others);
         #[cfg(feature = "diagnostics")]
         drop(asked);
+        whole.retain(|p| !unguarded.contains(p));
         let mut unmapped = Vec::new();
         for page in protect_noting(&mut g, &whole, &mut unmapped) {
             changed.remove(&page);
@@ -535,8 +546,13 @@ impl Tracked {
         let mut g = guards();
         let mut changed = self.changed.0.lock().unwrap_or_else(|e| e.into_inner());
         let others = aliases(&g, pages);
-        guard_aliases(&mut g, &others);
-        for page in protect(&mut g, pages) {
+        let unguarded = guard_aliases(&mut g, &others);
+        let pages: Vec<usize> = pages
+            .iter()
+            .copied()
+            .filter(|p| !unguarded.contains(p))
+            .collect();
+        for page in protect(&mut g, &pages) {
             changed.remove(&page);
             self.changed.taken(page);
         }
@@ -594,9 +610,31 @@ impl Tracked {
     }
 
     /// The bytes page `page` (a page number) held when it was first written
-    /// since it was taken, if it was armed then (and so changed).
+    /// since it was taken, if it was armed then (and so changed), with what
+    /// the copy took of it since: the copy's bytes before the submission.
     pub(crate) fn saved(&self, page: usize) -> Option<Box<[u8]>> {
         self.changed.1.lock().unwrap_or_else(|e| e.into_inner()).bytes.remove(&page)
+    }
+
+    /// The copy took `bytes` at title address `from`: any saved bytes of pages
+    /// it covers take them too, so marked copy-back neither takes a partial
+    /// refresh for the GPU's nor drops a shader write back to the pre-fault byte.
+    pub(crate) fn refreshed(&self, from: usize, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        let mut saved = self.changed.1.lock().unwrap_or_else(|e| e.into_inner());
+        if saved.bytes.is_empty() {
+            return;
+        }
+        let to = from + bytes.len();
+        for page in from / PAGE..to.div_ceil(PAGE) {
+            if let Some(before) = saved.bytes.get_mut(&page) {
+                let (a, b) = (from.max(page * PAGE), to.min((page + 1) * PAGE));
+                before[a - page * PAGE..b - page * PAGE]
+                    .copy_from_slice(&bytes[a - from..b - from]);
+            }
+        }
     }
 }
 
@@ -674,26 +712,39 @@ fn protect_noting(g: &mut Guards, pages: &[usize], unmapped_pages: &mut Vec<usiz
 /// in every tracker holding them. True if one of `[first, last)` was
 /// guarded.
 fn changed(g: &mut Guards, first: usize, last: usize, save: bool) -> bool {
-    let guarded = changed_here(g, first, last, save);
+    let guarded = g.protected.range(first..last).next().is_some();
     let others: Vec<usize> = g.alias_of.range(first..last).flat_map(|(_, o)| o.iter().copied()).collect();
     #[cfg(feature = "diagnostics")]
     {
         let held = others.iter().filter(|p| g.holders.contains_key(p)).count();
         crate::copystat::add(crate::copystat::C::AliasMarks, held as u64);
     }
+    // Every page's bytes are saved before any is opened: once a page is
+    // open, a write by another thread lands without a fault, and a save
+    // after it would keep that write as the page's old bytes.
+    mark_changed(g, first, last, save);
+    for &page in &others {
+        mark_changed(g, page, page + 1, save);
+    }
+    open_guarded(g, first, last);
     for page in others {
-        changed_here(g, page, page + 1, save);
+        open_guarded(g, page, page + 1);
     }
     guarded
 }
 
-/// [`changed`] of `[first, last)` alone. With `save`, before the write
-/// lands: trackers armed for a page they had taken keep its bytes.
-fn changed_here(g: &mut Guards, first: usize, last: usize, save: bool) -> bool {
+/// Gives write access back to the pages of `[first, last)` we guarded.
+fn open_guarded(g: &mut Guards, first: usize, last: usize) {
     let guarded: Vec<usize> = g.protected.range(first..last).copied().collect();
-    for &page in &guarded {
+    for page in guarded {
         open(g, page);
     }
+}
+
+/// Marks `[first, last)` changed in the trackers holding its pages. With
+/// `save`, before the write lands: trackers armed for a page they had taken
+/// keep its bytes.
+fn mark_changed(g: &mut Guards, first: usize, last: usize, save: bool) {
     for (&page, holders) in g.holders.range(first..last) {
         for c in holders {
             let first_write = {
@@ -708,7 +759,6 @@ fn changed_here(g: &mut Guards, first: usize, last: usize, save: bool) -> bool {
         #[cfg(feature = "diagnostics")]
         g.written.insert(page);
     }
-    !guarded.is_empty()
 }
 
 /// At each presented frame (diagnostics): counts the tracked pages written
@@ -824,8 +874,13 @@ pub fn title_memory_aliased(at: usize, others: &[usize]) {
             }
         }
     }
-    if others.iter().any(|&o| g.protected.contains(&(o / PAGE))) {
-        protect(&mut g, &[page]);
+    // If the new mapping cannot be guarded (a write the guards do not see is
+    // under way through it), the page is changed; its bytes now may hold that
+    // write already, so nothing is saved of them.
+    if others.iter().any(|&o| g.protected.contains(&(o / PAGE)))
+        && protect(&mut g, &[page]).is_empty()
+    {
+        changed(&mut g, page, page + 1, false);
     }
 }
 
@@ -1346,6 +1401,40 @@ pub(crate) mod tests {
         // SAFETY: a page of our pool, guarded: the handler opens it.
         unsafe { ((p + PAGE + 8) as *mut u8).write_volatile(1) };
         assert!(copy.changed(p / PAGE + 1) && texture.changed(p / PAGE + 1), "a title write marks both");
+    }
+
+    /// A write under way on another mapping of a page keeps the page open
+    /// there, so taking the page (or marking it taken) through its tracked
+    /// mapping must leave it changed and keep what was saved of it; aliasing
+    /// a busy mapping to a guarded one must mark the guarded page changed.
+    #[test]
+    fn a_busy_alias_leaves_the_page_changed_and_keeps_saved_bytes() {
+        let (a, b) = twin_views(1);
+        let t = track(a, PAGE, true).expect("views are tracked");
+        assert_eq!(t.take(a, a + PAGE), [(a, a + PAGE)]);
+        t.arm(a, a + PAGE);
+        let write = writing(b, 16);
+        assert!(t.changed(a / PAGE));
+        assert_eq!(t.take(a, a + PAGE), [(a, a + PAGE)]);
+        assert!(t.changed(a / PAGE), "take must leave the page changed");
+        t.taken(&[a / PAGE]);
+        assert!(t.changed(a / PAGE), "taken must leave the page changed");
+        // SAFETY: the second view of the page, kept open by `write`.
+        unsafe { (b as *mut u32).write_volatile(0x1234) };
+        assert_eq!(t.take(a, a + PAGE), [(a, a + PAGE)]);
+        drop(write);
+        let saved = t.saved(a / PAGE).expect("saved bytes survive");
+        assert_eq!(&saved[..4], &[0, 0, 0, 0]);
+        assert_eq!(t.take(a, a + PAGE), [(a, a + PAGE)]);
+        assert!(t.take(a, a + PAGE).is_empty(), "taken once the write ended");
+        let (c, _) = twin_views(1);
+        let busy_c = writing(c, 16);
+        title_memory_aliased(c, &[a]);
+        assert!(
+            t.changed(a / PAGE),
+            "aliasing a busy page marks the tracked one"
+        );
+        drop(busy_c);
     }
 
     /// A write or mapping that runs past the end of the address space (a
