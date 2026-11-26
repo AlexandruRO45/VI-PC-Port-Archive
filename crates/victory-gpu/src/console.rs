@@ -82,7 +82,7 @@ fn dedicated_video_memory() -> Option<usize> {
         if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0 {
             return None;
         }
-        Some(desc.DedicatedVideoMemory as usize)
+        Some(desc.DedicatedVideoMemory)
     };
     // SAFETY: plain factory and adapter queries, with no side effects; the
     // factory and adapter are freed on drop.
