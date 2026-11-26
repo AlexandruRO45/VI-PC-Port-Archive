@@ -88,6 +88,8 @@ pub(crate) struct Parts<'a> {
     /// Writes through buffer views mark their pages (`emit`, "Write marks").
     pub view_marks: bool,
     pub host_wave32: bool,
+    /// [`super::Options::wave32_approx`].
+    pub wave32_approx: bool,
 }
 
 enum Stop {
@@ -1207,8 +1209,11 @@ impl<'a> Lower<'a> {
                 let r = self.s.m.bin(c, Bin::And, r, low);
                 // Lane `hi` runs the section on the console even where it is
                 // elsewhere on the host; there it holds the identity. On a
-                // host of 32-lane waves the scan stays within the half: the
-                // ballot is asked about the lane `read_lane` reads.
+                // host of 32-lane waves the scan stays within the half (the
+                // ballot is asked about the lane `read_lane` reads): approximate.
+                if self.host_wave() < self.wave() && !self.x.wave32_approx {
+                    return Err("a cross-half wave scan on a 32-lane host");
+                }
                 let i32t = self.s.t.i32;
                 let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
                 let b = self
@@ -1863,7 +1868,10 @@ impl<'a> Lower<'a> {
                 self.balloting.remove(&lo);
                 let bit = bit?;
                 // On a host of 32-lane waves the half's own lanes: its high
-                // dword is 0 (`Parts::host_wave32`).
+                // dword is 0 (`Parts::host_wave32`): approximate.
+                if self.host_wave() < self.wave() && !self.x.wave32_approx {
+                    return Err("a 64-bit wave mask read as data on a 32-lane host");
+                }
                 let i32t = self.s.t.i32;
                 let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
                 let r = self
@@ -2930,7 +2938,10 @@ impl<'a> Lower<'a> {
             return Err("a cross-lane operation outside compute");
         }
         // On a host of 32-lane waves, lanes read lanes of their own half
-        // (`Parts::host_wave32`, `Lower::host_lane`).
+        // (`Parts::host_wave32`, `Lower::host_lane`): approximate.
+        if !quad && self.host_wave() < self.wave() && !self.x.wave32_approx {
+            return Err("a cross-half operation on a 32-lane host");
+        }
         debug_assert!(self.s.threads.is_none() || self.console_lanes);
         self.s.flags |= flags::WAVE_OPS;
         Ok(())
@@ -11045,6 +11056,7 @@ mod tests {
             mesh_stride: 0,
             view_marks: false,
             host_wave32: false,
+            wave32_approx: false,
         })
         .map(|_| ())
     }
@@ -11097,6 +11109,7 @@ mod tests {
             mesh_stride: 0,
             view_marks: false,
             host_wave32: false,
+            wave32_approx: false,
         })
     }
 
@@ -11318,6 +11331,7 @@ mod tests {
             mesh_stride: 0,
             view_marks: false,
             host_wave32: false,
+            wave32_approx: false,
         })
         .unwrap();
 
@@ -12241,6 +12255,7 @@ mod tests {
                 mesh_stride: 0,
                 view_marks: false,
                 host_wave32: false,
+                wave32_approx: false,
             })
             .unwrap();
             assert!(lowered.wave_ops);

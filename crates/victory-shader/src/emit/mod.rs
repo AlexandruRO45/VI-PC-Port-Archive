@@ -379,6 +379,11 @@ pub struct Options {
     /// e.g. NVIDIA GPUs). Wave64 compute programs without cross-half or
     /// single-wave LDS sharing are translated to run as two 32-lane waves.
     pub host_wave32: bool,
+    /// With `host_wave32`: also translate programs that read lanes or wave
+    /// masks across the two halves, or scan across them, each half acting
+    /// as a whole wave. Their results are approximate (a ballot counts 32
+    /// lanes at most); the default refuses them.
+    pub wave32_approx: bool,
 }
 
 /// Translates the vertex, pixel, compute or mesh program of a console
@@ -504,6 +509,7 @@ pub fn emit_with(
         mesh_stride,
         view_marks: options.view_marks,
         host_wave32: options.host_wave32,
+        wave32_approx: options.wave32_approx,
     };
     let l = match lower::lower(&parts(st, res)) {
         // Discarded lanes kept on as helpers can read what no surviving
@@ -1799,7 +1805,7 @@ mod tests {
     }
 
     #[test]
-    fn wave64_readlane_reads_its_own_half_on_wave32_host() {
+    fn wave64_cross_half_readlane_is_refused_unless_approximate_on_wave32_host() {
         // v_readlane_b32 s12, v5, 1; v_mov_b32 v3, s12; ds_write_b32 v0, v3; s_endpgm
         let words = [
             0xD760_000Cu32,
@@ -1832,9 +1838,17 @@ mod tests {
             host_wave32: true,
             ..Default::default()
         };
-        // Each 32-lane host wave stands for one half: lane 1 of its own.
+        let err = super::emit_with(&c, &native, &p, &st, &io, &res, opts)
+            .expect_err("cross-half v_readlane_b32 is refused by default on a 32-lane host");
+        assert!(err.to_string().contains("cross-half"), "unexpected refusal reason: {err}");
+        // Approximate: each 32-lane host wave stands for one half, lane 1 of
+        // its own.
+        let opts = super::Options {
+            wave32_approx: true,
+            ..opts
+        };
         super::emit_with(&c, &native, &p, &st, &io, &res, opts)
-            .expect("v_readlane_b32 translates on a 32-lane host");
+            .expect("v_readlane_b32 translates on a 32-lane host when approximate");
     }
 
     #[test]

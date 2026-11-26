@@ -65,14 +65,14 @@ fn build() -> &'static [u8; 32] {
             );
         }
         let wave32 = crate::host::host_wave32();
-        key(victory_shader::SOURCE_HASH, ENCODING, limit, wave32)
+        key(victory_shader::SOURCE_HASH, ENCODING, limit, wave32, crate::host::wave32_approx())
     })
 }
 
 /// This file, whose `encode` and `decode` define the entries.
 const ENCODING: &[u8] = include_bytes!("shader_cache.rs");
 
-fn key(translator: &str, encoding: &[u8], limit: u32, wave32: bool) -> [u8; 32] {
+fn key(translator: &str, encoding: &[u8], limit: u32, wave32: bool, approx: bool) -> [u8; 32] {
     let mut h = blake3::Hasher::new();
     h.update(translator.as_bytes());
     h.update(blake3::hash(encoding).as_bytes());
@@ -80,6 +80,9 @@ fn key(translator: &str, encoding: &[u8], limit: u32, wave32: bool) -> [u8; 32] 
     if wave32 {
         // Another translation of wave64 programs: other entries.
         h.update(b"host wave32");
+    }
+    if approx {
+        h.update(b"approximate halves");
     }
     *h.finalize().as_bytes()
 }
@@ -94,6 +97,7 @@ pub fn host_shader(container: &[u8]) -> (Result<HostShader, String>, bool) {
     let options = victory_shader::emit::Options {
         view_marks: true,
         host_wave32: crate::host::host_wave32(),
+        wave32_approx: crate::host::wave32_approx(),
     };
     let translate = |c: &[u8]| victory_shader::emit::translate_with(c, options).map_err(|e| e.to_string());
     match CACHE.get() {
@@ -490,12 +494,12 @@ mod tests {
     /// written before it is read.
     #[test]
     fn the_key_covers_translator_encoding_and_settings() {
-        let k = key("0123456789abcdef", b"encoding", 1 << 20, false);
-        assert_eq!(k, key("0123456789abcdef", b"encoding", 1 << 20, false));
-        assert_ne!(k, key("0123456789abcdee", b"encoding", 1 << 20, false));
-        assert_ne!(k, key("0123456789abcdef", b"encoding.", 1 << 20, false));
-        assert_ne!(k, key("0123456789abcdef", b"encoding", 1 << 19, false));
-        assert_ne!(k, key("0123456789abcdef", b"encoding", 1 << 20, true));
+        let k = key("0123456789abcdef", b"encoding", 1 << 20, false, false);
+        assert_eq!(k, key("0123456789abcdef", b"encoding", 1 << 20, false, false));
+        assert_ne!(k, key("0123456789abcdee", b"encoding", 1 << 20, false, false));
+        assert_ne!(k, key("0123456789abcdef", b"encoding.", 1 << 20, false, false));
+        assert_ne!(k, key("0123456789abcdef", b"encoding", 1 << 19, false, false));
+        assert_ne!(k, key("0123456789abcdef", b"encoding", 1 << 20, true, false));
         assert_eq!(
             *build(),
             key(
@@ -503,6 +507,7 @@ mod tests {
                 ENCODING,
                 victory_shader::emit::loop_limit(),
                 crate::host::host_wave32(),
+                crate::host::wave32_approx(),
             )
         );
         // The encoding part is this file as built.

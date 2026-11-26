@@ -200,6 +200,7 @@ fn build(
         mesh_stride: 0,
         view_marks: false,
         host_wave32: false,
+        wave32_approx: false,
     })
     .expect("lower");
     let shader = HostShader {

@@ -412,6 +412,7 @@ fn build_wave32_cs(pattern: MaskPattern, div: Divergence, op_words: &[u32]) -> H
         mesh_stride: 0,
         view_marks: false,
         host_wave32: false,
+        wave32_approx: false,
     })
     .expect("lower");
 

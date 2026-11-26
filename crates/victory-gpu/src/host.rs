@@ -140,6 +140,21 @@ pub(crate) fn host() -> Option<&'static Host> {
     .as_ref()
 }
 
+/// With [`host_wave32`]: `VICTORY_WAVE32_APPROX` also translates wave64
+/// programs that exchange across the two halves, each half acting as a whole
+/// wave (`victory_shader::emit::Options::wave32_approx`): approximate, off by
+/// default.
+pub(crate) fn wave32_approx() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = host_wave32() && crate::switch::on("VICTORY_WAVE32_APPROX");
+        if on {
+            tracing::warn!("VICTORY_WAVE32_APPROX: wave64 programs exchanging across halves run as two waves (approximate)");
+        }
+        on
+    })
+}
+
 /// Whether the host GPU runs compute waves of 32 lanes only (no
 /// `WaveSize(64)`: NVIDIA, Intel), so wave64 console programs must be
 /// translated for 32-lane waves (`victory_shader::emit::host_wave32`).
