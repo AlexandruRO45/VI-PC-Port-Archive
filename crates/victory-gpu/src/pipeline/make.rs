@@ -553,7 +553,12 @@ mod tests {
             .map(|n| {
                 std::thread::spawn(move || {
                     std::thread::sleep(budget * n / 4);
-                    let p = Pending::new(Vec::new(), None);
+                    let p = Pending::new(
+                        Vec::new(),
+                        None,
+                        #[cfg(feature = "diagnostics")]
+                        &[],
+                    );
                     let began = Instant::now();
                     wait_within(&WAITS, budget, &p, 3);
                     (began.duration_since(started), began.elapsed())
