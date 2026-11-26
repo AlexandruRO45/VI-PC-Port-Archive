@@ -118,11 +118,11 @@ pub fn run(
         Console::SeriesS => (victory_hle::console::Console::SeriesS, false),
         Console::Auto => {
             let (chosen, dedicated) = victory_gpu::console::profile_by_adapter();
-            println!(
-                "console        {} (auto: {} MiB of dedicated video memory)",
-                chosen.name(),
-                dedicated.map_or(0, |bytes| bytes >> 20)
+            let by = dedicated.map_or_else(
+                || "adapter memory unavailable".to_owned(),
+                |bytes| format!("{} MiB of dedicated video memory", bytes >> 20),
             );
+            println!("console        {} (auto: {by})", chosen.name());
             (chosen, true)
         }
     };
