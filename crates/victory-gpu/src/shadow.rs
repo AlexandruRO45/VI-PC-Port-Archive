@@ -761,6 +761,8 @@ pub(crate) struct Shadow {
     /// and the bytes from the buffer's first byte to `start` (the heap
     /// begins on a 64 KiB line; a title buffer need not).
     place: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64)>,
+    #[cfg(test)]
+    lazy_opted_in: bool,
 }
 
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
@@ -4271,6 +4273,8 @@ impl Shadow {
             deferred_count: AtomicUsize::new(0),
             resync_count: AtomicUsize::new(0),
             place: None,
+            #[cfg(test)]
+            lazy_opted_in: false,
         }
     }
 
@@ -5265,6 +5269,19 @@ impl Shadow {
             self.lazy_prepare_update(from, to, skip_busy);
         }
         if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
+            // The light refresh (`VICTORY_LIGHT_REFRESH`): nothing of the
+            // range was written that the copy does not hold, and the
+            // journal says so with nothing asked.
+            if crate::watch::light() && self.nothing_new(from, to) {
+                self.refresh_check(from, to);
+                #[cfg(feature = "diagnostics")]
+                {
+                    use crate::copystat::{C, add};
+                    add(C::Checked, (to - from) as u64);
+                    add(C::Unchanged, (to - from) as u64);
+                }
+                return 0;
+            }
             if let Some((now, written)) = crate::watch::writes(from, to, true) {
                 self.watched.store(1, Ordering::Relaxed);
                 let copied = self.copy_stale(from, to, now, &written);
@@ -5294,6 +5311,22 @@ impl Shadow {
             }
         }
         bytes
+    }
+
+    /// Whether [`Shadow::update_free`] of `[from, to)` would copy nothing,
+    /// known without asking the kernel or the guards
+    /// (`crate::watch::nothing_new`): the memory is watched, every page of
+    /// the range was taken, and none was noted written after it was.
+    /// `false` if the refresh would have to ask.
+    fn nothing_new(&self, from: usize, to: usize) -> bool {
+        if self.watched.load(Ordering::Relaxed) != 1
+            || self.deferred_count.load(Ordering::Acquire) != 0
+            || self.resync_count.load(Ordering::Acquire) != 0
+        {
+            return false;
+        }
+        let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+        crate::watch::nothing_new(from, to, self.start as usize / PAGE, &copied.at)
     }
 
     /// Diagnostic (`VICTORY_REFRESH_CHECK=1`; off by default): after a
@@ -6638,9 +6671,14 @@ static BACK_READS_TEST_OVERRIDE: AtomicU8 = AtomicU8::new(0);
 static LAZY_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 #[cfg(test)]
-struct LazyTestGuard {
+pub(crate) struct LazyTestGuard {
     _lock: std::sync::MutexGuard<'static, ()>,
     prev: u8,
+}
+
+#[cfg(test)]
+pub(crate) fn test_disable_lazy_copyback() -> LazyTestGuard {
+    LazyTestGuard::disable()
 }
 
 #[cfg(test)]
@@ -7778,6 +7816,10 @@ impl Shadow {
         if !lazy_copyback() || self.place.is_some() {
             return false;
         }
+        #[cfg(test)]
+        if !self.lazy_opted_in && std::env::var_os("VICTORY_LAZY_COPYBACK").is_none_or(|v| v != "1") {
+            return false;
+        }
         let page_addr = (self.start as usize).saturating_add(lo);
         if hi.saturating_sub(lo) != PAGE || !page_addr.is_multiple_of(PAGE) || hi > self.len as usize {
             return false;
@@ -8773,6 +8815,7 @@ void main(uint3 tid : SV_DispatchThreadID) {
         // SAFETY: live D3D12 buffer.
         let gpu = unsafe { buffer.GetGPUVirtualAddress() };
         let mut shadow = Shadow::new(buffer, data, gpu, addr, len);
+        shadow.lazy_opted_in = true;
         shadow.card = card;
         let shadow = Arc::new(shadow);
         if let Some(card) = &shadow.card {
@@ -9049,6 +9092,7 @@ void main(uint3 tid : SV_DispatchThreadID) {
             use windows_sys::Win32::Foundation::CloseHandle;
             use windows_sys::Win32::System::Memory::{MEMORY_MAPPED_VIEW_ADDRESS, UnmapViewOfFile};
             crate::watch::title_memory_remapped(self.addr(), self.len);
+            crate::watch::before_virtual_free(self.addr(), self.len);
             // SAFETY: unmapping our view and closing our section handle.
             unsafe {
                 UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
@@ -9279,20 +9323,22 @@ void main(uint3 tid : SV_DispatchThreadID) {
             drop(shadow);
         }
 
-        // 4. Unnotified raw `VirtualFree` followed by `Shadow::drop` MUST NOT crash
-        //    or clobber reused memory!
+        // 4. Unnotified raw `VirtualFree(MEM_DECOMMIT)` followed by `Shadow::drop`
+        //    MUST NOT crash or touch non-committed memory (keeps VA reserved until
+        //    `block` drops so parallel tests cannot recycle `raw_addr` mid-test).
         {
-            let mut block = VirtualBlock::new(PAGE, true);
+            use windows_sys::Win32::System::Memory::{MEM_DECOMMIT, VirtualFree};
+            let block = VirtualBlock::new(PAGE, true);
             // SAFETY: seed physical page before first dispatch.
             unsafe { std::ptr::write_bytes(block.ptr, 0x44, PAGE) };
             let raw_addr = block.addr();
             let shadow = make_test_shadow(h, raw_addr as u64, PAGE as u64, true).expect("shadow");
             pipe.dispatch_on(h, &list, &shadow, 0, PAGE, 0x7777_0000, 1);
             assert_eq!(shadow.deferred_count.load(Ordering::Acquire), 1);
-            block.free_raw();
+            // SAFETY: decommitting our own reserved page while holding reservation.
+            let ok = unsafe { VirtualFree(block.ptr.cast(), PAGE, MEM_DECOMMIT) };
+            assert_ne!(ok, 0);
             drop(shadow);
-            // Clear test journal entries for the recycled VA after testing raw teardown.
-            crate::watch::before_virtual_free(raw_addr, PAGE);
         }
 
         assert_eq!(LAZY_ARMED_COUNT.load(Ordering::Acquire), 0);
