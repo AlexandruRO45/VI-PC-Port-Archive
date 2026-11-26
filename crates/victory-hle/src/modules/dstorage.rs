@@ -1279,7 +1279,8 @@ mod tests {
             .open(&path)
             .unwrap();
         let file = open(&path);
-        void(file, 0x10);
+        let release: extern "system" fn(*mut c_void) -> u32 = call(file, 0x10);
+        assert_eq!(release(file), 0);
         drop(held);
     }
 
