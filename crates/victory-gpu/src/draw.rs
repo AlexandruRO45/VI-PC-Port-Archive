@@ -1203,7 +1203,11 @@ impl State {
                         None => self.user_value(compute, u.slot, u.root, u.dword),
                     };
                 }
-                if !compute && crate::material_demand::enabled()
+                let capture = (!compute)
+                    .then(|| crate::material_demand::capture_for(&stage.shader.hash, list))
+                    .flatten();
+                let demand = !compute && crate::material_demand::enabled();
+                if (demand || capture.is_some())
                     && let Some(fields) = crate::material_demand::fields(&stage.shader.hash)
                     && t.host.user_data.iter().any(|u| u.index == 8 && u.root == RootType::Table && u.slot == 0)
                     && let Some(u) = t.host.user_data.iter().find(|u| u.index == 14 && u.root == RootType::Constants)
@@ -1214,9 +1218,16 @@ impl State {
                     && !heap.samplers()
                     && let Some(&bound) = values.get(8)
                     && Some(u64::from(bound)) == table.checked_sub(heap.start)
-                    && crate::material_demand::wants(heap, record, fields)
                 {
-                    crate::material_demand::record(list, heap, *table, record, fields);
+                    let prioritize = demand && crate::material_demand::wants(heap, record, fields);
+                    if prioritize || capture.is_some() {
+                        crate::material_demand::record(
+                            list,
+                            heap,
+                            *table,
+                            crate::material_demand::Request { record, fields, prioritize, capture },
+                        );
+                    }
                 }
                 // SAFETY: an open list; `values` covers the parameter.
                 unsafe {
@@ -1915,7 +1926,8 @@ impl State {
             HEAP_TEXTURES_RECHECKED[1].fetch_add(changed, Ordering::Relaxed);
             HEAP_TEXTURES_RECHECKED[2].store(waiting, Ordering::Relaxed);
         }
-        let wanted = crate::material_demand::enabled().then(|| host.material_demand.take(heap, host, frame));
+        let wanted = (crate::material_demand::enabled() || crate::material_demand::trace_enabled())
+            .then(|| host.material_demand.take(heap, host, frame));
         let (mut due, census) = host.texture_slots_due(frame, 4096);
         if let Some(wanted) = wanted {
             crate::material_demand::promote(&mut due, &wanted, frame);

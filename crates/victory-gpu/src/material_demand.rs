@@ -26,6 +26,57 @@ pub(crate) fn enabled() -> bool {
     })
 }
 
+pub(crate) fn trace_enabled() -> bool {
+    static TRACE: OnceLock<bool> = OnceLock::new();
+    cfg!(feature = "diagnostics")
+        && *TRACE.get_or_init(|| {
+            std::env::var_os("VICTORY_MATERIAL_TEXTURE_TRACE").is_some_and(|v| v == "1")
+        })
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct Capture {
+    pub(crate) shader: &'static str,
+    pub(crate) frame: u64,
+    pub(crate) list: usize,
+}
+
+pub(crate) fn capture_for(hash: &str, list: &HostList) -> Option<Capture> {
+    #[cfg(feature = "diagnostics")]
+    if trace_enabled() {
+        let shader = match hash {
+            "a402e650d0acbc92" => "a402e650d0acbc92",
+            "b15ba4896d650511" => "b15ba4896d650511",
+            _ => return None,
+        };
+        return crate::capture::recording_listed().then(|| Capture {
+            shader,
+            frame: crate::queue::presented() + 1,
+            list: std::ptr::from_ref(list) as usize,
+        });
+    }
+    let _ = (hash, list);
+    None
+}
+
+// A listed frame can contain thousands of commands, even when the concurrent
+// readbacks finish before the recorder reaches the end of that frame.
+fn capture_budget(frame: u64) -> bool {
+    static BUDGET: Mutex<(u64, usize)> = Mutex::new((0, 0));
+    let mut budget = BUDGET.lock().unwrap_or_else(|e| e.into_inner());
+    if frame < budget.0 {
+        return false;
+    }
+    if frame != budget.0 {
+        *budget = (frame, 0);
+    }
+    if budget.1 == LIMIT {
+        return false;
+    }
+    budget.1 += 1;
+    true
+}
+
 pub(crate) fn fields(hash: &str) -> Option<&'static [u32]> {
     match hash {
         // The deferred character shaders read heap indices from the same
@@ -69,6 +120,20 @@ struct Observation {
     frame: u64,
     stamp: Mark,
     slots: Vec<u32>,
+    capture: Option<CapturedMaterial>,
+}
+
+struct CapturedMaterial {
+    draw: Capture,
+    record: u32,
+    fields: Vec<(u32, u32)>,
+}
+
+pub(crate) struct Request {
+    pub(crate) record: u32,
+    pub(crate) fields: &'static [u32],
+    pub(crate) prioritize: bool,
+    pub(crate) capture: Option<Capture>,
 }
 
 type RecordKey = (usize, u32, &'static [u32]);
@@ -178,7 +243,7 @@ fn indices(words: &[u32], fields: &[u32], count: u32) -> Vec<u32> {
     for field in fields {
         if let Some(&word) = words.get((field / 4) as usize) {
             // The guest shifts the packed index left five bits in a 32-bit register.
-            let slot = word.wrapping_shl(5) >> 5;
+            let slot = heap_slot(word);
             if slot < count && !slots.contains(&slot) {
                 slots.push(slot);
             }
@@ -187,13 +252,17 @@ fn indices(words: &[u32], fields: &[u32], count: u32) -> Vec<u32> {
     slots
 }
 
+fn heap_slot(word: u32) -> u32 {
+    word.wrapping_shl(5) >> 5
+}
+
 pub(crate) fn record(
     list: &HostList,
     heap: &Heap,
     table: u64,
-    record: u32,
-    fields: &'static [u32],
+    request: Request,
 ) {
+    let Request { record, fields, prioritize, capture } = request;
     let Some(handle) = table.checked_add(TABLE_DWORDS * 4) else {
         return;
     };
@@ -225,6 +294,10 @@ pub(crate) fn record(
     {
         return;
     }
+    let capture = capture.filter(|draw| capture_budget(draw.frame));
+    if !prioritize && capture.is_none() {
+        return;
+    }
     let Some(gpu) = crate::host::host() else {
         return;
     };
@@ -243,7 +316,9 @@ pub(crate) fn record(
     }
     list.keep(&back);
     list.keep(&source.buffer);
-    RECORDED.fetch_add(1, Ordering::Relaxed);
+    if prioritize {
+        RECORDED.fetch_add(1, Ordering::Relaxed);
+    }
     list.defer_after(move || {
         if !ticket.finish() || frame.abs_diff(crate::frame::current()) > MAX_AGE {
             return;
@@ -265,12 +340,23 @@ pub(crate) fn record(
             if back.Map(0, Some(&read), Some(&mut data)).is_err() {
                 return;
             }
-            let slots = if data.is_null() {
-                Vec::new()
+            let words = if data.is_null() {
+                &[]
             } else {
-                let words = std::slice::from_raw_parts(data.cast::<u32>(), bytes / 4);
-                indices(words, fields, count)
+                std::slice::from_raw_parts(data.cast::<u32>(), bytes / 4)
             };
+            let slots = if prioritize { indices(words, fields, count) } else { Vec::new() };
+            let captured = capture.map(|draw| CapturedMaterial {
+                draw,
+                record,
+                fields: fields
+                    .iter()
+                    .filter_map(|&offset| {
+                        let word = *words.get((offset / 4) as usize)?;
+                        Some((offset, heap_slot(word)))
+                    })
+                    .collect(),
+            });
             back.Unmap(0, Some(&D3D12_RANGE { Begin: 0, End: 0 }));
             if !slots.is_empty() {
                 let n = OBSERVED.fetch_add(1, Ordering::Relaxed) + 1;
@@ -283,6 +369,8 @@ pub(crate) fn record(
                         "GPU material records read for texture scheduling"
                     );
                 }
+            }
+            if !slots.is_empty() || captured.is_some() {
                 observations.push(Observation {
                     source_slot: slot,
                     view: view.clone(),
@@ -290,6 +378,7 @@ pub(crate) fn record(
                     stamp,
                     frame,
                     slots,
+                    capture: captured,
                 });
             }
         }
@@ -297,21 +386,34 @@ pub(crate) fn record(
 }
 
 impl Mailbox {
+    #[cfg(all(test, feature = "diagnostics"))]
+    pub(crate) fn captured_fields(&self) -> Vec<(u32, u32)> {
+        let observations = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        observations
+            .iter()
+            .find_map(|obs| obs.capture.as_ref())
+            .map(|capture| capture.fields.clone())
+            .unwrap_or_default()
+    }
+
     pub(crate) fn take(&self, heap: &Heap, host: &HostHeap, frame: u64) -> Vec<(u32, u64, bool)> {
         let observations = std::mem::take(&mut *self.0.lock().unwrap_or_else(|e| e.into_inner()));
         let mut priority = Vec::new();
         for obs in observations {
-            if frame.abs_diff(obs.frame) > MAX_AGE
-                || heap
+            let current = frame.abs_diff(obs.frame) <= MAX_AGE
+                && heap
                     .handle(obs.source_slot)
                     .and_then(crate::descriptor::checked_view)
                     .as_ref()
-                    != Some(&obs.view)
-                || !obs
+                    == Some(&obs.view)
+                && obs
                     .shadow
                     .upgrade()
-                    .is_some_and(|s| host.shows(obs.source_slot, &s.buffer) == Some(true))
-            {
+                    .is_some_and(|s| host.shows(obs.source_slot, &s.buffer) == Some(true));
+            if let Some(capture) = &obs.capture {
+                capture.report(heap, host, obs.stamp, frame, current);
+            }
+            if !current {
                 continue;
             }
             for slot in obs.slots {
@@ -327,6 +429,27 @@ impl Mailbox {
             }
         }
         priority
+    }
+}
+
+impl CapturedMaterial {
+    fn report(&self, heap: &Heap, host: &HostHeap, stamp: Mark, frame: u64, source_current: bool) {
+        let Capture { shader, frame: draw_frame, list } = self.draw;
+        tracing::info!(
+            shader, draw_frame, host_list = format_args!("{list:#x}"),
+            record = self.record, observed_frame = frame, source_current,
+            fields = ?self.fields, "material texture indices read back"
+        );
+        #[cfg(feature = "diagnostics")]
+        if source_current {
+            for &(offset, slot) in &self.fields {
+                let state = host.material_slot_state(heap, slot, stamp, frame);
+                tracing::info!(shader, draw_frame, host_list = format_args!("{list:#x}"),
+                    record = self.record, observed_frame = frame, offset, slot, %state,
+                    "material texture descriptor observed");
+            }
+        }
+        let _ = (heap, host, stamp);
     }
 }
 

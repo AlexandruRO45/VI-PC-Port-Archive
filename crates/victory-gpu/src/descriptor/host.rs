@@ -1168,6 +1168,42 @@ impl HostHeap {
         }
     }
 
+    /// Observe a sampled descriptor at readback time. A title rewrite
+    /// invalidates comparison with the command that selected the slot.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn material_slot_state(
+        &self,
+        heap: &super::Heap,
+        index: u32,
+        stamp: crate::material_demand::Mark,
+        frame: u64,
+    ) -> String {
+        let Some(epoch) = self.material_epochs.get().and_then(|e| e.get(index as usize)) else {
+            return "outside host view heap".into();
+        };
+        let unchanged = || epoch.load(std::sync::atomic::Ordering::Relaxed) <= stamp.descriptor;
+        if !unchanged() {
+            return "title descriptor rewritten".into();
+        }
+        let title = heap.handle(index).and_then(super::checked_view);
+        let native = self
+            .kept
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(index as usize)
+            .is_some_and(Option::is_some);
+        let host = self.describe_slot(index).unwrap_or_else(|| "unavailable".into());
+        let queue = self.texture_slot_state(index, frame, title.as_ref());
+        if unchanged() {
+            format!(
+                "title_texture={} native_resource={native} host=[{host}] queue=[{queue}]",
+                title.as_ref().is_some_and(is_texture_view),
+            )
+        } else {
+            "title descriptor rewritten".into()
+        }
+    }
+
     /// A shader-selected material field can re-enrol its current null block-compressed SRV.
     /// Never supersede another allocation, or upload title bytes over a GPU writer.
     pub(crate) fn demand_material_texture(&self, heap: &super::Heap, index: u32, stamp: crate::material_demand::Mark, frame: u64) -> Option<(u32, u64, bool)> {
