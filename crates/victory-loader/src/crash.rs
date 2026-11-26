@@ -556,8 +556,7 @@ fn asserts_left() -> &'static std::sync::atomic::AtomicUsize {
 /// debugger's breakpoint is not that: it patches the code, and the byte
 /// there is the instruction it replaced, so it is left alone.
 fn skip_assert_at(at: usize, code: i32, left: &std::sync::atomic::AtomicUsize) -> bool {
-    use std::sync::atomic::Ordering;
-    if code != EXCEPTION_BREAKPOINT || left.load(Ordering::Relaxed) == 0 {
+    if code != EXCEPTION_BREAKPOINT {
         return false;
     }
     // SAFETY: the CPU fetched the instruction at `at`, so its byte is
@@ -565,8 +564,46 @@ fn skip_assert_at(at: usize, code: i32, left: &std::sync::atomic::AtomicUsize) -
     if unsafe { (at as *const u8).read() } != 0xcc {
         return false;
     }
-    left.fetch_sub(1, Ordering::Relaxed);
-    true
+    // Only the title's own image: a `0xcc` in a host DLL (ntdll's
+    // `DbgBreakPoint`, a CRT `__debugbreak`, a Rust debug assert, the D3D12
+    // debug layer) is not the title's to spend, and continuing past one would
+    // hide a real fault in code we did not write.
+    if !in_title_image(at) {
+        return false;
+    }
+    take_budget(left)
+}
+
+/// Spends one of the assertions the title may skip. The budget is taken in the
+/// same step it is checked, so two threads at the last assert cannot both pass
+/// a zero check and wrap the counter to `usize::MAX`.
+fn take_budget(left: &std::sync::atomic::AtomicUsize) -> bool {
+    use std::sync::atomic::Ordering;
+    left.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+        .is_ok()
+}
+
+/// Whether `address` lies in the title's own image, which the loader maps under
+/// a name starting `victory-image-` ([`crate::prepare`]).
+fn in_title_image(address: usize) -> bool {
+    let mut module: HMODULE = std::ptr::null_mut();
+    // SAFETY: looks up the module containing `address`; no reference taken.
+    let found = unsafe {
+        GetModuleHandleExW(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            address as *const u16,
+            &mut module,
+        )
+    };
+    if found == 0 {
+        return false;
+    }
+    let mut path = [0u16; 260];
+    // SAFETY: `module` is a loaded module; the buffer length is passed.
+    let len = unsafe { GetModuleFileNameW(module, path.as_mut_ptr(), path.len() as u32) };
+    let path = String::from_utf16_lossy(&path[..len as usize]);
+    let name = path.rsplit('\\').next().unwrap_or(&path);
+    name.starts_with("victory-image-")
 }
 
 /// [`skip_assert_at`] on the exception being dispatched, moving `rip` past
@@ -1022,23 +1059,30 @@ mod tests {
         static CODE: [u8; 4] = [0xcc, 0x90, 0xcc, 0xcc];
         let at = CODE.as_ptr() as usize;
         let left = AtomicUsize::new(2);
-        assert!(skip_assert_at(at, EXCEPTION_BREAKPOINT, &left));
-        assert_eq!(left.load(Ordering::Relaxed), 1);
+        // A `0xcc` outside the title's image is somebody else's breakpoint (a
+        // host DLL's), and the title's budget is not spent on it.
+        assert!(!skip_assert_at(at, EXCEPTION_BREAKPOINT, &left));
+        assert_eq!(left.load(Ordering::Relaxed), 2, "not spent");
         // A debugger's breakpoint: the byte is the instruction it replaced.
         assert!(!skip_assert_at(at + 1, EXCEPTION_BREAKPOINT, &left));
-        assert_eq!(left.load(Ordering::Relaxed), 1, "not spent");
+        assert_eq!(left.load(Ordering::Relaxed), 2, "not spent");
         // Another kind of exception is not ours to skip.
         assert!(!skip_assert_at(
             at + 2,
             EXCEPTION_ILLEGAL_INSTRUCTION,
             &left
         ));
-        assert_eq!(left.load(Ordering::Relaxed), 1, "not spent");
-        assert!(skip_assert_at(at + 2, EXCEPTION_BREAKPOINT, &left));
+        assert_eq!(left.load(Ordering::Relaxed), 2, "not spent");
+        // The budget itself: one spent per skip, and never wrapped.
+        assert!(take_budget(&left));
+        assert_eq!(left.load(Ordering::Relaxed), 1);
+        assert!(take_budget(&left));
         assert_eq!(left.load(Ordering::Relaxed), 0);
-        assert!(
-            !skip_assert_at(at + 3, EXCEPTION_BREAKPOINT, &left),
-            "the budget is spent, so the next assert ends the process"
+        assert!(!take_budget(&left), "the budget is spent");
+        assert_eq!(
+            left.load(Ordering::Relaxed),
+            0,
+            "a second thread at the last assert wraps it no further"
         );
     }
 
