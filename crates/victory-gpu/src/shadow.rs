@@ -168,9 +168,31 @@ impl Shadow {
         (self.start + self.len).saturating_sub(address)
     }
 
-    /// `n` dwords of the copy at title address `address` (tests).
+    /// `n` dwords of the copy at title address `address`, as shaders see
+    /// them (tests): its GPU side, copied out by the GPU where that is in
+    /// video memory. What shaders write through views no list declared or
+    /// marked stays there (`crate::bindless::refresh`'s shortcut), not in
+    /// the system memory side.
     #[cfg(test)]
     pub(crate) fn read_host(&self, address: u64, n: usize) -> Vec<u32> {
+        if self.vram.is_none() {
+            return self.read_system(address, n);
+        }
+        let at = (address - self.start) as usize;
+        assert!(at + 4 * n <= self.len as usize);
+        let bytes = self.gpu_bytes(address, 4 * n);
+        bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|w| u32::from_le_bytes(*w))
+            .collect()
+    }
+
+    /// `n` dwords of the copy's system memory side at title address
+    /// `address`, which the CPU reads (tests).
+    #[cfg(test)]
+    pub(crate) fn read_system(&self, address: u64, n: usize) -> Vec<u32> {
         let at = (address - self.start) as usize;
         assert!(at + 4 * n <= self.len as usize);
         // SAFETY: inside the mapping (checked); the GPU is done with it.
@@ -178,12 +200,35 @@ impl Shadow {
     }
 
     /// Writes `bytes` into the copy at title address `address`, as shaders
-    /// do (tests).
+    /// of a submission that has ended wrote them (tests): into its GPU side
+    /// and, where that is in video memory, by a GPU copy into its system
+    /// memory side too, as the end of a submission brings shaders' writes
+    /// back ([`pull_written`]) before a copy-back reads them. Inside a
+    /// submission ([`HostList::defer_host`]), [`Shadow::write_gpu`]: the
+    /// submission brings the bytes back itself.
     #[cfg(test)]
     pub(crate) fn write_host(&self, address: u64, bytes: &[u8]) {
+        self.write_gpu(address, bytes);
+        if let Some(v) = &self.vram {
+            let at = address - self.start;
+            assert!(host().expect("a host GPU").copy_now(&[(
+                &v.home,
+                at,
+                &self.buffer,
+                at,
+                bytes.len() as u64,
+            )]));
+        }
+    }
+
+    /// Writes `bytes` into the copy's GPU side at title address `address`,
+    /// as shaders do while a submission runs (tests): video memory where
+    /// the copy has it, which the CPU does not see until the submission's
+    /// end brings it back.
+    #[cfg(test)]
+    pub(crate) fn write_gpu(&self, address: u64, bytes: &[u8]) {
         let at = (address - self.start) as usize;
         assert!(at + bytes.len() <= self.len as usize);
-        // Shaders write the GPU side: video memory where it is there.
         if let Some(v) = &self.vram {
             return v.bar.write(at, bytes);
         }
@@ -205,7 +250,7 @@ impl Shadow {
     pub(crate) fn gpu_bytes(&self, address: u64, n: usize) -> Vec<u8> {
         let host = host().expect("a host GPU");
         let (out, data) = host.shared_buffer(n as u64).expect("a buffer");
-        host.copy_now(&[(&out, 0, &self.buffer, self.offset(address), n as u64)]);
+        assert!(host.copy_now(&[(&out, 0, &self.buffer, self.offset(address), n as u64)]));
         // SAFETY: the mapped buffer of `n` bytes; the GPU copy has run.
         unsafe { std::slice::from_raw_parts(data, n).to_vec() }
     }
@@ -1199,8 +1244,25 @@ fn bring_back(runs: &[(Arc<Shadow>, usize, usize)]) {
     use std::sync::atomic::Ordering::Relaxed;
     crate::vram::PULLED[0].fetch_add(regions.iter().map(|r| r.4).sum(), Relaxed);
     crate::vram::PULLED[1].fetch_add(1, Relaxed);
-    if let Some(host) = host() {
-        host.copy_now(&regions);
+    let Some(host) = host() else {
+        return;
+    };
+    if host.copy_now(&regions) {
+        return;
+    }
+    // The GPU copy did not run, or its end was not seen: the bytes are read
+    // through the mappings instead (slow, but nothing shaders wrote is
+    // lost, and the copy-backs after this read what the GPU side holds),
+    // and no copy goes to video memory any more.
+    crate::vram::stop();
+    for &(i, from, to) in &joined {
+        let copy = &runs[i].0;
+        if let Some(v) = &copy.vram {
+            // SAFETY: inside the system memory side's mapping (cut to the
+            // copy); only the submitting thread writes it.
+            let home = unsafe { std::slice::from_raw_parts_mut(copy.data.add(from), to - from) };
+            v.bar.read_back(from, home);
+        }
     }
 }
 
@@ -1209,6 +1271,20 @@ struct Entry {
     shadow: Option<Arc<Shadow>>,
     /// The title made it without unordered access: shaders only read it.
     read_only: bool,
+}
+
+/// A buffer for host copies of title memory ([`crate::host::Host::shared_buffer`]):
+/// with `VICTORY_VRAM_COPIES`, in system memory always, so that copies go
+/// to video memory through [`crate::vram`] alone, within its budget, and
+/// not through `VICTORY_COPIES_IN_VIDEO_MEMORY` (diagnostics) too: their
+/// system memory sides, copies it refused, loose windows and copies of
+/// single views.
+fn copy_buffer(host: &crate::host::Host, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+    if crate::vram::on() {
+        host.system_buffer(size)
+    } else {
+        host.shared_buffer(size)
+    }
 }
 
 /// Title buffers by (start address, resource), with their copy once made.
@@ -1283,7 +1359,7 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
         // Shaders write some buffers (unordered access), so not upload memory.
         let size = len.next_multiple_of(1 << 16);
         let host = host()?;
-        let (home, data) = host.shared_buffer(size)?;
+        let (home, data) = copy_buffer(host, size)?;
         // A GPU side in video memory if the switch asks and the budget has
         // room; else the system memory buffer is both sides.
         let (buffer, vram) = match crate::vram::wanted(entry.read_only) {
@@ -1337,7 +1413,7 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     if let Some(shadow) = map.get(&(start, len)) {
         return Some(shadow.clone());
     }
-    let (buffer, data) = host()?.shared_buffer(len)?;
+    let (buffer, data) = copy_buffer(host()?, len)?;
     crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
@@ -1494,7 +1570,7 @@ impl Arena {
             Some(found) => found,
             None => {
                 let size = CHUNK.max((len + align).next_multiple_of(1 << 16));
-                let (buffer, data) = host()?.shared_buffer(size)?;
+                let (buffer, data) = copy_buffer(host()?, size)?;
                 crate::host::name(&buffer, || format!("title views {size:#x}"));
                 // SAFETY: a live buffer.
                 let gpu = unsafe { buffer.GetGPUVirtualAddress() };
@@ -1732,7 +1808,7 @@ pub(crate) mod tests {
             if marked {
                 mark(&copy, p as u64);
             }
-            list.defer_host(move || copy.write_host(p as u64 + 10, &[0x40 + k as u8]));
+            list.defer_host(move || copy.write_gpu(p as u64 + 10, &[0x40 + k as u8]));
         }
         list.close();
         host.execute(&[&list]);
@@ -1820,8 +1896,8 @@ pub(crate) mod tests {
         mark(&copy, p as u64);
         let c = copy.clone();
         list.defer_host(move || {
-            c.write_host(p as u64 + 10, &[0xaa]);
-            c.write_host((p + PAGE + 20) as u64, &[0xbb]);
+            c.write_gpu(p as u64 + 10, &[0xaa]);
+            c.write_gpu((p + PAGE + 20) as u64, &[0xbb]);
             write_title(p + 40, 0x11);
         });
         list.close();
@@ -1836,7 +1912,7 @@ pub(crate) mod tests {
             "brought back by the GPU"
         );
         assert_eq!(
-            copy.read_host(p as u64 + 40, 1)[0] & 0xff,
+            copy.read_system(p as u64 + 40, 1)[0] & 0xff,
             0x11,
             "the system memory side"
         );
@@ -1846,6 +1922,141 @@ pub(crate) mod tests {
             "and video memory have the title's byte"
         );
         assert_eq!(copy.update(p, len), 0, "both pages current");
+        unregister(p, p as u64);
+    }
+
+    /// The GPU copy that brings shaders' writes back fails (review of
+    /// #2993): its event first, then its signal after the list was
+    /// executed. With the event failing, the fence is read instead and the
+    /// copy counts as run. With the signal failing, the list's end cannot be
+    /// seen: the copier is not used again (its allocator is not reset under
+    /// a list that may be running), what the shaders wrote is read through
+    /// the mapping before the copy-backs (title memory and the system
+    /// memory side get it), and copies made after that stay in system
+    /// memory.
+    #[test]
+    fn a_failed_gpu_copy_of_shaders_writes_loses_none_of_them() {
+        use crate::host::{COPY_FAILS, FAIL_SIGNAL, FAIL_WAIT};
+        use std::sync::atomic::Ordering::Relaxed;
+        if !in_child(
+            "shadow::tests::a_failed_gpu_copy_of_shaders_writes_loses_none_of_them",
+            "2",
+        ) {
+            return;
+        }
+        let host = host().expect("a host GPU");
+        *FAKE.lock().unwrap() = Some((1 << 30, 0));
+        let len = 2 * PAGE;
+        let p = crate::watch::tests::pool(2);
+        register(p, p as u64, len as u64);
+        let copy = find(p as u64, len as u64).unwrap();
+        assert_eq!(copy.class(), Class::VramWritten);
+        copy.update(p, len);
+        // A submission whose shaders write `byte` at `at` in a marked page
+        // and in a declared range, the GPU copy after it failing as `fails`.
+        let run = |fails: u8, at: usize, byte: u8| {
+            let list = host.new_list().unwrap();
+            copy.refresh(&list, p as u64, len as u64);
+            copy.gpu_writes(&list, p as u64, PAGE as u64, true);
+            copy.gpu_writes(&list, (p + PAGE) as u64, PAGE as u64, false);
+            mark(&copy, p as u64);
+            let c = copy.clone();
+            list.defer_host(move || {
+                c.write_gpu((p + at) as u64, &[byte]);
+                c.write_gpu((p + PAGE + at) as u64, &[byte]);
+            });
+            list.close();
+            COPY_FAILS.store(fails, Relaxed);
+            host.execute(&[&list]);
+            assert_eq!(COPY_FAILS.load(Relaxed), 0, "the bring-back's copy failed");
+            for at in [p + at, p + PAGE + at] {
+                assert_eq!(
+                    title(at),
+                    byte,
+                    "fails {fails}: the shader's byte reached title memory"
+                );
+                assert_eq!(
+                    copy.read_system(at as u64, 1)[0] & 0xff,
+                    u32::from(byte),
+                    "fails {fails}: and the system memory side"
+                );
+            }
+        };
+        let read_back = crate::vram::READ_BACK.load(Relaxed);
+        run(FAIL_WAIT, 8, 0x5a);
+        assert_eq!(
+            crate::vram::READ_BACK.load(Relaxed),
+            read_back,
+            "the fence was read: the copy ran"
+        );
+        assert_eq!(
+            copy.gpu_bytes(p as u64 + 8, 1),
+            [0x5a],
+            "the copier still works"
+        );
+        run(FAIL_SIGNAL, 12, 0x6b);
+        assert!(
+            crate::vram::READ_BACK.load(Relaxed) > read_back,
+            "read back through the mapping"
+        );
+        assert!(
+            !host.copy_now(&[(&copy.buffer, 0, &copy.buffer, 64, 4)]),
+            "the copier is not used again"
+        );
+        let q = crate::watch::tests::pool(1);
+        register(q, q as u64, PAGE as u64);
+        assert_eq!(
+            find(q as u64, PAGE as u64).unwrap().class(),
+            Class::System,
+            "no copy admitted after it"
+        );
+        unregister(q, q as u64);
+        unregister(p, p as u64);
+    }
+
+    /// With main's `VICTORY_COPIES_IN_VIDEO_MEMORY` (diagnostics) set too
+    /// (review of #2993): the system memory side of a copy in video memory,
+    /// and a copy the budget refused, are in system memory (write-back),
+    /// not in GPU upload heaps outside the budget.
+    #[test]
+    fn with_both_switches_the_cpu_sides_stay_in_system_memory() {
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_CPU_PAGE_PROPERTY_WRITE_BACK, D3D12_HEAP_PROPERTIES, D3D12_HEAP_TYPE_CUSTOM,
+        };
+        if !crate::vram::tests::in_child_with(
+            "shadow::tests::with_both_switches_the_cpu_sides_stay_in_system_memory",
+            "2",
+            &[("VICTORY_COPIES_IN_VIDEO_MEMORY", "1")],
+        ) {
+            return;
+        }
+        let host = host().expect("a host GPU");
+        #[cfg(feature = "diagnostics")]
+        assert!(host.copies_in_video_memory(), "main's switch is on here");
+        let _ = host;
+        let system = |b: &ID3D12Resource| {
+            let mut props = D3D12_HEAP_PROPERTIES::default();
+            // SAFETY: a live buffer; plain out pointers.
+            unsafe { b.GetHeapProperties(Some(&mut props), None) }.unwrap();
+            props.Type == D3D12_HEAP_TYPE_CUSTOM
+                && props.CPUPageProperty == D3D12_CPU_PAGE_PROPERTY_WRITE_BACK
+        };
+        *FAKE.lock().unwrap() = Some((1 << 30, 0));
+        let (p, q) = (crate::watch::tests::pool(1), crate::watch::tests::pool(1));
+        register(p, p as u64, PAGE as u64);
+        let admitted = find(p as u64, PAGE as u64).unwrap();
+        assert_eq!(admitted.class(), Class::VramWritten);
+        assert!(
+            system(&admitted.vram.as_ref().unwrap().home),
+            "the system memory side"
+        );
+        // Use near the budget: refused.
+        *FAKE.lock().unwrap() = Some((1 << 30, (1 << 30) - (64 << 20)));
+        register(q, q as u64, PAGE as u64);
+        let refused = find(q as u64, PAGE as u64).unwrap();
+        assert_eq!(refused.class(), Class::System);
+        assert!(system(&refused.buffer), "a copy refused");
+        unregister(q, q as u64);
         unregister(p, p as u64);
     }
 
@@ -1887,7 +2098,7 @@ pub(crate) mod tests {
                 mark(&copy, at as u64);
             }
             let c = copy.clone();
-            list.defer_host(move || c.write_host(at as u64, &[byte]));
+            list.defer_host(move || c.write_gpu(at as u64, &[byte]));
             list.close();
             let before = pulled();
             host.execute(&[&list]);
@@ -1930,7 +2141,7 @@ pub(crate) mod tests {
         assert_eq!(copy.class(), Class::VramWritten);
         copy.update(p, PAGE);
         copy.writing(p, PAGE, true);
-        copy.write_host(p as u64 + 10, &[0xaa]);
+        copy.write_gpu(p as u64 + 10, &[0xaa]);
         mark(&copy, p as u64);
         BEFORE_TAKEN.with(|h| *h.borrow_mut() = Some(Box::new(move || write_title(p + 100, 0x77))));
         pull_written(std::iter::empty());
