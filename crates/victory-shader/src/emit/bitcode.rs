@@ -590,6 +590,18 @@ impl Module {
         }
     }
 
+    /// Compare and select instructions that [`Module::write`] writes.
+    #[cfg(test)]
+    pub fn written_compares_and_selects(&self) -> usize {
+        let plan = self.plan();
+        plan.layout
+            .iter()
+            .flat_map(|&b| &self.blocks[b].body)
+            .filter(|&&i| plan.live[i as usize])
+            .filter(|&&i| matches!(self.insts[i as usize].op, Op::Cmp(..) | Op::Select(..)))
+            .count()
+    }
+
     /// Calls of functions named `name` that [`Module::write`] writes.
     #[cfg(test)]
     pub fn written_calls(&self, name: &str) -> usize {
@@ -599,24 +611,6 @@ impl Module {
             .filter(|&&i| plan.live[i as usize])
             .filter(|&&i| matches!(self.insts[i as usize].op, Op::Call(f, _) if self.funcs[f as usize].name == name))
             .count()
-    }
-
-    /// Instructions (including terminators) that [`Module::write`] writes.
-    #[cfg(test)]
-    pub fn written_instructions(&self) -> usize {
-        let plan = self.plan();
-        plan.layout
-            .iter()
-            .map(|&b| {
-                let block = &self.blocks[b];
-                let live = block
-                    .phis
-                    .iter()
-                    .chain(&block.body)
-                    .filter(|&&i| plan.live[i as usize]);
-                live.count() + 1
-            })
-            .sum()
     }
 
     /// The globals and functions [`Module::write`] declares, each kept

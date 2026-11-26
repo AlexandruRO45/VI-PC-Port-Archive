@@ -60,9 +60,6 @@ pub(crate) struct Lowered {
     /// Heap handles written.
     #[cfg(test)]
     pub heap_handles: u32,
-    /// Instructions written to the DXIL function body.
-    #[cfg(test)]
-    pub instructions: usize,
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
@@ -75,6 +72,10 @@ pub(crate) struct Lowered {
     /// Whether the module contains the 32-lane half mask (`!31`).
     #[cfg(test)]
     pub has_half_wave_mask: bool,
+    #[cfg(test)]
+    binary_i32_calls: usize,
+    #[cfg(test)]
+    compares_and_selects: usize,
 }
 
 pub(crate) struct Parts<'a> {
@@ -1408,8 +1409,6 @@ impl<'a> Lower<'a> {
             #[cfg(test)]
             heap_handles: self.s.m.written_calls("dx.op.createHandleFromHeap") as u32,
             #[cfg(test)]
-            instructions: self.s.m.written_instructions(),
-            #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
             #[cfg(test)]
             rovs: self.s.flags & flags::ROVS != 0,
@@ -1417,6 +1416,10 @@ impl<'a> Lower<'a> {
             uses_lane_index: self.s.m.has_function("dx.op.waveGetLaneIndex"),
             #[cfg(test)]
             has_half_wave_mask: self.s.m.has_i32_const(!31),
+            #[cfg(test)]
+            binary_i32_calls: self.s.m.written_calls("dx.op.binary.i32"),
+            #[cfg(test)]
+            compares_and_selects: self.s.m.written_compares_and_selects(),
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -11095,22 +11098,31 @@ mod tests {
     }
 
     #[test]
-    fn min3_max3_med3_instruction_counts() {
-        // Baseline counts from main (63bcca4), including setup and terminators.
-        for (name, opcode, before, after) in [
-            ("v_min3_i32", 0x152, 22, 20),
-            ("v_min3_u32", 0x153, 22, 20),
-            ("v_max3_i32", 0x155, 22, 20),
-            ("v_max3_u32", 0x156, 22, 20),
-            ("v_med3_i32", 0x158, 26, 22),
-            ("v_med3_u32", 0x159, 26, 22),
+    fn min3_max3_med3_use_dxil_integer_min_max() {
+        // v_mov_b32 v0, v1 exercises the same setup and output store.
+        let baseline = lower_valu(&[0x7E00_0301]).unwrap();
+        for (name, opcode, calls) in [
+            ("v_min3_i32", 0x152, 2),
+            ("v_min3_u32", 0x153, 2),
+            ("v_max3_i32", 0x155, 2),
+            ("v_max3_u32", 0x156, 2),
+            ("v_med3_i32", 0x158, 4),
+            ("v_med3_u32", 0x159, 4),
         ] {
             let lowered = lower_valu(&[
                 0xD400_0000 | opcode << 16, // VOP3 v0, v1, v2, v3
                 0x040E_0501,
             ])
             .unwrap();
-            assert_eq!(lowered.instructions, after, "{name} (main: {before})");
+            assert_eq!(
+                lowered.binary_i32_calls,
+                baseline.binary_i32_calls + calls,
+                "{name}: dx.op.binary.i32 calls"
+            );
+            assert_eq!(
+                lowered.compares_and_selects, baseline.compares_and_selects,
+                "{name}: introduced compares or selects"
+            );
         }
     }
 
