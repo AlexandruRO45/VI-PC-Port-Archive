@@ -46,6 +46,55 @@ What each part does today and what it still needs:
 | Textures | Console tiled layouts and detiling for the modes the title uses | Render-target metadata planes |
 | Series S mode | Runs through the menus to the loading screen | The world, as above |
 
+## Performance on an RTX 5090 (2026-11-26)
+
+Goal: a steady 30 fps, the title's own cap, then the open world.
+
+Measured on one machine (Windows 11, RTX 5090 32 GB), release builds, in a
+fixed indoor scene of the first mission with no input: three 5-second
+measures per run. The work tree behind these numbers is not published in
+this repository yet.
+
+| Build | Frame rate | Frame time |
+|-------|-----------|------------|
+| fxceless/victory-fork main (d510ee4) | 6.5-8.0 fps | 125-155 ms |
+| Our work tree | 11.4-12.1 fps | 83-88 ms |
+
+Where a frame's time goes today (the stages overlap in part):
+
+| Stage | Time per frame | Volume per frame |
+|-------|----------------|------------------|
+| Preparing submissions: title memory copied to host copies, write tracking, descriptor heap sync | about 70 ms | 70-72 MB copied |
+| GPU work | about 50 ms | |
+| Shader writes put back into title memory | about 46 ms | about 64 MB |
+
+Changes kept, each measured against the build before it:
+
+| Change | Before | After |
+|--------|--------|-------|
+| Write tracking by 4 KiB parts instead of 64 KiB pages, heap refreshes by merged ranges | 90 MB copied, 10.8-11.1 fps | 75-80 MB, 11.0-11.8 fps |
+| Descriptor heap sync on a thread of its own | 10.4-10.8 fps | 10.9-12.1 fps |
+| Shader writes put back mark only the 4 KiB parts they cover | 79-82 MB copied | 70-72 MB |
+
+Tried and taken back out after measuring:
+
+- Leaving shader writes on the GPU until the title touches them: 9.7-10.1
+  fps against 10.2-11.8 (marking the pages costs more than it saves).
+- Title memory pools in GPU-upload memory: the title's startup got 9 to 72
+  times slower.
+
+Facts that shape the next steps:
+
+- The title sets a 33.3 ms frame interval itself (30 fps), although the
+  display mode it is given runs at 60 Hz.
+- A probe on the title's two write-combined memory pools (2.2 GB and 3.4
+  GB): after we copy one of their pages to the GPU, the next thing to touch
+  it is almost always our own put-back of shader writes. The title's code
+  wrote 800-2,600 such pages per 5 s and read 3-16; it never touched the
+  second pool. These pools are candidates to stay on the GPU.
+- Putting shader writes back is the next big cost: another fork does it on
+  several threads, comparing 32 bytes at a time, in 8 ms instead of 45.
+
 ## Getting started
 
 Requirements: Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with
