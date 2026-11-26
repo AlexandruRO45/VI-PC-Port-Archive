@@ -1785,7 +1785,15 @@ impl HostList {
             if back.Map(0, Some(&range), Some(&mut data)).is_err() {
                 return Vec::new();
             }
-            let s = std::slice::from_raw_parts(data.cast::<u64>(), count + 1).to_vec();
+            // `Map` returns the start of the resource, not of the range
+            // asked for: a list's stamps sit at its own slot, `begin` bytes
+            // in (they all used to be at 0, which is why only the list that
+            // closed last had any).
+            let s = std::slice::from_raw_parts(
+                data.cast::<u8>().add(begin).cast::<u64>(),
+                count + 1,
+            )
+            .to_vec();
             back.Unmap(0, None);
             s
         };
