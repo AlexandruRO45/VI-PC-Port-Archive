@@ -101,25 +101,12 @@ const MIN_DYNAMIC: u32 = 1 << 16;
 
 /// Slots past the dynamic ones of a capped heap for the page table's view
 /// pairs ([`HostHeap::pair`]), as an uncapped heap has below `HEAP_VIEWS`.
-/// Without them every pair took two dynamic slots, which ran out.
-const CAPPED_PAIRS: u32 = 1 << 16;
-
-/// The dynamic slots of a heap capped at [`PORTABLE_VIEWS`] that the title's
-/// views overfill: [`MIN_DYNAMIC`], or `VICTORY_DYNAMIC_SLOTS` (at most half
-/// the heap less [`CAPPED_PAIRS`]), taken from the title's slots kept in place. On NVIDIA the
-/// title's 1,245,184 views leave too few: thousands of tables a frame were
-/// refused, each a dropped draw; 524288 left 0-33 a frame (VIctory-NVIDIA).
-fn capped_dynamic() -> u32 {
-    static SLOTS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    *SLOTS.get_or_init(|| {
-        let asked = std::env::var("VICTORY_DYNAMIC_SLOTS").ok().and_then(|v| v.trim().parse::<u32>().ok());
-        let slots = asked.unwrap_or(MIN_DYNAMIC).clamp(MIN_DYNAMIC, PORTABLE_VIEWS / 2 - CAPPED_PAIRS);
-        if slots != MIN_DYNAMIC {
-            tracing::warn!(slots, "dynamic descriptor slots on a capped view heap");
-        }
-        slots
-    })
-}
+/// Without them every pair took two dynamic slots, which ran out. A pair per
+/// shadow copy: the world's about 4,700 copies take about 9,400 slots, so
+/// 2^14 leaves about 1.7 times that. Where the title overfills the heap each
+/// one is a title slot no longer kept in place, so no more than that; pairs
+/// past it still fall back to dynamic slots.
+const CAPPED_PAIRS: u32 = 1 << 14;
 
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
@@ -183,8 +170,8 @@ impl HostHeap {
                     // shortcut: descriptors past the host's limit are left
                     // out; a title that reaches them needs remapping.
                     tracing::warn!(error = %e, count, "host view heap capped at {PORTABLE_VIEWS}");
-                    let dynamic = capped_dynamic();
-                    (make(PORTABLE_VIEWS).ok()?, PORTABLE_VIEWS - dynamic - CAPPED_PAIRS, dynamic)
+                    let count = PORTABLE_VIEWS - MIN_DYNAMIC - CAPPED_PAIRS;
+                    (make(PORTABLE_VIEWS).ok()?, count, MIN_DYNAMIC)
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
