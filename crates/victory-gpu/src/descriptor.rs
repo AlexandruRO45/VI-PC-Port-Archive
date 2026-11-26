@@ -1146,8 +1146,9 @@ mod tests {
         put(3, addr + small, 0); // touches the nominal interval, starts after the visible mips
         let revived = host.demand_material_texture(heap, 1, stamp, frame).unwrap();
         assert!(host.texture_slots_due(frame, 8).0.contains(&revived));
-        assert!(host.material_upload_allowed(1, revived.1, addr, small, small));
-        assert!(!host.material_upload_allowed(1, revived.1, addr, small, small - 1));
+        assert_eq!(host.material_upload_refusal(1, revived.1, addr, small, small), None);
+        assert_eq!(host.material_upload_refusal(1, revived.1 + 1, addr, small, small), Some("stale_write"));
+        assert_eq!(host.material_upload_refusal(1, revived.1, addr, small, small - 1), Some("pages_unavailable"));
         let srv = host.mirror(1, heap.handle(1).unwrap(), true).unwrap();
         let live = host::placed_texture(&srv).unwrap();
         let View::Shader(texture, _) = live.view else { panic!("no sampled texture") };

@@ -1998,7 +1998,11 @@ impl State {
         };
         let began = std::time::Instant::now();
         for (index, write, recovered) in due {
+            #[cfg(feature = "diagnostics")]
+            let trace = |outcome| host.material_demand.upload_outcome(index, write, frame, outcome);
             if SPENT.load(Ordering::Relaxed) >= bytes_at_most || began.elapsed() > span {
+                #[cfg(feature = "diagnostics")]
+                trace("staging_pass_limit");
                 break;
             }
             // A placed texture whose memory is not mapped (not streamed in
@@ -2019,11 +2023,17 @@ impl State {
                 // another texture's.
                 let len = crate::resource::placed_bytes_from(&resource, crate::resource::first_mip(&desc)).unwrap_or(1);
                 let mapped = crate::texture::mapped_bytes(address as *const u8, len as usize);
-                if recovered && !host.material_upload_allowed(index, write, address, len, mapped) {
+                if recovered && let Some(reason) = host.material_upload_refusal(index, write, address, len, mapped) {
+                    #[cfg(feature = "diagnostics")]
+                    trace(reason);
+                    #[cfg(not(feature = "diagnostics"))]
+                    let _ = reason;
                     host.texture_slot_done(index, write, None);
                     continue;
                 }
                 if mapped == 0 {
+                    #[cfg(feature = "diagnostics")]
+                    trace("pages_unavailable");
                     HEAP_TEXTURES_AWAY.fetch_add(1, Ordering::Relaxed);
                     // Streamed out: what the slot showed is let go.
                     host.texture_slot_gone(index, write);
@@ -2032,6 +2042,8 @@ impl State {
                 }
                 if mapped < len {
                     if mapped <= host.texture_slot_mapped(index) {
+                        #[cfg(feature = "diagnostics")]
+                        trace("no_more_pages_mapped");
                         HEAP_TEXTURES_PARTLY[0].fetch_add(1, Ordering::Relaxed);
                         host.texture_slot_later(index, write, frame, most);
                         continue;
@@ -2067,10 +2079,17 @@ impl State {
             // under the line. `VICTORY_REUPLOAD_WHEN_FULL=0`: refused, as
             // before.
             let Some(handle) = heap.handle(index) else {
+                #[cfg(feature = "diagnostics")]
+                trace("missing_title_slot");
                 host.texture_slot_done(index, write, None);
                 continue;
             };
-            let upload = (room || reupload_when_full())
+            let can_mirror = room || reupload_when_full();
+            #[cfg(feature = "diagnostics")]
+            if !can_mirror {
+                trace("vram_budget");
+            }
+            let upload = can_mirror
                 .then(|| host.mirror_queued(index, handle, write, !room))
                 .and_then(Result::ok);
             let Some((view, _residence)) = upload else {

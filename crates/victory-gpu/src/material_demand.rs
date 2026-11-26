@@ -111,7 +111,51 @@ pub(crate) struct Mark {
 }
 
 #[derive(Default)]
-pub(crate) struct Mailbox(Arc<Mutex<Vec<Observation>>>);
+pub(crate) struct Mailbox {
+    observations: Arc<Mutex<Vec<Observation>>>,
+    #[cfg(feature = "diagnostics")]
+    uploads: Mutex<UploadWatch>,
+}
+
+#[cfg(feature = "diagnostics")]
+#[derive(Default)]
+struct UploadWatch(Vec<WatchedUpload>);
+
+#[cfg(feature = "diagnostics")]
+struct WatchedUpload {
+    slot: u32,
+    write: u64,
+    expires: u64,
+    remaining: u8,
+}
+
+#[cfg(feature = "diagnostics")]
+impl UploadWatch {
+    const SLOTS: usize = LIMIT * 9;
+    const FRAMES: u64 = 256;
+    const ATTEMPTS: u8 = 8;
+
+    fn watch(&mut self, slot: u32, write: u64, frame: u64) {
+        self.0.retain(|entry| entry.expires >= frame);
+        let expires = frame.saturating_add(Self::FRAMES);
+        if let Some(entry) = self.0.iter_mut().find(|entry| (entry.slot, entry.write) == (slot, write)) {
+            entry.expires = expires;
+        } else if self.0.len() < Self::SLOTS {
+            self.0.push(WatchedUpload { slot, write, expires, remaining: Self::ATTEMPTS });
+        }
+    }
+
+    fn record(&mut self, slot: u32, write: u64, frame: u64) -> bool {
+        let Some(entry) = self.0.iter_mut().find(|entry| (entry.slot, entry.write) == (slot, write)) else {
+            return false;
+        };
+        if frame > entry.expires || entry.remaining == 0 {
+            return false;
+        }
+        entry.remaining -= 1;
+        true
+    }
+}
 
 struct Observation {
     source_slot: u32,
@@ -305,7 +349,7 @@ pub(crate) fn record(
         return;
     };
     let shadow = Arc::downgrade(&source);
-    let mailbox = Arc::downgrade(&host.material_demand.0);
+    let mailbox = Arc::downgrade(&host.material_demand.observations);
     let count = host.count();
     // SAFETY: the verified range is in the title buffer in use as an SRV.
     // Like the title's indirect-record reads, its buffer promotes to COPY_SOURCE.
@@ -388,7 +432,7 @@ pub(crate) fn record(
 impl Mailbox {
     #[cfg(all(test, feature = "diagnostics"))]
     pub(crate) fn captured_fields(&self) -> Vec<(u32, u32)> {
-        let observations = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let observations = self.observations.lock().unwrap_or_else(|e| e.into_inner());
         observations
             .iter()
             .find_map(|obs| obs.capture.as_ref())
@@ -396,8 +440,17 @@ impl Mailbox {
             .unwrap_or_default()
     }
 
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn upload_outcome(&self, slot: u32, write: u64, frame: u64, outcome: &'static str) {
+        if trace_enabled()
+            && self.uploads.lock().unwrap_or_else(|e| e.into_inner()).record(slot, write, frame)
+        {
+            tracing::info!(slot, write, frame, outcome, "material texture upload outcome");
+        }
+    }
+
     pub(crate) fn take(&self, heap: &Heap, host: &HostHeap, frame: u64) -> Vec<(u32, u64, bool)> {
-        let observations = std::mem::take(&mut *self.0.lock().unwrap_or_else(|e| e.into_inner()));
+        let observations = std::mem::take(&mut *self.observations.lock().unwrap_or_else(|e| e.into_inner()));
         let mut priority = Vec::new();
         for obs in observations {
             let current = frame.abs_diff(obs.frame) <= MAX_AGE
@@ -425,6 +478,19 @@ impl Mailbox {
                 ) && !priority.contains(&item)
                 {
                     priority.push(item);
+                }
+            }
+            // This observes the queue after demand has had its normal turn.
+            // Trace-only recording never enrols, promotes or reorders a slot.
+            #[cfg(feature = "diagnostics")]
+            if let Some(capture) = &obs.capture {
+                for &(offset, slot) in &capture.fields {
+                    if let Some(write) = host.material_queued_write(heap, slot, obs.stamp) {
+                        self.uploads.lock().unwrap_or_else(|e| e.into_inner()).watch(slot, write, frame);
+                        tracing::info!(shader = capture.draw.shader, draw_frame = capture.draw.frame,
+                            record = capture.record, offset, slot, write, frame,
+                            "watch material texture upload");
+                    }
                 }
             }
         }
@@ -531,6 +597,28 @@ mod tests {
         assert_eq!(byte_range(16, regular, 44), Some((16, 28)));
         assert_eq!(byte_range(16, packed, 44), None);
         assert_eq!(byte_range(16, packed, 52), Some((16, 36)));
+    }
+
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn material_upload_watch_matches_the_write_and_bounds_repeated_logs() {
+        let mut watch = UploadWatch::default();
+        watch.watch(7, 10, 4);
+        assert!(!watch.record(7, 11, 4));
+        assert!(!watch.record(8, 10, 4));
+        for _ in 0..UploadWatch::ATTEMPTS {
+            assert!(watch.record(7, 10, 4));
+        }
+        watch.watch(7, 10, 5);
+        assert!(!watch.record(7, 10, 5));
+        watch.watch(7, 11, 5);
+        assert!(watch.record(7, 11, 5));
+        let late = 6 + UploadWatch::FRAMES;
+        assert!(!watch.record(7, 11, late));
+        for slot in 0..=UploadWatch::SLOTS as u32 {
+            watch.watch(slot, 12, late);
+        }
+        assert_eq!(watch.0.len(), UploadWatch::SLOTS);
     }
 
     #[test]
