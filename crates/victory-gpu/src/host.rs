@@ -1329,7 +1329,17 @@ impl Host {
             if groups.len() == 1 && started.elapsed() > std::time::Duration::from_millis(200) {
                 // SAFETY: a plain query.
                 let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
-                tracing::warn!(ms = started.elapsed().as_millis(), "slow host submission");
+                let notes: usize = runs
+                    .iter()
+                    .map(|r| r.notes.lock().unwrap_or_else(|e| e.into_inner()).len())
+                    .sum();
+                tracing::warn!(
+                    ms = started.elapsed().as_millis(),
+                    lists = runs.len(),
+                    notes,
+                    stamps = runs[0].stamps().is_some(),
+                    "slow host submission"
+                );
                 for (n, r) in runs.iter().enumerate() {
                     for (ms, op) in r.slowest(frequency, 2) {
                         tracing::warn!("slow list {n} command, {ms:.1} ms: {op}");
