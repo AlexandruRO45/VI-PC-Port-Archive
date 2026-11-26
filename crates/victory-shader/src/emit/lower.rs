@@ -97,9 +97,37 @@ enum Stop {
 
 pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
     let mut bad = HashMap::new();
+    #[cfg(feature = "diagnostics")]
+    let mut passes = 0u32;
     loop {
-        match Lower::new(parts, &bad).run() {
-            Ok(l) => return Ok(l),
+        #[cfg(feature = "diagnostics")]
+        {
+            passes += 1;
+        }
+        #[cfg(feature = "diagnostics")]
+        let started = std::time::Instant::now();
+        let mut made = Lower::new(parts, &bad);
+        #[cfg(feature = "diagnostics")]
+        let setup = started.elapsed();
+        #[cfg(feature = "diagnostics")]
+        let run_started = std::time::Instant::now();
+        let outcome = made.run();
+        #[cfg(feature = "diagnostics")]
+        let ran = run_started.elapsed();
+        match outcome {
+            Ok(l) => {
+                #[cfg(feature = "diagnostics")]
+                if passes > 1 {
+                    eprintln!(
+                        "lowering passes: {} blocks={} setup_us={} run_us={}",
+                        passes,
+                        parts.p.blocks.len(),
+                        setup.as_micros(),
+                        ran.as_micros()
+                    );
+                }
+                return Ok(l);
+            }
             Err(Stop::Retry(v, why)) => {
                 if bad.insert(v, why).is_some() {
                     return Err(ShaderError::Unsupported {
