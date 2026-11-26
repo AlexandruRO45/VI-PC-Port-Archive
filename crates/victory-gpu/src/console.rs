@@ -71,11 +71,13 @@ fn dedicated_video_memory() -> Option<usize> {
     use windows::Win32::Graphics::Dxgi::{
         CreateDXGIFactory2, DXGI_CREATE_FACTORY_FLAGS, IDXGIFactory4,
     };
-    // SAFETY: plain factory and adapter queries, freed on drop.
-    let factory: IDXGIFactory4 =
-        unsafe { CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)) }.ok()?;
-    let adapter = unsafe { factory.EnumAdapters1(0) }.ok()?;
-    let desc = unsafe { adapter.GetDesc1() }.ok()?;
+    // SAFETY: plain factory and adapter queries, with no side effects;
+    // the factory and adapter are freed on drop.
+    let desc = unsafe {
+        let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
+        let adapter = factory.EnumAdapters1(0).ok()?;
+        adapter.GetDesc1().ok()?
+    };
     Some(desc.DedicatedVideoMemory as usize)
 }
 
