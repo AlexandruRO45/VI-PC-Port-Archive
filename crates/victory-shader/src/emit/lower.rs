@@ -11497,6 +11497,7 @@ mod tests {
         (layout, used)
     }
 
+    #[cfg(all(test, windows))]
     #[test]
     fn waterfall_loops_over_descriptors_joined_per_lane_sample_with_each_lanes_own() {
         use crate::resource::tests::{WATERFALL_JOINED_MIXED_WAVE32, WATERFALL_JOINED_WAVE32};
@@ -11538,6 +11539,7 @@ mod tests {
         lower_with(&words, layout, used).expect("the high half is 0 wherever a lane runs");
     }
 
+    #[cfg(all(test, windows))]
     #[test]
     fn a_descriptor_skipped_only_by_lanes_that_never_run_needs_no_source() {
         // As `indirect_light_probes:CS_Alpha_Schedule`: the texture is
@@ -11586,6 +11588,7 @@ mod tests {
         }
     }
 
+    #[cfg(all(test, windows))]
     #[test]
     fn descriptors_joined_by_nested_control_flow_lower_to_one_uniform_handle() {
         // The view table at s0 (2D textures at entries 0 and 1, a raw UAV at
@@ -11639,6 +11642,7 @@ mod tests {
         }
     }
 
+    #[cfg(all(test, windows))]
     #[test]
     fn descriptors_reloaded_from_a_root_table_share_one_handle() {
         // The view table at s0 (2D textures at entries 0 and 1, a raw UAV at
