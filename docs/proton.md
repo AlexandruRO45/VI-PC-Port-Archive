@@ -96,8 +96,8 @@ output redirected to a file.
 
 The launch settings of `scripts/play.ps1` apply on Linux as on Windows.
 `VICTORY_KEYS` presses the pad's A on the start screen in every build, so an
-unattended run gets past it (it does nothing unless set). With
-`VICTORY_ONE_LATCH=0` on a vkd3d-proton older than 71cae09 (below), add
+unattended run gets past it (it does nothing unless set). On a vkd3d-proton
+older than 71cae09, which includes the 3.2.0 of current Proton (below), add
 `VICTORY_PIPELINE_WAIT_MS=0`.
 
 ## Problems seen under Proton
@@ -137,15 +137,13 @@ frame that asks for one of them spends the whole pipeline-wait budget
 2026-11-24/25 (694cc67, "Only run fixup passes after structurizer has run",
 and 3bc8276); with vkd3d-proton 71cae09, which has them, all six are made.
 
-Stopgap, on under Wine (`VICTORY_ONE_LATCH`): DXC writes loops with one latch,
-so the translation gives every loop one (the blocks that branched back branch
-to a new block that branches back alone). With it the six are made on 3.2.0
-too, and a world frame takes 53-60 ms here, the same as with
-`VICTORY_PIPELINE_WAIT_MS=0`. It is to be removed once Proton ships a
-vkd3d-proton with the dxil-spirv fix. Without it, `VICTORY_PIPELINE_WAIT_MS=0`
-avoids the wait for draws: those whose pipeline is not ready are dropped
-instead. Compute dispatches still wait for the six once (below): one frame of
-10 s at the world's start, then 54-60 ms frames (one cold run on 3.2.0).
+What to do on 3.2.0: `VICTORY_PIPELINE_WAIT_MS=0`, which avoids the wait for
+draws (those whose pipeline is not ready are dropped instead), or a
+vkd3d-proton with the dxil-spirv fix beside the executable. Compute dispatches
+still wait for the six once (below): one frame of 10 s at the world's start,
+then 54-60 ms frames (one cold run on 3.2.0). A change that made the
+translation give every loop one latch also made the six build on 3.2.0, but
+it changed the shader cache key for every Wine user and is not in the tree.
 
 ### Heads without skin (a floating cap, eyes and teeth)
 
@@ -169,7 +167,7 @@ waited for only until a worker has had it for 10 s; past that a dispatch is
 dropped as before (logged once per pipeline). Without the bound, the first
 world frame on a cold cache waited for some 670 compute pipelines one after
 another, 33 s, and the title's own watchdog (about 30 s) ended the run. With
-it, in two cold starts (one on 3.2.0 with the single latch off, one on
+it, in two cold starts (one on 3.2.0 with `VICTORY_PIPELINE_WAIT_MS=0`, one on
 71cae09), and four more with earlier forms of the bounds, the heads had skin,
 the head map was made within 15 ms of its dispatch, and the title ran on. With
 `VICTORY_COMPUTE_WAIT=0` on this tree the heads had no skin again.
