@@ -2185,10 +2185,13 @@ void main(uint3 id : SV_DispatchThreadID) {
             };
             let a = crate::resource::host_copy(object).unwrap();
             let b = crate::resource::host_copy(placed as This).unwrap();
+            // SAFETY: a live resource.
+            let own = unsafe { a.texture.GetDesc() }.Format.0 as u32;
             let shared = shared
-                && a.castable
-                    .iter()
-                    .any(|&c| crate::resource::family(c) == crate::resource::family(format));
+                && (crate::resource::family(own) == crate::resource::family(format)
+                    || a.castable
+                        .iter()
+                        .any(|&c| crate::resource::family(c) == crate::resource::family(format)));
             assert_eq!(std::sync::Arc::ptr_eq(&a, &b), shared, "round {round}: one host texture");
             let unordered = View::Unordered(object as usize, 0, Some([written, 4, 0, 0, 0, 0, 0, 0, 0, 0]));
             slots.make(0, &unordered);
