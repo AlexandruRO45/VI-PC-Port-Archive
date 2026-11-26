@@ -443,10 +443,10 @@ fn shown_at(pages: &[usize]) -> Vec<usize> {
 
 /// Reports writes into physical pages through our own views at every title
 /// view showing them (DirectStorage's page destinations).
-fn report_written(shown: &[usize]) {
-    for &page in shown {
-        drop(victory_gpu::kernel_will_write(page, PAGE));
-    }
+/// Tell the GPU write watch that pages are about to be written through our
+/// own views. Returns guards that keep the pages open until dropped.
+fn report_written(shown: &[usize]) -> Vec<victory_gpu::KernelWrite> {
+    shown.iter().map(|&page| victory_gpu::kernel_will_write(page, PAGE)).collect()
 }
 
 static PHYSICAL: LazyLock<Mutex<Physical>> = LazyLock::new(|| {
@@ -620,6 +620,8 @@ pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> boo
         return false;
     };
     let shown = shown_at(pages.get(offset / PAGE..(offset + data.len()).div_ceil(PAGE)).unwrap_or(&[]));
+    // Tell the watch before writing; guards stay alive during the write.
+    let _writing = report_written(&shown);
     let (mut within, mut done) = (offset % PAGE, 0);
     for (slice, n) in &runs {
         let Some(mut view) = View::map(slice, *n) else {
@@ -629,7 +631,7 @@ pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> boo
         view.bytes()[within..within + k].copy_from_slice(&data[done..done + k]);
         (within, done) = (0, done + k);
     }
-    report_written(&shown);
+    // _writing dropped here, after the write.
     true
 }
 
@@ -640,13 +642,13 @@ pub(crate) struct PageWindow {
     view: View,
     within: usize,
     len: usize,
-    /// Title views showing the pages, told when the window is done.
-    shown: Vec<usize>,
+    /// Write-watch guards held open while the window is live.
+    _writing: Vec<victory_gpu::KernelWrite>,
 }
 
 impl Drop for PageWindow {
     fn drop(&mut self) {
-        report_written(&self.shown);
+        // _writing dropped here, after the user has finished writing.
     }
 }
 
@@ -667,11 +669,12 @@ pub(crate) fn page_window(pages: &[usize], offset: usize, len: usize) -> Option<
     let [(slice, n)] = runs.as_slice() else {
         return None;
     };
+    let shown = shown_at(pages.get(offset / PAGE..(offset + len).div_ceil(PAGE)).unwrap_or(&[]));
     Some(PageWindow {
         view: View::map(slice, *n)?,
         within: offset % PAGE,
         len,
-        shown: shown_at(pages.get(offset / PAGE..(offset + len).div_ceil(PAGE)).unwrap_or(&[])),
+        _writing: report_written(&shown),
     })
 }
 
