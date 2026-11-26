@@ -361,6 +361,7 @@ extern "system" fn stand_in_proc(
     match message {
         // A user close (close button, Alt+F4, window or taskbar menu).
         wm::WM_CLOSE => {
+            note_close("WM_CLOSE to the window");
             end_title("window closed", Box::new(|| {}));
             return 0;
         }
@@ -431,6 +432,7 @@ extern "system" fn window_proc(
     // A user close (close button, Alt+F4, window or taskbar menu); a
     // console title never sees one, nor a WM_CLOSE from it.
     if message == wm::WM_SYSCOMMAND && wparam & 0xFFF0 == wm::SC_CLOSE as usize {
+        note_close("SC_CLOSE");
         end_title("window closed", Box::new(|| {}));
         return 0;
     }
@@ -439,6 +441,7 @@ extern "system" fn window_proc(
     let window = stand_in_of(hwnd);
     // SAFETY: visibility is a plain query on the stand-in.
     if message == wm::WM_CLOSE && !window.is_null() && unsafe { wm::IsWindowVisible(window) != 0 } {
+        note_close("WM_CLOSE to the title's window");
         end_title("window closed", Box::new(|| {}));
         return 0;
     }
@@ -482,6 +485,40 @@ extern "system" fn window_proc(
 
 /// Suspends the title as the console does when it ends it, runs `then`
 /// (once), then ends the process. Returns at once; later calls do nothing.
+/// Says how a close arrived: sent from another thread (and whether that
+/// thread waits for the answer) or posted, and which process owns the
+/// window in front. Test sessions were closed minutes in by a close no one
+/// meant to send; this names the likely sender next time.
+fn note_close(how: &str) {
+    use windows_sys::Win32::System::Threading::GetCurrentProcessId;
+    // SAFETY: plain queries about this thread's message and the desktop.
+    let (flags, front, owner) = unsafe {
+        let flags = wm::InSendMessageEx(std::ptr::null());
+        let front = wm::GetForegroundWindow();
+        let mut owner = 0u32;
+        if !front.is_null() {
+            wm::GetWindowThreadProcessId(front, &mut owner);
+        }
+        (flags, front, owner)
+    };
+    let sent = match flags & (wm::ISMEX_SEND | wm::ISMEX_NOTIFY | wm::ISMEX_CALLBACK) {
+        0 => "posted, or sent by this thread",
+        f if f & wm::ISMEX_NOTIFY != 0 => "sent by another thread, which does not wait",
+        f if f & wm::ISMEX_CALLBACK != 0 => "sent by another thread, with a callback",
+        _ => "sent by another thread, which waits",
+    };
+    // SAFETY: a plain query.
+    let ours = unsafe { GetCurrentProcessId() };
+    tracing::info!(
+        how,
+        sent,
+        front = format_args!("{:#x}", front as usize),
+        front_process = owner,
+        this_process = ours,
+        "close received"
+    );
+}
+
 pub(crate) fn end_title(why: &'static str, then: Box<dyn FnOnce() + Send>) {
     static ENDING: AtomicBool = AtomicBool::new(false);
     if ENDING.swap(true, Ordering::SeqCst) {
