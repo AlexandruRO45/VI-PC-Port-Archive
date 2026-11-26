@@ -160,7 +160,105 @@ fn uneven_sides(after: bool) -> Vec<u32> {
     a.finish()
 }
 
-fn build(words: &[u32]) -> HostShader {
+const S_CBRANCH_SCC0: u32 = 0x04;
+
+/// Threads 0-15 go round a loop without barriers (thread & 3) + 1 times,
+/// leaving it per lane, write 2 to LDS at their index and meet a barrier;
+/// every thread meets one after the join and reads LDS at its index & 15:
+/// 2 for every thread. The loop's latch must count the barriers after the
+/// loop (its exit), not its back edge's none: counted as none, the side
+/// looked lighter and got a barrier ahead of its write, which the other
+/// threads' barrier paired with, so they read LDS before it was written.
+fn loop_without_barriers_on_the_heavier_side() -> Vec<u32> {
+    let mut a = Asm::default();
+    a.put(PROLOGUE)
+        // LDS keeps what an earlier dispatch left: every thread clears the
+        // slot it reads first, and the group meets once.
+        .put(&[
+            0x7E0A_0280, // v_mov_b32 v5, 0
+            0x360C_008F, // v_and_b32 v6, 15, v0
+            0x340C_0C82, // v_lshlrev_b32 v6, 2, v6
+            0xD834_0000,
+            0x0000_0506, // ds_write_b32 v6, v5
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            S_BARRIER,
+        ])
+        .put(&[LANES_BELOW_16, SAVE_EXEC_VCC])
+        .branch(S_CBRANCH_EXECZ, "join")
+        .put(&[
+            0x3604_0083, // v_and_b32 v2, 3, v0
+            0x4A04_0481, // v_add_nc_u32 v2, 1, v2
+            0x7E06_0280, // v_mov_b32 v3, 0
+            0xBE87_037E, // s_mov_b32 s7, exec_lo
+        ])
+        .label("round")
+        .put(&[
+            0x4A06_0681, // v_add_nc_u32 v3, 1, v3
+            0x7D82_0503, // v_cmp_lt_u32 vcc_lo, v3, v2
+            0x877E_6A7E, // s_and_b32 exec_lo, exec_lo, vcc_lo
+        ])
+        .branch(S_CBRANCH_EXECNZ, "round")
+        .put(&[
+            0xBEFE_0307, // s_mov_b32 exec_lo, s7
+            V1_IS_2,
+            0xD834_0000,
+            0x0000_0114, // ds_write_b32 v20, v1
+            S_BARRIER,
+        ])
+        .label("join")
+        .put(&[
+            RESTORE_EXEC,
+            S_BARRIER,
+            0x3608_008F, // v_and_b32 v4, 15, v0
+            0x3408_0882, // v_lshlrev_b32 v4, 2, v4
+            0xD8D8_0000,
+            0x0100_0004, // ds_read_b32 v1, v4
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        ])
+        .put(EPILOGUE);
+    a.finish()
+}
+
+/// As [`loop_left_per_lane`], but the latch tests SCC of `s_cmp_eq_u32` of
+/// EXEC with 0 (no lane left) and goes round while it is clear: SCC of an
+/// equality of masks is "all lanes equal", so the wave goes round while any
+/// lane is left.
+fn loop_ended_by_a_mask_compare() -> Vec<u32> {
+    let mut a = Asm::default();
+    a.put(PROLOGUE)
+        .put(&[
+            0x3604_0083, // v_and_b32 v2, 3, v0
+            0x4A04_0481, // v_add_nc_u32 v2, 1, v2
+            0x7E02_0280, // v_mov_b32 v1, 0
+            0xBE87_037E, // s_mov_b32 s7, exec_lo
+        ])
+        .label("round")
+        .put(&[
+            S_BARRIER,
+            0x4A02_0281, // v_add_nc_u32 v1, 1, v1
+            0x7D82_0501, // v_cmp_lt_u32 vcc_lo, v1, v2
+            0x877E_6A7E, // s_and_b32 exec_lo, exec_lo, vcc_lo
+            0xBF06_807E, // s_cmp_eq_u32 exec_lo, 0
+        ])
+        .branch(S_CBRANCH_SCC0, "round")
+        .put(&[0xBEFE_0307]) // s_mov_b32 exec_lo, s7
+        .put(EPILOGUE);
+    a.finish()
+}
+
+/// The barriers lowering adds on branch edges, by the name of the first
+/// instruction of the block each edge leads into.
+fn padded_edges(words: &[u32]) -> Vec<(&'static str, u32)> {
+    let (lowered, firsts) = lowered(words);
+    lowered
+        .extra_barriers
+        .iter()
+        .map(|&((_, to), n)| (firsts[to], n))
+        .collect()
+}
+
+/// Lowers `words`; with the name of each IR block's first instruction.
+fn lowered(words: &[u32]) -> (lower::Lowered, Vec<&'static str>) {
     let native = NativeProgram {
         stage: HwStage::Cs,
         wave64: false,
@@ -184,7 +282,8 @@ fn build(words: &[u32]) -> HostShader {
             slot: 0,
         }],
         io: StageIo::Cs(ComputeIo {
-            rsrc2: 1 << 1,
+            // 512 bytes of LDS (`ComputeIo::lds_bytes`).
+            rsrc2: 1 << 1 | 1 << 15,
             threads: [THREADS, 1, 1],
         }),
         code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
@@ -206,6 +305,12 @@ fn build(words: &[u32]) -> HostShader {
         view_marks: false,
     })
     .expect("lower");
+    let firsts = p.blocks.iter().map(|b| b.insts.first().map_or("", |i| i.name())).collect();
+    (lowered, firsts)
+}
+
+fn build(words: &[u32]) -> HostShader {
+    let (lowered, _) = lowered(words);
     HostShader {
         stage: HwStage::Cs,
         dxil: lowered.dxil,
@@ -327,6 +432,68 @@ fn barrier_programs_decode_as_written() {
     assert_eq!(names(uneven_sides(false)), with(&uneven));
     let after: Vec<&'static str> = uneven.iter().copied().chain(["s_barrier"]).collect();
     assert_eq!(names(uneven_sides(true)), with(&after));
+    assert_eq!(
+        names(loop_without_barriers_on_the_heavier_side()),
+        with(&[
+            "v_mov_b32",
+            "v_and_b32",
+            "v_lshlrev_b32",
+            "ds_write_b32",
+            "s_waitcnt",
+            "s_barrier",
+            "v_cmp_gt_u32",
+            "s_and_saveexec_b32",
+            "s_cbranch_execz",
+            "v_and_b32",
+            "v_add_nc_u32",
+            "v_mov_b32",
+            "s_mov_b32",
+            "v_add_nc_u32",
+            "v_cmp_lt_u32",
+            "s_and_b32",
+            "s_cbranch_execnz",
+            "s_mov_b32",
+            "v_mov_b32",
+            "ds_write_b32",
+            "s_barrier",
+            "s_or_b32",
+            "s_barrier",
+            "v_and_b32",
+            "v_lshlrev_b32",
+            "ds_read_b32",
+            "s_waitcnt",
+        ])
+    );
+    assert_eq!(
+        names(loop_ended_by_a_mask_compare()),
+        with(&[
+            "v_and_b32",
+            "v_add_nc_u32",
+            "v_mov_b32",
+            "s_mov_b32",
+            "s_barrier",
+            "v_add_nc_u32",
+            "v_cmp_lt_u32",
+            "s_and_b32",
+            "s_cmp_eq_u32",
+            "s_cbranch_scc0",
+            "s_mov_b32",
+        ])
+    );
+}
+
+#[test]
+fn a_loop_without_barriers_counts_the_barriers_after_it() {
+    runs_as_the_console(
+        "loop without barriers on the heavier side",
+        &loop_without_barriers_on_the_heavier_side(),
+        |_| 2,
+    );
+}
+
+#[test]
+fn a_loop_ended_by_a_mask_compare_goes_round_while_any_lane_is_left() {
+    runs_as_the_console("loop ended by a mask compare", &loop_ended_by_a_mask_compare(), |t| (t & 3) + 1);
 }
 
 #[test]
@@ -347,4 +514,15 @@ fn a_side_meeting_no_more_barriers_exits() {
 #[test]
 fn barriers_that_cannot_be_balanced_run_as_the_console_runs_them() {
     runs_as_the_console("uneven sides, one after", &uneven_sides(true), |t| if t < 16 { 2 } else { 1 });
+}
+
+/// The side holding a loop without barriers, then a barrier, is the
+/// heavier one: the padding goes on the edge of the side that skips it
+/// (into the join, `s_or_b32` restoring EXEC), not into the loop's side.
+/// Counting the loop's latch by its back edge (none) made the loop's side
+/// look lighter and padded it instead; NVIDIA's results do not show that,
+/// so this looks at the lowering.
+#[test]
+fn a_loop_without_barriers_pads_the_side_that_skips_it() {
+    assert_eq!(padded_edges(&loop_without_barriers_on_the_heavier_side()), [("s_or_b32", 1)]);
 }
