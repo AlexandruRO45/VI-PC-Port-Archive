@@ -12,6 +12,8 @@ pub const SAMPLER_SPACE: u32 = 0;
 /// Where root CBVs and SRVs are bound: `b<root parameter index>` and
 /// `t<root parameter index>` in this space.
 pub const ROOT_CBV_SPACE: u32 = 1;
+/// Where the compute dispatch's group-id base is bound: `b0` in this space.
+pub const GROUP_BASE_SPACE: u32 = 3;
 /// The root SRV slot (`t255` in [`ROOT_CBV_SPACE`], past every title root
 /// parameter) of the view-stride table: dword `i` is the byte stride of
 /// the buffer view at view-heap index `i` ([`VIEW_STRIDE_BITS`]), with
@@ -103,7 +105,8 @@ pub(crate) struct Shader {
     /// A geometry shader taking triangles and emitting triangle strips of
     /// at most this many vertices (`rect`).
     pub gs: Option<u32>,
-    /// Dwords of user data the shader reads (0: no user-data buffer).
+    /// The compute group-id base's handle, once the shader reads TGID x.
+    pub group_base: Option<V>,
     pub user_data: u32,
     /// Immediate samplers, bound as `s0..` in [`SAMPLER_SPACE`].
     pub samplers: u32,
@@ -192,6 +195,7 @@ impl Shader {
             samplers: 0,
             cmp_samplers: 0,
             sampler_choices: Vec::new(),
+            group_base: None,
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
@@ -290,6 +294,29 @@ impl Shader {
         );
         // The size is known in `finish`, which fixes this placeholder.
         self.annotate(block, h, 13, u32::MAX)
+    }
+
+    /// The handle of the one-dword constant buffer holding the compute
+    /// dispatch's group-id base, made in the entry block.
+    pub fn group_base_handle(&mut self) -> V {
+        if let Some(h) = self.group_base {
+            return h;
+        }
+        let r = self.m.i32(0);
+        let bind = [r, r, self.m.i32(GROUP_BASE_SPACE), self.m.i8(2)];
+        let bind = self.m.aggregate(self.t.bind, &bind);
+        let (i, f) = (self.m.i32(0), self.m.bool(false));
+        let h = self.op(
+            self.entry,
+            "createHandleFromBinding",
+            Attr::ReadNone,
+            self.t.handle,
+            217,
+            &[bind, i, f],
+        );
+        let h = self.annotate(self.entry, h, 13, 4);
+        self.group_base = Some(h);
+        h
     }
 
     /// The handle of the root CBV of root parameter `slot`, made in the
@@ -603,7 +630,7 @@ impl Shader {
             || !self.root_cbvs.is_empty()
             || !self.root_srvs.is_empty()
             || !self.root_uavs.is_empty()
-            || self.memory.is_some()
+            || self.group_base.is_some()
             || self.memory_dirty.is_some()
             || self.view_addresses.is_some()
             || self.view_marks.is_some()
@@ -631,6 +658,29 @@ impl Shader {
                 bindings.push(Binding {
                     kind: 2,
                     space: USER_DATA_SPACE,
+                    register: 0,
+                    dxil_kind: 13,
+                });
+            }
+            if self.group_base.is_some() {
+                let arr = self.m.array(1, self.t.i32);
+                let ty = self.m.named_struct("GroupBase", vec![arr]);
+                let p = self.m.ptr(ty);
+                let u = self.m.undef(p);
+                let ops = vec![
+                    Some(i32c(&mut self, cbv_list.len() as u32)),
+                    Some(self.m.md_value(u)),
+                    Some(empty),
+                    Some(i32c(&mut self, GROUP_BASE_SPACE)),
+                    Some(i32c(&mut self, 0)),
+                    Some(i32c(&mut self, 1)),
+                    Some(i32c(&mut self, 4)),
+                    None,
+                ];
+                cbv_list.push(Some(self.m.md_node(ops)));
+                bindings.push(Binding {
+                    kind: 2,
+                    space: GROUP_BASE_SPACE,
                     register: 0,
                     dxil_kind: 13,
                 });

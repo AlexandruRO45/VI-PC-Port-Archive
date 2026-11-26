@@ -1292,3 +1292,92 @@ fn ds_bpermute_refuses_gds() {
         Err(crate::ShaderError::Unsupported { what: "GDS", .. })
     ));
 }
+
+/// Lowering a compute program that reads TGID x adds the base from its own
+/// constant buffer; a pixel or mesh program's group id does not. The
+/// branch makes the SGPR read an effect, with no resources to track.
+#[test]
+fn only_compute_group_x_gets_the_base() {
+    let code: Vec<u8> = [
+        0xBF07_8007u32, // s_cmp_lg_u32 s7, 0
+        0xBF85_0001,    // s_cbranch_scc1 +1
+        S_ENDPGM,
+        S_ENDPGM,
+    ]
+    .into_iter()
+    .flat_map(|w| w.to_le_bytes())
+    .collect();
+    let p = ir::build(&code, false, 256).unwrap();
+    let v = p
+        .inputs
+        .iter()
+        .find(|(r, _)| *r == ir::Reg::S(7))
+        .unwrap()
+        .1;
+    let lower_as = |stage, native_io, input| {
+        let native = NativeProgram {
+            stage,
+            wave64: false,
+            vgprs: 256,
+            layout: vec![],
+            used: vec![],
+            io: native_io,
+            code: code.clone(),
+        };
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &[], native.stage, Some(&st)).unwrap();
+        lower(&super::Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io::Io {
+                inputs: vec![(v, input)],
+                interps: vec![],
+                exports: vec![],
+                initialized_sgprs: None,
+            },
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 64,
+            view_marks: false,
+        })
+        .unwrap_or_else(|e| panic!("{stage:?}: {e}"))
+    };
+
+    let cs = lower_as(
+        HwStage::Cs,
+        StageIo::Cs(ComputeIo {
+            rsrc2: 7 << 1 | 1 << 7,
+            threads: [1, 1, 1],
+        }),
+        io::Input::GroupId(0),
+    );
+    assert!(cs.group_base, "a compute TGID x read must declare the base");
+    let ps = lower_as(
+        HwStage::Ps,
+        StageIo::Ps {
+            inputs: vec![],
+            input_addr: 0,
+            db_shader_control: 0,
+            patches: vec![],
+        },
+        io::Input::GroupId(0),
+    );
+    assert!(!ps.group_base, "a pixel shader has no group id");
+    let ms = lower_as(
+        HwStage::Ms,
+        StageIo::Ms(crate::native::MeshIo {
+            outputs: vec![],
+            clip_cntl: 0,
+            threads: 32,
+            max_vertices: 0,
+            max_primitives: 0,
+            topology: 2,
+            lds_bytes: 0,
+        }),
+        io::Input::MeshGroup,
+    );
+    assert!(!ms.group_base, "a mesh group is scaled, not based");
+}

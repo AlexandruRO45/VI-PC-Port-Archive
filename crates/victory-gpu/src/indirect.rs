@@ -13,9 +13,11 @@
 //! either.
 //!
 //! shortcut: the bounds (2^24 vertices, 2^26 vertex instances, 65,535
-//! groups per dimension and 2^20 per dispatch, one-dimensional mesh
-//! dispatches, the budget) cut legitimate work beyond them; raise them if
-//! the title needs more.
+//! groups per dimension except a dispatch's x, 2^20 per dispatch,
+//! one-dimensional mesh dispatches, the budget) cut legitimate work beyond
+//! them; raise them if the title needs more. A dispatch over the host's
+//! per-dimension limit is clamped into 17 chunks (kind 3), each with its
+//! own base for the shader's group id.
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::s;
@@ -24,10 +26,12 @@ use crate::compute::{compute, constants, root_view};
 use crate::host::{HostList, host, transition};
 
 const SOURCE: &str = r#"
-cbuffer Record : register(b0) { uint kind; uint stride; uint records; uint unused; };
+cbuffer Record : register(b0) { uint kind; uint stride; uint records; uint counted; };
 // The title's records, read only; the clamped ones go to the list's own.
 // In words: the caller refuses addresses and strides not multiples of 4.
 StructuredBuffer<uint> args : register(t0);
+// The title's record count, when `counted` (chunked dispatch only).
+StructuredBuffer<uint> counts : register(t1);
 RWStructuredBuffer<uint> dest : register(u0);
 // The list's work so far (vertex instances, threads): past the budget,
 // records run empty.
@@ -35,6 +39,9 @@ RWStructuredBuffer<uint> budget : register(u1);
 static const uint BUDGET = 1u << 27;
 // Groups of one dispatch; more run empty.
 static const uint GROUPS = 1u << 20;
+// A dispatch larger than D3D12's per-dimension limit runs in chunks of x.
+static const uint CHUNK = 65535;
+static const uint CHUNKS = 17;
 uint3 load3(uint at) {
     return uint3(args[at], args[at + 1], args[at + 2]);
 }
@@ -43,37 +50,63 @@ void store3(uint at, uint3 v) {
     dest[at + 1] = v.y;
     dest[at + 2] = v.z;
 }
-// Clamps the record at word `at` into `dest`; its cost.
-uint clamped(uint at) {
+// A whole dispatch's work, before its x is split. Compare by division so
+// that x * y * z cannot wrap before the 2^20-groups test.
+uint dispatch_cost(uint at) {
+    uint x = min(args[at], GROUPS);
+    uint y = min(args[at + 1], CHUNK);
+    uint z = min(args[at + 2], CHUNK);
+    uint yz = y * z;
+    if (yz != 0 && x > GROUPS / yz) {
+        x = 0;
+    }
+    return x * yz * 64;
+}
+// Clamps the title's record at word `at` into `dest` at word `to`; `host`
+// is the host record's index (a chunk of one title record for kind 3).
+// Returns the work charged to the budget.
+uint clamped(uint at, uint to, uint host) {
     uint cost;
     if (kind <= 1) {
         // Draws: vertex or index count, then instances.
         uint count = min(args[at], 1u << 24);
         uint instances = min(args[at + 1], (1u << 26) / max(count, 1u));
         cost = count * instances;
-        dest[at] = count;
-        dest[at + 1] = instances;
+        dest[to] = count;
+        dest[to + 1] = instances;
         // The rest of the record as it is: first vertex and instance (4 words
         // in all), or first index, base vertex and first instance (5).
-        dest[at + 2] = args[at + 2];
-        dest[at + 3] = args[at + 3];
+        dest[to + 2] = args[at + 2];
+        dest[to + 3] = args[at + 3];
         if (kind == 1) {
-            dest[at + 4] = args[at + 4];
+            dest[to + 4] = args[at + 4];
         }
     } else if (kind == 2) {
-        uint3 g = min(load3(at), uint3(65535, 65535, 65535));
+        uint3 g = min(load3(at), uint3(CHUNK, CHUNK, CHUNK));
         // x * y fits 32 bits; the whole count may not.
         if (g.z != 0 && g.x * g.y > GROUPS / g.z) {
             g = uint3(0, 0, 0);
         }
         cost = g.x * g.y * g.z * 64;
-        store3(at, g);
+        store3(to, g);
+    } else if (kind == 3) {
+        // Chunked dispatch: the command signature reads a base and three
+        // group counts from each 16-byte host record.
+        uint chunk = host % CHUNKS;
+        uint base = chunk * CHUNK;
+        uint x = args[at];
+        dest[to] = base;
+        dest[to + 1] = x > base ? min(x - base, CHUNK) : 0;
+        dest[to + 2] = min(args[at + 1], CHUNK);
+        dest[to + 3] = min(args[at + 2], CHUNK);
+        // Charge the whole title record once, to its first chunk.
+        cost = chunk == 0 ? dispatch_cost(at) : 0;
     } else {
         // Mesh dispatches: the console's are one-dimensional.
         uint3 g = load3(at);
-        g = uint3(min(g.x, 65535u), min(g.y, 1u), min(g.z, 1u));
+        g = uint3(min(g.x, CHUNK), min(g.y, 1u), min(g.z, 1u));
         cost = g.x * g.y * g.z * 128;
-        store3(at, g);
+        store3(to, g);
     }
     return cost;
 }
@@ -87,21 +120,32 @@ groupshared uint costs[64];
 [numthreads(64, 1, 1)]
 void main(uint lane : SV_GroupIndex) {
     uint left = 0;
+    // A chunked record rejected by the budget: all its chunks run empty.
+    uint reject = 0xffffffffu;
     if (lane == 0) {
         left = BUDGET - min(budget[0], BUDGET);
     }
-    for (uint tile = 0; tile < records / 64 + min(records % 64, 1u); tile++) {
-        uint record = tile * 64 + lane;
-        uint at = record * (stride / 4);
+    uint total = kind == 3 ? records * CHUNKS : records;
+    for (uint tile = 0; tile < total / 64 + min(total % 64, 1u); tile++) {
+        uint host = tile * 64 + lane;
+        uint at = kind == 3 ? (host / CHUNKS) * (stride / 4) : host * (stride / 4);
+        uint to = kind == 3 ? host * 4 : at;
         uint cost = 0;
-        if (record < records) {
-            cost = clamped(at);
+        if (host < total) {
+            cost = clamped(at, to, host);
         }
         costs[lane] = cost;
         GroupMemoryBarrierWithGroupSync();
         if (lane == 0) {
             for (uint i = 0; i < 64; i++) {
-                if (costs[i] > left) {
+                if (kind == 3) {
+                    uint h = tile * 64 + i;
+                    if (h < total && h % CHUNKS == 0 && costs[i] > left) {
+                        reject = h;
+                        costs[i] = PAST;
+                        left = 0;
+                    }
+                } else if (costs[i] > left) {
                     // The first record that does not fit takes what is
                     // left, so those after it run empty too.
                     costs[i] = PAST;
@@ -110,15 +154,33 @@ void main(uint lane : SV_GroupIndex) {
                     left -= costs[i];
                 }
             }
+            if (kind == 3) {
+                for (uint j = 0; j < 64; j++) {
+                    uint h = tile * 64 + j;
+                    if (h < total && h - h % CHUNKS == reject) {
+                        costs[j] = PAST;
+                    }
+                }
+            }
         }
         GroupMemoryBarrierWithGroupSync();
         if (costs[lane] == PAST) {
             // Draws keep their layout with no vertices; groups become zero.
-            dest[at] = 0;
+            dest[to] = 0;
+            if (kind == 3) {
+                dest[to + 1] = 0;
+                dest[to + 2] = 0;
+                dest[to + 3] = 0;
+            }
         }
     }
     if (lane == 0) {
         budget[0] = BUDGET - left;
+        if (kind == 3 && counted != 0) {
+            // ExecuteIndirect reads this as its count: one title record
+            // became CHUNKS host records.
+            dest[records * CHUNKS * 4] = min(counts[0], records) * CHUNKS;
+        }
     }
 }
 "#;
@@ -147,7 +209,8 @@ fn clamp() -> Option<&'static Clamp> {
 }
 
 /// The clamp, its root signature the record (b0), the title's records
-/// (t0), the budget (u1) and the clamped records (u0), as [`bound`] binds.
+/// (t0) and count (t1), the budget (u1) and the clamped records (u0), as
+/// [`bound`] binds.
 fn make() -> windows::core::Result<Clamp> {
     let device = &host().ok_or_else(windows::core::Error::empty)?.device;
     let params = [
@@ -155,17 +218,21 @@ fn make() -> windows::core::Result<Clamp> {
         root_view(D3D12_ROOT_PARAMETER_TYPE_SRV, 0, 0),
         root_view(D3D12_ROOT_PARAMETER_TYPE_UAV, 1, 0),
         root_view(D3D12_ROOT_PARAMETER_TYPE_UAV, 0, 0),
+        root_view(D3D12_ROOT_PARAMETER_TYPE_SRV, 1, 0),
     ];
     let (root, pso) = compute(device, s!("argument clamp"), SOURCE, 0, &params)?;
     Ok(Clamp { root, pso })
 }
 
 /// Records, in `list`, the clamp of `records` records of `kind` (PC
-/// argument numbering) `stride` bytes apart at host address `gpu` (a title
-/// buffer's copy, only read) into the list's own argument buffer, left
-/// ready to be read as arguments: that buffer, for [`done`] after the
-/// execution. Replaces the list's compute root signature and pipeline
-/// (callers bind theirs after). `None` if the clamp is not available.
+/// argument numbering: 3 is a chunked dispatch) `stride` bytes apart at
+/// host address `gpu` (a title buffer's copy, only read) into the list's
+/// own argument buffer, left ready to be read as arguments: that buffer,
+/// for [`done`] after the execution. `count` is the title's count buffer's
+/// address, read for kind 3 and written into the output's last word as
+/// the host record count. Replaces the list's compute root signature and
+/// pipeline (callers bind theirs after). `None` if the clamp is not
+/// available.
 ///
 /// Title buffers' copies are never transitioned: they are common between
 /// submissions and every use promotes them (shader and root views, the
@@ -178,16 +245,28 @@ fn make() -> windows::core::Result<Clamp> {
 // promoted to a write state the input assembler may not use (the debug
 // layer cannot see view accesses; GPU-based validation might); upgrade to
 // per-list tracked buffer states if a driver or that validation minds.
-pub(crate) fn bound(list: &HostList, gpu: u64, (kind, stride, records): (u32, u32, u32)) -> Option<ID3D12Resource> {
+pub(crate) fn bound(
+    list: &HostList,
+    gpu: u64,
+    (kind, stride, records): (u32, u32, u32),
+    count: Option<u64>,
+) -> Option<ID3D12Resource> {
     let (Some(c), Some(budget)) = (clamp(), list.budget()) else {
         return None;
     };
     if !gpu.is_multiple_of(4) || !stride.is_multiple_of(4) {
         return None;
     }
-    let out = list.arguments(u64::from(stride) * u64::from(records.max(1)))?;
+    let chunked = kind == 3;
+    if count.is_some_and(|at| !at.is_multiple_of(4)) {
+        return None;
+    }
+    let host_stride = if chunked { 16 } else { stride };
+    let words = (host_stride / 4) as u64 * u64::from(records.max(1));
+    let count_word = chunked && count.is_some();
+    let out = list.arguments(4 * (words + u64::from(count_word)))?;
     let l = &list.list;
-    let constants = [kind, stride, records, 0];
+    let constants = [kind, stride, records, u32::from(count.is_some())];
     // SAFETY: an open list; our root signature, pipeline and buffers, and
     // a title buffer's copy the caller's list holds.
     unsafe {
@@ -202,8 +281,18 @@ pub(crate) fn bound(list: &HostList, gpu: u64, (kind, stride, records): (u32, u3
         l.SetComputeRootShaderResourceView(1, gpu);
         l.SetComputeRootUnorderedAccessView(2, budget);
         l.SetComputeRootUnorderedAccessView(3, out.GetGPUVirtualAddress());
-        // One group walks every record.
-        l.Dispatch(records.min(1), 1, 1);
+        l.SetComputeRootShaderResourceView(4, count.unwrap_or(gpu));
+        // One group walks every host record.
+        l.Dispatch(
+            (if chunked {
+                records.saturating_mul(17)
+            } else {
+                records
+            })
+            .min(1),
+            1,
+            1,
+        );
         l.ResourceBarrier(&[
             uav_barrier(),
             transition(&out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT),
@@ -264,6 +353,7 @@ mod tests {
                 &list,
                 buffer.GetGPUVirtualAddress(),
                 (kind, per as u32 * 4, records),
+                None,
             )
             .unwrap();
             super::done(&list, &out);
@@ -324,6 +414,45 @@ mod tests {
         assert_eq!(past, (want, 1 << 27));
     }
 
+    /// A title dispatch over the host's per-dimension limit becomes 17
+    /// host records: three nonempty chunks of x, then empty ones with
+    /// their bases still set. The title's count becomes the host count.
+    #[test]
+    fn chunked_dispatch_records_hold_every_word() {
+        let Some(host) = super::host() else {
+            return; // no host GPU here
+        };
+        let (title, title_data) = host.shared_buffer(12).unwrap();
+        let (counts, count_data) = host.shared_buffer(4).unwrap();
+        let list = host.new_list().unwrap();
+        // SAFETY: mapped buffers written before the list runs, read after.
+        unsafe {
+            title_data
+                .cast::<u32>()
+                .copy_from_nonoverlapping([140_000u32, 1, 1].as_ptr(), 3);
+            count_data.cast::<u32>().write(1);
+            let out = super::bound(
+                &list,
+                title.GetGPUVirtualAddress(),
+                (3, 12, 1),
+                Some(counts.GetGPUVirtualAddress()),
+            )
+            .unwrap();
+            super::done(&list, &out);
+            list.close();
+            host.execute(&[&list]);
+            let mut p = std::ptr::null_mut();
+            out.Map(0, None, Some(&mut p)).unwrap();
+            let words = std::slice::from_raw_parts(p.cast::<u32>(), 17 * 4 + 1).to_vec();
+            let mut want = vec![0, 65_535, 1, 1, 65_535, 65_535, 1, 1, 131_070, 8_930, 1, 1];
+            for chunk in 3..17 {
+                want.extend([chunk * 65_535, 0, 1, 1]);
+            }
+            want.push(17);
+            assert_eq!(words, want);
+        }
+    }
+
     /// Clamps `records` records of `kind`, filled by repeating `words`,
     /// `calls` times in one list: each record's first word in the list's
     /// argument buffer after (zero when it runs empty). The title's copy,
@@ -351,7 +480,7 @@ mod tests {
             let gpu = buffer.GetGPUVirtualAddress();
             let mut out = None;
             for _ in 0..calls {
-                let clamped = super::bound(&list, gpu, spec).unwrap();
+                let clamped = super::bound(&list, gpu, spec, None).unwrap();
                 super::done(&list, &clamped);
                 out = Some(clamped);
             }
@@ -433,7 +562,7 @@ mod tests {
             let recorded: Vec<_> = lists
                 .iter()
                 .map(|l| {
-                    let out = super::bound(l, gpu, (2, 12, 1)).unwrap();
+                    let out = super::bound(l, gpu, (2, 12, 1), None).unwrap();
                     super::done(l, &out);
                     l.close();
                     (out, issued())
@@ -457,8 +586,9 @@ mod tests {
                 };
                 assert_eq!(clamped, [65_535, 1, 1]);
             }
-            // SAFETY: as above.
-            assert_eq!(unsafe { data.cast::<[u32; 3]>().read_volatile() }, [70_000, 1, 1], "the title's copy as written");
+            // SAFETY: a mapped buffer of ours, the lists have run.
+            let title = unsafe { data.cast::<[u32; 3]>().read_volatile() };
+            assert_eq!(title, [70_000, 1, 1], "the title's copy as written");
         }
     }
 

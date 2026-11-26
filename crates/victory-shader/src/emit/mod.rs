@@ -4,6 +4,9 @@
 //! on the lane layout (cross-lane operations) declares the console's wave
 //! size (`WaveSize`), so the host device must support it.
 //!
+//! A compute shader that reads TGID x adds the dispatch's group-id base
+//! from `b0` in [`GROUP_BASE_SPACE`] (module notes, "Group-id base"): the
+//! host splits a dispatch too large for D3D12 into chunks.
 //! What the host binds for a translated shader ([`HostShader`]):
 //!
 //! * **User data** at `b0, space 0` (32-bit root constants or a constant
@@ -174,6 +177,13 @@
 //!   [`VIEW_READS`] + the view's heap index in the same bitmap, after the
 //!   written pages, where still clear: the host makes views it left null
 //!   until a shader reads them (textures the title placed itself).
+//! * **Group-id base** (compute only, [`HostShader::group_base`]): a
+//!   program that reads TGID x adds the dword in the one-constant buffer
+//!   `b0` in [`GROUP_BASE_SPACE`] to `SV_GroupID.x`. The host binds it as
+//!   a root constant: a dispatch past D3D12's 65,535 groups per dimension
+//!   is split into chunks, each with its own base. TGID y/z and mesh
+//!   groups are unchanged.
+//!
 //!
 //! Entry points: [`translate`] (container bytes as the title passes them
 //! at pipeline creation → [`HostShader`]), [`emit`] (the same with the
@@ -236,9 +246,9 @@ use crate::{ShaderError, io, ir, resource, structure};
 
 pub use sampler::StaticSampler;
 pub use shader::{
-    HEAP_SAMPLERS, HEAP_VIEWS, MEMORY_SPACE, NULL_BUFFER_VIEW, ROOT_CBV_SPACE, SAMPLER_SPACE,
-    USER_DATA_SPACE, VIEW_INTEGER, VIEW_MARK_NONE, VIEW_MARKS, VIEW_READS, VIEW_SIGNED, VIEW_STRIDE_BITS,
-    VIEW_STRIDES, VIEW_WRITE_BITS, VIEW_WRITES,
+    GROUP_BASE_SPACE, HEAP_SAMPLERS, HEAP_VIEWS, MEMORY_SPACE, NULL_BUFFER_VIEW, ROOT_CBV_SPACE,
+    SAMPLER_SPACE, USER_DATA_SPACE, VIEW_INTEGER, VIEW_MARK_NONE, VIEW_MARKS, VIEW_READS,
+    VIEW_SIGNED, VIEW_STRIDE_BITS, VIEW_STRIDES, VIEW_WRITE_BITS, VIEW_WRITES,
 };
 
 /// The loop limit without an override: 2^20.
@@ -325,6 +335,10 @@ pub struct HostShader {
     /// `u`[`VIEW_WRITES`] in [`MEMORY_SPACE`] (module notes, "Write
     /// marks").
     pub view_marks: bool,
+    /// Whether the compute shader adds the dispatch's group-id base from
+    /// `b0` in [`GROUP_BASE_SPACE`] to TGID x (module notes, "Group-id
+    /// base").
+    pub group_base: bool,
 }
 
 impl HostShader {
@@ -536,6 +550,7 @@ pub fn emit_with(
         view_addresses: l.view_addresses,
         heap: l.heap,
         heap_writes: l.heap_writes,
+        group_base: l.group_base,
         view_marks: l.view_marks,
     })
 }
@@ -1070,6 +1085,7 @@ mod tests {
             heap: false,
             heap_writes: false,
             view_marks: false,
+            group_base: false,
         };
         let file = |var: &str, stage| {
             std::env::var(var).ok().map(|p| super::HostShader {
@@ -1087,6 +1103,7 @@ mod tests {
                 heap: false,
                 heap_writes: false,
                 view_marks: false,
+                group_base: false,
             })
         };
         let ps = file("VICTORY_REF_PS", crate::HwStage::Ps).unwrap_or(ps);

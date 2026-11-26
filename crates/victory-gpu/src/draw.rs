@@ -1124,8 +1124,28 @@ impl State {
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
         #[cfg(feature = "diagnostics")]
         self.probe_small(list, true);
-        // SAFETY: an open list with everything set.
-        unsafe { list.list.Dispatch(x, y, z) };
+        // D3D12 allows at most 65,535 groups per dimension. A translated
+        // compute shader adds the base we set before each chunk to TGID x;
+        // root constants are per list state, so always set it, zero too.
+        if let Some(param) = p.stages.iter().find_map(|s| s.group_base) {
+            let (mut base, mut left) = (0u32, x);
+            loop {
+                let groups = left.min(65_535);
+                // SAFETY: an open list with everything set.
+                unsafe {
+                    list.list.SetComputeRoot32BitConstant(param, base, 0);
+                    list.list.Dispatch(groups, y, z);
+                }
+                base = base.saturating_add(groups);
+                left -= groups;
+                if left == 0 {
+                    break;
+                }
+            }
+        } else {
+            // SAFETY: an open list with everything set.
+            unsafe { list.list.Dispatch(x, y, z) };
+        }
         #[cfg(feature = "diagnostics")]
         self.probe_written(list);
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
@@ -1752,8 +1772,22 @@ impl State {
             },
             None => None,
         };
+        // A translated compute shader adds a base to TGID x; such a
+        // pipeline needs a command signature with a constant argument and
+        // records four dwords apart (base, x, y, z).
+        let compute_pipeline = crate::pipeline::host_pipeline(self.pipeline as This);
+        let base_param = (kind == DISPATCH)
+            .then(|| compute_pipeline.and_then(|p| p.stages.iter().find_map(|s| s.group_base)))
+            .flatten();
+        let chunked = base_param.is_some();
+        let host_kind = if chunked { 3 } else { kind };
+        let host_stride = if chunked { 16 } else { stride };
+        let host_max = if chunked { max.saturating_mul(17) } else { max };
         let Some(signature) = matches!(kind, DRAW | INDEXED | DISPATCH | MESH)
-            .then(|| host_signature(kind, stride))
+            .then(|| {
+                let root = chunked.then(|| &compute_pipeline.expect("a chunked pipeline").root);
+                host_signature(kind, host_stride, root, base_param)
+            })
             .flatten()
         else {
             why("no host signature");
@@ -1764,7 +1798,16 @@ impl State {
             s.refresh(list, *at, 4);
         }
         // Bounded first: the clamp binds a compute pipeline of its own.
-        let Some(clamped) = crate::indirect::bound(list, args.gpu(arguments), (kind, stride, max)) else {
+        // SAFETY: a live shadow buffer of the title's count.
+        let count_gpu = counter
+            .as_ref()
+            .map(|(s, at)| unsafe { s.buffer.GetGPUVirtualAddress() + s.offset(*at) });
+        let Some(clamped) = crate::indirect::bound(
+            list,
+            args.gpu(arguments),
+            (host_kind, stride, max),
+            count_gpu,
+        ) else {
             why("not bounded (no clamp, or arguments not 4-byte aligned)");
             return false;
         };
@@ -1778,7 +1821,7 @@ impl State {
                 }) && self.prepare(list, kind == INDEXED)
             }
             MESH => self.prepare_for(list, false, true),
-            DISPATCH => match crate::pipeline::host_pipeline(self.pipeline as This) {
+            DISPATCH => match compute_pipeline {
                 Some(p) if p.compute => self.bind(list, p, true),
                 _ => false,
             },
@@ -1810,7 +1853,7 @@ impl State {
         unsafe {
             list.list.ExecuteIndirect(
                 &signature,
-                max,
+                host_max,
                 &clamped,
                 0,
                 counter.as_ref().map(|(s, _)| &s.buffer),
@@ -1824,9 +1867,22 @@ impl State {
             let always = !crate::host::traced_shaders().is_empty()
                 && crate::host::is_traced(&crate::pipeline::shaders_of(pipeline));
             if always || crate::capture::dump_on() {
-                let count = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
+                let count = if chunked {
+                    // The clamp put the host count at the end of its
+                    // argument buffer, already multiplied by 17.
+                    Some((&clamped, u64::from(host_stride) * u64::from(host_max)))
+                } else {
+                    counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)))
+                };
                 let name = crate::pipeline::shaders_of(pipeline);
-                crate::capture::read_indirect(list, (&clamped, 0), count, (kind, stride, max), name, always);
+                crate::capture::read_indirect(
+                    list,
+                    (&clamped, 0),
+                    count,
+                    (kind, host_stride, host_max),
+                    name,
+                    always,
+                );
             }
         }
         crate::indirect::done(list, &clamped);
@@ -1840,40 +1896,67 @@ impl State {
 }
 
 /// The host command signature for one argument of `kind` with records
-/// `stride` bytes apart (no root arguments, so no root signature), made
-/// once.
-fn host_signature(kind: u32, stride: u32) -> Option<ID3D12CommandSignature> {
-    static MADE: std::sync::Mutex<Vec<((u32, u32), ID3D12CommandSignature)>> =
-        std::sync::Mutex::new(Vec::new());
+/// `stride` bytes apart, made once per kind, stride and root signature. A
+/// chunked dispatch also sets the root constant `constant` from the record
+/// before its dispatch: a dword and three counts in 16 bytes.
+fn host_signature(
+    kind: u32,
+    stride: u32,
+    root: Option<&ID3D12RootSignature>,
+    constant: Option<u32>,
+) -> Option<ID3D12CommandSignature> {
+    // The key holds the root signature's address; the entry keeps a
+    // reference to it, so a freed one's address is never reused for another.
+    type SignatureKey = (u32, u32, usize, u32);
+    type SignatureCache = Vec<(
+        SignatureKey,
+        Option<ID3D12RootSignature>,
+        ID3D12CommandSignature,
+    )>;
+    static MADE: std::sync::Mutex<SignatureCache> = std::sync::Mutex::new(Vec::new());
+    let key = (
+        kind,
+        stride,
+        root.map_or(0, |r| r.as_raw() as usize),
+        constant.unwrap_or(u32::MAX),
+    );
     let mut made = MADE.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some((_, s)) = made.iter().find(|(k, _)| *k == (kind, stride)) {
+    if let Some((.., s)) = made.iter().find(|(k, ..)| *k == key) {
         return Some(s.clone());
     }
-    let argument = D3D12_INDIRECT_ARGUMENT_DESC {
-        Type: D3D12_INDIRECT_ARGUMENT_TYPE(kind as i32),
-        ..Default::default()
-    };
+    let mut arguments = [D3D12_INDIRECT_ARGUMENT_DESC::default(); 2];
+    arguments[0].Type = D3D12_INDIRECT_ARGUMENT_TYPE(kind as i32);
+    if let Some(param) = constant {
+        arguments[0].Type = D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT;
+        arguments[0].Anonymous = D3D12_INDIRECT_ARGUMENT_DESC_0 {
+            Constant: D3D12_INDIRECT_ARGUMENT_DESC_0_1 {
+                RootParameterIndex: param,
+                DestOffsetIn32BitValues: 0,
+                Num32BitValuesToSet: 1,
+            },
+        };
+        arguments[1].Type = D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH;
+    }
     let desc = D3D12_COMMAND_SIGNATURE_DESC {
         ByteStride: stride,
-        NumArgumentDescs: 1,
-        pArgumentDescs: &argument,
+        NumArgumentDescs: if constant.is_some() { 2 } else { 1 },
+        pArgumentDescs: arguments.as_ptr(),
         NodeMask: 0,
     };
     let mut signature: Option<ID3D12CommandSignature> = None;
-    // SAFETY: a description of one argument; no root arguments.
+    // SAFETY: a description of one or two arguments and, for two, the
+    // dispatching pipeline's live root signature.
     let result = unsafe {
-        crate::host::host()?.device.CreateCommandSignature(
-            &desc,
-            None::<&ID3D12RootSignature>,
-            &mut signature,
-        )
+        crate::host::host()?
+            .device
+            .CreateCommandSignature(&desc, root, &mut signature)
     };
     if let Err(e) = result {
         once!(error = %e, kind, stride, "host command signature refused");
         return None;
     }
     let signature = signature?;
-    made.push(((kind, stride), signature.clone()));
+    made.push((key, root.cloned(), signature.clone()));
     Some(signature)
 }
 
@@ -3925,5 +4008,190 @@ void main(uint3 id : SV_DispatchThreadID) {
             assert_eq!(host.log_messages(), None, "case {case} D3D12 debug errors");
             let _ = kept_obj;
         }
+    }
+
+    /// A compute shader with the same group-id base binding a translated
+    /// shader reads writes 1 at `buffer[tgid.x + base]`. A logical dispatch
+    /// of 70,000 groups (split at D3D12's limit) and an ExecuteIndirect of
+    /// the 17 host records a clamped title record becomes must each cover
+    /// every word and nothing past it.
+    #[test]
+    fn group_base_covers_a_dispatch_past_the_host_limit() {
+        const SOURCE: &str = r#"
+cbuffer Base : register(b1) { uint base; };
+RWStructuredBuffer<uint> out : register(u0);
+[numthreads(1, 1, 1)]
+void main(uint group : SV_GroupID) { out[group.x + base] = 1; }
+"#;
+
+        const N: u32 = 70_000;
+        const CHUNK: u32 = 65_535;
+        const RECORDS: u32 = 17;
+        let bytes = u64::from(N + 1) * 4;
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+
+        let base = D3D12_ROOT_PARAMETER {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+            Anonymous: D3D12_ROOT_PARAMETER_0 {
+                Constants: D3D12_ROOT_CONSTANTS {
+                    ShaderRegister: 1,
+                    RegisterSpace: 0,
+                    Num32BitValues: 1,
+                },
+            },
+            ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+        };
+        let params = [
+            crate::compute::root_view(D3D12_ROOT_PARAMETER_TYPE_UAV, 0, 0),
+            base,
+        ];
+        let Ok((root, pso)) =
+            crate::compute::compute(&host.device, s!("group base"), SOURCE, 0, &params)
+        else {
+            return; // no shader compiler here
+        };
+        let (base_param, uav_param) = (1u32, 0u32);
+        let signature = host_signature(2, 16, Some(&root), Some(base_param))
+            .expect("a root-constant dispatch signature");
+
+        let run = |indirect: bool| {
+            let (out, _) = host.shared_buffer(bytes).unwrap();
+            let slots = Slots::new(1);
+            let uav = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_TYPELESS,
+                ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+                Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                    Buffer: D3D12_BUFFER_UAV {
+                        FirstElement: 0,
+                        NumElements: N,
+                        StructureByteStride: 0,
+                        CounterOffsetInBytes: 0,
+                        Flags: D3D12_BUFFER_UAV_FLAG_RAW,
+                    },
+                },
+            };
+            // SAFETY: a live descriptor heap.
+            let cpu = unsafe { slots.0.GetCPUDescriptorHandleForHeapStart() };
+            // SAFETY: a live heap slot and output buffer.
+            unsafe {
+                host.device
+                    .CreateUnorderedAccessView(&out, None, Some(&uav), cpu)
+            };
+
+            let args = indirect.then(|| {
+                let (args, data) = host.shared_buffer(u64::from(RECORDS) * 16).unwrap();
+                let words = data.cast::<u32>();
+                // SAFETY: a mapped buffer of ours, written before the list runs.
+                unsafe {
+                    for c in 0..RECORDS {
+                        let base = c * CHUNK;
+                        let x = if N > base { (N - base).min(CHUNK) } else { 0 };
+                        for (i, v) in [base, x, 1, 1].into_iter().enumerate() {
+                            words.add(c as usize * 4 + i).write(v);
+                        }
+                    }
+                }
+                args
+            });
+            let readback: ID3D12Resource = {
+                let heap = D3D12_HEAP_PROPERTIES {
+                    Type: D3D12_HEAP_TYPE_READBACK,
+                    ..Default::default()
+                };
+                let desc = D3D12_RESOURCE_DESC {
+                    Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                    Width: bytes,
+                    Height: 1,
+                    DepthOrArraySize: 1,
+                    MipLevels: 1,
+                    Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                    ..Default::default()
+                };
+                let mut made = None;
+                // SAFETY: a plain resource creation.
+                unsafe {
+                    host.device.CreateCommittedResource(
+                        &heap,
+                        D3D12_HEAP_FLAG_NONE,
+                        &desc,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                        None,
+                        &mut made,
+                    )
+                }
+                .unwrap();
+                made.unwrap()
+            };
+            let list = host.new_list().unwrap();
+            // SAFETY: a live shader-visible descriptor heap.
+            let gpu = unsafe { slots.0.GetGPUDescriptorHandleForHeapStart() }.ptr;
+            // SAFETY: an open list, live objects, and buffers kept below.
+            unsafe {
+                let l = &list.list;
+                l.ResourceBarrier(&[crate::host::transition(
+                    &out,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                )]);
+                if let Some(args) = &args {
+                    l.ResourceBarrier(&[crate::host::transition(
+                        args,
+                        D3D12_RESOURCE_STATE_COMMON,
+                        D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                    )]);
+                }
+                l.SetDescriptorHeaps(&[Some(slots.0.clone())]);
+                l.SetComputeRootSignature(&root);
+                l.SetPipelineState(&pso);
+                l.SetComputeRootUnorderedAccessView(uav_param, gpu);
+                if let Some(args) = &args {
+                    l.ExecuteIndirect(&signature, RECORDS, args, 0, None, 0);
+                } else {
+                    for (base, groups) in [(0u32, CHUNK), (CHUNK, N - CHUNK)] {
+                        l.SetComputeRoot32BitConstant(base_param, base, 0);
+                        l.Dispatch(groups, 1, 1);
+                    }
+                }
+                l.ResourceBarrier(&[crate::host::transition(
+                    &out,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                )]);
+                l.CopyBufferRegion(&readback, 0, &out, 0, bytes);
+            }
+            list.keep(&root);
+            list.keep(&pso);
+            list.keep(&out);
+            list.keep(&slots.0);
+            list.keep(&readback);
+            if let Some(args) = &args {
+                list.keep(args);
+            }
+            list.close();
+            host.execute(&[&list]);
+
+            let mut data = std::ptr::null_mut();
+            // SAFETY: a mapped readback buffer, after the list has run.
+            unsafe { readback.Map(0, None, Some(&mut data)) }.unwrap();
+            // SAFETY: the readback buffer is mapped and large enough.
+            let words = unsafe { std::slice::from_raw_parts(data.cast::<u32>(), (N + 1) as usize) };
+            assert!(
+                words[..N as usize].iter().all(|&v| v == 1),
+                "indirect {indirect}: {} words not 1 (first {})",
+                words[..N as usize].iter().filter(|&&v| v != 1).count(),
+                words[..N as usize]
+                    .iter()
+                    .position(|&v| v != 1)
+                    .unwrap_or(0),
+            );
+            assert_eq!(
+                words[N as usize], 0,
+                "indirect {indirect}: a word past the dispatch"
+            );
+        };
+        run(false);
+        run(true);
     }
 }

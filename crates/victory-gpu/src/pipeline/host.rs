@@ -8,7 +8,9 @@
 use std::ffi::{CStr, CString};
 use std::sync::Arc;
 
-use victory_shader::emit::{MEMORY_SPACE, ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
+use victory_shader::emit::{
+    GROUP_BASE_SPACE, MEMORY_SPACE, ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE,
+};
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -340,6 +342,8 @@ pub(crate) struct Stage {
     pub(crate) shader: Arc<Shader>,
     /// The root parameter of its user data, and its size in dwords.
     pub(crate) user_data: Option<(u32, u32)>,
+    /// Our root parameter of the compute stage's dispatch group-id base.
+    pub(crate) group_base: Option<u32>,
     /// Root parameters of its root views: (title root parameter, ours).
     pub(crate) root_cbvs: Vec<(u8, u32)>,
     pub(crate) root_srvs: Vec<(u8, u32)>,
@@ -470,6 +474,7 @@ impl HostPipeline {
                 user_data: None,
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
+                group_base: None,
                 root_uavs: Vec::new(),
                 memory: None,
                 memory_dirty: None,
@@ -485,6 +490,20 @@ impl HostPipeline {
                             ShaderRegister: 0,
                             RegisterSpace: USER_DATA_SPACE,
                             Num32BitValues: dwords,
+                        },
+                    },
+                    ShaderVisibility: visibility,
+                });
+            }
+            if t.group_base {
+                stage.group_base = Some(params.len() as u32);
+                params.push(D3D12_ROOT_PARAMETER1 {
+                    ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+                    Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                        Constants: D3D12_ROOT_CONSTANTS {
+                            ShaderRegister: 0,
+                            RegisterSpace: GROUP_BASE_SPACE,
+                            Num32BitValues: 1,
                         },
                     },
                     ShaderVisibility: visibility,

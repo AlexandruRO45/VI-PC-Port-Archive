@@ -48,7 +48,12 @@ pub(crate) struct Lowered {
     /// Takes descriptors from the resource heap itself (root type 5, not
     /// a table), and whether as unordered access views.
     pub heap: bool,
+    /// Whether some of those are unordered access views: it may write
+    /// through any of the heap's.
     pub heap_writes: bool,
+    /// Whether the compute shader added the dispatch's group-id base to
+    /// TGID x (the host binds it as a root constant).
+    pub group_base: bool,
     /// Marks the pages it writes through buffer views (`emit`, "Write
     /// marks").
     pub view_marks: bool,
@@ -233,6 +238,8 @@ struct Lower<'a> {
     tail: Vec<Option<usize>>,
     /// The program writes UAVs: barriers fence them too.
     writes_uavs: bool,
+    /// The group-id base added to TGID x, loaded once in the entry block.
+    group_base: Option<V>,
     /// [`Lowered::heap`], [`Lowered::heap_writes`].
     heap: [bool; 2],
     /// src0 of the current instruction as DPP fetched it.
@@ -691,6 +698,7 @@ impl<'a> Lower<'a> {
             heap: [false; 2],
             src0: None,
             console_lanes,
+            group_base: None,
             pops: matches!(x.native.io, StageIo::Ps { db_shader_control, .. }
                 if db_shader_control & 1 << 16 != 0),
             root_memory,
@@ -1397,6 +1405,7 @@ impl<'a> Lower<'a> {
             memory,
             memory_writes,
             view_addresses,
+            group_base: self.group_base.is_some(),
             heap: self.heap[0],
             heap_writes: self.heap[1],
             view_marks: self.s.view_writes.is_some(),
@@ -1493,6 +1502,17 @@ impl<'a> Lower<'a> {
             // host's value can be.
             Input::FrontFace => (13, 0),
             Input::ThreadIdInGroup(c) => return self.thread_id(c),
+            // Only a compute dispatch's x is split into chunks; a mesh
+            // group's id is scaled separately and y/z are never split.
+            Input::GroupId(0) if self.x.native.stage == HwStage::Cs => {
+                let Val::I32(g) = self.compute_id("groupId.i32", 94, 0) else {
+                    unreachable!()
+                };
+                let Val::I32(base) = self.group_base() else {
+                    unreachable!()
+                };
+                return Val::I32(self.s.m.bin(self.s.entry, Bin::Add, g, base));
+            }
             Input::GroupId(c) => return self.compute_id("groupId.i32", 94, c),
             Input::GroupInfo => return Val::Missing("the thread-group info SGPR"),
             Input::MeshGroup => {
@@ -1757,6 +1777,28 @@ impl<'a> Lower<'a> {
             &[h, row],
         );
         self.s.m.extract(entry, r, index % 4)
+    }
+
+    /// The dispatch's group-id base, loaded from `b0` in
+    /// [`super::shader::GROUP_BASE_SPACE`] once in the entry block.
+    fn group_base(&mut self) -> Val {
+        if let Some(v) = self.group_base {
+            return Val::I32(v);
+        }
+        let h = self.s.group_base_handle();
+        let entry = self.s.entry;
+        let row = self.s.m.i32(0);
+        let r = self.s.op(
+            entry,
+            "cbufferLoadLegacy.i32",
+            Attr::ReadOnly,
+            self.s.t.cbuf_ret,
+            59,
+            &[h, row],
+        );
+        let v = self.s.m.extract(entry, r, 0);
+        self.group_base = Some(v);
+        Val::I32(v)
     }
 
     /// In a program that uses title memory, the address of the root SRV or
