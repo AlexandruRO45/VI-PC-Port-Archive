@@ -25,6 +25,8 @@ pub(crate) struct GraphicsState {
     rasterizer: D3D12_RASTERIZER_DESC,
     depth: D3D12_DEPTH_STENCIL_DESC,
     depth_bounds: bool,
+    view_locations: Vec<D3D12_VIEW_INSTANCE_LOCATION>,
+    view_instancing_flags: D3D12_VIEW_INSTANCING_FLAGS,
     /// Input elements, their names pointing into `names`.
     inputs: Vec<D3D12_INPUT_ELEMENT_DESC>,
     names: Vec<CString>,
@@ -77,6 +79,8 @@ impl Default for GraphicsState {
                 ..Default::default()
             },
             depth_bounds: false,
+            view_locations: Vec::new(),
+            view_instancing_flags: D3D12_VIEW_INSTANCING_FLAG_NONE,
             inputs: Vec::new(),
             names: Vec::new(),
             strip_cut: D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED,
@@ -227,6 +231,27 @@ impl GraphicsState {
                     self.depth_format = DXGI_FORMAT(crate::resource::pc_format(f) as i32);
                 }
                 17 => self.samples = data.cast::<DXGI_SAMPLE_DESC>().read_unaligned(),
+                22 => {
+                    // As with depth_stencil1, read this console subobject with the PC layout.
+                    let vi = at.add(8).cast::<D3D12_VIEW_INSTANCING_DESC>().read_unaligned();
+                    self.view_locations.clear();
+                    self.view_instancing_flags = D3D12_VIEW_INSTANCING_FLAG_NONE;
+                    let count = vi.ViewInstanceCount as usize;
+                    if count == 0 {
+                        return;
+                    }
+                    if vi.pViewInstanceLocations.is_null() {
+                        tracing::warn!(count, "view instancing subobject has null locations; ignored");
+                        return;
+                    }
+                    if count > D3D12_MAX_VIEW_INSTANCE_COUNT as usize {
+                        tracing::warn!(count, "view instancing count exceeds D3D12 limit; ignored");
+                        return;
+                    }
+                    self.view_locations
+                        .extend_from_slice(std::slice::from_raw_parts(vi.pViewInstanceLocations, count));
+                    self.view_instancing_flags = vi.Flags;
+                }
                 _ => {}
             }
         }
@@ -247,8 +272,13 @@ impl GraphicsState {
             })
             .collect();
         let depth_bounds = if self.depth_bounds { " depth bounds" } else { "" };
+        let view_instancing = if self.view_locations.is_empty() {
+            String::new()
+        } else {
+            format!(" view instancing {:?} {}", self.view_locations, self.view_instancing_flags.0)
+        };
         format!(
-            "{:?} {} {:?} {:?} {inputs:?} {} {} {:?} {} {:?}{depth_bounds}",
+            "{:?} {} {:?} {:?} {inputs:?} {} {} {:?} {} {:?}{depth_bounds}{view_instancing}",
             self.blend,
             self.sample_mask,
             self.rasterizer,
@@ -259,6 +289,31 @@ impl GraphicsState {
             self.depth_format.0,
             self.samples
         )
+    }
+
+    fn view_instancing(&self, host: &crate::host::Host) -> Option<D3D12_VIEW_INSTANCING_DESC> {
+        if self.view_locations.is_empty() {
+            return None;
+        }
+        if !host.view_instancing_supported {
+            crate::host::warn_view_instancing();
+            return None;
+        }
+        let mut flags = self.view_instancing_flags;
+        // D3D12's default view instance mask is 0 (all views disabled) whenever
+        // masking is enabled on a PSO, so forwarding the flag before
+        // `SetViewInstanceMask` is wired would silently discard every draw.
+        if flags.contains(D3D12_VIEW_INSTANCING_FLAG_ENABLE_VIEW_INSTANCE_MASKING) {
+            crate::host::warn_view_instance_masking();
+            flags = D3D12_VIEW_INSTANCING_FLAGS(
+                flags.0 & !D3D12_VIEW_INSTANCING_FLAG_ENABLE_VIEW_INSTANCE_MASKING.0,
+            );
+        }
+        Some(D3D12_VIEW_INSTANCING_DESC {
+            ViewInstanceCount: self.view_locations.len() as u32,
+            pViewInstanceLocations: self.view_locations.as_ptr(),
+            Flags: flags,
+        })
     }
 
     fn depth_with_bounds(&self, host: &crate::host::Host) -> Option<D3D12_DEPTH_STENCIL_DESC1> {
@@ -382,6 +437,11 @@ pub(crate) struct HostPipeline {
     /// written-pages bitmap, if a stage marks its writes through views
     /// (`victory_shader::emit`, "Write marks").
     pub(crate) marks: Option<(u32, u32)>,
+    /// On software adapters (WARP) with view instancing, the mask to apply via
+    /// `SetViewInstanceMask` when this graphics pipeline is bound (`1` for
+    /// plain pipelines, `0xF` for view-instanced ones). `None` on hardware
+    /// GPUs and compute pipelines.
+    pub(crate) view_instance_mask: Option<u32>,
 }
 
 /// Logs a pipeline that gets no host pipeline, once per reason.
@@ -637,6 +697,7 @@ impl HostPipeline {
                 slots: 0,
                 inputs: Vec::new(),
                 marks,
+                view_instance_mask: None,
             });
         }
         let Some(g) = g else {
@@ -644,6 +705,36 @@ impl HostPipeline {
         };
         let state = g.describe();
         let depth_with_bounds = g.depth_with_bounds(host);
+        // On WARP (`d3d10warp.dll`), binding a plain PSO after a multi-view PSO
+        // leaks the earlier PSO's view-instancing declaration across draws and
+        // command lists; on older WARP builds (e.g. Server 2022) an unmasked
+        // 1-view subobject alone still leaks. Giving SM 6.x (`PSV0`) plain
+        // graphics PSOs a masked 1-view `(0, 0)` subobject and pairing graphics
+        // binds with `SetViewInstanceMask` (`1` for plain, `0xF` for
+        // view-instanced) avoids the leak without touching hardware GPUs or
+        // legacy SM 5.1 test shaders.
+        static SINGLE_VIEW: [D3D12_VIEW_INSTANCE_LOCATION; 1] = [D3D12_VIEW_INSTANCE_LOCATION {
+            ViewportArrayIndex: 0,
+            RenderTargetArrayIndex: 0,
+        }];
+        let title_vi = g.view_instancing(host);
+        let warp_vi = host.software_adapter && host.view_instancing_supported;
+        let all_psv = warp_vi
+            && !stages.is_empty()
+            && stages.iter().all(|(s, _)| {
+                s.translated().is_some_and(|t| {
+                    victory_shader::Container::parse(&t.host.dxil)
+                        .is_ok_and(|c| c.part(victory_shader::FourCC::PSV0).is_some())
+                })
+            });
+        let view_instancing = title_vi.or_else(|| {
+            all_psv.then_some(D3D12_VIEW_INSTANCING_DESC {
+                ViewInstanceCount: 1,
+                pViewInstanceLocations: SINGLE_VIEW.as_ptr(),
+                Flags: D3D12_VIEW_INSTANCING_FLAG_ENABLE_VIEW_INSTANCE_MASKING,
+            })
+        });
+        let view_instance_mask = warp_vi.then_some(if title_vi.is_some() { 0xF } else { 1 });
         if mesh.is_some() {
             let name = super::library::name(
                 "mesh",
@@ -652,18 +743,9 @@ impl HostPipeline {
                 &state,
             );
             let ms = Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, code(0));
-            let made = match depth_with_bounds {
-                Some(depth) => stream_pipeline(
-                    &host.device, &root, ms, code(1), g,
-                    Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1, depth),
-                    &name,
-                ),
-                None => stream_pipeline(
-                    &host.device, &root, ms, code(1), g,
-                    Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, g.depth),
-                    &name,
-                ),
-            };
+            let made = stream_pipeline_for(
+                &host.device, &root, ms, code(1), g, depth_with_bounds, view_instancing, &name,
+            );
             let pso = match made {
                 Ok(pso) => pso,
                 Err(e) => {
@@ -685,6 +767,7 @@ impl HostPipeline {
                 slots: 0,
                 inputs: Vec::new(),
                 marks,
+                view_instance_mask,
             });
         }
 
@@ -733,7 +816,7 @@ impl HostPipeline {
             &state,
         );
         let started = std::time::Instant::now();
-        let made = if let Some(depth) = depth_with_bounds {
+        let made = if depth_with_bounds.is_some() || view_instancing.is_some() {
             let vertex = VertexStream {
                 vs: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS, desc.VS),
                 gs: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS, desc.GS),
@@ -743,10 +826,8 @@ impl HostPipeline {
                     desc.IBStripCutValue,
                 ),
             };
-            stream_pipeline(
-                &host.device, &root, vertex, desc.PS, g,
-                Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1, depth),
-                &name,
+            stream_pipeline_for(
+                &host.device, &root, vertex, desc.PS, g, depth_with_bounds, view_instancing, &name,
             )
         } else {
             super::library::pipeline(
@@ -787,6 +868,7 @@ impl HostPipeline {
             slots: g.slots(),
             inputs: g.elements(),
             marks,
+            view_instance_mask,
         })
     }
 }
@@ -804,6 +886,9 @@ fn host_topology(g: &GraphicsState) -> D3D12_PRIMITIVE_TOPOLOGY_TYPE {
 #[repr(C, align(8))]
 struct Sub<T>(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE, T);
 
+const _: () = assert!(size_of::<Sub<D3D12_VIEW_INSTANCING_DESC>>() == 32);
+const _: () = assert!(std::mem::offset_of!(Sub<D3D12_VIEW_INSTANCING_DESC>, 1) == 8);
+
 /// What a vertex pipeline's stream has in place of the mesh shader (the
 /// geometry shader is the rectangle lists' one, or empty).
 #[repr(C)]
@@ -814,18 +899,62 @@ struct VertexStream {
     strip_cut: Sub<D3D12_INDEX_BUFFER_STRIP_CUT_VALUE>,
 }
 
-/// The stream form used by mesh pipelines and vertex pipelines with depth bounds.
-fn stream_pipeline<S, D>(
+/// Chooses the depth-stencil and optional view-instancing subobjects for a
+/// stream pipeline.
+#[allow(clippy::too_many_arguments)]
+fn stream_pipeline_for<S>(
+    device: &ID3D12Device,
+    root: &ID3D12RootSignature,
+    stages: S,
+    ps: D3D12_SHADER_BYTECODE,
+    g: &GraphicsState,
+    depth_with_bounds: Option<D3D12_DEPTH_STENCIL_DESC1>,
+    view_instancing: Option<D3D12_VIEW_INSTANCING_DESC>,
+    name: &str,
+) -> windows::core::Result<ID3D12PipelineState> {
+    match (depth_with_bounds, view_instancing) {
+        (Some(depth), Some(vi)) => stream_pipeline(
+            device, root, stages, ps, g,
+            Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1, depth),
+            Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VIEW_INSTANCING, vi),
+            name,
+        ),
+        (Some(depth), None) => stream_pipeline(
+            device, root, stages, ps, g,
+            Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1, depth),
+            (),
+            name,
+        ),
+        (None, Some(vi)) => stream_pipeline(
+            device, root, stages, ps, g,
+            Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, g.depth),
+            Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VIEW_INSTANCING, vi),
+            name,
+        ),
+        (None, None) => stream_pipeline(
+            device, root, stages, ps, g,
+            Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, g.depth),
+            (),
+            name,
+        ),
+    }
+}
+
+/// The stream form used by mesh pipelines and vertex pipelines with depth
+/// bounds or view instancing.
+#[allow(clippy::too_many_arguments)]
+fn stream_pipeline<S, D, V>(
     device: &ID3D12Device,
     root: &ID3D12RootSignature,
     stages: S,
     ps: D3D12_SHADER_BYTECODE,
     g: &GraphicsState,
     depth: Sub<D>,
+    view_instancing: V,
     name: &str,
 ) -> windows::core::Result<ID3D12PipelineState> {
     #[repr(C)]
-    struct Stream<S, D> {
+    struct Stream<S, D, V> {
         root: Sub<*mut std::ffi::c_void>,
         stages: S,
         ps: Sub<D3D12_SHADER_BYTECODE>,
@@ -837,6 +966,7 @@ fn stream_pipeline<S, D>(
         dsv: Sub<DXGI_FORMAT>,
         samples: Sub<DXGI_SAMPLE_DESC>,
         topology: Sub<D3D12_PRIMITIVE_TOPOLOGY_TYPE>,
+        view_instancing: V,
     }
     let mut stream = Stream {
         root: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, root.as_raw()),
@@ -854,6 +984,7 @@ fn stream_pipeline<S, D>(
         // pipeline library compares descriptions with it, and loads none
         // made from a stream without it.
         topology: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY, host_topology(g)),
+        view_instancing,
     };
     let desc = D3D12_PIPELINE_STATE_STREAM_DESC {
         SizeInBytes: size_of_val(&stream),

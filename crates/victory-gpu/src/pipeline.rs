@@ -901,3 +901,5 @@ mod tests {
 
 #[cfg(all(test, windows))]
 mod depth_bounds_test;
+#[cfg(all(test, windows))]
+mod view_instancing_test;

@@ -649,6 +649,12 @@ impl State {
             // Also reached after the indirect clamp invalidates the pipeline.
             if !compute {
                 self.apply_depth_bounds(list);
+                if let Some(mask) = p.view_instance_mask
+                    && let Ok(l1) = l.cast::<ID3D12GraphicsCommandList1>()
+                {
+                    // SAFETY: an open command list supporting view instancing.
+                    unsafe { l1.SetViewInstanceMask(mask) };
+                }
             }
             self.host_pipeline = p.pso.as_raw() as usize;
             list.used_pipeline(&p.name);

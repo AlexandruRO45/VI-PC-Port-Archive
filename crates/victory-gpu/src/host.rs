@@ -42,6 +42,8 @@ const RTV_RING: u32 = 1024;
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
     pub(crate) depth_bounds_supported: bool,
+    pub(crate) view_instancing_supported: bool,
+    pub(crate) software_adapter: bool,
     queue: ID3D12CommandQueue,
     fence: ID3D12Fence,
     /// The last value signalled on `fence`, behind the submission lock.
@@ -204,6 +206,23 @@ fn create() -> windows::core::Result<Host> {
             )
             .is_ok()
             && options.DepthBoundsTestSupported.as_bool();
+        let mut options3 = D3D12_FEATURE_DATA_D3D12_OPTIONS3::default();
+        let view_instancing_supported = device
+            .CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS3,
+                (&raw mut options3).cast(),
+                size_of_val(&options3) as u32,
+            )
+            .is_ok()
+            && options3.ViewInstancingTier != D3D12_VIEW_INSTANCING_TIER_NOT_SUPPORTED;
+        let software_adapter = (|| -> windows::core::Result<bool> {
+            let luid = device.GetAdapterLuid();
+            let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
+            let adapter: IDXGIAdapter1 = factory.EnumAdapterByLuid(luid)?;
+            let desc = adapter.GetDesc1()?;
+            Ok(desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0)
+        })()
+        .unwrap_or(false);
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
             .flatten();
@@ -250,6 +269,8 @@ fn create() -> windows::core::Result<Host> {
         Ok(Host {
             device,
             depth_bounds_supported,
+            view_instancing_supported,
+            software_adapter,
             queue,
             fence,
             submitted: Mutex::new(0),
@@ -849,6 +870,16 @@ unsafe impl Sync for HostList {}
 pub(crate) fn warn_depth_bounds() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| tracing::warn!("the host GPU has no depth bounds test; depth bounds are ignored"));
+}
+
+pub(crate) fn warn_view_instancing() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| tracing::warn!("the host GPU has no view instancing; view instancing is ignored"));
+}
+
+pub(crate) fn warn_view_instance_masking() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| tracing::warn!("view instance masking is not forwarded yet; enabling all view instances"));
 }
 
 /// Timestamps per list (diagnostics); commands past them are not timed.
