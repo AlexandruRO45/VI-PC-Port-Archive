@@ -2154,9 +2154,20 @@ impl HostList {
 
     /// A read back of what shaders wrote, run once the submission has run
     /// (`crate::queue2`; the rows go into title memory through the list's
-    /// own `defer_after`).
-    pub(crate) fn defer_fetch(&self, fetch: crate::queue2::Fetch) {
-        self.deferred().fetches.push(fetch);
+    /// own `defer_after`). `false` when this texture and subresource are
+    /// already read back here: the second copy would take the texture as it
+    /// is by the end of the batch, so the caller records it in the list.
+    pub(crate) fn defer_fetch(&self, fetch: crate::queue2::Fetch) -> bool {
+        let mut deferred = self.deferred();
+        let same = deferred.fetches.iter().any(|earlier| {
+            earlier.subresource == fetch.subresource
+                && std::sync::Arc::ptr_eq(&earlier.copy, &fetch.copy)
+        });
+        if same {
+            return false;
+        }
+        deferred.fetches.push(fetch);
+        true
     }
 
     /// The read backs recorded into the list; taken once, at submission.

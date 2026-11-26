@@ -907,7 +907,7 @@ fn read_back(list: &crate::host::HostList, dst: &CopyLocation, at: [u32; 3], src
         len,
     )
     .map(|fetch| list.defer_fetch(fetch))
-    .is_some();
+    .unwrap_or(false);
     if !queued {
         // SAFETY: an open list; both locations in the host's layout, naming live
         // resources; the region lies in the footprint (checked).

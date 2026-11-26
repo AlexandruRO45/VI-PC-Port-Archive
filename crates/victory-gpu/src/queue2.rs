@@ -67,11 +67,11 @@ pub(crate) fn bits() -> u32 {
 pub(crate) struct Fetch {
     /// The host texture read from, kept alive, with the state and the
     /// number of state moves it had when the fetch was recorded.
-    copy: Arc<crate::resource::HostTexture>,
+    pub(crate) copy: Arc<crate::resource::HostTexture>,
     /// The readback buffer, kept alive by the list as well.
     buffer: ID3D12Resource,
     /// The texture's subresource, and the buffer's footprint.
-    subresource: u32,
+    pub(crate) subresource: u32,
     footprint: crate::resource::PlacedFootprint,
     /// Where in the buffer's footprint the copy starts.
     at: [u32; 3],
