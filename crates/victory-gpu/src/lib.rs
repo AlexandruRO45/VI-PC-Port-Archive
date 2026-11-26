@@ -65,8 +65,6 @@ mod texture;
 #[cfg(windows)]
 mod twin;
 #[cfg(windows)]
-mod format_twin;
-#[cfg(windows)]
 mod watch;
 
 #[cfg(all(windows, feature = "diagnostics"))]

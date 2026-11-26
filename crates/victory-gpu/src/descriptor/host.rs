@@ -1578,17 +1578,15 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 {
                     desc.Format = DXGI_FORMAT(format as i32);
                 }
-                // A view in a format of another family of the same texel
-                // size (R9G9B9E5 of an R32_UINT texture) reads a twin in
-                // that format (`crate::format_twin`).
+                // Views in a format of another family than the texture's
+                // (logged once per pair): the host makes them only where the
+                // texture was made castable to it (`fits`).
+                #[cfg(feature = "diagnostics")]
                 if let Some(d) = desc.as_ref() {
                     // SAFETY: a live resource.
-                    let own = unsafe { texture.GetDesc() }.Format.0 as u32;
-                    let view = d.Format.0 as u32;
-                    #[cfg(feature = "diagnostics")]
+                    let td = unsafe { texture.GetDesc() };
+                    let (own, view) = (td.Format.0 as u32, d.Format.0 as u32);
                     if view != own && crate::resource::family(view) != crate::resource::family(own) {
-                        // SAFETY: a live resource.
-                        let td = unsafe { texture.GetDesc() };
                         static SEEN: std::sync::Mutex<Vec<(u32, u32)>> = std::sync::Mutex::new(Vec::new());
                         let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
                         if !seen.contains(&(view, own)) && seen.len() < 64 {
@@ -1597,15 +1595,6 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                                 stand_in = crate::resource::view_on(view, own) == own,
                                 "a shader view in a format of another family than its host texture");
                         }
-                    }
-                    if !copy.castable.contains(&view)
-                        && crate::resource::view_on(view, own) != own
-                        && crate::format_twin::wanted(own, view)
-                        && let Some(twin) = crate::format_twin::twin(&copy, view)
-                    {
-                        // SAFETY: a live texture and a slot of our heap.
-                        unsafe { device.CreateShaderResourceView(&twin.texture, Some(d), at) };
-                        return Some(Some((twin.texture.clone(), None)));
                     }
                 }
                 if !fits(texture, &copy.castable, desc.as_mut().map(|d| &mut d.Format), false) {
