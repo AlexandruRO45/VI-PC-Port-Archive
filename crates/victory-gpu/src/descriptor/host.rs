@@ -5201,17 +5201,84 @@ mod tests {
         };
         assert_ne!(a.ptr, b.ptr);
         assert_ne!(Some(a.ptr), std::thread::spawn(|| staged(false, 0).map(|h| h.ptr)).join().unwrap());
-        let (buffer, _) = host.shared_buffer(1 << 16).unwrap();
+        let (buffer, data) = host.shared_buffer(1 << 16).unwrap();
         let index = heap.dynamic(1).unwrap();
-        let bytes = |at: D3D12_CPU_DESCRIPTOR_HANDLE| {
-            let mut bytes = [0u8; 32];
-            crate::host::read_into(at.ptr as *const u8, &mut bytes).then_some(bytes)
+        // Descriptor handles are opaque; shader-visible heaps cannot be read
+        // by the CPU. Check the data seen through the actual GPU descriptor.
+        use windows::core::Interface;
+        // SAFETY: these offsets are within the test's 64 KiB mapped buffer.
+        unsafe {
+            data.add(64).cast::<u32>().write_unaligned(0x22334455);
+            data.add(68).cast::<u32>().write_unaligned(0xaabbccdd);
+        }
+        let shader = crate::host::compile(
+            r#"
+#define RS "DescriptorTable(SRV(t0)), UAV(u0)"
+ByteAddressBuffer input_bytes : register(t0);
+RWByteAddressBuffer result : register(u0);
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void check_view() {
+    result.Store(0, input_bytes.Load(0));
+    result.Store(4, input_bytes.Load(4));
+    uint size;
+    input_bytes.GetDimensions(size);
+    result.Store(8, size);
+    result.Store(12, 0x13579bdf);
+}
+"#,
+            windows::core::s!("check_view"),
+            windows::core::s!("cs_5_1"),
+        ).unwrap();
+        let device = &host.device;
+        // SAFETY: the compiled shader contains its root signature; the PSO
+        // description borrows it while creating the pipeline.
+        let (root, pipeline): (ID3D12RootSignature, ID3D12PipelineState) = unsafe {
+            let root: ID3D12RootSignature = device.CreateRootSignature(0, &shader[..]).unwrap();
+            let pipeline: ID3D12PipelineState = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::transmute_copy(&root),
+                CS: D3D12_SHADER_BYTECODE {
+                    pShaderBytecode: shader.as_ptr().cast(),
+                    BytecodeLength: shader.len(),
+                },
+                ..Default::default()
+            }).unwrap();
+            (root, pipeline)
+        };
+        let read = || {
+            let (output, result) = host.shared_buffer(256).expect("test output buffer");
+            // SAFETY: private queue, allocator, list, fence and mapped output;
+            // the heap, pipeline and resources remain live until completion.
+            // Buffers in COMMON are implicitly promoted on first GPU access.
+            unsafe {
+                std::ptr::write_bytes(result, 0, 16);
+                let queue: ID3D12CommandQueue = device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                    Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
+                    ..Default::default()
+                }).unwrap();
+                let allocator: ID3D12CommandAllocator = device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+                let list: ID3D12GraphicsCommandList = device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, &pipeline).unwrap();
+                list.SetDescriptorHeaps(&[Some(heap.heap.clone())]);
+                list.SetComputeRootSignature(&root);
+                list.SetComputeRootDescriptorTable(0, heap.gpu_handle(index));
+                list.SetComputeRootUnorderedAccessView(1, output.GetGPUVirtualAddress());
+                list.Dispatch(1, 1, 1);
+                list.Close().unwrap();
+                let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+                queue.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
+                queue.Signal(&fence, 1).unwrap();
+                fence.SetEventOnCompletion(1, windows::Win32::Foundation::HANDLE::default()).unwrap();
+                assert!(device.GetDeviceRemovedReason().is_ok());
+                std::array::from_fn::<u32, 4, _>(|i| result.add(i * 4).cast::<u32>().read_unaligned())
+            }
         };
         heap.raw_at(index, &buffer, 64, 1024);
-        let (slot, beside) = (bytes(heap.cpu(index)), bytes(staged(false, 0).unwrap()));
-        assert_eq!(slot, beside, "copied as it was made");
+        assert_eq!(read(), [0x22334455, 0xaabbccdd, 1024, 0x13579bdf], "copied view is readable");
         heap.null_raw_at(index);
-        assert_ne!(bytes(heap.cpu(index)), slot, "another view since");
+        let null = read();
+        assert_eq!(&null[..2], &[0, 0], "null view reads zeros");
+        assert_eq!(null[3], 0x13579bdf, "null-view dispatch completed");
+        eprintln!("DESCRIPTOR_FUNCTIONAL_PASS");
         // SAFETY: a plain query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     }
