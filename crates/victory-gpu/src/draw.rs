@@ -793,6 +793,16 @@ impl State {
                         None => self.user_value(compute, u.slot, u.root, u.dword),
                     };
                 }
+                #[cfg(feature = "diagnostics")]
+                if crate::switch::on("VICTORY_DUMP_VIEWS")
+                    && crate::host::is_traced(&crate::pipeline::shaders_of(self.pipeline as This))
+                {
+                    let values = values.to_vec();
+                    let name = crate::pipeline::shaders_of(self.pipeline as This);
+                    list.defer(move || {
+                        tracing::info!(user_data = ?values, "traced user data {name}")
+                    });
+                }
                 // SAFETY: an open list; `values` covers the parameter.
                 unsafe {
                     if compute {
@@ -833,6 +843,22 @@ impl State {
                         once!(slot, "a shader reads a root view the title did not set");
                         continue;
                     };
+                    #[cfg(feature = "diagnostics")]
+                    if crate::switch::on("VICTORY_DUMP_VIEWS")
+                        && crate::host::is_traced(&crate::pipeline::shaders_of(self.pipeline as This))
+                        && let Some(shadow) = crate::shadow::find(*address, 64)
+                    {
+                        let (address, n) = (*address, 16);
+                        let name = crate::pipeline::shaders_of(self.pipeline as This);
+                        list.defer(move || {
+                            tracing::info!(
+                                address,
+                                root_kind = kind,
+                                dwords = ?shadow.dwords_at(address, n),
+                                "traced root view {name}"
+                            )
+                        });
+                    }
                     let Some(gpu) = root_view(list, *address, kind == 1, kind == 2) else {
                         continue;
                     };
