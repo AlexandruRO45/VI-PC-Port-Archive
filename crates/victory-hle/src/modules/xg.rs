@@ -484,8 +484,11 @@ extern "system" fn tiling(
     if l.thick {
         return E_NOTIMPL;
     }
-    // SAFETY: `count` is null or points to a caller-owned `u32`.
-    if unsafe { count.as_ref() }.is_some_and(|&n| n > 0) && out.is_null() {
+    // SAFETY: `count` is null or points to a caller-owned `u32`. Read the input
+    // capacity once up front so aliasing `count` with another output pointer
+    // (such as `tiles`) cannot mutate the capacity before the write loop.
+    let capacity = unsafe { count.as_ref() }.copied();
+    if capacity.is_some_and(|n| n > 0) && out.is_null() {
         return E_INVALIDARG;
     }
     let standard = l.first_tail_mip;
@@ -513,9 +516,9 @@ extern "system" fn tiling(
         if let Some(s) = shape.as_mut() {
             *s = [l.block[0] * block, l.block[1] * block, l.block[2]];
         }
-        if let Some(n) = count.as_mut() {
+        if let Some(cap) = capacity {
             let slices = if tail { l.slices.min(2) } else { l.slices };
-            let wanted = (standard * slices).saturating_sub(first).min(*n);
+            let wanted = (standard * slices).saturating_sub(first).min(cap);
             for i in 0..wanted {
                 let (slice, mip) = ((first + i) / standard, (first + i) % standard);
                 let m = &l.mips[mip as usize];
@@ -536,7 +539,7 @@ extern "system" fn tiling(
                 };
                 out.add(i as usize).write(entry);
             }
-            *n = wanted;
+            count.write(wanted);
         }
     }
     S_OK
@@ -833,6 +836,24 @@ mod tests {
         );
         assert_eq!(n, 0);
         assert!(tiles > 0);
+
+        // Aliasing `tiles` and `count` with an initial zero capacity and null
+        // `out` must still treat capacity as 0 and never dereference `out`.
+        let mut aliased = 0u32;
+        let aliased_ptr = std::ptr::addr_of_mut!(aliased);
+        assert_eq!(
+            tiling(
+                c,
+                aliased_ptr,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                aliased_ptr,
+                0,
+                std::ptr::null_mut(),
+            ),
+            S_OK
+        );
+        assert_eq!(aliased, 0);
         assert_eq!(release(c), 0);
     }
 }
