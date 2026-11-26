@@ -624,6 +624,7 @@ fn code_table_start(p: &crate::ir::Program, addresses: &[&crate::resource::Addre
         .unwrap_or(0) as u32;
     let fixed_below = addresses.iter().any(|a| a.dynamic.is_none() && a.offset < code_end);
     if fixed_below { lowest } else { lowest.max(code_end & !3) }
+}
 
 /// The lane masks (and the SCC beside them) a merged export or geometry
 /// program's prologue makes from its lane count in s3: `s_bfe_{i32,u32}
@@ -12507,6 +12508,7 @@ mod tests {
                 prims: vec![],
                 mesh_stride: 0,
                 view_marks: false,
+                gs: None,
             })
             .unwrap();
             assert!(lowered.wave_ops);
