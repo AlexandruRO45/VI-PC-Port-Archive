@@ -21,6 +21,7 @@ use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source, USER
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 mod bvh;
+pub(super) mod console;
 
 type Why = &'static str;
 
@@ -825,6 +826,8 @@ impl<'a> Lower<'a> {
                     .any(|i| i.name().contains("permute") && i.name() != "ds_bpermute_b32")
                 {
                     Some("ds_permute across the halves of a wave64 on a host without 64-lane waves")
+                } else if console::leaves_title_memory_out(p, root_memory, s.lds_dwords) {
+                    Some(console::TITLE_MEMORY_IN_HALVES)
                 } else {
                     None
                 };

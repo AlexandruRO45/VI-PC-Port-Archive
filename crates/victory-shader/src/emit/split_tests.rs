@@ -1419,3 +1419,50 @@ fn sgpr_spills_across_a_divergent_branch_stay_per_lane() {
         .collect();
     assert_eq!(out, want);
 }
+
+/// LDS shared within one console wave, in a program that also loads
+/// from an address it makes (title memory by address): on a host without
+/// 64-lane waves it stops with a reason instead of taking the console flow
+/// (the limit latentdev's patch for #439 adds). The same program without
+/// that load takes the console flow; with 64-lane waves both keep the
+/// console's wave size.
+#[test]
+fn lds_in_halves_keeps_out_of_programs_reaching_title_memory() {
+    let lds = [
+        0x3408_0082, // v_lshlrev_b32 v4, 2, v0
+        0xD834_0000,
+        0x0000_0004, // ds_write_b32 v4, v0
+        0x3A10_00A0, // v_xor_b32 v8, 32, v0
+        0x3410_1082, // v_lshlrev_b32 v8, 2, v8
+        0xD8D8_0000,
+        0x0200_0008, // ds_read_b32 v2, v8
+    ];
+    let pointer = [
+        0xBE8A_03FF,
+        0x0000_1000, // s_mov_b32 s10, 0x1000
+        0xBE8B_0380, // s_mov_b32 s11, 0
+        0xF400_0305,
+        0xFA00_0000, // s_load_dword s12, s[10:11], null (a constant address)
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0x4A04_040C, // v_add_nc_u32 v2, s12, v2
+    ];
+    let wave32 = super::Target {
+        lanes_min: 32,
+        lanes_max: 32,
+    };
+    let plain = program_lds(&lds, 64);
+    let cs = emit_for(&plain, wave32).expect("LDS alone takes the console flow");
+    assert_eq!(wave_size(&cs.dxil), Some(32));
+    let memory = program_lds(&[&lds[..], &pointer[..]].concat(), 64);
+    let e = emit_for(&memory, wave32)
+        .expect_err("title memory by address keeps LDS out of the halves")
+        .to_string();
+    assert!(
+        e.contains(super::lower::console::TITLE_MEMORY_IN_HALVES),
+        "{e}"
+    );
+    for p in [&plain, &memory] {
+        let cs = emit_for(p, super::Target::ANY).expect("64-lane waves");
+        assert_eq!(wave_size(&cs.dxil), Some(64));
+    }
+}
