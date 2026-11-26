@@ -455,10 +455,28 @@ fn v_fma_f16_quiets_nans() {
     let inputs = cases.map(|(input, _)| input);
     run_cases(&shader, &inputs, |backend, i, input, actual| {
         let expected = cases[i].1;
-        assert_eq!(
-            actual, expected,
-            "{backend} case {i} with {input:08x?}: got {actual:#010x}, expected {expected:#010x}"
-        );
+        if backend == "hardware" {
+            // Hardware can canonicalize the NaN during f32 arithmetic.
+            assert!(
+                is_f16_nan(actual as u16) && actual & 0x0200 != 0,
+                "{backend} case {i} with {input:08x?}: expected a quiet f16 NaN, got {actual:#010x}"
+            );
+            assert_eq!(
+                actual & 0x8000,
+                expected & 0x8000,
+                "{backend} case {i} with {input:08x?}: NaN sign"
+            );
+            assert_eq!(
+                actual >> 16,
+                expected >> 16,
+                "{backend} case {i} with {input:08x?}: upper half"
+            );
+        } else {
+            assert_eq!(
+                actual, expected,
+                "{backend} case {i} with {input:08x?}: got {actual:#010x}, expected {expected:#010x}"
+            );
+        }
     });
 }
 
