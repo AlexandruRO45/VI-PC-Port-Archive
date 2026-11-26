@@ -198,17 +198,30 @@ pub fn report_crashes() {
     }
 }
 
-/// What the vectored handler reports as it happens.
+/// Whether a breakpoint report at `at` is the title's own `int3`, which
+/// the handler steps over: only a real `0xCC` there counts, so a debugger's
+/// break elsewhere is left to it.
+///
+/// SAFETY: `at` is the reported address, or null.
+unsafe fn own_int3(at: *const u8) -> bool {
+    // SAFETY: the caller's.
+    !at.is_null() && unsafe { *at } == 0xCC
+}
+
 #[cfg(test)]
 mod breakpoint_tests {
-    use super::*;
+    use super::own_int3;
 
     #[test]
-    fn a_breakpoint_in_our_own_code_is_not_stepped_over() {
-        // The guard is on the reported address holding 0xCC: our own `int3`
-        // (under a debugger) or anything else must not move RIP.
-        // A null or non-code address is left for the debugger.
-        assert!(std::ptr::null::<u8>().is_null());
+    fn only_a_cc_at_the_address_is_stepped_over() {
+        let cc = [0xCCu8];
+        let other = [0x90u8];
+        // SAFETY: both point at one live byte.
+        unsafe {
+            assert!(own_int3(cc.as_ptr()));
+            assert!(!own_int3(other.as_ptr()));
+            assert!(!own_int3(std::ptr::null()));
+        }
     }
 }
 
@@ -568,7 +581,7 @@ unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
         let record = &*(*info).ExceptionRecord;
         if record.ExceptionCode == EXCEPTION_BREAKPOINT {
             let at = record.ExceptionAddress as *const u8;
-            if !at.is_null() && *at == 0xCC {
+            if own_int3(at) {
                 (*(*info).ContextRecord).Rip += 1;
                 return -1; // EXCEPTION_CONTINUE_EXECUTION
             }
