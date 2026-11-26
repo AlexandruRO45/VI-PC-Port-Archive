@@ -852,6 +852,19 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// The instruction at machine offset `offset`, as `name` and its raw fields:
+/// a refusal that points at an offset should also say which opcode it is.
+fn instruction_at(p: &victory_shader::ir::Program, offset: usize) -> String {
+    for b in &p.blocks {
+        for i in &b.insts {
+            if i.machine.offset == offset {
+                return format!("[{} {:?}]", i.name(), i.fields);
+            }
+        }
+    }
+    String::new()
+}
+
 #[cfg(test)]
 mod tests {
     /// Shader dumps are game-derived, so a dump directory in the repo is refused.
@@ -871,17 +884,4 @@ mod tests {
             "{err}"
         );
     }
-}
-
-/// The instruction at machine offset `offset`, as `name` and its raw fields:
-/// a refusal that points at an offset should also say which opcode it is.
-fn instruction_at(p: &victory_shader::ir::Program, offset: usize) -> String {
-    for b in &p.blocks {
-        for i in &b.insts {
-            if i.machine.offset == offset {
-                return format!("[{} {:?}]", i.name(), i.fields);
-            }
-        }
-    }
-    String::new()
 }
