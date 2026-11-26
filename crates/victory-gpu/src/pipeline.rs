@@ -151,6 +151,7 @@ impl Shader {
                 let (done, cached) = translate(&self.container);
                 let ms = started.elapsed().as_millis() as u64;
                 let (user_ms, kernel_ms) = thread_cpu_since(cpu);
+                #[cfg(feature = "diagnostics")]
                 if let Ok(t) = &done {
                     dump(&self.hash, &t.host.dxil);
                 }
