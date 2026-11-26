@@ -383,6 +383,24 @@ pub struct UserData {
     pub dword: u32,
 }
 
+thread_local! {
+    /// The wide form (two host waves with group barriers) asked for this
+    /// one program only ([`with_wave_wide`]), as `VICTORY_WAVE_WIDE=1` asks
+    /// it for every program.
+    static WAVE_WIDE_HERE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f` with the wide form of a wave64 program allowed for what it
+/// translates on this thread (`VICTORY_WAVE_WIDE_ONLY` in the GPU crate
+/// names the programs; `VICTORY_WAVE_WIDE=1` for all of them lost the card
+/// on an RTX 3080).
+pub fn with_wave_wide<R>(on: bool, f: impl FnOnce() -> R) -> R {
+    let before = WAVE_WIDE_HERE.with(|w| w.replace(on));
+    let r = f();
+    WAVE_WIDE_HERE.with(|w| w.set(before));
+    r
+}
+
 /// Translates the vertex, pixel, compute or mesh program of a console
 /// shader container.
 ///
@@ -548,7 +566,7 @@ pub fn emit(
                 [0x58, 0x1d, 0xab, 0x2c, 0xd8, 0xbc, 0xf2, 0x2e, 0x5c, 0x96, 0x4b, 0x98, 0xe9, 0x03, 0x48, 0xd1]
                     | [0x24, 0x31, 0xbb, 0xe7, 0xdc, 0x15, 0x4a, 0xd7, 0x59, 0xd2, 0x0b, 0xc9, 0x54, 0x82, 0x9c, 0x1c]
             );
-        let wide_on = wide_option.as_ref().map_or(scene_kernel, |v| v == "1");
+        let wide_on = wide_option.as_ref().map_or(scene_kernel || WAVE_WIDE_HERE.with(|w| w.get()), |v| v == "1");
         // A single guest wave can iterate an active-lane loop until both host
         // halves have finished. The precise latch and convergence conditions
         // for the driver compute route are checked by widen().

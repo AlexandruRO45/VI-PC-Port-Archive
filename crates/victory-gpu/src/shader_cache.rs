@@ -64,6 +64,7 @@ fn build() -> [u8; 32] {
         // executable had cached with the switch unset.
         for name in [
             "VICTORY_WAVE_WIDE",
+            "VICTORY_WAVE_WIDE_ONLY",
             "VICTORY_WAVE_DEEP_SKIPS",
             "VICTORY_WAVE_OWN_BITS",
             "VICTORY_WAVE_LOCAL",
@@ -112,10 +113,34 @@ pub fn precompile(container: &[u8]) -> Result<bool, String> {
     Ok(MISSES.load(Ordering::Relaxed) == misses)
 }
 
+/// Whether `container` is one of the programs `VICTORY_WAVE_WIDE_ONLY`
+/// names (comma-separated, the 16 hex digits the log's `hash=` gives): the
+/// wide form of a wave64 program for those alone. `VICTORY_WAVE_WIDE=1`
+/// for every program lost the card on an RTX 3080 (10 GB test 4), while
+/// five compute programs the title runs on the water are dropped without it.
+fn wide_only(container: &[u8]) -> bool {
+    static LIST: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    let list = LIST.get_or_init(|| {
+        std::env::var("VICTORY_WAVE_WIDE_ONLY")
+            .unwrap_or_default()
+            .split(',')
+            .map(|h| h.trim().to_ascii_lowercase())
+            .filter(|h| !h.is_empty())
+            .collect()
+    });
+    if list.is_empty() {
+        return false;
+    }
+    let hash = blake3::hash(container).to_hex();
+    list.iter().any(|h| hash.starts_with(h.as_str()))
+}
+
 /// The translation of a console shader container, from the cache when
 /// there is one.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
-    let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
+    let translate = |c: &[u8]| {
+        victory_shader::emit::with_wave_wide(wide_only(c), || victory_shader::emit::translate(c)).map_err(|e| e.to_string())
+    };
     match CACHE.get() {
         Some(cache) => cached(cache, &build(), container, translate),
         None => translate(container),
