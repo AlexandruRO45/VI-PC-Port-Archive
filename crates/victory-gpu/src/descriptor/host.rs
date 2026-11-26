@@ -1418,8 +1418,13 @@ fn fits(texture: &ID3D12Resource, castable: &[u32], mut format: Option<&mut DXGI
     };
     let own = d.Format.0 as u32;
     // A view in a format the host texture stands in for takes the
-    // texture's (`resource::target_format`).
-    if let Some(f) = format.as_deref_mut() {
+    // texture's (`resource::target_format`), unless the texture was made
+    // castable to it: then the view reads the bits in the title's format
+    // (R9G9B9E5 of an R11G11B10 texture GPU-written as R32_UINT: read as
+    // R11G11B10, Grand Theft Auto VI's lighting got garbage).
+    if let Some(f) = format.as_deref_mut()
+        && !castable.contains(&(f.0 as u32))
+    {
         f.0 = crate::resource::view_on(f.0 as u32, own) as i32;
     }
     if !allowed || DEPTH_FORMATS.iter().any(|&(typed, _)| typed == own) {
@@ -1580,6 +1585,19 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                     // SAFETY: a live resource.
                     let own = unsafe { texture.GetDesc() }.Format.0 as u32;
                     let view = d.Format.0 as u32;
+                    #[cfg(feature = "diagnostics")]
+                    if view != own && crate::resource::family(view) != crate::resource::family(own) {
+                        // SAFETY: a live resource.
+                        let td = unsafe { texture.GetDesc() };
+                        static SEEN: std::sync::Mutex<Vec<(u32, u32)>> = std::sync::Mutex::new(Vec::new());
+                        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+                        if !seen.contains(&(view, own)) && seen.len() < 64 {
+                            seen.push((view, own));
+                            tracing::warn!(view, own, width = td.Width, height = td.Height, castable = ?copy.castable,
+                                stand_in = crate::resource::view_on(view, own) == own,
+                                "a shader view in a format of another family than its host texture");
+                        }
+                    }
                     if !copy.castable.contains(&view)
                         && crate::resource::view_on(view, own) != own
                         && crate::format_twin::wanted(own, view)
