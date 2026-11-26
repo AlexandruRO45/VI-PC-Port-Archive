@@ -5332,12 +5332,13 @@ impl<'a> Lower<'a> {
     }
 
     /// The stride an access by element takes, from the used-resource
-    /// record: its zero names a raw buffer whose element size is the host
-    /// view's, known only at runtime — the access is refused, its error
-    /// separate from the unknown ones so runs can tell them apart.
+    /// record. Whether the record is missing or names none (the FSPX parser
+    /// leaves unread strides at zero), the element size is the host view's,
+    /// known only at runtime — the access is refused, its error separate
+    /// from the unknown ones so runs can tell them apart.
     fn index_stride(&self, used: Option<&UsedResource>) -> Result<u32, Why> {
         match used.map_or(0, |u| u.stride) {
-            0 => Err("a structured buffer whose stride is only the host view's"),
+            0 => Err("a structured buffer whose record names no stride"),
             s if s >= 4 && s.is_multiple_of(4) => Ok(s),
             _ => Err("a structured buffer of unknown stride"),
         }
@@ -11505,7 +11506,6 @@ mod tests {
         (layout, used)
     }
 
-    #[cfg(all(test, windows))]
     #[test]
     fn waterfall_loops_over_descriptors_joined_per_lane_sample_with_each_lanes_own() {
         use crate::resource::tests::{WATERFALL_JOINED_MIXED_WAVE32, WATERFALL_JOINED_WAVE32};
@@ -11547,7 +11547,6 @@ mod tests {
         lower_with(&words, layout, used).expect("the high half is 0 wherever a lane runs");
     }
 
-    #[cfg(all(test, windows))]
     #[test]
     fn a_descriptor_skipped_only_by_lanes_that_never_run_needs_no_source() {
         // As `indirect_light_probes:CS_Alpha_Schedule`: the texture is
@@ -11588,6 +11587,7 @@ mod tests {
         let layout = vec![root(RootType::Table, 0, 0)];
         let l = lower_with(&words, layout, used).unwrap();
         assert_eq!(l.nonuniform_handles, 0);
+        #[cfg(windows)]
         if let Ok(mut v) = super::super::validator::Validator::load(
             super::super::validator::Validator::default_path().as_deref(),
         ) {
@@ -11596,7 +11596,6 @@ mod tests {
         }
     }
 
-    #[cfg(all(test, windows))]
     #[test]
     fn descriptors_joined_by_nested_control_flow_lower_to_one_uniform_handle() {
         // The view table at s0 (2D textures at entries 0 and 1, a raw UAV at
@@ -11642,6 +11641,7 @@ mod tests {
         let l = lower_with(&words, layout, used).unwrap();
         // One image handle from the joins' heap index, the same in all lanes.
         assert_eq!(l.nonuniform_handles, 0);
+        #[cfg(windows)]
         if let Ok(mut v) = super::super::validator::Validator::load(
             super::super::validator::Validator::default_path().as_deref(),
         ) {
@@ -11650,7 +11650,6 @@ mod tests {
         }
     }
 
-    #[cfg(all(test, windows))]
     #[test]
     fn descriptors_reloaded_from_a_root_table_share_one_handle() {
         // The view table at s0 (2D textures at entries 0 and 1, a raw UAV at
@@ -11693,6 +11692,7 @@ mod tests {
         // One image handle made in the entry block for both loads, and the
         // UAV's.
         assert_eq!(l.heap_handles, 2);
+        #[cfg(windows)]
         if let Ok(mut v) = super::super::validator::Validator::load(
             super::super::validator::Validator::default_path().as_deref(),
         ) {

@@ -186,6 +186,29 @@ fn root(root: RootType, user_data: u8, slot: u8) -> RootParam {
         assert!(e.to_string().contains("swizzling or a record limit"), "{e}");
     }
 
+    /// Swizzle bits alone (the record count left unlimited) refuse the
+    /// index the same way — a swizzled view is not addressed flat either.
+    #[test]
+    fn a_built_root_view_with_swizzle_bits_alone_is_refused_by_index() {
+        let words = [
+            0x8801_FF01,
+            0x4010_0000, // s_or_b32 s1, s1, stride 16 and swizzle bits
+            0xBE82_03C1, // s_mov_b32 s2, -1 (no record limit)
+            0xBE83_03FF,
+            0x1101_4FAC, // s_mov_b32 s3, (the console's buffer word 3)
+            0xE030_2000,
+            0x8000_0100, // buffer_load_dword v1, v0, s[0:3], 0 idxen
+            0x7E0A_0301, // v_mov_b32 v5, v1
+            0xD834_0000,
+            0x0000_0500, // ds_write_b32 v0, v5
+            S_ENDPGM,
+        ];
+        let e = lower_with(&words, vec![root(RootType::Descriptor, 0, 0)], vec![])
+            .err()
+            .unwrap();
+        assert!(e.to_string().contains("swizzling or a record limit"), "{e}");
+    }
+
     /// A stride only the host view's — the record names none, the
     /// descriptor's words are runtime data: refused by that, so runs can
     /// tell it from an unknown stride. The record's own dword stride
@@ -217,11 +240,21 @@ fn root(root: RootType, user_data: u8, slot: u8) -> RootParam {
             }]
         };
         let layout = || vec![root(RootType::Table, 0, 0), root(RootType::Constants, 1, 1)];
+        let refused = |stride: u32| {
+            let mut record = used();
+            record[0].stride = stride;
+            lower_with(&words, layout(), record).err().unwrap()
+        };
+        // No record at all, or one that names none (unread FSPX metadata):
+        // the element size is the host view's, known only at runtime.
         let e = lower_with(&words, layout(), used()).err().unwrap();
-        assert!(
-            e.to_string().contains("stride is only the host view's"),
-            "{e}"
-        );
+        assert!(e.to_string().contains("record names no stride"), "{e}");
+        // A stride that names no element the host can view.
+        for stride in [2, 3, 5, 6] {
+            let e = refused(stride);
+            assert!(e.to_string().contains("unknown stride"), "{stride}: {e}");
+        }
+        // The record's own dword stride still names its elements.
         let mut used4 = used();
         used4[0].stride = 4;
         lower_with(&words, layout(), used4).unwrap();
