@@ -14,7 +14,7 @@ Unzip it into a folder of its own. The launcher keeps everything next to itself:
 
 ## What it does
 
-- **Runtimes:** the archive's top 3, read live from [the archive site](https://guernica4u.github.io/GTA6-PC-Port-Archive/), plus ztrx, Hyphen (hyphenn), VIctory and xcl. Hover over a runtime to see how far it gets.
+- **Runtimes:** the archive's top 3, read live from [the archive site](https://guernica4u.github.io/GTA6-PC-Port-Archive/), plus ztrx, Hyphen (hyphenn), cool_fox, VIctory and xcl. ztrx and cool_fox were taken off GitHub by their authors; the launcher installs the last copy this archive saved. Hover over a runtime to see how far it gets.
 - **Install & play:** the first PLAY on a runtime downloads its source from this archive into `runtimes\<name>` next to the launcher and builds it into that folder's `target\release`. That needs [git](https://git-scm.com/download/win) and [Rust](https://rustup.rs) with the MSVC build tools. A console window shows the progress and stays open if something fails.
 - **Slideshow:** shows every picture in the `backgrounds` folder next to the launcher. To add pictures, drag them onto the window. With no pictures, it shows the game's own splash screen.
 - **Music:** plays a song from your copy of the game's `audio.rpf`, using the Opus decoder built into Windows. Settings switches between 5 songs. The speaker button in the top bar mutes it. Music stops while the game runs. Only the v1.0.2.1 dump is supported: the songs are found by their position in its `audio.rpf`.

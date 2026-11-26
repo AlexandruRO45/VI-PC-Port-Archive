@@ -1,6 +1,6 @@
 // Minimal game launcher: pick the game's .exe once, pick a runtime, press PLAY. Side tabs: Launcher, Conversion
 // (the runtime), Settings. Slideshow of the pictures in backgrounds\ (drop more on the window), music from the game's own audio.
-// Runtimes: the archive top 3 (AnyXboxX left out, ztrx always 3rd) plus Hyphen (hyphenn, was victory-fork), VIctory and xcl,
+// Runtimes: the archive top 3 (AnyXboxX left out, ztrx always 3rd) plus Hyphen (hyphenn, was victory-fork), cool_fox, VIctory and xcl,
 // each installed in runtimes\<key> and built into its target\release.
 // Build: build.bat (uses the C# compiler that ships with Windows, C# 5).
 using System;
@@ -24,8 +24,8 @@ using System.Xml;
 [assembly: AssemblyTitle("GTA VI Launcher")]
 [assembly: AssemblyDescription("Runs your game dump through the PC port runtimes")]
 [assembly: AssemblyProduct("GTA VI Launcher")]
-[assembly: AssemblyVersion("1.6.0.0")]
-[assembly: AssemblyFileVersion("1.6.0.0")]
+[assembly: AssemblyVersion("1.6.1.0")]
+[assembly: AssemblyFileVersion("1.6.1.0")]
 
 // One runtime project, as the archive's site describes it.
 class Runtime
@@ -76,7 +76,7 @@ static class Launcher
     public static readonly string Settings = Path.Combine(Here, "launcher.txt");
     public const string Archive = "https://github.com/Guernica4u/GTA6-PC-Port-Archive.git";
     const string ArchiveSite = "https://raw.githubusercontent.com/Guernica4u/GTA6-PC-Port-Archive/main/docs/index.html";
-    static readonly string[] Wanted = { "ztrx", "hyphenn", "victory-fork", "victory", "xcl" }; // the user's picks: Zettrox, Hyphen (renamed), VIctory, xcl; kept even once gone
+    static readonly string[] Wanted = { "ztrx", "hyphenn", "victory-fork", "victory", "xcl", "cool-fox" }; // the user's picks: Zettrox, Hyphen (renamed), VIctory, xcl, cool_fox; kept even once gone
     static readonly string[] Excluded = { "anyxboxx" }; // the user doesn't want it, even when it ranks
     static readonly Dictionary<string, string> Names = new Dictionary<string, string>
     {
@@ -146,14 +146,14 @@ static class Launcher
         return pick;
     }
 
-    // Offline fallback: the archive on 26 Nov 2026, after cool_fox took first place.
+    // Offline fallback: the archive on 26 Nov 2026, after cool_fox left GitHub the day it took first place.
     const string Builtin =
-        "  \"cool-fox\": { repo: \"codec-d/cool_fox\", name: \"cool_fox\", top: 1, branch: \"cool-fox\", reached: 5, note: \"VIctory-7900XTX with settings tested on RTX cards. Prologue and first mission at 13-22 fps.\" },\n" +
-        "  \"victory-7900xtx\": { repo: \"avatarmanz/VIctory-7900XTX\", name: \"VIctory-7900XTX\", top: 2, branch: \"victory-7900xtx\", reached: 5, note: \"Prologue and first mission at 13-22 fps. Needs about 64 GB of RAM.\" },\n" +
+        "  \"cool-fox\": { repo: \"codec-d/cool_fox\", gone: \"26 Nov 2026\", name: \"cool_fox\", branch: \"cool-fox\", reached: 5, note: \"VIctory-7900XTX with settings tested on RTX cards. Prologue and first mission at 13-22 fps.\" },\n" +
+        "  \"victory-7900xtx\": { repo: \"avatarmanz/VIctory-7900XTX\", name: \"VIctory-7900XTX\", top: 1, branch: \"victory-7900xtx\", reached: 5, note: \"Prologue and first mission at 13-22 fps. Needs about 64 GB of RAM.\" },\n" +
         "  ztrx: { repo: \"Zettrox/ztrx\", gone: \"25 Nov 2026\", name: \"ztrx\", branch: \"ztrx\", reached: 5, note: \"The prologue is playable. NVIDIA only.\" },\n" +
-        "  hyphenn: { repo: \"fxceless/victory-fork\", name: \"hyphenn\", top: 5, branch: \"hyphenn\", reached: 4, note: \"First gameplay scene at 2-4 fps.\" },\n" +
-        "  dexnom: { repo: \"DexNom/VIctory\", name: \"DexNom Runtime\", top: 3, branch: \"dexnom\", reached: 4, note: \"VIctory fork tuned on Radeon, experimental ray tracing.\" },\n" +
-        "  belobug: { repo: \"Belobug/VIctory-Belobug-AMD\", name: \"VIctory-Belobug-AMD\", top: 4, branch: \"belobug\", reached: 4, note: \"The world renders lit at 5-7 fps on an RX 9070 XT.\" },\n" +
+        "  hyphenn: { repo: \"fxceless/victory-fork\", name: \"hyphenn\", top: 4, branch: \"hyphenn\", reached: 4, note: \"First gameplay scene at 2-4 fps.\" },\n" +
+        "  dexnom: { repo: \"DexNom/VIctory\", name: \"DexNom Runtime\", top: 2, branch: \"dexnom\", reached: 4, note: \"VIctory fork tuned on Radeon, experimental ray tracing.\" },\n" +
+        "  belobug: { repo: \"Belobug/VIctory-Belobug-AMD\", name: \"VIctory-Belobug-AMD\", top: 3, branch: \"belobug\", reached: 4, note: \"The world renders lit at 5-7 fps on an RX 9070 XT.\" },\n" +
         "  victory: { repo: \"Marvisak/VIctory\", name: \"VIctory\", branch: \"victory\", reached: 3, note: \"Menus and the world intro.\" },\n" +
         "  xcl: { repo: \"ivall/xcl\", name: \"xcl\", branch: \"xcl\", reached: 2, note: \"Its own code, not VIctory. Menus at 30 fps; gameplay not reached yet.\" },\n";
 
@@ -227,7 +227,7 @@ static class Launcher
             "  tuxbox: { repo: \"brcly/TuxBox\", name: \"TuxBox\", branch: \"tuxbox\", reached: 2 },\n" +
             "  \"leonida-old\": { repo: \"x/L\", gone: \"23 Nov 2026\", name: \"Leonida\", reached: 9 },\n";
         var keys = string.Join(",", Choose(ParseArchive(site)).Select(r => r.Key + r.Rank).ToArray());
-        if (keys != "cool-fox1,victory-7900xtx2,ztrx3,dexnom0,hyphenn0,victory0,xcl0") return 5;
+        if (keys != "victory-7900xtx1,dexnom2,ztrx3,belobug0,hyphenn0,cool-fox0,victory0,xcl0") return 5;
         foreach (var r in Choose(ParseArchive(Builtin))) // every runtime builds into runtimes\<key>\target\release
             if (!r.Exe.StartsWith(Path.Combine(Here, "runtimes", r.Key, @"target\release\"))) return 9;
         if (Choose(ParseArchive(Builtin)).First(r => r.Key == "hyphenn").Name != "Hyphen") return 6;
@@ -926,11 +926,12 @@ class LauncherForm : Form
         TextRenderer.DrawText(g, "The PC port runtime PLAY runs the game with. #1 to #3 are the archive's current top 3.", pathF, new Point(x, S(74)), muted2);
         int y = S(108), rw = w - x - S(40);
         var mid = TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine | TextFormatFlags.EndEllipsis;
-        // shortcut: no scrolling; 7 runtimes fit the smallest window, add a scroll offset if the list grows past ~8.
-        for (int i = 0; i < runtimes.Count; i++, y += S(56))
+        // Rows shrink to fit the window. shortcut: no scrolling; past ~10 runtimes rows get too thin, add a scroll offset then.
+        int step = Math.Min(S(56), (ClientSize.Height - y - S(12)) / Math.Max(1, runtimes.Count));
+        for (int i = 0; i < runtimes.Count; i++, y += step)
         {
             var rt = runtimes[i];
-            var r = new Rectangle(x, y, rw, S(50));
+            var r = new Rectangle(x, y, rw, step - S(6));
             hits["row" + i] = r;
             bool on = rt == cur, hot = hover == "row" + i;
             using (var path = Rounded(r, S(8)))
