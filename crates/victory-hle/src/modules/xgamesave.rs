@@ -364,41 +364,66 @@ fn matches_legacy(version: &Version, old: &Path) -> std::io::Result<bool> {
     Ok(true)
 }
 
-/// Moves a container of the old layout (blob files named by encoded name,
-/// a `.display` file) into a committed version. Keeps uncertain legacy data
-/// alongside the active save, outside the version list.
-fn migrate(root: &Path, name: &str, old: &Path) -> Option<PathBuf> {
-    let dir = container_dir(root, name);
-    if let Some(version) = current_named(&dir, name).ok()? {
-        let can_remove = if version.dir.ends_with("v1") {
+/// Reserve a fresh slot before moving the legacy data so earlier backups
+/// stay intact even if a legacy build creates the folder again.
+fn preserve_legacy(dir: &Path, old: &Path) -> std::io::Result<PathBuf> {
+    let backups = dir.join(".legacy");
+    std::fs::create_dir_all(&backups)?;
+    for number in 0..=u64::MAX {
+        let slot = backups.join(number.to_string());
+        match std::fs::create_dir(&slot) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+        let backup = slot.join("save");
+        if let Err(e) = std::fs::rename(old, &backup) {
+            let _ = std::fs::remove_dir(&slot);
+            return Err(e);
+        }
+        return Ok(backup);
+    }
+    Err(std::io::Error::other("legacy save backup slots exhausted"))
+}
+
+/// Whether migration can skip the first commit. Stop when the destination
+/// is ambiguous and preserve the legacy data for manual recovery.
+fn migration_done(dir: &Path, name: &str, old: &Path) -> Option<bool> {
+    let can_remove = match current_named(dir, name) {
+        Ok(None) => return Some(false),
+        Ok(Some(version)) if version.dir.ends_with("v1") => {
             matches_legacy(&version, old).unwrap_or(false)
-        } else {
+        }
+        Ok(Some(version)) => {
             // A later commit can omit blobs that an update deleted. Check
             // its listed files before letting it supersede the legacy data.
             (0..version.blobs.len()).all(|i| {
                 let blob = version.blob(i);
                 blob.is_file() && std::fs::File::open(blob).is_ok()
             })
-        };
-        if !can_remove {
-            let backup = dir.join(".legacy");
-            let moved = backup.try_exists().and_then(|exists| {
-                if exists {
-                    return Err(std::io::ErrorKind::AlreadyExists.into());
-                }
-                std::fs::rename(old, &backup)
-            });
-            match moved {
-                Ok(()) => {
-                    tracing::warn!(container = name, path = %backup.display(), "retained ambiguous legacy save")
-                }
-                Err(e) => {
-                    tracing::warn!(container = name, %e, "could not move ambiguous legacy save")
-                }
-            }
-            return None;
         }
-    } else {
+        // current() found committed folders but could not load any of them.
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidData && dir.is_dir() => false,
+        Err(_) => return None,
+    };
+    if can_remove {
+        return Some(true);
+    }
+    match preserve_legacy(dir, old) {
+        Ok(backup) => {
+            tracing::warn!(container = name, path = %backup.display(), "retained ambiguous legacy save")
+        }
+        Err(e) => tracing::warn!(container = name, %e, "could not move ambiguous legacy save"),
+    }
+    None
+}
+
+/// Moves a container of the old layout (blob files named by encoded name,
+/// a `.display` file) into a committed version, then removes it.
+fn migrate(root: &Path, name: &str, old: &Path) -> Option<PathBuf> {
+    let dir = container_dir(root, name);
+    let done = migration_done(&dir, name, old)?;
+    if !done {
         let display = std::fs::read_to_string(old.join(".display")).unwrap_or_default();
         let mut blobs: Vec<(String, Vec<u8>)> = std::fs::read_dir(old)
             .ok()?
@@ -590,8 +615,8 @@ fn delete(root: &Path, name: &str) -> HRESULT {
         Ok(None) => return S_OK,
         Err(e) => return io_error(&dir, &e),
     }
-    // A legacy folder that could not be moved would be imported again if
-    // we removed its active save. Leave both in place until it can be moved.
+    // Retire any remaining legacy folders with the active save so a later
+    // open cannot import them again. The final rename also retires backups.
     let entries = match std::fs::read_dir(root) {
         Ok(entries) => entries,
         Err(e) => return io_error(root, &e),
@@ -601,10 +626,12 @@ fn delete(root: &Path, name: &str) -> HRESULT {
             Ok(entry) => entry,
             Err(e) => return io_error(root, &e),
         };
+        let old = entry.path();
         if entry.file_name().to_str().and_then(decode).as_deref() == Some(name)
-            && entry.path().is_dir()
+            && old.is_dir()
+            && let Err(e) = preserve_legacy(&dir, &old)
         {
-            return NO_ACCESS;
+            return io_error(&old, &e);
         }
     }
     let gone = dir.with_extension("gone");
@@ -1289,6 +1316,31 @@ mod tests {
         assert_eq!((v.dir.file_name(), v.display.as_str()), (Some("v1".as_ref()), "Chapter 1"));
     }
 
+    /// An empty configuration id names none. As a folder name it would be
+    /// the folder every configuration lives in, whose folders then look
+    /// like containers of the old layout and are converted away.
+    #[test]
+    fn an_empty_configuration_id_is_the_default_one() {
+        let saves = tempfile::tempdir().unwrap();
+        let scid = Provider::open(saves.path(), Some("scid")).unwrap();
+        assert_eq!(update(&scid.root, "one", &[("a", Some("kept"))]), S_OK);
+        let kept = Some(("one".into(), vec![("a".into(), "kept".into())]));
+        assert_eq!(state(&scid.root), kept);
+
+        let empty = Provider::open(saves.path(), Some("")).unwrap();
+        assert!(scid.root.is_dir(), "another configuration's saves are gone");
+        assert_eq!(state(&scid.root), kept);
+        let default = Provider::open(saves.path(), None).unwrap();
+        assert_eq!(empty.root, default.root);
+
+        // Named configurations stay apart, from it and from each other.
+        assert_ne!(empty.root, scid.root);
+        assert_eq!(state(&empty.root), None);
+        let other = Provider::open(saves.path(), Some("other")).unwrap();
+        assert_eq!(state(&other.root), None);
+        assert_eq!(state(&scid.root), kept);
+    }
+
     fn write_legacy_slot(root: &Path) -> PathBuf {
         let old = root.join("Slot");
         std::fs::create_dir(&old).unwrap();
@@ -1331,7 +1383,7 @@ mod tests {
             for _ in 0..2 {
                 Provider::open(saves.path(), Some("scid")).unwrap();
 
-                let backup = dir.join(".legacy");
+                let backup = dir.join(".legacy/0/save");
                 assert!(!old.exists(), "{case}");
                 let metadata = std::fs::read(backup.join(".display")).unwrap();
                 assert_eq!(metadata, b"one", "{case}");
@@ -1366,62 +1418,58 @@ mod tests {
 
     #[test]
     fn incomplete_later_version_preserves_legacy_data() {
-        let saves = tempfile::tempdir().unwrap();
-        let p = Provider::open(saves.path(), Some("scid")).unwrap();
-        let dir = p.container("Slot").dir;
-        commit(&dir, 2, "Slot", "two", &[("a", Source::Data(b"new a"))]).unwrap();
-        std::fs::remove_file(dir.join("v2").join("0")).unwrap();
-        write_legacy_slot(&p.root);
+        for missing in ["0", MANIFEST] {
+            let saves = tempfile::tempdir().unwrap();
+            let p = Provider::open(saves.path(), Some("scid")).unwrap();
+            let dir = p.container("Slot").dir;
+            commit(&dir, 2, "Slot", "two", &[("a", Source::Data(b"new a"))]).unwrap();
+            let missing_file = dir.join("v2").join(missing);
+            std::fs::remove_file(&missing_file).unwrap();
+            if missing == MANIFEST {
+                assert!(matches!(
+                    current_named(&dir, "Slot"),
+                    Err(e) if e.kind() == std::io::ErrorKind::InvalidData
+                ));
+            }
+            let old = write_legacy_slot(&p.root);
 
-        Provider::open(saves.path(), Some("scid")).unwrap();
+            Provider::open(saves.path(), Some("scid")).unwrap();
 
-        let backup = dir.join(".legacy");
-        assert_eq!(std::fs::read(backup.join("b")).unwrap(), b"old b");
-        assert!(!dir.join("v2").join("0").exists());
+            let backup = dir.join(".legacy/0/save");
+            let saved_blob = std::fs::read(backup.join("b")).unwrap();
+            assert_eq!(saved_blob, b"old b", "{missing}");
+            assert!(!old.exists(), "{missing}");
+            assert!(!missing_file.exists(), "{missing}");
+            assert!(!dir.join("v1").exists(), "{missing}");
+        }
     }
 
     #[test]
-    fn an_existing_backup_keeps_both_legacy_copies() {
+    fn existing_backups_allow_preservation_and_delete() {
         let saves = tempfile::tempdir().unwrap();
         let p = Provider::open(saves.path(), Some("scid")).unwrap();
         assert_eq!(update(&p.root, "one", &[("a", Some("old a"))]), S_OK);
         let dir = p.container("Slot").dir;
-        let backup = dir.join(".legacy");
-        std::fs::create_dir(&backup).unwrap();
-        std::fs::write(backup.join("b"), b"earlier copy").unwrap();
-        let old = write_legacy_slot(&p.root);
-
+        write_legacy_slot(&p.root);
         Provider::open(saves.path(), Some("scid")).unwrap();
 
-        assert_eq!(std::fs::read(backup.join("b")).unwrap(), b"earlier copy");
-        assert_eq!(std::fs::read(old.join("b")).unwrap(), b"old b");
-        assert_eq!(delete(&p.root, "Slot"), NO_ACCESS);
-        assert!(dir.join("v1").is_dir());
-    }
+        let old = write_legacy_slot(&p.root);
+        std::fs::write(old.join("b"), b"later copy").unwrap();
+        Provider::open(saves.path(), Some("scid")).unwrap();
 
-    /// An empty configuration id names none. As a folder name it would be
-    /// the folder every configuration lives in, whose folders then look
-    /// like containers of the old layout and are converted away.
-    #[test]
-    fn an_empty_configuration_id_is_the_default_one() {
-        let saves = tempfile::tempdir().unwrap();
-        let scid = Provider::open(saves.path(), Some("scid")).unwrap();
-        assert_eq!(update(&scid.root, "one", &[("a", Some("kept"))]), S_OK);
-        let kept = Some(("one".into(), vec![("a".into(), "kept".into())]));
-        assert_eq!(state(&scid.root), kept);
+        let backups = dir.join(".legacy");
+        assert_eq!(std::fs::read(backups.join("0/save/b")).unwrap(), b"old b");
+        let later_blob = std::fs::read(backups.join("1/save/b")).unwrap();
+        assert_eq!(later_blob, b"later copy");
+        assert!(!old.exists());
 
-        let empty = Provider::open(saves.path(), Some("")).unwrap();
-        assert!(scid.root.is_dir(), "another configuration's saves are gone");
-        assert_eq!(state(&scid.root), kept);
-        let default = Provider::open(saves.path(), None).unwrap();
-        assert_eq!(empty.root, default.root);
-
-        // Named configurations stay apart, from it and from each other.
-        assert_ne!(empty.root, scid.root);
-        assert_eq!(state(&empty.root), None);
-        let other = Provider::open(saves.path(), Some("other")).unwrap();
-        assert_eq!(state(&other.root), None);
-        assert_eq!(state(&scid.root), kept);
+        // A fresh legacy folder can also appear before the next provider open.
+        let pending = write_legacy_slot(&p.root);
+        assert_eq!(delete(&p.root, "Slot"), S_OK);
+        assert!(!pending.exists());
+        assert!(!dir.exists());
+        Provider::open(saves.path(), Some("scid")).unwrap();
+        assert_eq!(state(&p.root), None);
     }
 
     #[test]
