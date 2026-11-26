@@ -134,12 +134,21 @@ pub(crate) fn available_physical_ram() -> Option<u64> {
     ok.then_some(m.ullAvailPhys)
 }
 
+/// Soft VRAM usage watermark (percent of DXGI local budget) at which
+/// [`vram_keep`] begins evicting idle filled-texture host copies.
+/// [`crate::resource`] stops proactive queue uploads below this line so
+/// upload admission and eviction do not oscillate.
+pub(crate) const VRAM_EVICT_SOFT_PCT: u64 = 82;
+pub(crate) const VRAM_EVICT_HARD_PCT: u64 = 90;
+const VRAM_TARGET_SOFT_PCT: u64 = 78;
+const VRAM_TARGET_HARD_PCT: u64 = 74;
+
 /// How long host copies of textures the title fills must have been idle to
 /// be let go, in milliseconds, and how many bytes of them go at most (the
 /// longest idle first): none but those of ten minutes while what is in use
 /// of the card (`used`: without what our own blocks have free, with what is
-/// kept free for others) is under 88 % of its budget, else enough to come
-/// down to 85 %. `VICTORY_TEXTURE_KEEP=0`: [`vram_idle_ms`]' older rule,
+/// kept free for others) is under 82 % of its budget, else enough to come
+/// down to 78 % (or 74 % from 90 % on). `VICTORY_TEXTURE_KEEP=0`: [`vram_idle_ms`]' older rule,
 /// all that are idle; `=1`: that rule with its two longer times.
 ///
 /// (By those times everything idle for 2.5 s went from 75 % of the budget
@@ -153,12 +162,12 @@ pub(crate) fn vram_keep(budget: u64, used: u64) -> (u64, u64) {
         return (IDLE_MS, u64::MAX);
     }
     let share = |percent: u64| budget / 100 * percent;
-    if used < share(82) {
+    if used < share(VRAM_EVICT_SOFT_PCT) {
         (KEPT_MS, u64::MAX)
-    } else if used < share(90) {
-        (IDLE_MS, used - share(78))
+    } else if used < share(VRAM_EVICT_HARD_PCT) {
+        (IDLE_MS, used - share(VRAM_TARGET_SOFT_PCT))
     } else {
-        (SHORT_MS, used - share(80))
+        (SHORT_MS, used - share(VRAM_TARGET_HARD_PCT))
     }
 }
 
@@ -10323,14 +10332,29 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
 
     #[test]
     fn textures_are_kept_while_the_card_has_room() {
-        use super::vram_keep;
+        use super::{VRAM_EVICT_HARD_PCT, VRAM_EVICT_SOFT_PCT, vram_keep};
         let gib = 1 << 30;
-        assert_eq!(vram_keep(100 * gib, 81 * gib).0, 600_000);
-        // Past it: the longest idle ones, enough to come down.
+        assert_eq!(
+            vram_keep(100 * gib, (VRAM_EVICT_SOFT_PCT - 1) * gib),
+            (600_000, u64::MAX)
+        );
+        // Soft pressure (82%..90%): evict down to 78%.
+        assert_eq!(vram_keep(100 * gib, 82 * gib), (5_000, 4 * gib));
         assert_eq!(vram_keep(100 * gib, 85 * gib), (5_000, 7 * gib));
-        assert_eq!(vram_keep(100 * gib, 95 * gib), (1_500, 15 * gib));
-        assert_eq!(vram_keep(100 * gib, 120 * gib), (1_500, 40 * gib));
-        assert_eq!(vram_keep(0, 7).0, 5_000);
+        assert_eq!(vram_keep(100 * gib, 89 * gib), (5_000, 11 * gib));
+        // Hard pressure (>= 90%): shorter idle window and deeper target (74%),
+        // strictly monotonic across the 89% -> 90% boundary.
+        assert_eq!(vram_keep(100 * gib, VRAM_EVICT_HARD_PCT * gib), (1_500, 16 * gib));
+        assert_eq!(vram_keep(100 * gib, 95 * gib), (1_500, 21 * gib));
+        assert_eq!(vram_keep(100 * gib, 120 * gib), (1_500, 46 * gib));
+        let mut prev = (u64::MAX, 0);
+        for pct in VRAM_EVICT_SOFT_PCT..=120 {
+            let (ms, bytes) = vram_keep(100 * gib, pct * gib);
+            assert!(ms <= prev.0, "idle_ms increased at {pct}%: {ms} > {}", prev.0);
+            assert!(bytes >= prev.1, "evict bytes decreased at {pct}%: {bytes} < {}", prev.1);
+            prev = (ms, bytes);
+        }
+        assert_eq!(vram_keep(0, 7), (5_000, u64::MAX));
     }
 
     #[test]

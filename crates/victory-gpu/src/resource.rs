@@ -1668,7 +1668,7 @@ fn texture_floor_bytes(vram_budget: Option<u64>) -> u64 {
 /// Whether more host copies of textures the title fills may be made for
 /// shaders that pick textures by index (`draw.rs` `heap_textures`): always
 /// up to [`texture_floor_bytes`] bytes of them, beyond that while the card's
-/// memory in use by this process is under nine tenths of the budget the system
+/// memory in use by this process is under four fifths of the budget the system
 /// gives it ([`room_percent`] says another share; `VICTORY_TEXTURE_BUDGET_MB`
 /// sets a limit on those copies' bytes instead). Past the budget the system moves the card's memory into the PC's,
 /// which ended runs 20 and 24.
@@ -1754,22 +1754,26 @@ pub(crate) fn room_lately() -> bool {
     room
 }
 
+/// Default budget share (percent) up to which [`room`] admits new filled-texture
+/// host copies and [`room_lately`] keeps old descriptor views alive. Kept 2 %
+/// below [`crate::host::VRAM_EVICT_SOFT_PCT`] (80 % vs 82 %) so admission stops
+/// before [`let_go_idle`] starts full-table eviction sweeps.
+#[cfg(windows)]
+const DEFAULT_TEXTURE_ROOM_PCT: u64 = crate::host::VRAM_EVICT_SOFT_PCT - 2;
+
+#[cfg(windows)]
+fn parse_room_percent(raw: Option<&str>) -> u64 {
+    raw.and_then(|v| v.trim().parse::<u64>().ok())
+        .map_or(DEFAULT_TEXTURE_ROOM_PCT, |percent| percent.clamp(50, 97))
+}
+
 /// The share of the card's budget, in percent, up to which host copies of
-/// textures picked by index are made ([`room`]): 90 unless
-/// `VICTORY_TEXTURE_ROOM_PERCENT` says another (50 to 97). At 90 about a
-/// tenth of the budget, 1,020 MB of 10,200, stays unused while thousands of
-/// textures wait (runs 170-174); the card copies of title buffers from
-/// 1 MiB up take 449 MB more of the card than before (941 against 492),
-/// and 94 gives the textures about that much back.
+/// textures picked by index are made ([`room`]): [`DEFAULT_TEXTURE_ROOM_PCT`]
+/// (80) unless `VICTORY_TEXTURE_ROOM_PERCENT` says another (50 to 97).
 #[cfg(windows)]
 fn room_percent() -> u64 {
     static PERCENT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *PERCENT.get_or_init(|| {
-        std::env::var("VICTORY_TEXTURE_ROOM_PERCENT")
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .map_or(90, |percent| percent.clamp(50, 97))
-    })
+    *PERCENT.get_or_init(|| parse_room_percent(std::env::var("VICTORY_TEXTURE_ROOM_PERCENT").ok().as_deref()))
 }
 
 /// For the card accounting line ([`card_accounting`]): the title texture
@@ -2010,6 +2014,28 @@ pub(crate) fn card_accounting(room: bool, due: [u64; 5], never: Vec<(u64, u64)>,
 /// it; a thread that asked for it and has not yet recorded its use (which
 /// makes the list or the slot hold it) is protected by that idle time alone.
 /// Every caller uses it at once, within the title's call.
+#[cfg(windows)]
+const EMPTY_PRESSURE_SWEEP_COOLDOWN_MS: u64 = 2_000;
+
+#[cfg(windows)]
+fn encode_pressure_backoff(until_ms: u64, idle_ms: u64) -> u64 {
+    (until_ms << 16) | idle_ms.min(u16::MAX as u64)
+}
+
+/// Returns `true` when a `most != u64::MAX` full-table scan recently freed
+/// zero textures at the same or stricter `idle_ms` tier and its short cooldown
+/// has not expired yet. Escalating pressure (smaller `idle_ms`) always runs
+/// immediately.
+#[cfg(windows)]
+fn skip_empty_pressure_sweep(state: u64, now_ms: u64, idle_ms: u64) -> bool {
+    if state == 0 {
+        return false;
+    }
+    let until_ms = state >> 16;
+    let prev_idle_ms = state & 0xffff;
+    now_ms < until_ms && idle_ms >= prev_idle_ms
+}
+
 /// Called before a submission starts, by the thread that submits.
 /// `VICTORY_TEXTURE_SWEEP=0` lets nothing go.
 #[cfg(windows)]
@@ -2044,6 +2070,14 @@ pub(crate) fn let_go_idle() {
         }
         _ => (crate::host::vram_idle_ms(memory), u64::MAX),
     };
+    static EMPTY_BACKOFF: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if most != u64::MAX {
+        if skip_empty_pressure_sweep(EMPTY_BACKOFF.load(Relaxed), crate::host::now_ms(), idle_ms) {
+            return;
+        }
+    } else {
+        EMPTY_BACKOFF.store(0, Relaxed);
+    }
     // For the trail (`crate::host::trail`): how many went, their bytes,
     // and the first one.
     let (mut went, mut bytes, mut first) = (0u64, 0u64, None);
@@ -2122,6 +2156,18 @@ pub(crate) fn let_go_idle() {
             }
             crate::host::retire(host);
         }
+    }
+    drop(all);
+    if most != u64::MAX {
+        let next = if went == 0 {
+            encode_pressure_backoff(
+                crate::host::now_ms().saturating_add(EMPTY_PRESSURE_SWEEP_COOLDOWN_MS),
+                idle_ms,
+            )
+        } else {
+            0
+        };
+        EMPTY_BACKOFF.store(next, Relaxed);
     }
     SWEPT_US[0].fetch_add(1, Relaxed);
     SWEPT_US[1].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
@@ -4534,6 +4580,26 @@ float4 lit() : SV_Target { return 1.0; }
         assert_eq!(texture_floor_bytes(Some(12 * GIB)), 2 * GIB);
         assert_eq!(texture_floor_bytes(Some(24 * GIB)), 2 * GIB);
         assert_eq!(texture_floor_bytes(Some(32 * GIB)), 2 * GIB);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn texture_room_stays_below_soft_eviction_and_backoff_respects_escalation() {
+        assert_eq!(DEFAULT_TEXTURE_ROOM_PCT, 80);
+        assert!(DEFAULT_TEXTURE_ROOM_PCT < crate::host::VRAM_EVICT_SOFT_PCT);
+        assert_eq!(parse_room_percent(None), DEFAULT_TEXTURE_ROOM_PCT);
+        assert_eq!(parse_room_percent(Some(" 94 ")), 94);
+        assert_eq!(parse_room_percent(Some("10")), 50);
+        assert_eq!(parse_room_percent(Some("99")), 97);
+        assert_eq!(parse_room_percent(Some("auto")), DEFAULT_TEXTURE_ROOM_PCT);
+
+        let state = encode_pressure_backoff(3_000, 5_000);
+        assert!(skip_empty_pressure_sweep(state, 1_500, 5_000));
+        // Escalating pressure (>= 90%, 1,500 ms window) bypasses cooldown immediately.
+        assert!(!skip_empty_pressure_sweep(state, 1_500, 1_500));
+        // Expired cooldown runs again.
+        assert!(!skip_empty_pressure_sweep(state, 3_000, 5_000));
+        assert!(!skip_empty_pressure_sweep(0, 1_500, 5_000));
     }
 
     /// A placed texture viewed from a later level has a host copy of that
