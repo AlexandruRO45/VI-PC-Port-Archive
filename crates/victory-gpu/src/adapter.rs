@@ -44,7 +44,11 @@ pub(crate) fn log(device: &ID3D12Device) {
                 size_of_val(&options) as u32,
             )
             .is_ok()
-            .then_some((options.WaveLaneCountMin, options.WaveLaneCountMax));
+            .then_some(Lanes {
+                ops: options.WaveOps.as_bool(),
+                min: options.WaveLaneCountMin,
+                max: options.WaveLaneCountMax,
+            });
         (used, preferred, lanes)
     };
     let Some(used) = used else { return };
@@ -53,7 +57,7 @@ pub(crate) fn log(device: &ID3D12Device) {
         vendor = format_args!("{:#06x}", used.vendor),
         driver = used.driver.as_deref().unwrap_or("unknown"),
         dedicated_mib = used.dedicated_mib,
-        lanes = %lanes.map_or_else(|| "unknown".to_owned(), |(min, max)| format!("{min}-{max}")),
+        lanes = %lanes.map_or_else(|| "unknown".to_owned(), |l| format!("{}-{}", l.min, l.max)),
         "host GPU"
     );
     for warning in warnings(&used, preferred.as_ref(), lanes) {
@@ -61,9 +65,17 @@ pub(crate) fn log(device: &ID3D12Device) {
     }
 }
 
+/// The device's wave operations and lane range (`D3D12_OPTIONS1`).
+#[derive(Clone, Copy, Debug)]
+struct Lanes {
+    ops: bool,
+    min: u32,
+    max: u32,
+}
+
 /// What the log should warn about the device's adapter (`used`), given
-/// DXGI's high-performance one and the device's wave lane range.
-fn warnings(used: &Adapter, preferred: Option<&Adapter>, lanes: Option<(u32, u32)>) -> Vec<String> {
+/// DXGI's high-performance one and the device's wave lanes.
+fn warnings(used: &Adapter, preferred: Option<&Adapter>, lanes: Option<Lanes>) -> Vec<String> {
     let mut out = Vec::new();
     if let Some(p) = preferred.filter(|p| !p.software && p.luid != used.luid) {
         out.push(format!(
@@ -74,13 +86,31 @@ fn warnings(used: &Adapter, preferred: Option<&Adapter>, lanes: Option<(u32, u32
         ));
     }
     // Translated compute programs that depend on lane layout declare the
-    // console's wave size (`emit` module docs).
-    if let Some((_, max)) = lanes.filter(|&(_, max)| max < 32) {
-        out.push(format!(
-            "{} runs waves of at most {max} lanes: compute programs that need the console's \
-             32 or 64 get no pipeline on it",
+    // console's wave size, 32 or 64 (`emit` module docs).
+    match lanes {
+        Some(l) if !l.ops => out.push(format!(
+            "{} has no wave operations: compute programs that read other lanes \
+             get no pipeline on it",
             used.name
-        ));
+        )),
+        Some(l) => {
+            let missing: Vec<String> = [32u32, 64]
+                .into_iter()
+                .filter(|n| !(l.min..=l.max).contains(n))
+                .map(|n| n.to_string())
+                .collect();
+            if !missing.is_empty() {
+                out.push(format!(
+                    "{} runs waves of {}-{} lanes: compute programs that declare the \
+                     console's wave of {} get no pipeline on it",
+                    used.name,
+                    l.min,
+                    l.max,
+                    missing.join(" or ")
+                ));
+            }
+        }
+        None => {}
     }
     out
 }
@@ -96,6 +126,7 @@ unsafe fn describe(adapter: &IDXGIAdapter1) -> Option<Adapter> {
         .position(|&c| c == 0)
         .unwrap_or(desc.Description.len());
     // The UMD version, when the adapter answers for `IDXGIDevice`.
+    // SAFETY: a plain adapter query with an interface id that outlives it.
     let driver = unsafe { adapter.CheckInterfaceSupport(&IDXGIDevice::IID) }
         .ok()
         .map(|v| {
@@ -143,23 +174,43 @@ mod tests {
         let intel = adapter("Intel(R) UHD Graphics", 1, false);
         let nvidia = adapter("NVIDIA GeForce RTX 4050 Laptop GPU", 2, false);
         let warp = adapter("Microsoft Basic Render Driver", 3, true);
-        let one = warnings(&intel, Some(&nvidia), Some((32, 32)));
+        let one = warnings(&intel, Some(&nvidia), lanes(32, 64));
         assert_eq!(one.len(), 1);
         assert!(one[0].contains("on Intel(R) UHD Graphics, but NVIDIA GeForce RTX 4050"));
-        assert!(warnings(&nvidia, Some(&nvidia), Some((32, 32))).is_empty());
+        assert!(warnings(&nvidia, Some(&nvidia), lanes(32, 64)).is_empty());
         // Only software is preferred (no GPU): nothing better to point at.
-        assert!(warnings(&intel, Some(&warp), Some((32, 32))).is_empty());
+        assert!(warnings(&intel, Some(&warp), lanes(32, 64)).is_empty());
         assert!(warnings(&intel, None, None).is_empty());
     }
 
+    fn lanes(min: u32, max: u32) -> Option<Lanes> {
+        Some(Lanes {
+            ops: true,
+            min,
+            max,
+        })
+    }
+
     #[test]
-    fn a_gpu_without_32_lane_waves_is_warned_about() {
-        let intel = adapter("Intel(R) UHD Graphics", 1, false);
-        let one = warnings(&intel, Some(&intel), Some((16, 16)));
-        assert_eq!(one.len(), 1);
-        assert!(one[0].contains("at most 16 lanes"));
-        assert!(warnings(&intel, Some(&intel), Some((32, 64))).is_empty());
-        assert!(warnings(&intel, Some(&intel), Some((4, 128))).is_empty());
+    fn a_gpu_without_the_consoles_wave_sizes_is_warned_about() {
+        let gpu = adapter("GPU", 1, false);
+        let one = |l: Option<Lanes>| {
+            let w = warnings(&gpu, Some(&gpu), l);
+            assert!(w.len() <= 1, "{w:?}");
+            w.into_iter().next().unwrap_or_default()
+        };
+        assert!(one(lanes(16, 16)).contains("of 16-16 lanes"));
+        assert!(one(lanes(16, 16)).contains("wave of 32 or 64 get"));
+        assert!(one(lanes(32, 32)).contains("wave of 64 get"));
+        assert!(one(lanes(64, 64)).contains("wave of 32 get"));
+        assert!(one(lanes(32, 64)).is_empty());
+        assert!(one(lanes(4, 128)).is_empty());
+        let no_ops = one(Some(Lanes {
+            ops: false,
+            min: 0,
+            max: 0,
+        }));
+        assert!(no_ops.contains("has no wave operations"));
     }
 
     /// On this machine's default device: its adapter is found and named.
