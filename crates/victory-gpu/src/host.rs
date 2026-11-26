@@ -379,6 +379,15 @@ pub(crate) fn video_memory() -> Option<[(f64, f64); 2]> {
     Some([info(DXGI_MEMORY_SEGMENT_GROUP_LOCAL)?, info(DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL)?])
 }
 
+/// A host timestamp in the title's clock, [`crate::queue::TIMESTAMP_FREQUENCY`].
+///
+/// The product is taken in u128: a tick count times 100 MHz passes u64::MAX
+/// at any host clock above 0.1 Hz per tick, which every real queue is.
+fn title_ticks(at: u64, host_hz: u64) -> u64 {
+    let title_hz = u128::from(crate::queue::TIMESTAMP_FREQUENCY);
+    (u128::from(at) * title_hz / u128::from(host_hz.max(1))) as u64
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     thread_local! {
@@ -1514,13 +1523,11 @@ impl Host {
                 // SAFETY: a read-back buffer this finished list resolved into.
                 if unsafe { back.Map(0, Some(&range), Some(&mut data)) }.is_ok() {
                     if *timestamps {
-                        // The title's clock is TIMESTAMP_FREQUENCY, the host's
-                        // is its queue's.
-                        let host = self.timestamp_frequency().max(1);
+                        let host = self.timestamp_frequency();
                         for i in 0..*bytes / 8 {
                             // SAFETY: the resolution wrote every piece.
                             let at = unsafe { data.cast::<u64>().add(i as usize).read_unaligned() };
-                            let ticks = at.saturating_mul(crate::queue::TIMESTAMP_FREQUENCY) / host;
+                            let ticks = title_ticks(at, host);
                             // SAFETY: the results go inside the buffer, checked by the caller.
                             copy_mapped(
                                 unsafe { title.add(i as usize * 8) },
@@ -4260,4 +4267,15 @@ mod present_plane_tests {
         // Premultiplied half-blue over opaque red.
         assert_eq!(composite, Some((64, 64, [127, 0, 128, 255])));
     }
+}
+
+#[test]
+fn timestamps_scale_to_the_title_clock() {
+    // A 1 GHz host and a 10 MHz one, with the tick counts a reviewer read
+    // back on each: both products pass u64::MAX, and a saturating multiply
+    // would give both the same (and wrong) interval.
+    assert_eq!(title_ticks(26_509_312, 1_000_000_000), 2_650_931);
+    assert_eq!(title_ticks(254_637, 10_000_000), 2_546_370);
+    // A zero frequency, which a device without timestamps reports.
+    assert_eq!(title_ticks(1_000_000_000, 0), 100_000_000_000_000_000);
 }
