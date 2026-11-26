@@ -855,6 +855,13 @@ pub(crate) fn warn_depth_bounds() {
 #[cfg(feature = "diagnostics")]
 const STAMPS: u32 = 4096;
 
+/// Stamps sets kept side by side, one per list, so that every list of a
+/// batched submission resolves into its own range: without it the last list
+/// to close overwrites the rest (they all resolved at offset 0), and per
+/// command times could only be read when every list was submitted alone -
+/// which is the mode that made them 10x wrong.
+const STAMP_SLOTS: u64 = 64;
+
 /// A marker's text and the host range its command reads (diagnostics).
 #[cfg(feature = "diagnostics")]
 type Note = (String, Option<(u64, u64)>);
@@ -878,6 +885,17 @@ pub(crate) fn dred_on() -> bool {
 fn timing() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| crate::switch::on("VICTORY_GPU_TIMING"))
+}
+
+/// Whether each command is timed (`VICTORY_GPU_STAMPS`): a timestamp before
+/// each noted command and a read-back after the list, *without* the one-list-
+/// per-submission mode `VICTORY_GPU_TIMING` turns on - that mode waits for
+/// every list on its own and reads ~10x the real frame. With it a batched
+/// submission can still name the commands that cost it.
+#[cfg(feature = "diagnostics")]
+fn stamping() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| timing() || crate::switch::on("VICTORY_GPU_STAMPS"))
 }
 
 /// Names a host object for the device-removed report, which names the
@@ -1303,6 +1321,20 @@ impl Host {
                     tracing::warn!("slow list command, {ms:.1} ms: {op}");
                 }
             }
+            // One submission of every list, and long: each list's own stamps
+            // say which of its commands took it (a batch is waited for as a
+            // whole, so the frame report cannot tell them apart).
+            #[cfg(feature = "diagnostics")]
+            if groups.len() == 1 && started.elapsed() > std::time::Duration::from_millis(200) {
+                // SAFETY: a plain query.
+                let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
+                tracing::warn!(ms = started.elapsed().as_millis(), "slow host submission");
+                for (n, r) in runs.iter().enumerate() {
+                    for (ms, op) in r.slowest(frequency, 2) {
+                        tracing::warn!("slow list {n} command, {ms:.1} ms: {op}");
+                    }
+                }
+            }
             // SAFETY: a plain query.
             if groups.len() > 1 && removed_in.is_none() && unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
                 removed_in = Some(i);
@@ -1676,7 +1708,7 @@ impl HostList {
     /// The timestamp heap and its read-back buffer (diagnostics, timing on).
     #[cfg(feature = "diagnostics")]
     fn stamps(&self) -> Option<&(ID3D12QueryHeap, ID3D12Resource)> {
-        if !timing() {
+        if !stamping() {
             return None;
         }
         self.stamps
@@ -1687,7 +1719,7 @@ impl HostList {
                 let readback = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() };
                 let desc = D3D12_RESOURCE_DESC {
                     Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-                    Width: u64::from(STAMPS) * 8,
+                    Width: u64::from(STAMPS) * 8 * STAMP_SLOTS,
                     Height: 1,
                     DepthOrArraySize: 1,
                     MipLevels: 1,
@@ -1719,6 +1751,12 @@ impl HostList {
             .as_ref()
     }
 
+    /// Where this list's stamps sit in the read-back buffer.
+    #[cfg(feature = "diagnostics")]
+    fn stamp_base(&self) -> u64 {
+        (self.id % STAMP_SLOTS) * u64::from(STAMPS) * 8
+    }
+
     /// The noted commands that took longest on the GPU, longest first, as
     /// (milliseconds, text) (diagnostics, timing on, after the list ran).
     #[cfg(feature = "diagnostics")]
@@ -1728,7 +1766,9 @@ impl HostList {
             return Vec::new();
         };
         let mut data = std::ptr::null_mut();
-        let range = D3D12_RANGE { Begin: 0, End: (count + 1) * 8 };
+        let base = self.stamp_base();
+        let begin = base as usize;
+        let range = D3D12_RANGE { Begin: begin, End: begin + (count + 1) * 8 };
         // SAFETY: a read-back buffer the finished list resolved into.
         let stamps: Vec<u64> = unsafe {
             if back.Map(0, Some(&range), Some(&mut data)).is_err() {
@@ -1778,7 +1818,14 @@ impl HostList {
             // SAFETY: an open list, our heap and read-back buffer.
             unsafe {
                 self.list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, count);
-                self.list.ResolveQueryData(heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, count + 1, back, 0);
+                self.list.ResolveQueryData(
+                    heap,
+                    D3D12_QUERY_TYPE_TIMESTAMP,
+                    0,
+                    count + 1,
+                    back,
+                    self.stamp_base(),
+                );
             }
         }
         // SAFETY: our list.
