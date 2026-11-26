@@ -15,15 +15,27 @@
 //! share, [`console`] which console model the title sees. Planned:
 //! `present` (swap chain).
 
-// This fork: compiler warnings in the newer GPU code are let through until it
-// is tidied, so that `-D warnings` passes (with the clippy lints let through
-// in the workspace Cargo.toml).
+// This fork: warnings in the newer GPU code are let through here, in this
+// crate alone, until it is tidied, so that `-D warnings` passes; one pull
+// request each can take one off.
 #![allow(
     dead_code,
     unused_variables,
     unused_assignments,
     private_interfaces,
-    dropping_copy_types
+    dropping_copy_types,
+    clippy::manual_is_multiple_of,
+    clippy::large_enum_variant,
+    clippy::precedence,
+    clippy::too_many_arguments,
+    clippy::unnecessary_sort_by,
+    clippy::cloned_ref_to_slice_refs,
+    clippy::wrong_self_convention,
+    clippy::unnecessary_cast,
+    clippy::needless_borrow,
+    clippy::mem_replace_with_default,
+    clippy::if_same_then_else,
+    clippy::unusual_byte_groupings
 )]
 
 #[cfg(windows)]

@@ -30,6 +30,8 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+// Parsed once at start; boxing the large variant would only add noise.
+#[allow(clippy::large_enum_variant)]
 enum Command {
     /// Summarise one PE image: headers, sections, imports, TLS, build id.
     Inspect {
