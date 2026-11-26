@@ -138,8 +138,8 @@ impl Lower<'_> {
                 match self.root_address(src) {
                     Some((root_lo, root_hi)) => {
                         self.s.flags |= super::flags::INT64;
-                        // The root descriptor carries the base directly (unlike the explicit
-                        // descriptor path below, which drops its low byte).
+                        // The root descriptor's low byte is already zero (see the shortcut
+                        // above), so its base can be used directly here.
                         let base = wide64(self, root_lo, root_hi);
                         let zero = self.s.m.i32(0);
                         let ptr = wide64(self, lo, node_hi.unwrap_or(zero));
