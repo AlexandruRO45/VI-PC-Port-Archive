@@ -2993,11 +2993,36 @@ impl Early {
         }
         const COPY_DEST: i32 = D3D12_RESOURCE_STATE_COPY_DEST.0;
         const SHADER_RESOURCE: u32 = 0x40 | 0x80;
-        for (staging, copy) in first {
-            if used.contains(&(std::sync::Arc::as_ptr(&copy) as usize))
-                || !batch.texture_due(&staging)
-                || !staging.refresh()
-            {
+        let due: Vec<_> = first
+            .into_iter()
+            .filter(|(staging, copy)| {
+                !used.contains(&(std::sync::Arc::as_ptr(copy) as usize)) && batch.texture_due(staging)
+            })
+            .collect();
+        // Each texture's memory is read, hashed and detiled on its own
+        // (its own staging buffer, notes and lock): several at once on some
+        // threads (`VICTORY_TEXTURE_THREADS=0`: one after another on this
+        // thread, as before). While a scene streams in, the textures new to
+        // a submission were the submitting thread's longest stretches.
+        static SEVERAL: OnceLock<bool> = OnceLock::new();
+        let several = *SEVERAL.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_THREADS").is_none_or(|v| v != "0"));
+        let dirty: Vec<std::sync::atomic::AtomicBool> =
+            due.iter().map(|_| std::sync::atomic::AtomicBool::new(false)).collect();
+        let look = |which: &[usize]| {
+            for &i in which {
+                if due[i].0.refresh() {
+                    dirty[i].store(true, Ordering::Relaxed);
+                }
+            }
+        };
+        let all: Vec<usize> = (0..due.len()).collect();
+        if several && due.len() > 1 {
+            in_parallel(&all, 1, look);
+        } else {
+            look(&all);
+        }
+        for (i, (staging, copy)) in due.into_iter().enumerate() {
+            if !dirty[i].load(Ordering::Relaxed) {
                 continue;
             }
             let real = copy.state.swap(SHADER_RESOURCE, Ordering::Relaxed) as i32;
