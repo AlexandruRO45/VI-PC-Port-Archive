@@ -531,6 +531,13 @@ pub(crate) static HEAP_BUFFER_MICROS: AtomicU64 = AtomicU64::new(0);
 /// picked by index that runs inside it (`heap_textures`), and the buffer
 /// slots the pass over buffer views looked at; since the last frame line.
 pub(crate) static HEAP_PASS_PARTS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+/// Optional CPU wall-clock breakdown of the buffer part: descriptor
+/// scan/mirroring (including lock waits), span aggregation, refresh.
+pub(crate) static HEAP_PHASE_US: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+pub(crate) fn heap_profile() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_PROFILE").is_some_and(|v| v == "1"))
+}
 /// Textures brought up to date for shaders that pick them by index
 /// ([`State::heap_textures`]), the bytes of their memory, and the slots
 /// still waiting.
@@ -1618,6 +1625,7 @@ impl State {
             }
             ranges.insert(index, (shadow, address, address + len));
         }
+        let after_scan = heap_profile().then(std::time::Instant::now);
         let views = ranges.len() as u32;
         // Per host copy, the span its picked views cover.
         let mut spans: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)> =
@@ -1630,6 +1638,7 @@ impl State {
         }
         drop(kept);
         let bytes: u64 = spans.values().map(|s| s.2 - s.1).sum();
+        let after_spans = after_scan.map(|_| std::time::Instant::now());
         // Memory that is not write-watched is copied whole by every refresh.
         // It was once refreshed only every 120 frames (unmapped pages read
         // one by one cost 14 GB a frame in run 11, before they were
@@ -1663,6 +1672,15 @@ impl State {
             shadow.refresh(list, *from, to - from);
         }
         let textures_began = std::time::Instant::now();
+        if let (Some(scan), Some(spans_done)) = (after_scan, after_spans) {
+            for (counter, elapsed) in HEAP_PHASE_US.iter().zip([
+                scan.duration_since(started),
+                spans_done.duration_since(scan),
+                textures_began.duration_since(spans_done),
+            ]) {
+                counter.fetch_add(elapsed.as_micros() as u64, Ordering::Relaxed);
+            }
+        }
         self.heap_textures(list, heap, host);
         HEAP_PASS_PARTS[0].fetch_add(textures_began.elapsed().as_micros() as u64, Ordering::Relaxed);
         HEAP_BUFFER_PASSES.fetch_add(1, Ordering::Relaxed);
