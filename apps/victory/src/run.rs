@@ -100,8 +100,8 @@ pub fn run(
         println!("not executing (pass --execute to start the title)");
         return Ok(());
     }
-    if std::env::var("VICTORY_FILE_BACKED_PAGES").is_ok_and(|v| v == "1") {
-        victory_hle::modules::xmem::use_page_files(cfg.cache_subdir("physical-pages")?);
+    if let Some(dir) = cfg.prepare_page_files()? {
+        victory_hle::modules::xmem::use_page_files(dir);
     }
     victory_loader::report_crashes();
     victory_loader::log_crashes_to(temp.with_file_name("crashes.log"));

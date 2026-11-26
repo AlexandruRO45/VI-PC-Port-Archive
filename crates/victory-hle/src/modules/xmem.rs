@@ -10,7 +10,9 @@
 use std::alloc::{Layout, alloc, dealloc};
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::c_void;
+use std::fs::File;
 use std::io;
+use std::os::windows::fs::OpenOptionsExt;
 use std::os::windows::io::AsRawHandle;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -19,6 +21,7 @@ use std::sync::{Arc, LazyLock, Mutex, MutexGuard, OnceLock};
 use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_COMMITMENT_LIMIT, HANDLE, INVALID_HANDLE_VALUE,
 };
+use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_DELETE_ON_CLOSE;
 use windows_sys::Win32::System::IO::DeviceIoControl;
 use windows_sys::Win32::System::Ioctl::FSCTL_SET_SPARSE;
 use windows_sys::Win32::System::Memory::{
@@ -349,10 +352,34 @@ const PAGE: usize = 64 << 10;
 
 static PAGE_FILES: OnceLock<PathBuf> = OnceLock::new();
 
-/// Uses temporary sparse files under this checked cache directory instead of
+/// Uses temporary sparse files under this checked directory instead of
 /// charging the Windows pagefile for mapped console physical pages.
 pub fn use_page_files(dir: PathBuf) {
     let _ = PAGE_FILES.set(dir);
+}
+
+fn page_file(dir: &Path) -> io::Result<File> {
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let mut options = File::options();
+    options
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .share_mode(0)
+        .custom_flags(FILE_FLAG_DELETE_ON_CLOSE);
+    // Never open an existing path, even if a previous process used the same PID.
+    for _ in 0..64 {
+        let id = NEXT.fetch_add(1, Ordering::Relaxed);
+        let path = dir.join(format!("victory-pages-{}-{id}.tmp", std::process::id()));
+        match options.open(path) {
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            result => return result,
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "no unused page file name",
+    ))
 }
 
 struct Section {
@@ -375,7 +402,7 @@ impl Drop for Section {
 impl Section {
     fn new(size: usize, dir: Option<&Path>) -> io::Result<Self> {
         let file = if let Some(dir) = dir {
-            let file = tempfile::tempfile_in(dir)?;
+            let file = page_file(dir)?;
             let mut returned = 0;
             // SAFETY: a new writable file; no input or output buffer.
             if unsafe {
@@ -483,7 +510,13 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     };
     if dir.is_some() {
         static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| tracing::info!("XMem physical pages backed by temporary cache files"));
+        ONCE.call_once(|| {
+            tracing::info!(
+                pages = n,
+                bytes = size,
+                "XMem physical pages backed by temporary cache files"
+            )
+        });
     }
     tracing::debug!(
         n,

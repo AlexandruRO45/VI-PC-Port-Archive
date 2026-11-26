@@ -179,6 +179,7 @@ fn show_config() -> Result<()> {
             .map_or("(none)".into(), |p| p.display().to_string())
     );
     println!("game_dir    : {}", status(&cfg.game_dir));
+    println!("page files  : {}", status(&cfg.physical_pages_dir));
     println!("cache_dir   : {}", cfg.cache_dir.display());
     for t in &cfg.test_titles {
         println!("test_title  : {}", status(&Some(t.clone())));
@@ -186,6 +187,7 @@ fn show_config() -> Result<()> {
     for p in cfg
         .game_dir
         .iter()
+        .chain(&cfg.physical_pages_dir)
         .chain(&cfg.test_titles)
         .chain([&cfg.cache_dir])
     {

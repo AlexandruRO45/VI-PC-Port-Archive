@@ -55,12 +55,9 @@ Check **Committed** under **Task Manager → Performance → Memory**. If
 `crashes.log` reports Windows error 1455, close other applications or increase
 the Windows paging file size, then retry.
 
-On Windows with limited commit, `VICTORY_FILE_BACKED_PAGES=1` backs the
-title's physical page pools with temporary sparse files in the cache directory
-instead of the system paging file. Use a local volume supporting sparse files
-(e.g. NTFS), with several GiB free for pages the title writes. Files are
-removed on process exit. This trades commit for disk space and potentially
-I/O; it does not reduce GPU memory requirements. The default is unchanged.
+On Windows with limited commit, set `[paths].physical_pages_dir` in `victory.toml`
+to a directory on a local sparse-capable volume (e.g. NTFS) with several GiB free.
+This trades pagefile commit for temporary disk space and I/O; leave it unset for the default behavior.
 
 ```powershell
 cargo xtask install-hooks                # asset-policy check on every commit
