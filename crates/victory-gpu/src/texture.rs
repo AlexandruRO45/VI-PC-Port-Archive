@@ -846,6 +846,7 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
         // not held, as before.
         static HOLD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if *HOLD.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_HOLD_READS").is_none_or(|v| v != "0")) {
+            crate::tiles::ORDER[6].fetch_add(1, Relaxed);
             list.keep(texture);
         }
         list.defer_texture(staging);
