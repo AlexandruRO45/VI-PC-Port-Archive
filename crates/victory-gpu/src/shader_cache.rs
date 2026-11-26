@@ -39,7 +39,9 @@ static MISSES: AtomicU64 = AtomicU64::new(0);
 /// Keeps translated shaders in a folder of `dir` from now on: the folder
 /// of this translator, `None` if it cannot be opened.
 pub fn use_shader_cache(dir: PathBuf) -> Option<PathBuf> {
-    let dir = dir.join(&blake3::Hash::from(build(emulate_fma())).to_hex()[..16]);
+    // The FMA setting is hashed into every entry's key (`host_shader`), so the folder name
+    // leaves it out: the host may not have decided it yet.
+    let dir = dir.join(&blake3::Hash::from(build(false)).to_hex()[..16]);
     match Cache::open(&dir) {
         Ok(cache) => {
             tracing::info!(dir = %dir.display(), "shader cache");
