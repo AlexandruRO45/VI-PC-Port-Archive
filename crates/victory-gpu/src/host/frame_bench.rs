@@ -27,6 +27,8 @@
 //!
 //! [`world_frame_preparing`] prints the frame's parts next to the published
 //! numbers, then what each mechanism costs on its own ([`unit_costs`]).
+//! [`distant_refreshes_preparing`] counts what one batch with ranges far
+//! apart and a page apart in one copy checks and copies.
 //!
 //! Comparing builds: code layout alone moves `copying back` by about half
 //! (from ~122 to ~180 ms on a Ryzen 5 5600X, `diag` profile on WARP, with
@@ -508,8 +510,12 @@ fn world_frame_preparing() {
     unit_costs(&all);
 }
 
-/// One refresh batch asks for the first and last pages of an 8 MiB copy.
-/// The refresh and copy-back counters show whether each step spans the gap.
+/// One refresh batch asks for pages 0, 2 and the last of an 8 MiB copy; the
+/// title wrote those and page 1, which nobody asks for. The refresh and
+/// copy-back counters show whether each step spans a gap: the bytes checked
+/// are the whole copy for a batch that keeps one span, four pages for one
+/// that joins ranges a page apart (copying page 1 too), three pages for one
+/// that keeps exactly what was asked.
 #[test]
 #[ignore = "benchmark"]
 fn distant_refreshes_preparing() {
@@ -522,8 +528,8 @@ fn distant_refreshes_preparing() {
     const GPU: u32 = 0x8765_4321;
     let b = Buffer::new(pool(LEN), LEN, 0).expect("an 8 MiB host copy");
     b.copy.update(b.start, LEN);
-    let pages = [0, LEN / PAGE - 1];
-    for page in pages {
+    let pages = [0, 2, LEN / PAGE - 1];
+    for page in [0, 1, 2, LEN / PAGE - 1] {
         b.write(page, u64::from(CPU), false);
     }
     let ranges = pages.map(|page| (b.start + page * PAGE) as u64);
@@ -553,7 +559,7 @@ fn distant_refreshes_preparing() {
         let value = unsafe { ((at as usize + 128) as *const u32).read_volatile() };
         assert_eq!(value, GPU, "the write reached title memory");
     }
-    println!("two distant {PAGE}-byte ranges of an {LEN}-byte copy: {merged} bytes merged");
+    println!("{PAGE}-byte ranges at pages {pages:?} of an {LEN}-byte copy: {merged} bytes merged");
     #[cfg(feature = "diagnostics")]
     {
         use crate::copystat::C;
