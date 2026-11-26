@@ -1030,6 +1030,243 @@ mod tests {
         }
     }
 
+    /// Run in its own test process: the submission journal is global.
+    #[test]
+    #[ignore = "isolated synthetic grouping coherence test"]
+    fn grouping_preserves_write_coherence() {
+        struct Allocation {
+            base: usize,
+            bytes: usize,
+        }
+        impl Allocation {
+            fn new(blocks: usize) -> Self {
+                let bytes = blocks * PAGE;
+                let base = unsafe {
+                    VirtualAlloc(
+                        std::ptr::null(),
+                        bytes,
+                        MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                        PAGE_READWRITE,
+                    )
+                } as usize;
+                assert_ne!(base, 0);
+                let a = Self { base, bytes };
+                assert_eq!(base % PAGE, 0);
+                JOURNAL
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .written
+                    .retain(|&p, _| p < base / PAGE || p >= (base + bytes) / PAGE);
+                a
+            }
+            fn range(&self, first: usize, last: usize) -> (usize, usize) {
+                assert!(first < last && last * PAGE <= self.bytes);
+                (self.base + first * PAGE, self.base + last * PAGE)
+            }
+            fn write(&self, block: usize, value: u8) {
+                let (at, _) = self.range(block, block + 1);
+                unsafe { (at as *mut u8).write_volatile(value) };
+            }
+        }
+        impl Drop for Allocation {
+            fn drop(&mut self) {
+                ask_once_end();
+                ask_ahead_done();
+                JOURNAL
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .written
+                    .retain(|&p, _| p < self.base / PAGE || p >= (self.base + self.bytes) / PAGE);
+                let freed = unsafe { VirtualFree(self.base as *mut _, 0, MEM_RELEASE) };
+                if !std::thread::panicking() {
+                    assert_ne!(freed, 0);
+                }
+            }
+        }
+        fn changed(range: (usize, usize), watermark: u64) -> Vec<usize> {
+            let (_, pages) = writes(range.0, range.1, false).expect("native range");
+            pages
+                .into_iter()
+                .filter(|&(_, stamp)| stamp > watermark)
+                .map(|(page, _)| page - range.0 / PAGE)
+                .collect()
+        }
+        assert!(once());
+        ask_once_end();
+        ask_ahead_done();
+        let a = Allocation::new(160);
+        let b = Allocation::new(4);
+        let ar = a.range(0, 160);
+        let br = b.range(0, 4);
+        writes(ar.0, ar.1, false).unwrap();
+        let (watermark, _) = writes(br.0, br.1, false).unwrap();
+        // Unsorted, overlapping, duplicate, adjacent and widely separated ranges.
+        let ranges = [
+            a.range(140, 142),
+            a.range(1, 4),
+            a.range(0, 2),
+            a.range(4, 5),
+            a.range(1, 4),
+            a.range(8, 10),
+            br,
+        ];
+        for block in [0, 2, 4, 6, 8, 141] {
+            a.write(block, 1);
+        }
+        b.write(3, 1);
+        ask_once(&ranges);
+        for _ in 0..3 {
+            for (range, expected) in [
+                (a.range(0, 2), vec![0]),
+                (a.range(1, 4), vec![1]),
+                (a.range(4, 5), vec![0]),
+                (a.range(8, 10), vec![0]),
+                (a.range(140, 142), vec![1]),
+                (br, vec![3]),
+            ] {
+                assert!(asked(range.0, range.1).is_some());
+                assert_eq!(changed(range, watermark), expected);
+            }
+        }
+        println!("E02.3 mixed/overlap/duplicate/adjacent/reservations/consumers ok");
+        let during = JOURNAL.lock().unwrap_or_else(|e| e.into_inner()).asked;
+        a.write(3, 2);
+        wrote(a.base + 3 * PAGE, 1);
+        assert_eq!(changed(a.range(1, 4), during), vec![2]);
+        assert_eq!(changed(a.range(1, 4), during), vec![2]);
+        ask_once_end();
+        // The gap write must survive whether it was reset by a merged query
+        // or left for this later query.
+        assert_eq!(changed(a.range(6, 7), watermark), vec![0]);
+        let (next, _) = writes(ar.0, ar.1, false).unwrap();
+        ask_once(&ranges);
+        assert!(changed(a.range(1, 4), next).is_empty());
+        ask_once_end();
+        println!(
+            "E02.3 gap writes/notified writes/next epoch ok; policy_gap_kib={}",
+            ahead_gap() * PAGE / 1024
+        );
+    }
+
+    /// Isolated lifecycle test: retained journal history is intentional.
+    /// A new epoch must see new writes at the same virtual addresses.
+    #[test]
+    #[ignore = "isolated synthetic allocation lifecycle test"]
+    fn grouping_preserves_reused_addresses() {
+        use windows_sys::Win32::System::Memory::MEM_DECOMMIT;
+        const SIZE: usize = 40 * PAGE;
+        struct Allocation(usize);
+        impl Drop for Allocation {
+            fn drop(&mut self) {
+                ask_once_end();
+                ask_ahead_done();
+                if self.0 != 0 {
+                    title_memory_remapped(self.0, SIZE);
+                    let freed = unsafe { VirtualFree(self.0 as *mut _, 0, MEM_RELEASE) };
+                    JOURNAL
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .written
+                        .retain(|&p, _| p < self.0 / PAGE || p >= (self.0 + SIZE) / PAGE);
+                    if !std::thread::panicking() {
+                        assert_ne!(freed, 0);
+                    }
+                }
+            }
+        }
+        let alloc = |at: usize| unsafe {
+            VirtualAlloc(
+                at as *const _,
+                SIZE,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            ) as usize
+        };
+        assert!(once(), "run with VICTORY_ASK_ONCE=1");
+        ask_once_end();
+        ask_ahead_done();
+        let base = alloc(0);
+        assert_ne!(base, 0);
+        let mut owned = Allocation(base);
+        assert_eq!(base % PAGE, 0);
+        let ranges = [(base, base + PAGE), (base + 32 * PAGE, base + 33 * PAGE)];
+        let mark = |block: usize, byte: u8| unsafe {
+            ((base + block * PAGE) as *mut u8).write_volatile(byte)
+        };
+        let changed = |watermark: u64| {
+            let mut out = Vec::new();
+            for &(a, b) in &ranges {
+                assert!(asked(a, b).is_some(), "missing current ahead coverage");
+                let (_, pages) = writes(a, b, false).expect("write-watched");
+                out.extend(
+                    pages
+                        .into_iter()
+                        .filter(|&(_, t)| t > watermark)
+                        .map(|(p, _)| p - base / PAGE),
+                );
+            }
+            out
+        };
+        let (initial, _) = writes(base, base + SIZE, false).unwrap();
+        mark(0, 1);
+        mark(32, 2);
+        ask_once(&ranges);
+        assert_eq!(changed(initial), [0, 32]);
+        ask_once_end();
+        assert!(ranges.iter().all(|&(a, b)| asked(a, b).is_none()));
+        let (old_epoch, _) = writes(base, base + SIZE, false).unwrap();
+
+        // Decommit/recommit one tracked page at the same address.
+        title_memory_remapped(base, PAGE);
+        assert_ne!(
+            unsafe { VirtualFree(base as *mut _, PAGE, MEM_DECOMMIT) },
+            0
+        );
+        assert_eq!(
+            unsafe { VirtualAlloc(base as *const _, PAGE, MEM_COMMIT, PAGE_READWRITE) } as usize,
+            base
+        );
+        title_memory_remapped(base, PAGE);
+        // Drain any OS lifecycle-generated dirty bits before explicit writes.
+        let (recommitted, _) = writes(base, base + SIZE, false).unwrap();
+        assert!(recommitted > old_epoch);
+        mark(0, 3);
+        ask_once(&ranges);
+        assert_eq!(changed(recommitted), [0]);
+        assert_eq!(changed(recommitted), [0]);
+        ask_once_end();
+        println!("E02.6 decommit/recommit ok");
+
+        // Release the entire reservation and reserve exactly the same address.
+        title_memory_remapped(base, SIZE);
+        assert_ne!(unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) }, 0);
+        owned.0 = 0;
+        let replacement = alloc(base);
+        assert_ne!(replacement, 0, "exact-address reservation unavailable");
+        owned.0 = replacement;
+        assert_eq!(replacement, base);
+        title_memory_remapped(base, SIZE);
+        assert!(ranges.iter().all(|&(a, b)| asked(a, b).is_none()));
+        // Touch the newly allocated page before establishing the write-watch
+        // baseline: its first read may be reported as a write by Windows.
+        assert_eq!(unsafe { (base as *const u8).read_volatile() }, 0);
+        let (fresh, _) = writes(base, base + SIZE, false).unwrap();
+        assert!(fresh > recommitted);
+        mark(32, 4);
+        ask_once(&ranges);
+        assert_eq!(changed(fresh), [32]);
+        assert_eq!(changed(fresh), [32]);
+        ask_once_end();
+        let (next, _) = writes(base, base + SIZE, false).unwrap();
+        ask_once(&ranges);
+        assert!(changed(next).is_empty());
+        ask_once_end();
+        println!(
+            "E02.6 release/reuse/next epoch ok; policy_gap_kib={}",
+            ahead_gap() * PAGE / 1024
+        );
+    }
+
     #[test]
     fn kernel_pages_fold_into_guest_pages_without_losing_writes() {
         let mut journal = EMPTY_JOURNAL;
