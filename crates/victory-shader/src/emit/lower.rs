@@ -62,6 +62,8 @@ pub(crate) struct Lowered {
     /// Heap handles made with a non-uniform index.
     #[cfg(test)]
     pub nonuniform_handles: u32,
+    #[cfg(test)]
+    pub barrier_modes: Vec<u32>,
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
@@ -595,7 +597,149 @@ fn lane_uniform(p: &Program, st: &Structured, all: &[bool]) -> HashSet<Value> {
     same
 }
 
-/// What a register value holds, for [`wave_local`].
+/// Whether `v` is the same in every lane of its console wave in the
+/// surrounding control flow: constants, scalar reads, and lane operations
+/// whose inputs all are, through loop-carried phis. An LDS read at a
+/// uniform address counts only while no later LDS write can intervene:
+/// every lane asks for the same dword, but both halves must observe the
+/// same write (the shader uses this for a wave's running scan).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Uniform {
+    Yes,
+    No,
+    /// Only reachable through the value being checked (a loop back edge).
+    Cycle,
+}
+
+fn lds_stable(p: &Program, at: usize) -> bool {
+    p.blocks.iter().skip(at).all(|b| {
+        b.insts
+            .iter()
+            .all(|i| !i.name().starts_with("ds_") || i.name().starts_with("ds_read"))
+    })
+}
+
+fn operand_uniform(
+    p: &Program,
+    st: &Structured,
+    at: usize,
+    inst: &Inst,
+    op: &Operand,
+    path: &mut HashSet<Value>,
+) -> Uniform {
+    match *op {
+        Operand::Vector { reg, .. } => inst
+            .read(Reg::V(reg))
+            .map_or(Uniform::No, |x| value_uniform(p, st, at, x, path)),
+        Operand::Scalar { code, .. } => inst
+            .read(Reg::S(code))
+            .filter(|x| st.masks.contains_key(x) || st.highs.contains_key(x))
+            .map_or(Uniform::Yes, |_| Uniform::No),
+        _ => Uniform::Yes,
+    }
+}
+
+fn value_uniform(
+    p: &Program,
+    st: &Structured,
+    at: usize,
+    v: Value,
+    path: &mut HashSet<Value>,
+) -> Uniform {
+    if !path.insert(v) {
+        return Uniform::Cycle;
+    }
+    let mut result = Uniform::No;
+    'find: {
+        for block in &p.blocks {
+            for phi in &block.phis {
+                if phi.value != v {
+                    continue;
+                }
+                let (mut yes, mut cycle) = (false, false);
+                for &a in &phi.args {
+                    match value_uniform(p, st, at, a, path) {
+                        Uniform::No => {
+                            result = Uniform::No;
+                            break 'find;
+                        }
+                        Uniform::Yes => yes = true,
+                        Uniform::Cycle => cycle = true,
+                    }
+                }
+                // A loop's back edge alone is not a seed; at least one
+                // incoming value must come from outside the cycle.
+                result = if yes {
+                    Uniform::Yes
+                } else if cycle {
+                    Uniform::Cycle
+                } else {
+                    Uniform::Yes
+                };
+                break 'find;
+            }
+            for inst in &block.insts {
+                if !inst.writes.iter().any(|&(_, w)| w == v) {
+                    continue;
+                }
+                let name = inst.name();
+                if name.starts_with("ds_read") {
+                    if !lds_stable(p, at) {
+                        result = Uniform::No;
+                        break 'find;
+                    }
+                    let Fields::Ds { addr, .. } = &inst.fields else {
+                        result = Uniform::No;
+                        break 'find;
+                    };
+                    result = addr
+                        .as_ref()
+                        .map_or(Uniform::Yes, |a| operand_uniform(p, st, at, inst, a, path));
+                    break 'find;
+                }
+                if name.starts_with("v_mbcnt")
+                    || name.contains("lane")
+                    || name.starts_with("v_cmpx")
+                {
+                    result = Uniform::No;
+                    break 'find;
+                }
+                let Fields::Valu(val) = &inst.fields else {
+                    result = Uniform::No;
+                    break 'find;
+                };
+                if val.dpp.is_some() || val.sdwa.is_some() {
+                    result = Uniform::No;
+                    break 'find;
+                }
+                let mut yes = false;
+                let mut cycle = false;
+                for op in &val.src {
+                    match operand_uniform(p, st, at, inst, op, path) {
+                        Uniform::No => {
+                            result = Uniform::No;
+                            break 'find;
+                        }
+                        Uniform::Yes => yes = true,
+                        Uniform::Cycle => cycle = true,
+                    }
+                }
+                result = if yes {
+                    Uniform::Yes
+                } else if cycle {
+                    Uniform::Cycle
+                } else {
+                    Uniform::Yes
+                };
+                break 'find;
+            }
+        }
+    }
+    path.remove(&v);
+    result
+}
+
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Wave {
     /// Nothing that depends on how the threads are divided into waves.
@@ -1363,6 +1507,30 @@ fn half_input_partners(io: &StageIo, inputs: &[SigElement]) -> HashMap<u8, u8> {
         }
     }
     partners
+}
+
+/// The title's barrier retains its memory fences even when group sync
+/// would wait for a host wave that never visits it. Explicit overrides
+/// keep their old meanings; automatic mode is a targeted compatibility
+/// workaround for narrow-wave hosts and is restricted to single-console-wave
+/// groups (`group_threads <= console_wave`), so multi-console-wave groups
+/// never lose cross-wave synchronization.
+fn barrier_mode(
+    setting: u8,
+    host_wave: u32,
+    console_wave: u32,
+    group_threads: Option<u32>,
+    divergent: bool,
+    writes_uavs: bool,
+) -> u32 {
+    let single_console_wave = group_threads.is_some_and(|t| t <= console_wave);
+    let waits = match setting {
+        0 => false,
+        1 => !divergent,
+        2 => true,
+        _ => !(host_wave != 0 && host_wave < console_wave && single_console_wave && divergent),
+    };
+    8 | if writes_uavs { 2 } else { 0 } | u32::from(waits)
 }
 
 fn unsupported(offset: usize, what: Why) -> Stop {
@@ -2430,6 +2598,8 @@ impl<'a> Lower<'a> {
             root_uavs,
             #[cfg(test)]
             nonuniform_handles: self.s.nonuniform_handles,
+            #[cfg(test)]
+            barrier_modes: self.s.m.barrier_modes(),
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
             dxil: self.s.finish(),
@@ -5331,17 +5501,17 @@ impl<'a> Lower<'a> {
                 // Thread-group sync with a shared-memory fence, and a UAV
                 // fence when the program writes UAVs (the waits before an
                 // s_barrier make those writes visible on the console).
-                let mut mode = if self.writes_uavs { 1 | 2 | 8 } else { 1 | 8 };
-                // Without the wait for the group (bit 0) where not every
-                // lane arrives, or where the switch says so.
-                let waits = match super::group_sync() {
-                    0 => false,
-                    1 => !self.fence_only.contains(&b),
-                    _ => true,
-                };
-                if !waits {
-                    mode &= !1;
-                }
+                let setting = super::group_sync();
+                let divergent = self.fence_only.contains(&b);
+                let group_threads = self.s.threads.map(|t| t.iter().product());
+                let mode = barrier_mode(
+                    setting,
+                    host_max_wave(),
+                    self.wave(),
+                    group_threads,
+                    divergent,
+                    self.writes_uavs,
+                );
                 let mode = self.s.m.i32(mode);
                 let void = self.s.t.void;
                 self.s
@@ -8786,12 +8956,20 @@ impl<'a> Lower<'a> {
                 let (mine, any) = self.first_lane(a, guard);
                 // two host waves that exchange: the console's first lane may be in the other
                 // one, unless every lane holds the same value
-                let alike = match v.src.first() {
-                    Some(&Operand::Vector { reg, .. }) => {
-                        inst.read(Reg::V(reg)).is_some_and(|x| self.uniform.contains(&x))
-                    }
-                    _ => true,
+                let src = match v.src.first() {
+                    Some(&Operand::Vector { reg, .. }) => inst.read(Reg::V(reg)),
+                    _ => None,
                 };
+                let alike = src.is_some_and(|x| {
+                    self.uniform.contains(&x)
+                        || value_uniform(
+                            self.x.p,
+                            self.x.st,
+                            self.cur_ir,
+                            x,
+                            &mut HashSet::new(),
+                        ) == Uniform::Yes
+                });
                 let halves = self.exchange.as_ref().is_some_and(|e| !e.1) && !self.local;
                 let r = if halves && !alike {
                     if !self.all_lanes(self.cur_ir) {
@@ -12717,6 +12895,84 @@ mod tests {
     use crate::{io, ir, resource, structure};
 
     const S_ENDPGM: u32 = 0xBF81_0000;
+
+    #[test]
+    fn automatic_barriers_keep_fences_and_only_drop_unsafe_sync() {
+        for writes in [false, true] {
+            let fence = 8 | if writes { 2 } else { 0 };
+            for (host, console, threads, divergent, waits) in [
+                (32, 64, Some(64), true, false),
+                (32, 64, Some(64), false, true),
+                (32, 64, Some(128), true, true),
+                (32, 64, None, true, true),
+                (64, 64, Some(64), true, true),
+                (32, 32, Some(32), true, true),
+                (0, 64, Some(64), true, true),
+            ] {
+                assert_eq!(
+                    super::barrier_mode(3, host, console, threads, divergent, writes),
+                    fence | u32::from(waits),
+                );
+            }
+            assert_eq!(super::barrier_mode(0, 32, 64, Some(64), false, writes), fence);
+            assert_eq!(super::barrier_mode(1, 64, 64, Some(64), true, writes), fence);
+            assert_eq!(super::barrier_mode(1, 32, 64, Some(64), false, writes), fence | 1);
+            assert_eq!(super::barrier_mode(2, 32, 64, Some(64), true, writes), fence | 1);
+        }
+    }
+
+    #[test]
+    fn automatic_barrier_flags_reach_the_emitted_shader() {
+        let divergent = [
+            0x7D88_0090, // v_cmp_gt_u32 vcc, 16, v0
+            0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+            0xBF88_0001, // s_cbranch_execz past the barrier
+            0xBF8A_0000, // s_barrier
+            0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+        ];
+        let mut divergent32 = divergent;
+        divergent32[1] = 0xBE8C_3C6A; // s_and_saveexec_b32 s12, vcc_lo
+        divergent32[4] = 0xBEFE_030C; // s_mov_b32 exec_lo, s12
+        for (body, wave64, threads, host, expected) in [
+            (&divergent[..], true, 64, 32, 8),
+            (&divergent[..], true, 128, 32, 9),
+            (&divergent[..], true, 64, 64, 9),
+            (&divergent32[..], false, 64, 32, 9),
+            (&[0xBF8A_0000][..], true, 64, 32, 9),
+        ] {
+            let native = NativeProgram {
+                stage: HwStage::Cs,
+                wave64,
+                vgprs: 16,
+                layout: vec![],
+                used: vec![],
+                io: StageIo::Cs(ComputeIo { rsrc2: 0, threads: [threads, 1, 1] }),
+                code: body.iter().copied().chain([S_ENDPGM])
+                    .flat_map(u32::to_le_bytes).collect(),
+            };
+            let p = ir::build(&native.code, wave64, native.vgprs).expect("IR");
+            let st = structure::structure(&p).expect("structure");
+            let res = resource::track(&p, &[], native.stage, Some(&st)).expect("resources");
+            let io = io::raise(&p, &native).expect("IO");
+            let old_wave = super::TEST_HOST_WAVE.replace(Some(host));
+            let old_mode = super::super::TEST_GROUP_SYNC.replace(Some(3));
+            let shader = lower(&Parts {
+                native: &native,
+                p: &p,
+                st: &st,
+                io: &io,
+                res: &res,
+                inputs: vec![],
+                outputs: vec![],
+                prims: vec![],
+                mesh_stride: 0,
+            });
+            super::TEST_HOST_WAVE.set(old_wave);
+            super::super::TEST_GROUP_SYNC.set(old_mode);
+            let shader = shader.unwrap_or_else(|e| panic!("wave64={wave64}, host={host}: {e:?}"));
+            assert_eq!(shader.barrier_modes, vec![expected]);
+        }
+    }
 
     #[test]
     fn packed_pixel_inputs_find_their_second_row() {

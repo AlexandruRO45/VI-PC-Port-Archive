@@ -8771,6 +8771,7 @@ impl Meter {
             self.caption = Some(buffer);
         }
         let Some(caption) = &self.caption else { return };
+        crate::fpsbox::set(fps, ms, draws);
         let text = format!(" | VIctory {fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame");
         let mut text: Vec<u16> = caption.iter().copied().chain(text.encode_utf16()).collect();
         text.push(0);
@@ -8803,7 +8804,53 @@ impl Host {
     /// Shows `texture`, which is in `state` (a host state) and stays in it,
     /// as frame `frame` (saved if captures are on). `None` if nothing was
     /// shown; else, in diagnostics builds, whether the frame was black.
+    /// Short uppercase GPU name for the on-screen HUD (`fpsbox`).
+    pub(crate) fn gpu_label(&self) -> String {
+        let raw = self
+            .adapter
+            .as_ref()
+            .and_then(|a| unsafe { a.GetDesc1() }.ok())
+            .map(|d| {
+                let end = d
+                    .Description
+                    .iter()
+                    .position(|&c| c == 0)
+                    .unwrap_or(d.Description.len());
+                String::from_utf16_lossy(&d.Description[..end])
+            })
+            .unwrap_or_default();
+        let trimmed = raw
+            .trim()
+            .strip_prefix("NVIDIA GeForce ")
+            .or_else(|| raw.trim().strip_prefix("AMD Radeon "))
+            .or_else(|| raw.trim().strip_prefix("Intel(R) "))
+            .unwrap_or(raw.trim());
+        trimmed.to_ascii_uppercase()
+    }
+
+    /// Current local VRAM usage of this process in MiB, if DXGI reports it.
+    pub(crate) fn vram_used_mb(&self) -> Option<u32> {
+        use windows::Win32::Graphics::Dxgi::{DXGI_MEMORY_SEGMENT_GROUP_LOCAL, IDXGIAdapter3};
+        let adapter = self.adapter.as_ref()?.cast::<IDXGIAdapter3>().ok()?;
+        let mut info = Default::default();
+        // SAFETY: live DXGI adapter3 and valid out-struct.
+        unsafe { adapter.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mut info) }.ok()?;
+        Some((info.CurrentUsage >> 20).min(u64::from(u32::MAX)) as u32)
+    }
+
     pub(crate) fn present(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {
+        self.present_over(texture, state, None, frame)
+    }
+
+    /// [`Self::present`], with the title's second plane laid over `texture`
+    /// when there is one (`crate::compose`). Its state is left as it was.
+    pub(crate) fn present_over(
+        &self,
+        texture: &ID3D12Resource,
+        state: u32,
+        over: Option<(&ID3D12Resource, u32)>,
+        frame: u64,
+    ) -> Option<bool> {
         // SAFETY: a live resource.
         let desc = unsafe { texture.GetDesc() };
         let Some(format) = swap_format(desc.Format) else {
@@ -8879,6 +8926,12 @@ impl Host {
             };
             copy.reset();
             let list = &copy.list;
+            let laid = over.and_then(|(ui, ui_state)| {
+                crate::compose::record(&self.device, list, texture, ui, ui_state)
+            });
+            if let Some(laid) = &laid {
+                copy.keep(laid);
+            }
             list.ResourceBarrier(&[
                 transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE),
                 transition(
@@ -8887,7 +8940,10 @@ impl Host {
                     D3D12_RESOURCE_STATE_COPY_DEST,
                 ),
             ]);
-            list.CopyResource(&back, texture);
+            list.CopyResource(&back, laid.as_ref().unwrap_or(texture));
+            // The performance HUD, into the corner of what is shown (not of the
+            // title's own frame, which the lines below read back).
+            crate::fpsbox::draw(self, list, &back, (width, height, format));
             #[cfg(feature = "diagnostics")]
             let capture = crate::capture::wanted(frame)
                 .then(|| crate::capture::read_back(&self.device, list, texture))
