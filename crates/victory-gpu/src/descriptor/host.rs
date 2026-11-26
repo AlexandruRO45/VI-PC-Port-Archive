@@ -727,41 +727,173 @@ impl HostHeap {
                 _ => clamped.push((a, b)),
             }
         }
-        let stale: Vec<u32> = {
+        enum StaleSlot {
+            Null(u32),
+            Set {
+                index: u32,
+                raw: [u32; 3],
+                key: u64,
+                view: View,
+                later: bool,
+            },
+        }
+        let stale: Vec<StaleSlot> = {
             let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
             with_views(|views| {
                 let mut out = Vec::new();
                 for &(first, last) in &clamped {
                     for i in first..last {
                         // SAFETY: records in title heap memory the caller found mapped.
-                        let [tag, id, generation] =
+                        let raw @ [tag, id, generation] =
                             unsafe { (at(i) as *const [u32; 3]).read_unaligned() };
                         let cur_made = made[i as usize];
                         if tag != VIEW_TAG {
                             if cur_made != 0 {
-                                out.push(i);
+                                out.push(StaleSlot::Null(i));
                             }
                             continue;
                         }
-                        let current = views
-                            .get(id as usize)
-                            .is_some_and(|(_, cur_gen)| *cur_gen == generation);
-                        let want = if current {
-                            u64::from(generation) << 32 | u64::from(id)
-                        } else {
-                            0
-                        };
-                        if cur_made != want {
-                            out.push(i);
+                        match views.get(id as usize) {
+                            Some((view, cur_gen)) if *cur_gen == generation => {
+                                let key = u64::from(generation) << 32 | u64::from(id);
+                                if cur_made != key {
+                                    out.push(StaleSlot::Set {
+                                        index: i,
+                                        raw,
+                                        key,
+                                        view: view.clone(),
+                                        later: is_placed_texture(view),
+                                    });
+                                }
+                            }
+                            _ => {
+                                if cur_made != 0 {
+                                    out.push(StaleSlot::Null(i));
+                                }
+                            }
                         }
                     }
                 }
                 out
             })
         };
-        for i in stale {
-            self.mirror(i, at(i), false);
+        if stale.is_empty() {
+            return;
         }
+
+        // Batch-resolve existing host buffer copies under one `BUFFERS` lock
+        // outside `self.made` so each buffer descriptor reuses its resolved
+        // copy across view creation and `bindless::Viewed`.
+        let mut prepared: Vec<Option<PreparedBuffer>> = (0..stale.len()).map(|_| None).collect();
+        let mut buf_slots: Vec<(usize, u64, u64, u64, bool)> = Vec::new();
+        for (idx, slot) in stale.iter().enumerate() {
+            let StaleSlot::Set { view, later: false, .. } = slot else {
+                continue;
+            };
+            #[cfg(test)]
+            tests::while_preparing();
+            match view {
+                View::Placed(..) if is_placed_texture(view) => {}
+                View::Shader(r, _) | View::Unordered(r, _, _)
+                    if crate::resource::texture_memory(*r as crate::object::This).is_some() => {}
+                &View::Constant(address, size) => {
+                    buf_slots.push((idx, address, u64::from(size), 4, true));
+                }
+                _ => {
+                    if let Some((address, len)) = buffer_range(view) {
+                        buf_slots.push((idx, address, len, u64::from(view_stride(view)), false));
+                    }
+                }
+            }
+        }
+        if !buf_slots.is_empty() {
+            let queries: Vec<(u64, u64)> = buf_slots.iter().map(|&(_, a, l, _, _)| (a, l)).collect();
+            let existing = crate::shadow::find_existing_batch(&queries);
+            for (&(idx, address, len, element, is_cbv), found) in buf_slots.iter().zip(existing) {
+                let shadow = found.or_else(|| crate::shadow::find(address, len));
+                let Some(shadow) = shadow else { continue };
+                let (shadow, own) = if element == 0 || shadow.offset(address).is_multiple_of(element) {
+                    (shadow, false)
+                } else {
+                    let exact_len = if is_cbv { len.min(shadow.left(address)) } else { len };
+                    let Some((s, o)) = crate::shadow::for_view(address, exact_len, element) else {
+                        continue;
+                    };
+                    (s, o)
+                };
+                prepared[idx] = Some(PreparedBuffer { shadow, own, address, len });
+            }
+        }
+
+        for (slot, prep) in stale.into_iter().zip(prepared) {
+            match slot {
+                StaleSlot::Null(i) => {
+                    self.mirror(i, at(i), false);
+                }
+                StaleSlot::Set { index, raw, key, view, later } => {
+                    if !later && prep.is_none() {
+                        self.mirror(index, at(index), false);
+                    } else {
+                        self.mirror_prepared(index, at(index), raw, key, view, later, prep);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Mirrors a single title slot using a buffer copy already resolved by
+    /// [`HostHeap::sync_ranges`], falling back to [`HostHeap::mirror`] if the
+    /// slot's title bytes or recorded view generation changed meanwhile.
+    #[allow(clippy::too_many_arguments)]
+    fn mirror_prepared(
+        &self,
+        index: u32,
+        handle: u64,
+        raw: [u32; 3],
+        key: u64,
+        view: View,
+        later: bool,
+        prepared: Option<PreparedBuffer>,
+    ) {
+        let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: title slot verified mapped by `sync_ranges`.
+        let unchanged = unsafe { (handle as *const [u32; 3]).read_unaligned() } == raw
+            && with_views(|views| {
+                views
+                    .get(raw[1] as usize)
+                    .is_some_and(|(_, cur_gen)| *cur_gen == raw[2])
+            });
+        if !unchanged {
+            drop(made);
+            self.mirror(index, handle, false);
+            return;
+        }
+        if made[index as usize] == key {
+            return;
+        }
+        self.set_stride(index, Some(&view));
+        self.note_address(index, Some(&view));
+        if later {
+            // Made once a shader reads it (`crate::shadow::take_reads`).
+            crate::shadow::forget_read(index);
+        }
+        made[index as usize] = key;
+        let (kept, mark) = if later {
+            (None, None)
+        } else {
+            make_marked_with(&view, prepared.as_ref(), self.cpu(index))
+        };
+        self.set_mark(index, mark);
+        if kept.is_none() && !self.sampler {
+            null_for(&view, self.cpu(index));
+        }
+        if !self.sampler {
+            let buf = prepared
+                .as_ref()
+                .map(|p| (p.shadow.clone(), p.address, p.len));
+            self.viewed.set_with(index, Some(&view), kept.is_some(), buf);
+        }
+        self.keep(index, kept.flatten());
     }
 
     /// Makes host slot `index` from the record the title has at `handle`
@@ -838,12 +970,12 @@ impl HostHeap {
         // staging copy) for each of the ~20,000 the title has views of
         // ran the host out of memory (run b2).
         let later = !for_draw && is_placed_texture(&view);
-        if !later {
+        let prepared = if !later {
             // What the view needs (the texture it views, the copy of the
             // memory) is made without the slot lock, which title threads
             // binding and writing views wait on (run evict5).
             drop(made);
-            prepare(&view);
+            let prepared = prepare_resolved(&view);
             made = self.made.lock().unwrap_or_else(|e| e.into_inner());
             // The title may have written another record there meanwhile (and
             // another thread made it): that one is the slot's.
@@ -855,7 +987,10 @@ impl HostHeap {
             if made[index as usize] == key && !needs_remake() {
                 return Some(view);
             }
-        }
+            prepared
+        } else {
+            None
+        };
         {
             self.set_stride(index, Some(&view));
             self.note_address(index, Some(&view));
@@ -867,14 +1002,17 @@ impl HostHeap {
             let (kept, mark) = if later {
                 (None, None)
             } else {
-                make_marked(&view, self.cpu(index))
+                make_marked_with(&view, prepared.as_ref(), self.cpu(index))
             };
             self.set_mark(index, mark);
             if kept.is_none() && !self.sampler {
                 null_for(&view, self.cpu(index));
             }
             if !self.sampler {
-                self.viewed.set(index, Some(&view), kept.is_some());
+                let buf = prepared
+                    .as_ref()
+                    .map(|p| (p.shadow.clone(), p.address, p.len));
+                self.viewed.set_with(index, Some(&view), kept.is_some(), buf);
             }
             self.keep(index, kept.flatten());
         }
@@ -1265,11 +1403,22 @@ type Kept = Option<(ID3D12Resource, Option<std::sync::Arc<crate::shadow::Shadow>
 #[cfg(feature = "diagnostics")]
 static REFUSED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
+/// Pre-resolved buffer copy for a buffer SRV, UAV, or CBV so [`make_with`]
+/// and `bindless::Viewed::set_with` reuse it without re-acquiring `shadow`'s
+/// locks.
+struct PreparedBuffer {
+    shadow: std::sync::Arc<crate::shadow::Shadow>,
+    own: bool,
+    address: u64,
+    len: u64,
+}
+
 fn buffer_srv(
     address: u64,
     len: u64,
     mut desc: D3D12_SHADER_RESOURCE_VIEW_DESC,
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
+    prepared: Option<&PreparedBuffer>,
 ) -> Option<Kept> {
     let element = element_size(&desc);
     // SAFETY: a buffer view's union member.
@@ -1280,9 +1429,11 @@ fn buffer_srv(
     }
     // The copy its own bytes are in, its first element counted from there.
     let start = address + buffer.FirstElement * element;
-    let Some((shadow, own)) =
-        crate::shadow::for_view(start, u64::from(buffer.NumElements) * element, element)
-    else {
+    let resolved = match prepared {
+        Some(p) => Some((p.shadow.clone(), p.own)),
+        None => crate::shadow::for_view(start, u64::from(buffer.NumElements) * element, element),
+    };
+    let Some((shadow, own)) = resolved else {
         #[cfg(feature = "diagnostics")]
         if REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 200 {
             tracing::info!(start = format_args!("{start:#x}"), len, element, count = buffer.NumElements, "refused buffer view: no host copy");
@@ -1330,6 +1481,7 @@ fn buffer_uav(
     len: u64,
     mut desc: D3D12_UNORDERED_ACCESS_VIEW_DESC,
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
+    prepared: Option<&PreparedBuffer>,
 ) -> Option<Kept> {
     // SAFETY: a buffer view's union member.
     let buffer = unsafe { &mut desc.Anonymous.Buffer };
@@ -1345,17 +1497,20 @@ fn buffer_uav(
         return None;
     }
     let start = address + buffer.FirstElement * element;
-    let (shadow, own) = crate::shadow::for_view(start, u64::from(buffer.NumElements) * element, element)?;
+    let (shadow, own) = match prepared {
+        Some(p) => (p.shadow.clone(), p.own),
+        None => crate::shadow::for_view(start, u64::from(buffer.NumElements) * element, element)?,
+    };
     // SAFETY: a live buffer.
-    let flags = unsafe { shadow.buffer.GetDesc() }.Flags;
-    if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
+    let res_desc = unsafe { shadow.buffer.GetDesc() };
+    if res_desc.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
         once!("unordered access to a buffer whose host copy shaders cannot write");
         return None;
     }
     buffer.FirstElement = shadow.offset(start) / element;
     buffer.CounterOffsetInBytes = 0;
     let (first, count) = (buffer.FirstElement, buffer.NumElements);
-    if !in_buffer(&shadow.buffer, first, count, element) {
+    if !within(res_desc.Width, first, count, element) {
         once!(first, count, element, "unordered buffer view empty or past its host copy");
         return None;
     }
@@ -1379,8 +1534,16 @@ thread_local! {
 /// buffer view whose writes shaders mark (`victory_shader::emit`, "Write
 /// marks").
 fn make_marked(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> (Option<Kept>, Option<(u32, u32)>) {
+    make_marked_with(view, None, at)
+}
+
+fn make_marked_with(
+    view: &View,
+    prepared: Option<&PreparedBuffer>,
+    at: D3D12_CPU_DESCRIPTOR_HANDLE,
+) -> (Option<Kept>, Option<(u32, u32)>) {
     MARK.with(|m| m.set(None));
-    let kept = make(view, at);
+    let kept = make_with(view, prepared, at);
     (kept, MARK.with(std::cell::Cell::take))
 }
 
@@ -1514,6 +1677,14 @@ pub(crate) fn make_view(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<
 /// Makes the host descriptor for `view` at `at`: the host resource it
 /// views, or `None` if it cannot.
 fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
+    make_with(view, None, at)
+}
+
+fn make_with(
+    view: &View,
+    prepared: Option<&PreparedBuffer>,
+    at: D3D12_CPU_DESCRIPTOR_HANDLE,
+) -> Option<Kept> {
     let host = host()?;
     let device = &host.device;
     match view {
@@ -1523,8 +1694,13 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             // (`victory_shader::emit`, "Constant buffers in the heap"): the
             // console needs 16-byte alignment, a host constant buffer view
             // 256, which most of the title's do not have on the host.
-            let shadow = crate::shadow::find(address, u64::from(size))?;
-            let bytes = u64::from(size).min(shadow.left(address));
+            let bytes = match prepared {
+                Some(p) => u64::from(size).min(p.shadow.left(address)),
+                None => {
+                    let shadow = crate::shadow::find(address, u64::from(size))?;
+                    u64::from(size).min(shadow.left(address))
+                }
+            };
             let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
                 Format: DXGI_FORMAT_R32_TYPELESS,
                 ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
@@ -1537,7 +1713,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                     },
                 },
             };
-            buffer_srv(address, bytes, desc, at)
+            buffer_srv(address, bytes, desc, at, prepared)
         }
         View::Shader(resource, desc) => {
             let resource = *resource as crate::object::This;
@@ -1569,7 +1745,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             } else if let (Some((data, len)), Some(desc)) =
                 (crate::resource::buffer_bytes(resource), desc)
             {
-                buffer_srv(data as u64, len, srv_desc(desc), at)
+                buffer_srv(data as u64, len, srv_desc(desc), at, prepared)
             } else {
                 None
             }
@@ -1579,7 +1755,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             let Some(copy) = crate::resource::host_copy(resource) else {
                 return match (crate::resource::buffer_bytes(resource), desc) {
                     (Some((data, len)), Some(desc)) => {
-                        buffer_uav(data as u64, len, uav_desc(desc), at)
+                        buffer_uav(data as u64, len, uav_desc(desc), at, prepared)
                     }
                     _ => None,
                 };
@@ -1635,7 +1811,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
         }
         View::Placed(unordered, resource, desc) => {
             if let Some(view) = placed_texture(view) {
-                return make(&view, at);
+                return make_with(&view, None, at);
             }
             const BUFFER: u32 = 1;
             if resource[0] != BUFFER {
@@ -1646,9 +1822,9 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
             let words: &[u32; 10] = desc[..10].try_into().unwrap_or(&[0; 10]);
             if *unordered {
-                buffer_uav(address, len, uav_desc(words), at)
+                buffer_uav(address, len, uav_desc(words), at, prepared)
             } else {
-                buffer_srv(address, len, srv_desc(words), at)
+                buffer_srv(address, len, srv_desc(words), at, prepared)
             }
         }
     }
@@ -1661,19 +1837,38 @@ fn is_placed_texture(view: &View) -> bool {
 
 /// Makes what a host view of `view` needs, if it is not made yet: the
 /// texture it views (made on first use) or the host copy of the buffer
-/// memory it views. The slot's view is then quick to make.
-fn prepare(view: &View) {
+/// memory it views. Returns the resolved buffer copy when `view` is a buffer
+/// or constant buffer view so the caller does not look it up again.
+fn prepare_resolved(view: &View) -> Option<PreparedBuffer> {
     #[cfg(test)]
     tests::while_preparing();
     match view {
         View::Placed(..) if is_placed_texture(view) => {
             let _ = placed_texture(view);
+            None
         }
-        View::Shader(r, _) | View::Unordered(r, _, _) if crate::resource::texture_memory(*r as crate::object::This).is_some() => {
+        View::Shader(r, _) | View::Unordered(r, _, _)
+            if crate::resource::texture_memory(*r as crate::object::This).is_some() =>
+        {
             let _ = crate::resource::host_resource(*r as crate::object::This);
+            None
+        }
+        &View::Constant(address, size) => {
+            let len = u64::from(size);
+            let shadow = crate::shadow::find(address, len)?;
+            let bytes = len.min(shadow.left(address));
+            let (shadow, own) = if shadow.offset(address).is_multiple_of(4) {
+                (shadow, false)
+            } else {
+                crate::shadow::for_view(address, bytes, 4)?
+            };
+            Some(PreparedBuffer { shadow, own, address, len })
         }
         _ => {
-            let _ = view_copy(view);
+            let (address, len) = buffer_range(view)?;
+            let element = u64::from(view_stride(view));
+            let (shadow, own) = crate::shadow::for_view(address, len, element)?;
+            Some(PreparedBuffer { shadow, own, address, len })
         }
     }
 }
@@ -2565,6 +2760,48 @@ mod tests {
         assert_eq!(heap.address_at(15), Some(base + 1024));
         assert_eq!(heap.address_at(40), Some(0));
         assert_eq!(heap.address_at(63), Some(base + 768));
+
+        crate::shadow::unregister(pool, base);
+        crate::watch::tests::free(pool);
+    }
+
+    /// A slot rewritten by the title while `sync_ranges` prepares its batched
+    /// buffer copies is detected and retried so the host ends up viewing the
+    /// newer record.
+    #[test]
+    fn sync_ranges_retries_slot_rewritten_while_preparing() {
+        let Some(heap) = HostHeap::new(false, 16) else {
+            return;
+        };
+        assert!(heap.view_addresses().is_some());
+        let pool = crate::watch::tests::pool(1);
+        let base = pool as u64;
+        crate::shadow::register(pool, base, 64 << 10);
+
+        let records = vec![[0u32; 8]; 16];
+        let step = size_of::<[u32; 8]>() as u64;
+        let start = records.as_ptr() as u64;
+
+        let write_srv_at = move |slot_addr: u64, offset: u64| {
+            let mut resource = [0u32; 14];
+            (resource[0], resource[4]) = (1, 64);
+            let mut view = [0u32; 16];
+            (view[1], view[2], view[6], view[7]) =
+                (1, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING, 16, 4);
+            let addr = base + offset;
+            (view[10], view[11]) = (addr as u32, (addr >> 32) as u32);
+            crate::descriptor::create_placed_srv(std::ptr::null(), &resource, &view, slot_addr);
+        };
+        let slot5 = start + 5 * step;
+        write_srv_at(slot5, 0);
+
+        *WHILE_PREPARING.lock().unwrap() = Some(Box::new(move || {
+            // Rewrite slot 5 to a new buffer offset between Phase 1 and Phase 3.
+            write_srv_at(slot5, 1024);
+        }));
+        heap.sync_ranges(&[(0, 16)], start, step);
+        assert!(WHILE_PREPARING.lock().unwrap().is_none(), "hook should have fired");
+        assert_eq!(heap.address_at(5), Some(base + 1024), "slot should view rewritten record");
 
         crate::shadow::unregister(pool, base);
         crate::watch::tests::free(pool);
