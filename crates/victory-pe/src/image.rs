@@ -230,17 +230,26 @@ impl ImageInfo {
     }
 
     /// Maps an RVA to an offset in the file, if it is backed by file data.
+    ///
+    /// Pages within the virtual size but beyond the raw data size are mapped
+    /// in memory as zero-filled (Windows maps the full virtual size), so they
+    /// return None here — the caller treats them as zero-filled memory rather
+    /// than unmapped.
     pub fn rva_to_file_offset(&self, rva: u32) -> Option<u32> {
         self.sections.iter().find_map(|s| {
             let delta = rva.checked_sub(s.rva)?;
-            // Raw data may be padded past the virtual size; that padding is
-            // not part of the section in memory.
+            // Header values are untrusted: an offset near 4 GiB overflows.
             let backed = match s.virtual_size {
                 0 => s.file_size,
-                vs => vs.min(s.file_size),
+                vs => vs,
             };
-            // Header values are untrusted: an offset near 4 GiB overflows.
-            (delta < backed).then(|| s.file_offset.checked_add(delta))?
+            // Within raw data: has file data to read.
+            if delta < s.file_size {
+                return s.file_offset.checked_add(delta);
+            }
+            // Within virtual size but beyond raw data: mapped as zeros by
+            // Windows, no file data to read.
+            (delta < backed).then_some(None)?
         })
     }
 
