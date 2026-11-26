@@ -128,6 +128,16 @@ def vulkan_device_name(adapter, summary):
     return None
 
 
+def filter_name(name):
+    """The part of a device name to filter by.
+
+    RADV appends its own tag, as in "AMD Radeon RX 6700 XT (RADV NAVI22)", and
+    the name a Proton guest sees can lack it. Both filters match substrings, so
+    the name without the tag selects the device either way.
+    """
+    return re.sub(r"\s*\([^()]*\)\s*$", "", name) or name
+
+
 def select_adapter(adapter):
     """Have vkd3d-proton and DXVK expose only the requested adapter.
 
@@ -141,7 +151,8 @@ def select_adapter(adapter):
         return None
     name = vulkan_device_name(adapter, summary)
     if name:
-        os.environ.update(VKD3D_FILTER_DEVICE_NAME=name, DXVK_FILTER_DEVICE_NAME=name)
+        pattern = filter_name(name)
+        os.environ.update(VKD3D_FILTER_DEVICE_NAME=pattern, DXVK_FILTER_DEVICE_NAME=pattern)
     return name
 
 

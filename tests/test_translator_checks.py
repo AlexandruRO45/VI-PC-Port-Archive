@@ -1,7 +1,7 @@
 from pathlib import Path
 import unittest
 
-from tools.check_translator_gpu import CHECKS, ROOT, command_for, printed_block, vulkan_device_name
+from tools.check_translator_gpu import CHECKS, ROOT, command_for, filter_name, printed_block, vulkan_device_name
 
 
 class TranslatorCheckListTests(unittest.TestCase):
@@ -31,6 +31,14 @@ class TranslatorCheckListTests(unittest.TestCase):
         self.assertEqual(vulkan_device_name("10de:2b85", summary), "NVIDIA GeForce RTX 5090")
         self.assertEqual(vulkan_device_name("1002:13C0", summary), "AMD Radeon Graphics (RADV RAPHAEL_MENDOCINO)")
         self.assertIsNone(vulkan_device_name("10de:2705", summary))
+
+    def test_filters_by_the_name_without_the_driver_tag(self):
+        # A Proton guest can see the RADV device without the tag the host prints.
+        self.assertEqual(filter_name("AMD Radeon RX 6700 XT (RADV NAVI22)"), "AMD Radeon RX 6700 XT")
+        self.assertEqual(filter_name("AMD Radeon Graphics (RADV RAPHAEL_MENDOCINO)"), "AMD Radeon Graphics")
+        self.assertEqual(filter_name("NVIDIA GeForce RTX 5090"), "NVIDIA GeForce RTX 5090")
+        self.assertEqual(filter_name("Intel(R) Arc(tm) A770 Graphics (DG2)"), "Intel(R) Arc(tm) A770 Graphics")
+        self.assertEqual(filter_name("(unnamed)"), "(unnamed)")
 
     def test_reads_the_program_a_unit_test_prints(self):
         output = "running 1 test\nBEGIN_HLSL\nvoid main() {}\n\nEND_HLSL\ntest ok\nBEGIN_HLSL\nsecond\nEND_HLSL\n"
