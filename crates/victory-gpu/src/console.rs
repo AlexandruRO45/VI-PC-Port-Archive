@@ -75,6 +75,7 @@ fn dedicated_video_memory() -> Option<usize> {
         CreateDXGIFactory2, DXGI_ADAPTER_FLAG_SOFTWARE, DXGI_CREATE_FACTORY_FLAGS,
         DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE, IDXGIAdapter1, IDXGIFactory4, IDXGIFactory6,
     };
+    use windows::core::Interface;
     let memory = |adapter: &IDXGIAdapter1| -> Option<usize> {
         // SAFETY: a plain adapter query.
         let desc = unsafe { adapter.GetDesc1() }.ok()?;
