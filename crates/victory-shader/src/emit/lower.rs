@@ -10704,6 +10704,24 @@ mod tests {
     }
 
     #[test]
+    fn a_global_load_into_lds_is_refused() {
+        // Encoding from gfx10::sp3::tests::loads_into_lds_have_no_result_register:
+        // global_load_dword v2, s[4:5] inst_offset:1024 lds.
+        let words = [
+            0x7E04_0280, // v_mov_b32 v2, 0
+            0xBE84_0380, // s_mov_b32 s4, 0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xDC30_A400,
+            0x0004_0002, // global_load_dword v2, s[4:5] inst_offset:1024 lds
+            S_ENDPGM,
+        ];
+        let Err(crate::ShaderError::Unsupported { what, .. }) = lowers(&words, 6 << 1) else {
+            panic!("a global load into LDS translated");
+        };
+        assert_eq!(what, "a global load result");
+    }
+
+    #[test]
     fn the_24_bit_multiplies_lower_both_halves() {
         // VOP2 `op v0, v1, v2`: v_mul_i32_i24 and v_mul_u32_u24 (the low
         // dword) and v_mul_hi_i32_i24 and v_mul_hi_u32_u24 (the high one).
