@@ -3,7 +3,7 @@
   "issues": 56,
   "prs": 542,
   "comments": 7514,
-  "updated": 1795664146
+  "updated": 1795506056
  },
  "leonida-old": {
   "issues": 371,
@@ -15,37 +15,37 @@
   "issues": 484,
   "prs": 658,
   "comments": 14283,
-  "updated": 1795654096
+  "updated": 1795504328
  },
  "victory": {
   "issues": 633,
   "prs": 612,
   "comments": 14651,
-  "updated": 1795649262
+  "updated": 1795506755
  },
  "xbox2windows": {
   "issues": 297,
   "prs": 1137,
   "comments": 6274,
-  "updated": 1795677506
+  "updated": 1795506551
  },
  "tuxbox": {
   "issues": 19,
   "prs": 68,
   "comments": 157,
-  "updated": 1795662779
+  "updated": 1795541444
  },
  "hyphenn": {
   "issues": 257,
   "prs": 15,
   "comments": 2545,
-  "updated": 1795672328
+  "updated": 1795552504
  },
  "anyxboxx": {
   "issues": 56,
   "prs": 138,
   "comments": 385,
-  "updated": 1795652103
+  "updated": 1795556730
  },
  "ztrx": {
   "issues": 50,
@@ -57,18 +57,24 @@
   "issues": 0,
   "prs": 48,
   "comments": 85,
-  "updated": 1795655527
+  "updated": 1795628767
  },
  "belobug": {
   "issues": 56,
   "prs": 146,
   "comments": 345,
-  "updated": 1795654568
+  "updated": 1795629969
  },
  "victory-7900xtx": {
   "issues": 72,
   "prs": 0,
   "comments": 211,
-  "updated": 1795677547
+  "updated": 1795644874
+ },
+ "cool-fox": {
+  "issues": 3,
+  "prs": 4,
+  "comments": 8,
+  "updated": 1795674794
  }
 }

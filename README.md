@@ -1,6 +1,6 @@
 # GTA6 PC Port Archive
 
-Archived copies of twelve open-source projects that work on running GTA VI on PC, first saved on 2026-11-23 and updated on 2026-11-24.
+Archived copies of thirteen open-source projects that work on running GTA VI on PC, first saved on 2026-11-23 and updated on 2026-11-24.
 ZERO of Rockstars game assets, files, or leaked info is on this repo, NOTHING HERE IS BREAKING ANY LAW OR ANYONE'S TOS
 ## GTA VI Launcher
 
@@ -26,6 +26,7 @@ ZERO of Rockstars game assets, files, or leaked info is on this repo, NOTHING HE
 | [`dexnom/`](dexnom) | DexNom Runtime: a VIctory fork for AMD Radeon cards | `DexNom/VIctory` | GPL-3.0 |
 | [`belobug/`](belobug) | VIctory-Belobug-AMD: a VIctory fork for AMD Radeon cards | `Belobug/VIctory-Belobug-AMD` | GPL-3.0 |
 | [`victory-7900xtx/`](victory-7900xtx) | VIctory-7900XTX: a VIctory fork tuned for speed on an AMD RX 7900 XTX | `avatarmanz/VIctory-7900XTX` | GPL-3.0 |
+| [`cool-fox/`](cool-fox) | cool_fox: VIctory-7900XTX with a ready-made Windows build and launcher | `codec-d/cool_fox` | GPL-3.0 |
 | [`github-export/`](github-export) | each project's issues, pull requests and comments | | |
 
 Each project folder keeps its own license file. Leonida's (old and new) `third_party/rpf9-explorer` submodule
@@ -35,7 +36,7 @@ Each project folder keeps its own license file. Leonida's (old and new) `third_p
 
 The old Leonida's branches keep their original `leonida/` names.
 
-`main` is a single snapshot of all twelve projects. Each project's original history, with its original commits, authors,
+`main` is a single snapshot of all thirteen projects. Each project's original history, with its original commits, authors,
 hashes and file paths, is on its own branches:
 
 | Project | Code | Pull requests | Issues and comments |
@@ -52,6 +53,7 @@ hashes and file paths, is on its own branches:
 | DexNom Runtime | `dexnom/main`, other branches as `dexnom/branch/<name>` (2) | `dexnom/pr/<number>` (48) | `dexnom/github-export` |
 | VIctory-Belobug-AMD | `belobug/main` | `belobug/pr/<number>` (146) | `belobug/github-export` |
 | VIctory-7900XTX | `victory-7900xtx/main` | `victory-7900xtx/pr/<number>` (0) | `victory-7900xtx/github-export` |
+| cool_fox | `cool-fox/main` | `cool-fox/pr/<number>` (4) | `cool-fox/github-export` |
 
 Get one project on its own:
 
