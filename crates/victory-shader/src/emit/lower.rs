@@ -6,6 +6,8 @@
 //! emitter cannot express is `Missing` with a reason, and only fails the
 //! program when something with an effect (an export, a branch) needs it.
 
+pub(super) mod amd;
+
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use super::UserData;
@@ -5975,6 +5977,7 @@ impl<'a> Lower<'a> {
                     .op(c, "getDimensions", Attr::ReadOnly, dims, 72, &[h, mip]);
                 // A raw view counts bytes; the descriptor's record count is in elements.
                 let n = self.s.m.extract(c, d, 0);
+                let n = self.hoisted_size(&src, props)?.unwrap_or(n); // amd.rs
                 let stride = used.map_or(0, |u| u.stride);
                 let n = if props.0 & 0xFF == 11 && stride > 1 {
                     let k = self.s.m.i32(stride);
