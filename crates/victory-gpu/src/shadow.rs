@@ -1638,6 +1638,7 @@ pub(crate) mod tests {
             info.Protect
         };
         copy_back_marks_with(&[], false, true);
+        assert!(crate::watch::lazy_armed(), "the marked pages wait behind their seals");
         // SAFETY: bytes of our pool.
         unsafe {
             let read = |at: usize| ((p + at) as *const u8).read_volatile();

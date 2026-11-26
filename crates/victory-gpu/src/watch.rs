@@ -848,6 +848,13 @@ pub(crate) fn arm_lazy(
         // SAFETY: a block we made read-only (failing harmlessly if gone).
         if unsafe { VirtualProtect((page * PAGE) as *const _, PAGE, PAGE_NOACCESS, &mut old) } == 0
         {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                tracing::warn!(
+                    page = format_args!("{:#x}", page),
+                    "the host refuses no-access inside its write-watched pools: the marked pages go back eagerly (logged once)"
+                );
+            });
             eager.push((copy.clone(), *page));
         } else {
             g.lazy.insert(*page, copy.clone());
