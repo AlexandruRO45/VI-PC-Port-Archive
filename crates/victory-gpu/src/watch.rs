@@ -558,6 +558,9 @@ impl Tracked {
 
     /// The caller made pages (page numbers) of its copy equal to title
     /// memory itself (what shaders wrote went back): taken and guarded.
+    ///
+    /// Locks `MAPPING` non-reentrantly; must not be called while holding a
+    /// [`Remapping`] guard.
     pub(crate) fn taken(&self, pages: &[usize]) {
         let _remap = MAPPING.lock().unwrap_or_else(|e| e.into_inner());
         let pages: Vec<usize> = pages.iter().copied().filter(|&p| !self.was_remapped(p)).collect();
@@ -882,6 +885,9 @@ impl Drop for Remapping {
 /// [`MAPPING`] so a concurrent remap cannot race between the remap check and
 /// the copy-back write. Returns `false` if any page in `[at, at + len)` was
 /// already remapped.
+///
+/// Locks `MAPPING` non-reentrantly; must not be called while holding a
+/// [`Remapping`] guard.
 pub(crate) fn write_back(
     tracked: Option<&Tracked>,
     at: usize,

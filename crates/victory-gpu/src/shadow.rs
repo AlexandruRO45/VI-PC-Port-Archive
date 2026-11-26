@@ -454,29 +454,20 @@ impl Shadow {
                 if host != old && crate::host::read_into((start + at) as *const u8, title) {
                     // Title memory with the GPU's bytes put in; the copy
                     // takes the title's bytes in turn.
-                    let mut changed = false;
-                    for ((t, h), o) in title.iter_mut().zip(host.iter_mut()).zip(old) {
-                        if *h != *o && *t != *h {
-                            *t = *h;
-                            changed = true;
-                        }
-                        *h = *t;
-                    }
-                    #[cfg(test)]
-                    tests::before_copy_back_write();
-                    let wrote = if changed {
-                        crate::watch::write_back(self.tracked.as_ref(), start + at, n, || {
+                    if merge_writeback(title, host, old) {
+                        #[cfg(test)]
+                        tests::before_copy_back_write();
+                        if crate::watch::write_back(self.tracked.as_ref(), start + at, n, || {
                             crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
-                        })
-                    } else {
-                        self.tracked
-                            .as_ref()
-                            .is_none_or(|t| !t.was_remapped((start + at) / PAGE))
-                    };
-                    if changed && wrote {
-                        written += n;
-                    }
-                    if wrote {
+                        }) {
+                            written += n;
+                            synced.push((start + at) / PAGE);
+                        }
+                    } else if self
+                        .tracked
+                        .as_ref()
+                        .is_none_or(|t| !t.was_remapped((start + at) / PAGE))
+                    {
                         synced.push((start + at) / PAGE);
                     }
                 }
