@@ -15,19 +15,22 @@ fn a_remap_publishes_only_its_completed_texture() {
     // The mapping lock, write guards and no-wait switch are process-wide.
     const CHILD: &str = "VICTORY_TEST_TEXTURE_REMAP";
     if std::env::var_os(CHILD).is_none() {
-        let status = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                std::thread::current().name().unwrap(),
-                "--nocapture",
-            ])
-            .env(CHILD, "1")
-            .env("VICTORY_TEXTURE_NO_WAIT", "1")
-            .env("VICTORY_TEXTURE_GUARD", "1")
-            .env("VICTORY_D3D12_WARP", "1")
-            .status()
-            .unwrap();
-        assert!(status.success());
+        for light in ["0", "1"] {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    std::thread::current().name().unwrap(),
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("VICTORY_TEXTURE_NO_WAIT", "1")
+                .env("VICTORY_TEXTURE_GUARD", "1")
+                .env("VICTORY_LIGHT_REFRESH", light)
+                .env("VICTORY_D3D12_WARP", "1")
+                .status()
+                .unwrap();
+            assert!(status.success(), "VICTORY_LIGHT_REFRESH={light}");
+        }
         return;
     }
     if host().is_none() {
@@ -164,6 +167,11 @@ fn a_remap_publishes_only_its_completed_texture() {
     assert!(staging.dirty.load(Relaxed));
     assert_eq!(staging.last.lock().unwrap().hash, Some(new));
     assert_eq!(staged(), new);
+    // Once the retry has consumed the remap, an ordinary check can skip
+    // the unchanged pages again in either write-tracking mode.
+    staging.dirty.store(false, Relaxed);
+    assert_eq!(staging.refresh_timed(), 0);
+    assert!(!staging.dirty.load(Relaxed));
     drop(staging);
     drop(owner);
     crate::watch::title_memory_remapped(source as usize, SIZE);
