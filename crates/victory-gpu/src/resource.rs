@@ -858,6 +858,13 @@ impl HostTexture {
         Self::counted(texture, state, castable, 0, Some(tiled))
     }
 
+    /// The video memory this texture holds now: its allocation, or for a
+    /// tiled one ([`HostTexture::tiled`], counted as 0 bytes) the tiles its
+    /// levels have. What eviction frees by giving it up.
+    pub(crate) fn held_bytes(&self) -> u64 {
+        self.tiled.as_ref().map_or(self.bytes, crate::tiles::Tiled::given_bytes)
+    }
+
     fn counted(
         texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
         state: u32,
@@ -1697,9 +1704,10 @@ pub(crate) fn evict_unused() {
         return;
     }
     let over = crate::host::video_memory().map_or(0, |[(used, budget), _]| {
-        // Free space in the heaps of textures takes the card's memory but
-        // is not in use: new textures go there first.
-        let used = used - crate::placement::free_bytes() as f64 / 1e6;
+        // Free space in the heaps of textures, and free tiles in the pool of
+        // levels on demand, take the card's memory but are not in use: new
+        // textures and levels go there first.
+        let used = used - (crate::placement::free_bytes() + crate::tiles::free_bytes()) as f64 / 1e6;
         if used > BUDGET_HIGH * budget { ((used - BUDGET_LOW * budget) * 1e6) as u64 } else { 0 }
     });
     evict(frame, now_ms(), over);
@@ -1739,7 +1747,7 @@ pub(crate) fn evict_among(
         }
     }
     let uses: Vec<(u64, u64, u64)> =
-        candidates.iter().map(|(t, _)| (t.last[0].load(Relaxed), t.last[1].load(Relaxed), t.bytes)).collect();
+        candidates.iter().map(|(t, _)| (t.last[0].load(Relaxed), t.last[1].load(Relaxed), t.held_bytes())).collect();
     let chosen = choose(&uses, frame, now, over);
     let gone: Vec<Owned> = chosen.into_iter().map(|i| candidates[i].clone()).collect();
     give_up(&gone, frame)
@@ -1802,7 +1810,7 @@ fn give_up(gone: &[Owned], frame: u64) -> (u64, u64) {
     let mut given = GIVEN_UP.lock().unwrap_or_else(|e| e.into_inner());
     let given = given.get_or_insert_with(Default::default);
     given.retain(|_, &mut f| frame.saturating_sub(f) <= SOON_FRAMES);
-    let bytes = gone.iter().map(|(t, _)| t.bytes).sum();
+    let bytes = gone.iter().map(|(t, _)| t.held_bytes()).sum();
     for (t, owners) in gone {
         for &r in owners.iter().filter(|r| live.contains(r)) {
             let mut h = resource(r as This).host.lock().unwrap_or_else(|e| e.into_inner());

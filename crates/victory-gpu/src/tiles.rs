@@ -169,6 +169,13 @@ impl Heap {
 /// the host GPU (textures name their heaps by place).
 static POOL: Mutex<Vec<Option<Heap>>> = Mutex::new(Vec::new());
 
+/// The bytes of the pool's heaps no texture holds (counted by the host as
+/// in use).
+pub(crate) fn free_bytes() -> u64 {
+    let pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+    pool.iter().flatten().map(|h| u64::from(h.free_tiles())).sum::<u64>() * TILE
+}
+
 /// Tiles taken: the heap, its place in the pool and the runs.
 type Taken = (ID3D12Heap, usize, Vec<(u32, u32)>);
 
@@ -457,8 +464,7 @@ impl Tiled {
     }
 
     /// The bytes of the tiles it has now.
-    #[cfg(test)]
-    fn given_bytes(&self) -> u64 {
+    pub(crate) fn given_bytes(&self) -> u64 {
         let given = self.given.lock().unwrap_or_else(|e| e.into_inner());
         given.runs.iter().map(|run| u64::from(run.2) * TILE).sum()
     }
@@ -604,9 +610,15 @@ mod tests {
         assert!(!tiled.whole());
         assert_eq!(tiled.without(0xfff), 0xfff);
         // Level 0 of BC1 2048x2048: 2 MiB, 32 tiles.
+        let free_before = free_bytes();
         assert!(tiled.give(&texture, 1));
         assert_eq!(tiled.without(0xfff), 0xffe);
         assert_eq!(tiled.given_bytes(), 32 * TILE);
+        // The pool's free bytes went down by what the level took (or a new
+        // heap came, with all but those tiles free).
+        let heap = u64::from(HEAP_TILES) * TILE;
+        let now = free_bytes() + 32 * TILE;
+        assert!(now == free_before || now == free_before + heap, "{now} {free_before}");
         // The last level: packed with the other small ones on most hosts
         // (giving it gives them all), its own standard level where the
         // host packs nothing (WARP).
