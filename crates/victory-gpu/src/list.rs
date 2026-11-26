@@ -1921,6 +1921,9 @@ pub(crate) fn has_newer_table(list: This) -> bool {
     table == NEWER_LIST_FUNCTIONS.0.as_ptr()
 }
 
+#[cfg(all(test, windows))]
+mod packed_copy_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
