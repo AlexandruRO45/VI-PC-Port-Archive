@@ -523,7 +523,10 @@ impl HostHeap {
     pub(crate) fn copy_overflow(&self, first: u32, index: u32, n: u32, table: u64) -> Option<(u32, Vec<Option<View>>)> {
         let o = self.overflow.as_ref()?;
         let from = index.checked_sub(self.count)?;
-        if n == 0 || u64::from(from) + u64::from(n) > u64::from(o.len) || first + n > self.count + self.dynamic {
+        if n == 0
+            || u64::from(from) + u64::from(n) > u64::from(o.len)
+            || first.checked_add(n).is_none_or(|end| end > self.count + self.dynamic)
+        {
             return None;
         }
         // The table's records, and their views in one look-up.
@@ -610,8 +613,23 @@ impl HostHeap {
         let mut retired = Vec::new();
         {
             let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
-            for (slot, resource) in kept.iter_mut().skip(first as usize).zip(resources) {
-                if let Some((old, _)) = std::mem::replace(slot, resource) {
+            for (k, (slot, resource)) in kept.iter_mut().skip(first as usize).zip(resources).enumerate() {
+                let old = std::mem::replace(slot, resource);
+                #[cfg(not(feature = "diagnostics"))]
+                let _ = k;
+                // As `HostHeap::keep` notes a texture a slot stops viewing.
+                #[cfg(feature = "diagnostics")]
+                if let Some((old, _)) = &old
+                    && !self.sampler
+                    && slot.as_ref().map(|s| windows::core::Interface::as_raw(&s.0)) != Some(windows::core::Interface::as_raw(old))
+                    // SAFETY: a live resource.
+                    && unsafe { old.GetDesc() }.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER
+                {
+                    use windows::core::Interface;
+                    let left = crate::resource::life::holders(old);
+                    crate::resource::life::note(old.as_raw() as usize, crate::resource::life::SLOT, u64::from(first) + k as u64, left);
+                }
+                if let Some((old, _)) = old {
                     retired.push(old);
                 }
             }
@@ -1095,6 +1113,38 @@ impl HostHeap {
                 self.viewed.set(index, view.as_ref(), false);
                 crate::shadow::forget_read(index);
             }
+        }
+        drop(made);
+        self.evict_overflow(textures);
+    }
+
+    /// [`HostHeap::evict`] of the overflow slots: one viewing a texture given
+    /// up lets go of it and is made again at its next use (its key cleared),
+    /// of the texture made again then. Its descriptor is never read by the
+    /// GPU (a CPU-only heap), so it is left as it is until then. What it held
+    /// goes once the work in flight has run, after the shard's lock.
+    /// Lock order: under `SHADER_HEAPS` (`descriptor::evict`), then a shard;
+    /// `copy_overflow` takes shards without `SHADER_HEAPS`.
+    fn evict_overflow(&self, textures: &std::collections::HashSet<usize>) {
+        let Some(o) = &self.overflow else { return };
+        let mut retired = Vec::new();
+        for shard in &o.shards {
+            let mut slots = shard.lock().unwrap_or_else(|e| e.into_inner());
+            for slot in slots.iter_mut() {
+                let given_up = slot
+                    .kept
+                    .as_ref()
+                    .is_some_and(|k| k.1.is_none() && textures.contains(&(windows::core::Interface::as_raw(&k.0) as usize)));
+                if given_up {
+                    if let Some((old, _)) = slot.kept.take() {
+                        retired.push(old);
+                    }
+                    (slot.key, slot.mark) = (0, None);
+                }
+            }
+        }
+        for old in retired {
+            crate::host::retire(old);
         }
     }
 

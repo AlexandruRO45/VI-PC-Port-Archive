@@ -2878,6 +2878,58 @@ uint ps() : SV_Target { return 1; }
         crate::object::slot::<Release>(writable, 0x10)(writable);
     }
 
+    /// A texture fed from title memory, read through an overflow table and
+    /// then given up (`resource::give_up_now`): the overflow slot lets go
+    /// of it, so the next copy makes its view again, of the texture made
+    /// again with the title's new bytes, not of the one given up.
+    #[test]
+    fn an_overflow_table_reads_a_texture_given_up_as_made_again() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let guest_heap = heap_keeping(4, 16);
+        let title_heap = crate::descriptor::heap(guest_heap);
+        let heap = title_heap.host().unwrap();
+        let slots = Slots::from_heap(heap.heap.clone());
+        let read = compile_cs(READ);
+        let (out, data) = host.shared_buffer(64 * 64 * 16).unwrap();
+        let address = crate::watch::tests::pool(1) as u64;
+        let object = texture_at_address(address, &texture_words(64, 64, 28, 0x100, 0));
+        // SAFETY: the texture's memory, 256-byte rows of 64 texels.
+        unsafe { std::ptr::write_bytes(address as *mut u8, 0x40, 64 * 64 * 4) };
+        let mut desc = [0u32; 10];
+        desc[..6].copy_from_slice(&[28, 4, 0x1688, 0, 0, 1]);
+        // Title slot 8: past the host's title slots.
+        let slot = title_heap.start + 8 * 32;
+        crate::descriptor::create_srv(std::ptr::null(), object, &desc, slot);
+        let view = crate::descriptor::view(slot).unwrap();
+        let copied = heap.dynamic(1).unwrap();
+        let copy_and_read = || {
+            let (made, _) = heap.copy_overflow(copied, 8, 1, slot).expect("an overflow table");
+            let list = host.new_list().unwrap();
+            readable(&list, &used(ResourceType::Srv), &view, false);
+            // SAFETY: no submission runs; the mapped output.
+            unsafe { data.cast::<[f32; 4]>().write([0.0; 4]) };
+            run(&list, &slots, &read, copied, Some(&out), (1, 1));
+            list.close();
+            host.execute(&[&list]);
+            // SAFETY: the dispatch wrote its first texel there and has run.
+            (made, unsafe { data.cast::<[f32; 4]>().read() }[0])
+        };
+        let (made, texel) = copy_and_read();
+        assert_eq!(made, 1);
+        assert!((texel - 64.0 / 255.0).abs() < 1e-6, "{texel}");
+        assert!(crate::resource::give_up_now(object), "fed from title memory");
+        // SAFETY: the texture's memory: the title writes new bytes.
+        unsafe { std::ptr::write_bytes(address as *mut u8, 0x80, 64 * 64 * 4) };
+        let (made, texel) = copy_and_read();
+        assert_eq!(made, 1, "made again: its texture was given up");
+        assert!((texel - 128.0 / 255.0).abs() < 1e-6, "the new bytes, through the texture made again: {texel}");
+        heap.release(copied, 1);
+        type Release = extern "system" fn(This) -> u32;
+        crate::object::slot::<Release>(guest_heap, 0x10)(guest_heap);
+    }
+
     /// Fresh tables of 8 past the host's title slots, per 1,000: made one
     /// view at a time (`VICTORY_OVERFLOW_VIEWS=0`), against copied from the
     /// overflow heap at their first use (its views made) and with their
