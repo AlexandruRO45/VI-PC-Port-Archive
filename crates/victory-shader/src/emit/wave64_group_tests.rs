@@ -202,8 +202,8 @@ fn run(threads: u32) {
             .SetEnableGPUBasedValidation(true);
     });
     let host = Host::new(false).expect("hardware D3D12 adapter");
-    // SAFETY: The feature query writes only into the matching D3D12 description.
     let mut caps = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+    // SAFETY: The feature query writes only into the matching D3D12 description.
     unsafe {
         host.device
             .CheckFeatureSupport(
