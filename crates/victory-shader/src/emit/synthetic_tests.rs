@@ -1035,6 +1035,8 @@ fn pops_wait_loop_exits_immediately_for_inactive_lanes() {
 enum Sample {
     Plain,
     Offset,
+    /// `image_sample_b_o` with a bias of 1: offset, bias, u, v.
+    BiasOffset,
 }
 
 /// Per lane of a [8, 8, 1] group (v0 = x, v1 = y): (u, v) from entry 1 of
@@ -1067,11 +1069,20 @@ fn quad_program_as(form: Sample) -> Vec<u32> {
         0x7E18_0281, // v_mov_b32 v12, 1 (offset x 1, y 0)
         0xBF8C_3F70, // s_waitcnt vmcnt(0)
     ];
+    if matches!(form, Sample::BiasOffset) {
+        w.extend([
+            0x7E1E_030E, // v_mov_b32 v15, v14
+            0x7E1C_030D, // v_mov_b32 v14, v13
+            0x7E1A_02F2, // v_mov_b32 v13, 1.0
+        ]);
+    }
     w.extend(match form {
         // image_sample v4, v[13:14], s[12:19], s[8:11] dmask:0x1 dim:2D
         Sample::Plain => [0xF080_0108, 0x0043_040D],
         // image_sample_o v4, v[12:14]: offset, u, v
         Sample::Offset => [0xF0C0_0108, 0x0043_040C],
+        // image_sample_b_o v4, v[12:15]: offset, bias, u, v
+        Sample::BiasOffset => [0xF0D4_0108, 0x0043_040C],
     });
     w.extend([
         0xBF8C_3F70, // s_waitcnt vmcnt(0)
@@ -1101,12 +1112,16 @@ fn compute_samples_take_derivatives_from_lane_quads() {
     let mut texels = Vec::new();
     for l in 0..levels {
         let n = (size >> l) as usize;
-        texels.extend(vec![[l as f32, 0.0, 0.0, 1.0]; n * n]);
+        // Red is the level plus the texel's x over 10000: a tag for
+        // which texel a sample read (linear in x, so a filter keeps it).
+        for _ in 0..n {
+            texels.extend((0..n).map(|x| [l as f32 + x as f32 / 1e4, 0.0, 0.0, 1.0]));
+        }
     }
     let input: Vec<u32> = (0..64u32)
         .flat_map(|f| {
             let (x, y) = (f % 8, f / 8);
-            let u = (16.0 + 2.0 * (x / 2) as f32 + 0.5) / size as f32;
+            let u = (17.0 + 2.0 * (x / 2) as f32) / size as f32;
             let v = (4.0 + 8.0 * y as f32 + 0.5) / size as f32;
             [u.to_bits(), v.to_bits()]
         })
@@ -1120,15 +1135,31 @@ fn compute_samples_take_derivatives_from_lane_quads() {
         (true, Sample::Plain),
         (false, Sample::Offset),
         (true, Sample::Offset),
+        (false, Sample::BiasOffset),
+        (true, Sample::BiasOffset),
     ] {
-        let shader = match build_group(&quad_program_as(form), wave64, [8, 8, 1], 1 << 1 | 1 << 11) {
-            Ok(s) => s,
-            Err(e) => panic!("wave{} {form:?}: lower: {e:?}", if wave64 { 64 } else { 32 }),
+        // The level (a bias of 1 adds one) and the texel offset in x.
+        let (level, offset) = match form {
+            Sample::Plain => (1.0, 0.0),
+            Sample::Offset => (1.0, 1.0),
+            Sample::BiasOffset => (2.0, 1.0),
         };
-        if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref())
+        let shader = match build_group(&quad_program_as(form), wave64, [8, 8, 1], 1 << 1 | 1 << 11)
+        {
+            Ok(s) => s,
+            Err(e) => panic!(
+                "wave{} {form:?}: lower: {e:?}",
+                if wave64 { 64 } else { 32 }
+            ),
+        };
+        if let Ok(mut v) =
+            validator::Validator::load(validator::Validator::default_path().as_deref())
             && let Err(e) = v.validate(&mut shader.dxil.clone())
         {
-            panic!("wave{}: DXIL validation failed: {e:?}", if wave64 { 64 } else { 32 });
+            panic!(
+                "wave{}: DXIL validation failed: {e:?}",
+                if wave64 { 64 } else { 32 }
+            );
         }
         let views = [
             View::Mipped(size, size, levels, &texels),
@@ -1166,11 +1197,24 @@ fn compute_samples_take_derivatives_from_lane_quads() {
             let got: Vec<f32> = out[0][..64].iter().map(|&x| f32::from_bits(x)).collect();
             eprintln!("wave{w} {form:?} {label}: levels {got:?}");
             for (f, &g) in got.iter().enumerate() {
+                let (x, y) = (f % 8, f / 8);
+                let l = g.round();
                 assert!(
-                    (g - 1.0).abs() < 0.02,
-                    "wave{w} {label}: thread ({}, {}) sampled level {g}, the lane quads give 1 (2x2 tiles give 3)",
-                    f % 8,
-                    f / 8
+                    (l - level).abs() < 0.5 && (g - l) < 0.01,
+                    "wave{w} {form:?} {label}: thread ({x}, {y}) sampled level {g}, the lane quads give {level} (2x2 tiles give 3)"
+                );
+                // The texel read: at the sampled level's size n, u lands on
+                // coordinate c (in texels); the offset moves it by whole
+                // texels. A point sample reads texel floor(c), a linear one
+                // c - 0.5 of the tag.
+                let n = (size >> l as u32) as f32;
+                let c = (17.0 + 2.0 * (x / 2) as f32) / size as f32 * n + offset;
+                let tag = (g - l) * 1e4;
+                assert!(
+                    (tag - c.floor()).abs() < 0.05 || (tag - (c - 0.5)).abs() < 0.05,
+                    "wave{w} {form:?} {label}: thread ({x}, {y}) read texel {tag}, the offset of {offset} gives {} (or {})",
+                    c.floor(),
+                    c - 0.5
                 );
             }
         }

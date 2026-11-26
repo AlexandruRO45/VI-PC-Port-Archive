@@ -7,9 +7,11 @@ use super::{Attr, Bin, Lower, V, Val, Why, flags};
 /// gradients (`_d`, `_cd`), and `image_get_lod`.
 pub(super) fn implicit_level(name: &str) -> bool {
     name == "image_get_lod"
-        || name
-            .strip_prefix("image_sample")
-            .is_some_and(|rest| !rest.split('_').any(|t| matches!(t, "l" | "lz" | "d" | "cd")))
+        || name.strip_prefix("image_sample").is_some_and(|rest| {
+            !rest
+                .split('_')
+                .any(|t| matches!(t, "l" | "lz" | "d" | "cd"))
+        })
 }
 
 impl Lower<'_> {

@@ -8664,7 +8664,7 @@ impl<'a> Lower<'a> {
         let (op, sample) = match name {
             "image_sample" | "image_sample_o" => (60, true),
             "image_sample_lz" | "image_sample_l" => (62, true),
-            "image_sample_b" => (61, true),
+            "image_sample_b" | "image_sample_b_o" => (61, true),
             "image_sample_c_lz" => (65, true),
             "image_sample_d" | "image_sample_d_cl" => (63, true),
             "image_get_lod" if self.s.pixel => (81, true),
@@ -8745,8 +8745,9 @@ impl<'a> Lower<'a> {
             // Texel offsets (`_o`) come first: x in bits 0-5, y in 8-13,
             // signed (programmable offsets: gathers only).
             let offset_word = name.ends_with("_o");
-            let first =
-                usize::from(offset_word) + usize::from(name == "image_sample_b") + usize::from(cmp);
+            let first = usize::from(offset_word)
+                + usize::from(matches!(name, "image_sample_b" | "image_sample_b_o"))
+                + usize::from(cmp);
             // Coordinates the size divides (not the array slice); explicit
             // gradients (x then y) come before the coordinates.
             let spatial = coords - usize::from(kind == 6 || kind == 7);
@@ -8842,6 +8843,18 @@ impl<'a> Lower<'a> {
                 && self.s.threads.is_some()
                 && self.s.mesh.is_none()
                 && kind != 5;
+            // Quads are four lanes of a row: the tail of a group that is not
+            // whole quads has lanes to read that are not threads. Lanes of a
+            // quad that diverge before the sample give undefined derivatives,
+            // as on the hardware.
+            if quad_grads
+                && self
+                    .s
+                    .threads
+                    .is_some_and(|t| t.iter().product::<u32>() % 4 != 0)
+            {
+                return Err("an implicit-level sample in a group of partial quads");
+            }
             match op {
                 60 | 61 if quad_grads => {
                     // A bias scales the footprint by 2^bias; it follows the
