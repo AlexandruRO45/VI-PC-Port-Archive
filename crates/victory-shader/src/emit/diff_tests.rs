@@ -1201,6 +1201,7 @@ fn float_semantics_are_the_consoles() {
 /// the same `SampleGrad` (the host's own projection) is printed alongside.
 #[test]
 fn cube_gradients_pick_the_level() {
+    let _one = one_at_a_time();
     use super::host::{Dispatch, View};
     let Some((console, pc)) = tools() else {
         eprintln!("no console or PC compiler; skipped");
@@ -1346,6 +1347,7 @@ fn close(a: u32, b: u32) -> bool {
 
 #[test]
 fn translated_compute_matches_pc() {
+    let _one = one_at_a_time();
     use super::host::{Dispatch, Stride, View};
     let Some((console, pc)) = tools() else {
         eprintln!("no console or PC compiler; skipped");
@@ -1567,3 +1569,4 @@ fn translated_compute_matches_pc() {
     let _ = std::fs::remove_dir_all(&dir);
     assert!(failures.is_empty(), "{failures:#?}");
 }
+

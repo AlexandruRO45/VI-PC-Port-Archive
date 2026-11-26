@@ -184,11 +184,11 @@ fn lower_valu_cs(native: &NativeProgram) -> Result<HostShader, crate::ShaderErro
 /// from several test threads at once, now and then none of their dispatches
 /// ever completes and the test binary hangs; and two GPU tests at once on
 /// WARP can end the test process with an access violation, and two tests
-/// dispatching at once can have one read back what the other wrote — that is
-/// how `memory_tests`' title-memory test failed now and then in a full
-/// workspace run (#1882). **Every GPU test module takes this lock**, and a
-/// new one that makes a `Host` without it is the way the failure comes back:
-/// `diff_tests` was the last module missing it.
+/// dispatching at once can have one read back what the other wrote, which is
+/// the likeliest cause of `memory_tests`' title-memory test failing now and
+/// then in a full workspace run (#1882; not reproduced on its own). A GPU
+/// test that makes a `Host` takes this lock; `diff_tests` and `rect.rs` were
+/// the modules that did not.
 pub(super) static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Runs `shader` on every available SM 6.6 host (hardware GPU and WARP) for
