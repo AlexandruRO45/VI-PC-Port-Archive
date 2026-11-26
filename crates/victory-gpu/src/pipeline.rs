@@ -481,6 +481,17 @@ pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
     make::ready(&pipeline(this).host)
 }
 
+#[cfg(windows)]
+pub(crate) fn host_pipeline_r11<'a>(
+    this: This,
+    samples: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC,
+) -> Option<&'a host::HostPipeline> {
+    if this.is_null() {
+        return None;
+    }
+    make::ready(make::Pending::for_r11(&pipeline(this).host, samples)?)
+}
+
 /// Host pipelines queued and not made yet.
 #[cfg(windows)]
 pub(crate) fn making() -> u64 {

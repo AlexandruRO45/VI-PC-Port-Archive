@@ -121,6 +121,40 @@ fn integer_target(format: DXGI_FORMAT) -> bool {
 }
 
 impl GraphicsState {
+    pub(crate) fn matches_samples(&self, samples: DXGI_SAMPLE_DESC) -> bool {
+        self.samples.Count == samples.Count && self.samples.Quality == samples.Quality
+    }
+
+    pub(crate) fn r11_variant(&self, samples: DXGI_SAMPLE_DESC) -> Option<Self> {
+        if self.targets.NumRenderTargets != 1
+            || self.targets.RTFormats[0] != DXGI_FORMAT_R10G10B10A2_UNORM
+            || !self.matches_samples(samples)
+        {
+            return None;
+        }
+        let names = self.names.clone();
+        let mut inputs = self.inputs.clone();
+        for (element, name) in inputs.iter_mut().zip(&names) {
+            element.SemanticName = PCSTR(name.as_ptr().cast());
+        }
+        let mut targets = self.targets;
+        targets.RTFormats[0] = DXGI_FORMAT_R11G11B10_FLOAT;
+        Some(Self {
+            blend: self.blend,
+            sample_mask: self.sample_mask,
+            rasterizer: self.rasterizer,
+            depth: self.depth,
+            depth_bounds: self.depth_bounds,
+            inputs,
+            names,
+            strip_cut: self.strip_cut,
+            topology: self.topology,
+            targets,
+            depth_format: self.depth_format,
+            samples,
+        })
+    }
+
     /// Once the title's whole state is read: blending is off for the
     /// render targets that hold integers. The title leaves it on for them
     /// (the console's hardware does not blend integers, whatever the state
@@ -1038,6 +1072,10 @@ fn root_signature(
 }
 
 #[cfg(test)]
+#[path = "r11_test.rs"]
+mod r11_test;
+
+#[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::atomic::Ordering;
@@ -1057,7 +1095,7 @@ mod tests {
     const PS: &str = "float4 main() : SV_Target { return 1; }";
 
     /// The PC `dxc.exe` (`VICTORY_PC_DXC`, else the newest Windows SDK's).
-    fn dxc() -> Option<PathBuf> {
+    pub(super) fn dxc() -> Option<PathBuf> {
         let dxc = match std::env::var_os("VICTORY_PC_DXC") {
             Some(p) => PathBuf::from(p),
             None => victory_shader::emit::validator::Validator::default_path()?
@@ -1066,7 +1104,7 @@ mod tests {
         dxc.exists().then_some(dxc)
     }
 
-    fn compile(dxc: &Path, dir: &Path, src: &str, profile: &str) -> Vec<u8> {
+    pub(super) fn compile(dxc: &Path, dir: &Path, src: &str, profile: &str) -> Vec<u8> {
         let (hlsl, out) = (
             dir.join(format!("{profile}.hlsl")),
             dir.join(format!("{profile}.dxil")),
