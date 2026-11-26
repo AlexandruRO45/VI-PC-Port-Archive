@@ -9,8 +9,13 @@ platform; these notes are what has worked for testers.
 - Run `victory.exe` with `proton runinprefix`, in a prefix of its own.
   Tested: proton-cachyos 11.0 with the `d3d12.dll` and `d3d12core.dll` of
   Proton Experimental 11.0 (vkd3d-proton 3.2.0) next to `victory.exe`.
-- Use those native Direct3D 12 DLLs and **Microsoft's `d3dcompiler_47.dll`**,
-  for example from `winetricks d3dcompiler_47`, next to `victory.exe`:
+- Use those native Direct3D 12 DLLs and **Microsoft's `d3dcompiler_47.dll`
+  from a Windows 10 or 11 SDK** (version 10.0.x; tested: 10.0.26100.7705, the
+  x64 one from the SDK's "Windows SDK for Windows Store Apps Tools" cabinets),
+  next to `victory.exe`. Not the one from `winetricks d3dcompiler_47`: that is
+  the Windows 8.1 build (6.3.9600.16384), which does not know VIctory's
+  `cs_5_1` target either (`X3506: unrecognized compiler target 'cs_5_1'`),
+  with the same result as below (found by arogan178):
 
   ```
   WINEDLLOVERRIDES="d3d12,d3d12core,dxgi,d3dcompiler_47=n,b"
