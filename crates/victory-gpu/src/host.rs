@@ -243,10 +243,34 @@ fn create() -> windows::core::Result<Host> {
         {
             Ok(true) => crate::shader_cache::set_emulate_fma(false),
             Ok(false) => {
-                crate::shader_cache::set_emulate_fma(true);
-                tracing::warn!(
-                    "the host GPU does not fuse multiply-adds: emulating fused f32 multiply-add in f64"
-                );
+                let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
+                let mut options1 = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+                let supports_emulation = device
+                    .CheckFeatureSupport(
+                        D3D12_FEATURE_D3D12_OPTIONS,
+                        (&raw mut options).cast(),
+                        size_of_val(&options) as u32,
+                    )
+                    .is_ok()
+                    && options.DoublePrecisionFloatShaderOps.as_bool()
+                    && device
+                        .CheckFeatureSupport(
+                            D3D12_FEATURE_D3D12_OPTIONS1,
+                            (&raw mut options1).cast(),
+                            size_of_val(&options1) as u32,
+                        )
+                        .is_ok()
+                    && options1.Int64ShaderOps.as_bool();
+                crate::shader_cache::set_emulate_fma(supports_emulation);
+                if supports_emulation {
+                    tracing::warn!(
+                        "the host GPU does not fuse multiply-adds: emulating fused f32 multiply-add in f64"
+                    );
+                } else {
+                    tracing::warn!(
+                        "the host GPU does not fuse multiply-adds and lacks the needed double or int64 shader operations: fused results may differ"
+                    );
+                }
             }
             Err(e) => tracing::debug!(error = %e, "multiply-add fusing not checked"),
         }
