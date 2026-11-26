@@ -869,6 +869,7 @@ pub(crate) fn arm_lazy(
 
 /// Diagnostics of the arming so far — (sealed, refused by the guard state,
 /// refused sealing by the host) — so a test's failure names its stage.
+#[cfg(test)]
 pub(crate) fn lazy_arms() -> (usize, usize, usize) {
     use std::sync::atomic::Ordering::Relaxed;
     (
