@@ -551,6 +551,8 @@ fn hand_out(
 ) -> HRESULT {
     tracing::trace!(?shaders, "pipeline state");
     #[cfg(windows)]
+    record::record(&shaders, graphics.as_deref());
+    #[cfg(windows)]
     let host = Arc::new(make::Pending::new(shaders.clone(), graphics));
     #[cfg(windows)]
     make::early(&host);
@@ -749,12 +751,27 @@ pub(crate) mod host;
 mod library;
 #[cfg(windows)]
 mod make;
+#[cfg(windows)]
+mod record;
 
 /// Keeps compiled host pipelines, and the list of title pipelines to start
 /// early, in `dir` (a folder of the cache) across runs.
 #[cfg(windows)]
 pub fn use_pipeline_cache(dir: std::path::PathBuf) {
     library::use_pipeline_cache(dir);
+}
+
+/// Keeps what the title's pipelines are made from in `dir`, and makes them
+/// before the title asks on the next launch (`VICTORY_PSO_RECORD=1`).
+#[cfg(windows)]
+pub fn use_pso_record(dir: std::path::PathBuf) {
+    record::use_dir(dir);
+}
+
+/// Starts every recorded pipeline on the workers (diagnostics).
+#[cfg(windows)]
+pub fn prebuild_pipelines() {
+    record::prebuild();
 }
 
 /// Saves the pipeline cache now if anything was added (at the end of a run).

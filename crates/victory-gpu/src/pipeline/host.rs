@@ -151,6 +151,122 @@ fn host_blend(blend: &D3D12_BLEND_DESC, targets: &D3D12_RT_FORMAT_ARRAY) -> D3D1
 }
 
 impl GraphicsState {
+    /// Its value fields as bytes, then its input elements with their names
+    /// as indices, then the names: what a recording keeps (see `record`).
+    pub(crate) fn encode(&self) -> Vec<u8> {
+        fn put<T: Copy>(out: &mut Vec<u8>, v: &T) {
+            // SAFETY: a plain old-data struct of the host ABI.
+            unsafe {
+                out.extend_from_slice(std::slice::from_raw_parts(
+                    (v as *const T).cast::<u8>(),
+                    std::mem::size_of::<T>(),
+                ));
+            }
+        }
+        let mut out = Vec::new();
+        put(&mut out, &self.blend);
+        put(&mut out, &self.sample_mask);
+        put(&mut out, &self.rasterizer);
+        put(&mut out, &self.depth);
+        out.push(u8::from(self.depth_bounds));
+        put(&mut out, &self.strip_cut);
+        put(&mut out, &self.topology);
+        put(&mut out, &self.targets);
+        put(&mut out, &self.depth_format);
+        put(&mut out, &self.samples);
+        out.extend_from_slice(&(self.inputs.len() as u32).to_le_bytes());
+        for e in &self.inputs {
+            let name = self
+                .names
+                .iter()
+                .position(|n| n.as_ptr().cast::<u8>() == e.SemanticName.0)
+                .unwrap_or(0) as u32;
+            for v in [
+                name,
+                e.SemanticIndex,
+                e.Format.0 as u32,
+                e.InputSlot,
+                e.AlignedByteOffset,
+                e.InputSlotClass.0 as u32,
+                e.InstanceDataStepRate,
+            ] {
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        out.extend_from_slice(&(self.names.len() as u32).to_le_bytes());
+        for n in &self.names {
+            let b = n.as_bytes_with_nul();
+            out.extend_from_slice(&(b.len() as u32).to_le_bytes());
+            out.extend_from_slice(b);
+        }
+        out
+    }
+
+    /// The state `encode` wrote, or nothing when the bytes are not it.
+    pub(crate) fn decode(bytes: &[u8]) -> Option<Self> {
+        fn take<T: Copy>(b: &[u8], at: &mut usize) -> Option<T> {
+            let n = std::mem::size_of::<T>();
+            let v = b.get(*at..*at + n)?;
+            *at += n;
+            // SAFETY: a plain old-data struct of the host ABI, aligned by
+            // the copy below.
+            Some(unsafe { std::ptr::read_unaligned(v.as_ptr().cast::<T>()) })
+        }
+        let mut at = 0;
+        let mut g = Self {
+            blend: take(bytes, &mut at)?,
+            sample_mask: take(bytes, &mut at)?,
+            rasterizer: take(bytes, &mut at)?,
+            depth: take(bytes, &mut at)?,
+            depth_bounds: *bytes.get(at)? != 0,
+            strip_cut: take(bytes, &mut at)?,
+            topology: take(bytes, &mut at)?,
+            targets: take(bytes, &mut at)?,
+            depth_format: take(bytes, &mut at)?,
+            samples: take(bytes, &mut at)?,
+            inputs: Vec::new(),
+            names: Vec::new(),
+        };
+        at += 1;
+        let n = take::<u32>(bytes, &mut at)? as usize;
+        let mut elements = Vec::new();
+        for _ in 0..n {
+            let mut w = [0u32; 7];
+            for v in &mut w {
+                *v = take(bytes, &mut at)?;
+            }
+            elements.push(w);
+        }
+        let n = take::<u32>(bytes, &mut at)? as usize;
+        for _ in 0..n {
+            let len = take::<u32>(bytes, &mut at)? as usize;
+            let b = bytes.get(at..at + len)?;
+            at += len;
+            g.names
+                .push(std::ffi::CString::from_vec_with_nul(b.to_vec()).ok()?);
+        }
+        for w in elements {
+            let name = g.names.get(w[0] as usize)?.as_ptr();
+            g.inputs.push(
+                windows::Win32::Graphics::Direct3D12::D3D12_INPUT_ELEMENT_DESC {
+                    SemanticName: windows::core::PCSTR(name.cast()),
+                    SemanticIndex: w[1],
+                    Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(w[2] as i32),
+                    InputSlot: w[3],
+                    AlignedByteOffset: w[4],
+                    InputSlotClass:
+                        windows::Win32::Graphics::Direct3D12::D3D12_INPUT_CLASSIFICATION(
+                            w[5] as i32,
+                        ),
+                    InstanceDataStepRate: w[6],
+                },
+            );
+        }
+        Some(g)
+    }
+}
+
+impl GraphicsState {
     /// Takes in one subobject of a stream: its type, then its data at +4
     /// (+8 for those holding pointers).
     ///

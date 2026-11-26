@@ -45,7 +45,11 @@ pub fn use_shader_cache(dir: std::path::PathBuf) {
     #[cfg(windows)]
     {
         victory_gpu::pipeline::use_pipeline_cache(dir.with_file_name("pipelines"));
+        victory_gpu::pipeline::use_pso_record(dir.with_file_name("pso-record"));
         victory_gpu::shader_cache::use_shader_cache(dir);
+        // The recorded pipelines compile on the workers while the title
+        // loads, so its first world frames find them made.
+        std::thread::spawn(victory_gpu::pipeline::prebuild_pipelines);
     }
     #[cfg(not(windows))]
     let _ = dir;

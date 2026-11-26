@@ -161,6 +161,8 @@ struct Retired {
     frame: u64,
     /// When.
     at: std::time::Instant,
+    /// What it is, for the free trace.
+    kind: &'static str,
     #[allow(dead_code)]
     object: Box<dyn std::any::Any>,
 }
@@ -180,6 +182,7 @@ pub(crate) fn retire<T: 'static>(object: T) {
             submission,
             frame,
             at: std::time::Instant::now(),
+            kind: std::any::type_name::<T>(),
             object: Box::new(object),
         });
 }
@@ -206,6 +209,19 @@ fn bury(finished: u64) {
             .count();
         retired.drain(..n).collect()
     };
+    // Diagnostics (`VICTORY_FREE_TRACE`): what is freed and when, to place
+    // a GPU fault against the free that preceded it.
+    if cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_FREE_TRACE").is_some() {
+        for r in &done {
+            tracing::info!(
+                kind = r.kind,
+                submission = r.submission,
+                frame = r.frame,
+                kept_ms = r.at.elapsed().as_millis() as u64,
+                "retired free"
+            );
+        }
+    }
     drop(done);
 }
 

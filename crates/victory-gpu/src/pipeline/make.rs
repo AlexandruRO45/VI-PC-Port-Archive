@@ -147,7 +147,7 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
 }
 
 /// Queues `p` for the workers, once.
-fn start(p: &Arc<Pending>) {
+pub(crate) fn start(p: &Arc<Pending>) {
     if !p.queued.swap(true, Ordering::Relaxed) {
         PEAK.fetch_max(
             WAITING.fetch_add(1, Ordering::Relaxed) + 1,
