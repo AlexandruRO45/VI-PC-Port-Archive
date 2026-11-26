@@ -932,8 +932,10 @@ mod tests {
     #[test]
     fn direct_mesh_dispatch_uses_all_group_counts() {
         use crate::object::{S_OK, This, guid, slot};
-        use std::os::windows::process::CommandExt;
-        use victory_shader::{HwStage, emit};
+        use victory_shader::native::{MeshIo, StageIo};
+        use victory_shader::{
+            Container, HwStage, NativeProgram, emit, io, ir, resource, structure,
+        };
 
         let Some(host) = host().filter(|host| host.mesh_shaders()) else {
             eprintln!("mesh shaders unavailable; skipped");
@@ -954,72 +956,48 @@ mod tests {
             eprintln!("mesh pipeline statistics unavailable; skipped");
             return;
         }
-        let dxc = std::env::var_os("VICTORY_PC_DXC")
-            .map(std::path::PathBuf::from)
-            .or_else(|| {
-                emit::validator::Validator::default_path().map(|p| p.with_file_name("dxc.exe"))
-            });
-        let Some(dxc) = dxc.filter(|path| path.is_file()) else {
-            eprintln!("no PC dxc.exe; skipped");
-            return;
+        // A one-thread mesh shader with no geometry. The query counts
+        // invocations, so one invocation is one dispatched workgroup.
+        let native = NativeProgram {
+            stage: HwStage::Ms,
+            wave64: false,
+            vgprs: 1,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Ms(MeshIo {
+                outputs: vec![],
+                clip_cntl: 0,
+                threads: 1,
+                max_vertices: 3,
+                max_primitives: 1,
+                topology: 2, // Triangle
+                lds_bytes: 0,
+            }),
+            code: 0xbf81_0000u32.to_le_bytes().to_vec(), // s_endpgm
         };
-        let dir = tempfile::tempdir().unwrap();
-        let hlsl = dir.path().join("grid.hlsl");
-        let dxil = dir.path().join("grid.dxil");
-        // One thread per group makes MSInvocations equal the number of groups.
-        std::fs::write(
-            &hlsl,
-            r#"
-struct Vertex { float4 pos : SV_Position; };
-[numthreads(1, 1, 1)]
-[outputtopology("triangle")]
-void main(out vertices Vertex verts[3], out indices uint3 tris[1]) {
-    SetMeshOutputCounts(3, 1);
-    verts[0].pos = float4(-1, -1, 0.5, 1);
-    verts[1].pos = float4(-1,  1, 0.5, 1);
-    verts[2].pos = float4( 1, -1, 0.5, 1);
-    tris[0] = uint3(0, 1, 2);
-}
-"#,
-        )
-        .unwrap();
-        let output = std::process::Command::new(dxc)
-            .creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW)
-            .args(["-T", "ms_6_6", "-E", "main", "-Fo"])
-            .args([&dxil, &hlsl])
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let dxil = std::fs::read(dxil).unwrap();
-        let shader = Shader::new("mesh", &dxil);
+        let container = Container {
+            digest: [0; 16],
+            version: (1, 0),
+            parts: vec![],
+        };
+        let program = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+        let structured = structure::structure(&program).unwrap();
+        let resources =
+            resource::track(&program, &native.layout, native.stage, Some(&structured)).unwrap();
+        let shader_io = io::raise(&program, &native).unwrap();
+        let host_shader =
+            emit::emit(&container, &native, &program, &structured, &shader_io, &resources).unwrap();
+        let shader = Shader::new("mesh", &host_shader.dxil);
         assert!(
             shader
                 .translated
                 .set(Some(Translated {
-                    host: emit::HostShader {
-                        stage: HwStage::Ms,
-                        dxil,
-                        user_data: vec![],
-                        samplers: vec![],
-                        static_samplers: vec![],
-                        root_cbvs: vec![],
-                        root_srvs: vec![],
-                        root_uavs: vec![],
-                        memory: false,
-                        memory_writes: false,
-                        view_addresses: false,
-                        heap: false,
-                        heap_writes: false,
-                        view_marks: false,
-                    },
+                    host: host_shader,
                     used: vec![],
                 }))
                 .is_ok()
         );
+
         let mut graphics = GraphicsState {
             topology: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
             ..Default::default()
@@ -1062,6 +1040,19 @@ void main(out vertices Vertex verts[3], out indices uint3 tris[1]) {
             crate::list::create_list(null, 0, 0, alloc, null, &list_iid, &mut list),
             S_OK
         );
+        // Bind a guest view heap. The normal list path supplies the fallback
+        // sampler heap needed by the pipeline's directly indexed signature.
+        let desc: [u32; 8] = [0, 1, 1, 0, 0, 0, 0, 0];
+        let iid = ID3D12DescriptorHeap::IID;
+        let iid = guid(iid.data1, iid.data2, iid.data3, iid.data4);
+        let mut heap = null;
+        assert_eq!(
+            crate::descriptor::create_heap(null, desc.as_ptr().cast(), &iid, &mut heap),
+            S_OK
+        );
+        slot::<extern "system" fn(This, u32, *const This)>(
+            list, crate::list::slot_offset_for_test(list, 0x100),
+        )(list, 1, &heap);
         let native = crate::list::host_list(list).unwrap();
         slot::<extern "system" fn(This, This)>(list, 0xc8)(list, pipeline);
         let mut queries: Option<ID3D12QueryHeap> = None;
@@ -1119,7 +1110,7 @@ void main(out vertices Vertex verts[3], out indices uint3 tris[1]) {
         .iter()
         .map(|s| s.MSInvocations)
         .collect();
-        for object in [list, alloc, pipeline] {
+        for object in [list, alloc, pipeline, heap] {
             slot::<extern "system" fn(This) -> u32>(object, 0x10)(object);
         }
         assert_eq!(actual, [2, 6, 8, 24, 0, 2]);
