@@ -159,6 +159,7 @@ impl Shader {
                     Ok(t) => tracing::info!(
                         stage = self.stage,
                         hash = %self.hash,
+                        thread = std::thread::current().name().unwrap_or("unnamed"),
                         user_data = t.host.user_data.len(),
                         samplers = t.host.samplers.len(),
                         cached,
