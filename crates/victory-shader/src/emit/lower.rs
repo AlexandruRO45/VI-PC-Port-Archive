@@ -1259,6 +1259,9 @@ impl<'a> Lower<'a> {
                     r
                 }
             }
+            (Op::MinF | Op::MaxF, Some(_)) => {
+                return Err("a wave prefix of an operation other than a sum");
+            }
             (op, Some(inclusive)) => {
                 let lane = self.s.op(c, "waveGetLaneIndex", Attr::ReadOnly, i32t, 111, &[]);
                 let one_b = self.s.m.bool(true);
@@ -1321,12 +1324,7 @@ impl<'a> Lower<'a> {
                             let t = self.s.m.cmp(c, p, peer, acc);
                             self.s.m.select(c, t, peer, acc)
                         }
-                        Op::MinF | Op::MaxF => {
-                            let (fa, fb) = (self.as_float(acc), self.as_float(peer));
-                            let m = self.max_min(op == Op::MaxF, fa, fb);
-                            self.as_int(m)
-                        }
-                        Op::AddU | Op::AddF | Op::AddH => unreachable!(),
+                        Op::MinF | Op::MaxF | Op::AddU | Op::AddF | Op::AddH => unreachable!(),
                     };
                     acc = self.s.m.select(c, take, merged, acc);
                 }

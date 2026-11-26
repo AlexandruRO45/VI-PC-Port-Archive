@@ -2446,51 +2446,8 @@ fn build_wave_prefix_cs(vop2_op: u8, ident: u32, inclusive: bool, wave64: bool) 
 
 #[test]
 fn wave_prefix_non_sum_ops_match_scan_across_lanes() {
-    fn fmin_rdna(a: u32, b: u32) -> u32 {
-        let ftz = |bits: u32| {
-            let f = f32::from_bits(bits);
-            if f != 0.0 && f.is_subnormal() {
-                f32::from_bits(bits & 0x8000_0000)
-            } else {
-                f
-            }
-        };
-        let (fa, fb) = (ftz(a), ftz(b));
-        if fa.is_nan() {
-            return b;
-        }
-        if fb.is_nan() {
-            return a;
-        }
-        if fa == 0.0 && fb == 0.0 {
-            return a | b;
-        }
-        if fa < fb { a } else { b }
-    }
-    fn fmax_rdna(a: u32, b: u32) -> u32 {
-        let ftz = |bits: u32| {
-            let f = f32::from_bits(bits);
-            if f != 0.0 && f.is_subnormal() {
-                f32::from_bits(bits & 0x8000_0000)
-            } else {
-                f
-            }
-        };
-        let (fa, fb) = (ftz(a), ftz(b));
-        if fa.is_nan() {
-            return b;
-        }
-        if fb.is_nan() {
-            return a;
-        }
-        if fa == 0.0 && fb == 0.0 {
-            return a & b;
-        }
-        if fa > fb { a } else { b }
-    }
-
     type PrefixOp = (&'static str, u8, u32, fn(u32, u32) -> u32);
-    let ops: [PrefixOp; 9] = [
+    let ops: [PrefixOp; 7] = [
         ("min_u32", 0x13, u32::MAX, |a, b| a.min(b)),
         ("max_u32", 0x14, 0, |a, b| a.max(b)),
         ("min_i32", 0x11, 0x7FFF_FFFF, |a, b| {
@@ -2499,8 +2456,6 @@ fn wave_prefix_non_sum_ops_match_scan_across_lanes() {
         ("max_i32", 0x12, 0x8000_0000, |a, b| {
             ((a as i32).max(b as i32)) as u32
         }),
-        ("min_f32", 0x0F, 0x7F80_0000, fmin_rdna),
-        ("max_f32", 0x10, 0xFF80_0000, fmax_rdna),
         ("and_b32", 0x1B, u32::MAX, |a, b| a & b),
         ("or_b32", 0x1C, 0, |a, b| a | b),
         ("xor_b32", 0x1D, 0, |a, b| a ^ b),
