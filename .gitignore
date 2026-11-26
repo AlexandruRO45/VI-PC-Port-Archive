@@ -81,3 +81,7 @@
 *.swp
 Thumbs.db
 .DS_Store
+
+# local agent + vkd3d cache artifacts
+.opencode/
+vkd3d-proton.cache*
