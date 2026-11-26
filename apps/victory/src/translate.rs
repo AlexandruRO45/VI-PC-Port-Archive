@@ -593,6 +593,24 @@ fn translate(
     }
 }
 
+/// Keep the source offset and stage readable within a 100-byte filename stem.
+fn dump_filename(label: &str, dxil: &[u8]) -> String {
+    const HASH_CHARS: usize = 32;
+    const SUFFIX_CHARS: usize = 100 - HASH_CHARS - 1;
+    // Shortened labels can coincide, and one source label can emit different shaders.
+    let mut key = blake3::Hasher::new();
+    key.update(&(label.len() as u64).to_le_bytes());
+    key.update(label.as_bytes());
+    key.update(dxil);
+    let digest = key.finalize().to_hex();
+    let name: String = label
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    let suffix = &name[name.len().saturating_sub(SUFFIX_CHARS)..];
+    format!("{}_{suffix}.dxil", &digest[..HASH_CHARS])
+}
+
 /// Validates an emitted shader if asked to.
 fn check(
     mut shader: emit::HostShader,
@@ -607,14 +625,8 @@ fn check(
     if t.list
         && let Ok(dir) = std::env::var("VICTORY_EMIT_DUMP")
     {
-        let name: String = label()
-            .chars()
-            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-            .collect();
-        let _ = std::fs::write(
-            format!("{dir}/{}.dxil", &name[name.len().saturating_sub(100)..]),
-            &shader.dxil,
-        );
+        let path = Path::new(&dir).join(dump_filename(&label(), &shader.dxil));
+        let _ = std::fs::write(path, &shader.dxil);
     }
     if let Some((h, stub_ps)) = &checks.host {
         let made = match shader.stage {
@@ -854,6 +866,24 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn dump_names_preserve_distinct_labels_and_shaders() {
+        use super::dump_filename;
+
+        let label = "pass-a.bin@0x0 Vs";
+        let name = dump_filename(label, b"A");
+        assert_ne!(name, dump_filename("pass_a.bin@0x0 Vs", b"A"));
+        assert_ne!(name, dump_filename(label, b"B"));
+        assert_eq!(name, dump_filename(label, b"A"));
+        assert!(name.ends_with("_pass_a_bin_0x0_Vs.dxil"));
+
+        let tail = "x".repeat(100);
+        let a = dump_filename(&format!("one/{tail}.bin@0x0 Vs"), b"A");
+        let b = dump_filename(&format!("two/{tail}.bin@0x0 Vs"), b"A");
+        assert_ne!(a, b);
+        assert_eq!(a.len(), 100 + ".dxil".len());
+    }
+
     /// Shader dumps are game-derived, so a dump directory in the repo is refused.
     #[test]
     fn emit_dump_inside_repo_is_refused() {
