@@ -48,6 +48,8 @@ mod placement;
 mod primitive;
 pub mod query;
 pub mod queue;
+#[cfg(windows)]
+mod queue2;
 pub mod resource;
 pub mod root;
 #[cfg(windows)]

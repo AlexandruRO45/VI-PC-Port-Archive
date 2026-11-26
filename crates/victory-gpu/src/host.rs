@@ -1030,6 +1030,9 @@ struct Deferred {
     /// shaders read title memory with no copy (`crate::memory`); then what
     /// they wrote through views does not go back either.
     missed: Vec<Box<dyn Fn() -> bool + Send>>,
+    /// Read backs of what shaders wrote, recorded by the list's commands and
+    /// run once the submission has run (`crate::queue2`, `VICTORY_QUEUE2`).
+    fetches: Vec<crate::queue2::Fetch>,
 }
 
 impl Host {
@@ -1101,6 +1104,12 @@ impl Host {
         })
     }
 
+    /// The queue submissions go to (`crate::queue2` uses it for a copy the
+    /// copy queue may not make).
+    pub(crate) fn direct_queue(&self) -> &ID3D12CommandQueue {
+        &self.queue
+    }
+
     /// A new list, open for recording.
     pub(crate) fn new_list(&self) -> windows::core::Result<HostList> {
         // SAFETY: plain object creation.
@@ -1154,6 +1163,10 @@ impl Host {
 
     /// Runs closed lists and waits for them.
     pub(crate) fn execute(&self, runs: &[&HostList]) {
+        // With `VICTORY_ASYNC_SUBMIT` the submissions the thread of ours has
+        // been given go first: this one keeps its place behind them (the
+        // present's copy of the frame among them).
+        crate::queue::before_sync();
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
@@ -1331,6 +1344,13 @@ impl Host {
                 removed_during(runs, removed_in)
             ));
         }
+        // Read backs of what shaders wrote: with `VICTORY_QUEUE2` bit 1 they
+        // run on a copy queue of ours now that the submission has run, and
+        // their rows go into title memory below (`defer_after`), before the
+        // bottom-of-pipe writes.
+        let fetches: Vec<crate::queue2::Fetch> = runs.iter().flat_map(|list| list.take_fetches()).collect();
+        crate::queue2::run(&fetches);
+        drop(fetches);
         // What shaders wrote goes back before the bottom-of-pipe writes,
         // which tell the title the GPU is done; each range once per
         // submission, however many dispatches declared it (the world's
@@ -1833,6 +1853,9 @@ impl HostList {
     /// one): the state it leaves, if that is a change. Nothing for the
     /// list's first use (its prelude moves the texture there).
     fn track(&self, copy: &std::sync::Arc<crate::resource::HostTexture>, wanted: u32) -> Option<u32> {
+        // Every use moves the count, changed state or not: a fetch recorded
+        // before it goes on the direct queue (`crate::queue2`).
+        copy.moves.fetch_add(1, Ordering::Relaxed);
         let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
         match states.entry(std::sync::Arc::as_ptr(copy) as usize) {
             std::collections::hash_map::Entry::Vacant(v) => {
@@ -2127,6 +2150,18 @@ impl HostList {
     /// bottom-of-pipe writes.
     pub(crate) fn defer_after(&self, work: impl Fn() + Send + 'static) {
         self.deferred().after.push(Box::new(work));
+    }
+
+    /// A read back of what shaders wrote, run once the submission has run
+    /// (`crate::queue2`; the rows go into title memory through the list's
+    /// own `defer_after`).
+    pub(crate) fn defer_fetch(&self, fetch: crate::queue2::Fetch) {
+        self.deferred().fetches.push(fetch);
+    }
+
+    /// The read backs recorded into the list; taken once, at submission.
+    fn take_fetches(&self) -> Vec<crate::queue2::Fetch> {
+        std::mem::take(&mut self.deferred().fetches)
     }
 
     /// Stores `what` (`bytes` of it) at `dst` once the list has run.
