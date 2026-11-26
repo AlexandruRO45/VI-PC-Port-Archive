@@ -2282,6 +2282,42 @@ fn v_mul_legacy_f32_treats_denormals_as_zero() {
     });
 }
 
+/// A whole-wave binary64 sum as the console compiler expands
+/// `WaveActiveSum` of a double (each dword moved by DPP on its own,
+/// `v_add_f64` on the pairs, the rows joined by `v_permlanex16`, lane 31 read
+/// and copied out), then converted with `v_cvt_f32_f64`. One thread: the sum
+/// is its own value, so the result is `x as f32`.
+#[test]
+fn a_whole_wave_binary64_sum_reaches_the_host() {
+    let mut body = vec![0xBE94_3DC1]; // s_or_saveexec_b32 s20, -1
+    body.extend(vop3(0x101, 5, 128, vgpr(1), sgpr(20))); // v_cndmask_b32 v5, 0, v1, s20
+    body.extend(vop3(0x101, 6, 128, vgpr(2), sgpr(20))); // v_cndmask_b32 v6, 0, v2, s20
+    for ctrl in [0x00B1u32, 0x004E, 0x0164, 0x0168] {
+        // v_mov_b32 v7, v5 and v8, v6 (DPP), then v_add_f64 v[5:6], v[7:8], v[5:6]
+        body.extend([vop1(1, 7, 0xFA), 0xFF00_0000 | ctrl << 8 | 5]);
+        body.extend([vop1(1, 8, 0xFA), 0xFF00_0000 | ctrl << 8 | 6]);
+        body.extend(vop3(0x164, 5, vgpr(7), vgpr(5), 0));
+    }
+    body.extend(vop3(0x378, 7, vgpr(5), 128, 128)); // v_permlanex16_b32 v7, v5, 0, 0
+    body.extend(vop3(0x378, 8, vgpr(6), 128, 128)); // v_permlanex16_b32 v8, v6, 0, 0
+    body.extend(vop3(0x164, 5, vgpr(7), vgpr(5), 0)); // v_add_f64 v[5:6], v[7:8], v[5:6]
+    body.extend(vop3(0x360, 22, vgpr(5), 128 + 31, 0)); // v_readlane_b32 s22, v5, 31
+    body.extend(vop3(0x360, 23, vgpr(6), 128 + 31, 0)); // v_readlane_b32 s23, v6, 31
+    body.push(s_mov_b32(24, 22));
+    body.push(s_mov_b32(25, 23));
+    body.push(s_mov_b32(126, 20)); // s_mov_b32 exec_lo, s20
+    body.push(vop1(0x00f, 0, sgpr(24))); // v_cvt_f32_f64 v0, s[24:25]
+    let shader = build_valu_cs(&body);
+    let cases = [1.0f64, -2.5, 3.0e10, 0.1, 0.0].map(|x| {
+        let b = x.to_bits();
+        [b as u32, (b >> 32) as u32, 0, 0]
+    });
+    run_cases(&shader, &cases, |backend, i, [lo, hi, _, _], got| {
+        let want = f64::from_bits(u64::from(hi) << 32 | u64::from(lo)) as f32;
+        assert_eq!(got, want.to_bits(), "{backend}: case {i}");
+    });
+}
+
 /// `v_cvt_f32_f64`: the pair v1:v2 read as binary64, truncated to f32 bits
 /// in v0 with MODE's default round mode (nearest even). The host does the
 /// conversion with `fptrunc`, so Rust's `as f32` is the expectation.
