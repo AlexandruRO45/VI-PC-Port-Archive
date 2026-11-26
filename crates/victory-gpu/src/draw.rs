@@ -2806,6 +2806,78 @@ uint ps() : SV_Target { return 1; }
         }
     }
 
+    #[test]
+    fn an_overflow_srv_follows_a_replaced_texture_without_a_new_record() {
+        let Some(host) = crate::host::host() else { return };
+        let guest_heap = heap_keeping(4, 16);
+        let title_heap = crate::descriptor::heap(guest_heap);
+        let heap = title_heap.host().unwrap();
+        let slots = Slots::from_heap(heap.heap.clone());
+        let shader = compile_cs(READ);
+        let (out, data) = host.shared_buffer(64 * 64 * 16).unwrap();
+        let address = crate::watch::tests::pool(1) as u64;
+        let words = texture_words(64, 64, 28, 0x100, 0); // linear RGBA8
+        // SAFETY: the first texel lies in the committed pool page.
+        unsafe { (address as *mut [u8; 4]).write([255, 0, 0, 255]) };
+        let View::Placed(_, _, desc) = placed_view(address, words) else { unreachable!() };
+        let slot = title_heap.start + 8 * 32;
+        crate::descriptor::create_placed_srv(std::ptr::null(), &words, &desc, slot);
+        let view = crate::descriptor::view(slot).unwrap();
+        // SAFETY: slot 8 is inside the title heap and holds a 3-word view record.
+        let record = || unsafe { (slot as *const [u32; 3]).read_unaligned() };
+        let original = record();
+
+        let read_slot = |index| {
+            let list = host.new_list().unwrap();
+            readable(&list, &used(ResourceType::Srv), &view, false);
+            // SAFETY: the previous submission has completed; clear its mapped output.
+            unsafe { data.cast::<[f32; 4]>().write([0.0; 4]) };
+            run(&list, &slots, &shader, index, Some(&out), (1, 1));
+            list.close();
+            host.execute(&[&list]);
+            // SAFETY: the dispatch wrote its first float4 here and has completed.
+            unsafe { data.cast::<[f32; 4]>().read() }
+        };
+        let copied = heap.dynamic(1).unwrap();
+        let fresh = heap.dynamic(1).unwrap();
+        let copy_and_read = || {
+            let (made, _) = heap.copy_overflow(copied, 8, 1, slot).expect("overflow table");
+            (made, read_slot(copied))
+        };
+        let red = [1.0, 0.0, 0.0, 1.0];
+        let green = [0.0, 1.0, 0.0, 1.0];
+        let placed = crate::resource::texture_at(address, &words).unwrap();
+        let old = crate::resource::host_resource(placed).unwrap();
+        assert_eq!(copy_and_read(), (1, red));
+
+        // Request render-target use at the same address only after sampling the red texture.
+        // The host now needs a different resource; the title's SRV was never rewritten.
+        let writable = texture_at_address(address, &texture_words(64, 64, 28, 0x100, 1));
+        let new = crate::resource::host_copy(writable).unwrap();
+        assert_ne!(old, new.texture);
+        let list = host.new_list().unwrap();
+        // SAFETY: the RTV describes this live render target; the list tracks its state.
+        unsafe {
+            if let Some(barrier) = list.move_texture(&new, D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32) {
+                list.list.ResourceBarrier(&[barrier]);
+            }
+            list.list.ClearRenderTargetView(host.rtv(&new.texture, None), &green, None);
+        }
+        crate::texture::host_writes(&list, writable);
+        list.close();
+        host.execute(&[&list]);
+        assert_eq!(record(), original);
+        heap.make_at(fresh, &view);
+        assert_eq!(read_slot(fresh), green, "freshly made SRV");
+        assert_eq!(copy_and_read(), (1, green), "replacement remade once");
+        assert_eq!(copy_and_read(), (0, green), "unchanged replacement reused");
+        heap.release(copied, 1);
+        heap.release(fresh, 1);
+        type Release = extern "system" fn(This) -> u32;
+        crate::object::slot::<Release>(guest_heap, 0x10)(guest_heap);
+        crate::object::slot::<Release>(writable, 0x10)(writable);
+    }
+
     /// Fresh tables of 8 past the host's title slots, per 1,000: made one
     /// view at a time (`VICTORY_OVERFLOW_VIEWS=0`), against copied from the
     /// overflow heap at their first use (its views made) and with their
@@ -2907,6 +2979,11 @@ uint ps() : SV_Target { return 1; }
             };
             // SAFETY: plain creation.
             let heap = unsafe { host.device.CreateDescriptorHeap(&desc) }.unwrap();
+            Self::from_heap(heap)
+        }
+
+        fn from_heap(heap: ID3D12DescriptorHeap) -> Self {
+            let host = crate::host::host().unwrap();
             // SAFETY: a plain query.
             let step = unsafe { host.device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) };
             Slots(heap, step)
