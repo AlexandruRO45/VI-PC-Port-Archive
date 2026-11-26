@@ -1012,6 +1012,9 @@ struct Deferred {
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
+    /// Buffer ranges already declared as written by shaders since the last
+    /// title copy (host copy, address, bytes, marked, uses title memory).
+    gpu_writes: std::collections::HashSet<(usize, usize, usize, bool, bool)>,
     /// Textures whose contents the list brings up to date.
     textures: std::collections::HashSet<usize>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
@@ -1030,6 +1033,15 @@ struct Deferred {
     /// shaders read title memory with no copy (`crate::memory`); then what
     /// they wrote through views does not go back either.
     missed: Vec<Box<dyn Fn() -> bool + Send>>,
+}
+
+impl Deferred {
+    /// A step may write title memory: later refreshes and GPU-write
+    /// declarations must run again after it.
+    fn title_written(&mut self) {
+        self.refreshed.clear();
+        self.gpu_writes.clear();
+    }
 }
 
 impl Host {
@@ -2055,7 +2067,7 @@ impl HostList {
         deferred
             .copies
             .push(Step::Copy(dst as usize, src as usize, len));
-        deferred.refreshed.clear();
+        deferred.title_written();
     }
 
     /// Copies `len` bytes of title memory at `src` into the list's upload
@@ -2086,7 +2098,9 @@ impl HostList {
 
     /// Shaders of the list write `[address, address + len)` of a buffer's
     /// host copy: copied back into title memory once the list has run
-    /// (`marked`: the pages they mark).
+    /// (`marked`: the pages they mark). Identical declarations on the same
+    /// list are recorded once until a step that may write title memory
+    /// intervenes.
     pub(crate) fn defer_gpu_write(
         &self,
         shadow: &std::sync::Arc<crate::shadow::Shadow>,
@@ -2095,9 +2109,19 @@ impl HostList {
         marked: bool,
     ) {
         let memory = self.memory_writer.load(Ordering::Relaxed);
-        self.deferred()
-            .copies
-            .push(Step::GpuWrite(shadow.clone(), address, len, marked, memory));
+        let mut deferred = self.deferred();
+        let key = (
+            std::sync::Arc::as_ptr(shadow) as usize,
+            address,
+            len,
+            marked,
+            memory,
+        );
+        if deferred.gpu_writes.insert(key) {
+            deferred
+                .copies
+                .push(Step::GpuWrite(shadow.clone(), address, len, marked, memory));
+        }
     }
 
     /// Shaders of the list take views from the heap itself
@@ -2272,10 +2296,12 @@ impl HostList {
     }
 
     /// Runs `work` when the list is submitted, in order with its copies.
-    /// `work` may write title memory (refreshes after it copy again).
+    /// `work` may write title memory (refreshes and GPU-write declarations
+    /// after it run again).
     pub(crate) fn defer(&self, work: impl Fn() + Send + 'static) {
-        self.deferred().copies.push(Step::Run(Box::new(work)));
-        self.deferred().refreshed.clear();
+        let mut deferred = self.deferred();
+        deferred.copies.push(Step::Run(Box::new(work)));
+        deferred.title_written();
     }
 
     /// As [`HostList::defer`], for work that writes only host memory.
@@ -4015,6 +4041,237 @@ mod withholding {
             drop(copy);
             crate::watch::tests::free(p);
         }
+    }
+}
+
+#[cfg(test)]
+mod gpu_write_dedup {
+    use super::{HostList, Step, host};
+
+    fn gpu_write_steps(list: &HostList) -> Vec<(usize, usize, usize, bool, bool)> {
+        list.deferred()
+            .copies
+            .iter()
+            .filter_map(|step| match step {
+                Step::GpuWrite(shadow, address, len, marked, memory) => Some((
+                    std::sync::Arc::as_ptr(shadow) as usize,
+                    *address,
+                    *len,
+                    *marked,
+                    *memory,
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Repeated identical `defer_gpu_write` declarations on the same list collapse
+    /// into a single `Step::GpuWrite` until a title-writing step (`defer_copy` or
+    /// `defer`) or `reset` clears the per-list set; host-only steps do not clear it.
+    #[test]
+    fn identical_gpu_writes_deduplicate_until_title_written_or_reset() {
+        use crate::watch::PAGE;
+        let Some(host) = host() else {
+            return; // no host GPU here
+        };
+        let p = crate::watch::tests::pool(2);
+        let len = 2 * PAGE;
+        crate::shadow::register(p, p as u64, len as u64);
+        let copy = crate::shadow::find(p as u64, len as u64).unwrap();
+        let list = host.new_list().unwrap();
+
+        for _ in 0..50 {
+            list.defer_gpu_write(&copy, p, 64, false);
+        }
+        assert_eq!(
+            gpu_write_steps(&list).len(),
+            1,
+            "identical declarations collapse into one step"
+        );
+
+        for _ in 0..10 {
+            list.defer_gpu_write(&copy, p + 64, 64, false);
+        }
+        assert_eq!(
+            gpu_write_steps(&list).len(),
+            2,
+            "a distinct range records its own step once"
+        );
+
+        // A host-only step does not write title memory and keeps deduplication active.
+        list.defer_host(|| {});
+        list.defer_gpu_write(&copy, p, 64, false);
+        assert_eq!(gpu_write_steps(&list).len(), 2);
+
+        // `defer_copy` may write title memory, so a subsequent declaration is recorded again.
+        list.defer_copy(p as *mut u8, (p + 128) as *const u8, 4);
+        list.defer_gpu_write(&copy, p, 64, false);
+        list.defer_gpu_write(&copy, p, 64, false);
+        assert_eq!(gpu_write_steps(&list).len(), 3);
+
+        // `defer` (`Step::Run`) may also write title memory.
+        list.defer(|| {});
+        list.defer_gpu_write(&copy, p, 64, false);
+        list.defer_gpu_write(&copy, p, 64, false);
+        assert_eq!(gpu_write_steps(&list).len(), 4);
+
+        // `reset` starts a fresh per-list deduplication set.
+        list.close();
+        list.reset();
+        list.defer_gpu_write(&copy, p, 64, false);
+        list.defer_gpu_write(&copy, p, 64, false);
+        assert_eq!(gpu_write_steps(&list).len(), 1);
+
+        list.close();
+        crate::shadow::unregister(p, p as u64);
+        drop(copy);
+        crate::watch::tests::free(p);
+    }
+
+    /// Declarations on the same `(shadow, address, len)` with distinct `(marked, memory)`
+    /// flags must never collapse into each other.
+    #[test]
+    fn distinct_marked_and_memory_flags_are_never_collapsed() {
+        use crate::watch::PAGE;
+        let Some(host) = host() else {
+            return; // no host GPU here
+        };
+        let p = crate::watch::tests::pool(1);
+        crate::shadow::register(p, p as u64, PAGE as u64);
+        let copy = crate::shadow::find(p as u64, PAGE as u64).unwrap();
+        let copy_ptr = std::sync::Arc::as_ptr(&copy) as usize;
+        let list = host.new_list().unwrap();
+
+        let combos = [(true, false), (false, false), (true, true), (false, true)];
+        for &(marked, memory) in &combos {
+            let _writer = list.writer_uses_memory(memory);
+            for _ in 0..3 {
+                list.defer_gpu_write(&copy, p, 64, marked);
+            }
+        }
+        // Re-declaring any already-seen combination adds no new step.
+        for &(marked, memory) in &combos {
+            let _writer = list.writer_uses_memory(memory);
+            list.defer_gpu_write(&copy, p, 64, marked);
+        }
+
+        let expected: Vec<_> = combos
+            .into_iter()
+            .map(|(marked, memory)| (copy_ptr, p, 64, marked, memory))
+            .collect();
+        assert_eq!(gpu_write_steps(&list), expected);
+
+        list.close();
+        crate::shadow::unregister(p, p as u64);
+        drop(copy);
+        crate::watch::tests::free(p);
+    }
+
+    /// A marked declaration followed by an unmarked declaration on the same range
+    /// still takes its pre-submit snapshot and copies back, and an intervening
+    /// `defer_copy` re-enables snapshot refresh for a subsequent identical write.
+    #[test]
+    fn deduped_marked_then_unmarked_and_post_copy_writes_copy_back() {
+        use crate::watch::PAGE;
+        let Some(host) = host() else {
+            return; // no host GPU here
+        };
+        let p = crate::watch::tests::pool(1);
+        // SAFETY: our pool, not guarded yet.
+        unsafe { std::ptr::write_bytes(p as *mut u8, 0x11, 64) };
+        crate::shadow::register(p, p as u64, PAGE as u64);
+        let copy = crate::shadow::find(p as u64, PAGE as u64).unwrap();
+
+        // 1. Marked declarations followed by unmarked on the exact same range.
+        let list = host.new_list().unwrap();
+        copy.refresh(&list, p as u64, 64);
+        for _ in 0..8 {
+            list.defer_gpu_write(&copy, p, 64, true);
+        }
+        for _ in 0..8 {
+            list.defer_gpu_write(&copy, p, 64, false);
+        }
+        assert_eq!(gpu_write_steps(&list).len(), 2);
+        let writer = copy.clone();
+        list.defer_host(move || writer.write_host(p as u64, &[0x77]));
+        list.close();
+        host.execute(&[&list]);
+        // SAFETY: bytes of our pool.
+        unsafe {
+            assert_eq!((p as *const u8).read_volatile(), 0x77);
+            assert_eq!(((p + 1) as *const u8).read_volatile(), 0x11);
+        }
+
+        // 2. Same unmarked declaration before and after `defer_copy`.
+        list.reset();
+        let src: [u8; 4] = [0x22; 4];
+        copy.refresh(&list, p as u64, 64);
+        list.defer_gpu_write(&copy, p, 64, false);
+        list.defer_copy((p + 8) as *mut u8, src.as_ptr(), src.len());
+        copy.refresh(&list, p as u64, 64);
+        list.defer_gpu_write(&copy, p, 64, false);
+        assert_eq!(gpu_write_steps(&list).len(), 2);
+        let writer = copy.clone();
+        list.defer_host(move || writer.write_host(p as u64, &[0x55]));
+        list.close();
+        host.execute(&[&list]);
+        // SAFETY: bytes of our pool.
+        unsafe {
+            assert_eq!((p as *const u8).read_volatile(), 0x55);
+            assert_eq!(
+                ((p + 8) as *const u8).read_volatile(),
+                0x22,
+                "post-copy refresh synced the snapshot so title copy bytes stay"
+            );
+        }
+
+        crate::shadow::unregister(p, p as u64);
+        drop(copy);
+        crate::watch::tests::free(p);
+    }
+
+    /// An ordinary write declaration followed by a title-memory write declaration
+    /// on the exact same range still withholds copy-back when the list misses.
+    #[test]
+    fn deduped_ordinary_then_memory_write_still_withholds_on_miss() {
+        use crate::watch::PAGE;
+        let Some(host) = host() else {
+            return; // no host GPU here
+        };
+        let p = crate::watch::tests::pool(1);
+        // SAFETY: our pool, not guarded yet.
+        unsafe { (p as *mut u8).write_volatile(0x11) };
+        crate::shadow::register(p, p as u64, PAGE as u64);
+        let copy = crate::shadow::find(p as u64, PAGE as u64).unwrap();
+        let list = host.new_list().unwrap();
+
+        copy.refresh(&list, p as u64, 32);
+        for _ in 0..5 {
+            copy.gpu_writes(&list, p as u64, 32, false);
+        }
+        {
+            let _writer = list.writer_uses_memory(true);
+            for _ in 0..5 {
+                copy.gpu_writes(&list, p as u64, 32, false);
+            }
+        }
+        assert_eq!(gpu_write_steps(&list).len(), 2);
+        let writer = copy.clone();
+        list.defer_host(move || writer.write_host(p as u64, &[0x99]));
+        list.defer_missed(|| true);
+        list.close();
+        host.execute(&[&list]);
+
+        // SAFETY: byte of our pool.
+        let byte = unsafe { (p as *const u8).read_volatile() };
+        assert_eq!(
+            byte, 0x11,
+            "the title-memory declaration was preserved and withheld copy-back"
+        );
+
+        crate::shadow::unregister(p, p as u64);
+        drop(copy);
+        crate::watch::tests::free(p);
     }
 }
 
