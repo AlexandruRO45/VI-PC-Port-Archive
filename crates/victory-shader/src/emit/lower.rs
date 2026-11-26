@@ -73,9 +73,9 @@ pub(crate) struct Lowered {
     #[cfg(test)]
     pub has_half_wave_mask: bool,
     #[cfg(test)]
-    binary_i32_calls: usize,
+    binary_i32_opcodes: Vec<i64>,
     #[cfg(test)]
-    compares_and_selects: usize,
+    icmps_and_selects: (usize, usize),
 }
 
 pub(crate) struct Parts<'a> {
@@ -1417,9 +1417,9 @@ impl<'a> Lower<'a> {
             #[cfg(test)]
             has_half_wave_mask: self.s.m.has_i32_const(!31),
             #[cfg(test)]
-            binary_i32_calls: self.s.m.written_calls("dx.op.binary.i32"),
+            binary_i32_opcodes: self.s.m.written_call_opcodes("dx.op.binary.i32"),
             #[cfg(test)]
-            compares_and_selects: self.s.m.written_compares_and_selects(),
+            icmps_and_selects: self.s.m.written_icmps_and_selects(),
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -11099,29 +11099,36 @@ mod tests {
 
     #[test]
     fn min3_max3_med3_use_dxil_integer_min_max() {
-        // v_mov_b32 v0, v1 exercises the same setup and output store.
-        let baseline = lower_valu(&[0x7E00_0301]).unwrap();
-        for (name, opcode, calls) in [
-            ("v_min3_i32", 0x152, 2),
-            ("v_min3_u32", 0x153, 2),
-            ("v_max3_i32", 0x155, 2),
-            ("v_max3_u32", 0x156, 2),
-            ("v_med3_i32", 0x158, 4),
-            ("v_med3_u32", 0x159, 4),
-        ] {
+        const I_MAX: i64 = 37;
+        const I_MIN: i64 = 38;
+        const U_MAX: i64 = 39;
+        const U_MIN: i64 = 40;
+        let cases: [(&str, u32, &[i64]); 6] = [
+            ("v_min3_i32", 0x152, &[I_MIN, I_MIN]),
+            ("v_min3_u32", 0x153, &[U_MIN, U_MIN]),
+            ("v_max3_i32", 0x155, &[I_MAX, I_MAX]),
+            ("v_max3_u32", 0x156, &[U_MAX, U_MAX]),
+            ("v_med3_i32", 0x158, &[I_MAX, I_MAX, I_MIN, I_MIN]),
+            ("v_med3_u32", 0x159, &[U_MAX, U_MAX, U_MIN, U_MIN]),
+        ];
+        // v_xor3_b32 v0, v1, v2, v3 keeps the same inputs and buffer store
+        // live. The shared setup and store contribute an icmp and a select.
+        let control = lower_valu(&[0xD578_0000, 0x040E_0501]).unwrap();
+        for (name, opcode, expected) in cases {
             let lowered = lower_valu(&[
                 0xD400_0000 | opcode << 16, // VOP3 v0, v1, v2, v3
                 0x040E_0501,
             ])
             .unwrap();
+            let mut opcodes = lowered.binary_i32_opcodes;
+            opcodes.sort_unstable();
+            let mut expected_opcodes = control.binary_i32_opcodes.clone();
+            expected_opcodes.extend_from_slice(expected);
+            expected_opcodes.sort_unstable();
             assert_eq!(
-                lowered.binary_i32_calls,
-                baseline.binary_i32_calls + calls,
-                "{name}: dx.op.binary.i32 calls"
-            );
-            assert_eq!(
-                lowered.compares_and_selects, baseline.compares_and_selects,
-                "{name}: introduced compares or selects"
+                (opcodes, lowered.icmps_and_selects),
+                (expected_opcodes, control.icmps_and_selects),
+                "{name}: dx.op.binary.i32 opcodes and (icmp, select) counts"
             );
         }
     }
