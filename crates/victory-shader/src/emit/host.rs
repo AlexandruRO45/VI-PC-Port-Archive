@@ -2204,11 +2204,19 @@ mod tests {
 
     /// The hardware path uses one queue for every host. Several threads
     /// dispatch on it at once, each checking its own readback token.
+    /// Skipped only without a hardware SM 6.6 device; a queue that cannot be
+    /// made on one fails.
     #[test]
     fn parallel_hardware_dispatches_on_shared_queue() {
-        let Ok(first) = Host::new_for(false) else {
-            eprintln!("no hardware SM 6.6 adapter for concurrent dispatches; skipped");
-            return;
+        let first = match Host::new_for(false) {
+            Ok(host) => host,
+            Err(e) => {
+                if let Err(device) = create_device(false) {
+                    eprintln!("no hardware SM 6.6 adapter ({device}); skipped");
+                    return;
+                }
+                panic!("hardware device made, shared queue failed: {e}");
+            }
         };
         let second = Host::new_for(false).expect("second hardware Host::new");
         assert_eq!(
@@ -2216,6 +2224,14 @@ mod tests {
             second.device(),
             "hardware device should be shared"
         );
+        let queue = first.queue().expect("first hardware queue");
+        assert_eq!(
+            queue,
+            second.queue().expect("second hardware queue"),
+            "hardware queue should be shared"
+        );
+        // Workers compare addresses: `first` keeps this queue alive.
+        let queue = queue.as_raw() as usize;
 
         let shader = constant_probe();
         let threads = 8;
@@ -2234,6 +2250,8 @@ mod tests {
                     barrier.wait();
                     let (host, pipeline) = setup.expect("hardware Host::new");
                     let (root, pso) = pipeline.expect("hardware pipeline");
+                    let own = host.queue().expect("worker hardware queue");
+                    assert_eq!(own.as_raw() as usize, queue, "thread {i} has its own queue");
                     let mut user_data = vec![0; shader.user_data_dwords().max(1) as usize];
                     for u in &shader.user_data {
                         if u.root == crate::native::RootType::Constants {
