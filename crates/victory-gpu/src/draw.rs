@@ -162,21 +162,45 @@ pub(crate) fn take_dropped() -> u64 {
 }
 static DROPPED: AtomicU64 = AtomicU64::new(0);
 
-/// Marks the last traced draw as not run on the host, counts it by why
-/// (the reason [`not_run`] gave, if its pipeline has a host one) and notes
-/// it in the list (diagnostics).
-#[cfg(feature = "diagnostics")]
+/// Counts a draw or dispatch of `pipeline` as not run on the host (without a
+/// host pipeline: by whether one can still arrive; else by the reason
+/// [`not_run`] gave) and, with the diagnostics feature, marks it in the trace
+/// and notes it in the list.
 fn dropped(list: &HostList, pipeline: usize, kind: &str) {
-    let why = NOT_RUN.with(|w| w.replace(""));
-    if why.is_empty() || crate::pipeline::host_pipeline(pipeline as This).is_none() {
-        crate::pipeline::note_drop(pipeline as This);
-    } else {
-        crate::pipeline::note_why(format!("{kind}: {why} {}", crate::pipeline::shaders_of(pipeline as This)));
+    count_dropped(pipeline, kind);
+    #[cfg(feature = "diagnostics")]
+    {
+        let why = NOT_RUN.with(|w| w.replace(""));
+        list.note_op(|| {
+            format!(
+                "DROPPED {kind} ({why}) {}",
+                crate::pipeline::shaders_of(pipeline as This)
+            )
+        });
+        if let Some(last) = FRAME.lock().unwrap_or_else(|e| e.into_inner()).last_mut() {
+            last.push_str(" DROPPED");
+        }
     }
-    list.note_op(|| format!("DROPPED {kind} ({why}) {}", crate::pipeline::shaders_of(pipeline as This)));
-    if let Some(last) = FRAME.lock().unwrap_or_else(|e| e.into_inner()).last_mut() {
-        last.push_str(" DROPPED");
+    #[cfg(not(feature = "diagnostics"))]
+    let _ = (list, kind);
+}
+
+/// The counter side of [`dropped`], in every build.
+fn count_dropped(pipeline: usize, kind: &str) {
+    #[cfg(feature = "diagnostics")]
+    {
+        let why = NOT_RUN.with(|w| w.replace(""));
+        if !why.is_empty() && crate::pipeline::host_pipeline(pipeline as This).is_some() {
+            crate::pipeline::note_why(format!(
+                "{kind}: {why} {}",
+                crate::pipeline::shaders_of(pipeline as This)
+            ));
+            return;
+        }
     }
+    #[cfg(not(feature = "diagnostics"))]
+    let _ = kind;
+    crate::pipeline::note_drop(pipeline as This);
 }
 
 #[cfg(feature = "diagnostics")]
@@ -1106,7 +1130,6 @@ impl State {
                 "a dispatch without a host pipeline dropped"
             );
             DROPPED.fetch_add(1, Ordering::Relaxed);
-            #[cfg(feature = "diagnostics")]
             dropped(list, self.pipeline, "dispatch");
             return;
         };
@@ -1116,7 +1139,6 @@ impl State {
         }
         if !self.bind(list, p, true) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
-            #[cfg(feature = "diagnostics")]
             dropped(list, self.pipeline, "dispatch");
             return;
         }
@@ -1215,7 +1237,6 @@ impl State {
             };
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
-            #[cfg(feature = "diagnostics")]
             dropped(list, self.pipeline, "mesh");
         }
     }
@@ -1590,7 +1611,6 @@ impl State {
         }
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
-            #[cfg(feature = "diagnostics")]
             dropped(list, self.pipeline, "draw");
         }
     }
@@ -1684,7 +1704,6 @@ impl State {
         }
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
-            #[cfg(feature = "diagnostics")]
             dropped(list, self.pipeline, "indexed");
         }
     }
@@ -1732,7 +1751,6 @@ impl State {
         // reads. Same order as the `is_skipped` check above, for the same
         // reason.
         if crate::pipeline::host_pipeline(self.pipeline as This).is_none() {
-            #[cfg(feature = "diagnostics")]
             crate::pipeline::note_drop(self.pipeline as This);
             why("no host pipeline");
             return false;
