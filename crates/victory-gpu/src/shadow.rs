@@ -1910,7 +1910,12 @@ fn sparse_buffer(start: u64, len: u64, of: Option<Arc<Shadow>>) -> Option<Shadow
     });
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-    tracing::info!(start = format_args!("{start:#x}"), len, alias = of.is_some(), "sparse copies of title memory");
+    tracing::info!(
+        start = format_args!("{start:#x}"),
+        len,
+        alias = of.is_some(),
+        "sparse copies of title memory"
+    );
     Some(Shadow {
         buffer,
         data: std::ptr::null_mut(),

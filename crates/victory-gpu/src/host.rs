@@ -1147,9 +1147,6 @@ struct Deferred {
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
-    /// Buffer ranges declared written by shaders since the last title copy
-    /// (host copy, address, bytes): declaring them again would change nothing.
-    gpu_written: std::collections::HashSet<(usize, usize, usize)>,
     /// Upload memory filled from title memory since the last title write
     /// (source, bytes): its host address, which a second fill would find
     /// holding the same bytes.
@@ -1498,29 +1495,32 @@ impl Host {
         let mut card_writes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> =
             Vec::new();
         let mut cpu_back: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
-        // A copy is either a card's or not, so one set of ranges serves both.
-        let mut declared = std::collections::HashSet::new();
         for list in runs {
             for step in &list.deferred().copies {
-                if let Step::GpuWrite(shadow, address, len) = step
-                    && declared.insert((std::sync::Arc::as_ptr(shadow) as usize, *address, *len))
-                {
+                if let Step::GpuWrite(shadow, address, len) = step {
                     let target = if shadow.is_card() {
                         &mut card_writes
                     } else {
                         &mut cpu_back
                     };
-                    target.push((shadow.clone(), *address, *len));
+                    if !target.iter().any(|(s, a, l)| {
+                        std::sync::Arc::ptr_eq(s, shadow) && (*a, *l) == (*address, *len)
+                    }) {
+                        target.push((shadow.clone(), *address, *len));
+                    }
                 }
             }
         }
         for (shadow, address, len) in batch.bindless_writes.drain(..) {
-            if declared.insert((std::sync::Arc::as_ptr(&shadow) as usize, address, len)) {
-                let target = if shadow.is_card() {
-                    &mut card_writes
-                } else {
-                    &mut cpu_back
-                };
+            let target = if shadow.is_card() {
+                &mut card_writes
+            } else {
+                &mut cpu_back
+            };
+            if !target
+                .iter()
+                .any(|(s, a, l)| std::sync::Arc::ptr_eq(s, &shadow) && (*a, *l) == (address, len))
+            {
                 target.push((shadow, address, len));
             }
         }
@@ -2527,7 +2527,6 @@ impl HostList {
             .copies
             .push(Step::Copy(dst as usize, src as usize, len));
         deferred.refreshed.clear();
-        deferred.gpu_written.clear();
         deferred.filled.clear();
     }
 
@@ -2580,13 +2579,9 @@ impl HostList {
         address: usize,
         len: usize,
     ) {
-        let mut deferred = self.deferred();
-        let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len);
-        if deferred.gpu_written.insert(key) {
-            deferred
-                .copies
-                .push(Step::GpuWrite(shadow.clone(), address, len));
-        }
+        self.deferred()
+            .copies
+            .push(Step::GpuWrite(shadow.clone(), address, len));
     }
 
     /// A wait for a memory value.
@@ -2950,7 +2945,6 @@ impl HostList {
         let mut deferred = self.deferred();
         deferred.copies.push(Step::Run(Box::new(work)));
         deferred.refreshed.clear();
-        deferred.gpu_written.clear();
         deferred.filled.clear();
     }
 
