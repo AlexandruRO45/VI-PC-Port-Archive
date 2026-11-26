@@ -85,7 +85,8 @@ pub fn host_shader(container: &[u8]) -> (Result<HostShader, String>, bool) {
     // Writes through views mark their pages: copy-backs compare only those
     // (`crate::shadow::copy_back_marks`).
     let options = victory_shader::emit::Options { view_marks: true };
-    let translate = |c: &[u8]| victory_shader::emit::translate_with(c, options).map_err(|e| e.to_string());
+    let translate =
+        |c: &[u8]| victory_shader::emit::translate_with(c, options).map_err(|e| e.to_string());
     match CACHE.get() {
         Some(cache) => cached(cache, build(), container, translate),
         None => (translate(container), false),
@@ -466,14 +467,15 @@ mod tests {
         };
         let refused = (Err("unsupported".to_owned()), false);
         assert_eq!(cached(&cache, &build, b"other", fail), refused);
-        assert_eq!(cached(&cache, &build, b"other", fail), (refused.0, true));
+        assert_eq!(
+            cached(&cache, &build, b"other", fail),
+            (refused.0.clone(), true)
+        );
         assert_eq!(fails.load(Ordering::Relaxed), 1);
 
         let path = walk(dir.path())
             .into_iter()
-            .find(|path| {
-                std::fs::read(path).is_ok_and(|bytes| bytes.starts_with(REFUSED))
-            })
+            .find(|path| std::fs::read(path).is_ok_and(|bytes| bytes.starts_with(REFUSED)))
             .expect("cached refusal entry");
         std::fs::write(&path, &encode(&Err("unsupported".to_owned()))[..8]).unwrap();
         assert_eq!(
