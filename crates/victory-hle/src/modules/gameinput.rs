@@ -1,6 +1,7 @@
 //! `gameinput.dll`: input devices from the host. Gamepads come from XInput
 //! (host slots 0-3); while none is connected, the keyboard drives one
-//! stand-in gamepad (`FALLBACK_BUTTONS`). The keyboard is a device of its own
+//! stand-in gamepad (`FALLBACK_BUTTONS`), otherwise it also drives the first
+//! connected pad (`with_keys`). The keyboard is a device of its own
 //! too. A poll thread turns host state into readings (a new one per change)
 //! and runs device callbacks on connect and disconnect.
 #![allow(non_snake_case)]
@@ -148,6 +149,22 @@ fn fallback(keys: &[KeyState]) -> PadState {
         left_y: on(b'W') - on(b'S'),
         right_x: on(b'L') - on(b'J'),
         right_y: on(b'I') - on(b'K'),
+    }
+}
+
+/// A host pad with the keyboard's stand-in on top: buttons of either, the
+/// further trigger, and on each stick axis the keys while they are held.
+/// With no key held this is the pad as it is.
+fn with_keys(pad: PadState, keys: PadState) -> PadState {
+    let axis = |pad: f32, keys: f32| if keys == 0.0 { pad } else { keys };
+    PadState {
+        buttons: pad.buttons | keys.buttons,
+        left_trigger: pad.left_trigger.max(keys.left_trigger),
+        right_trigger: pad.right_trigger.max(keys.right_trigger),
+        left_x: axis(pad.left_x, keys.left_x),
+        left_y: axis(pad.left_y, keys.left_y),
+        right_x: axis(pad.right_x, keys.right_x),
+        right_y: axis(pad.right_y, keys.right_y),
     }
 }
 
@@ -468,11 +485,19 @@ impl State {
     ) -> Vec<Event> {
         let now = now();
         let mut events = std::mem::take(&mut self.pending);
-        let any_pad = pads.iter().any(Option::is_some);
+        let from_keys = fallback(&keys);
+        // The keyboard also drives the first connected pad, so a pad left
+        // plugged in (or a virtual one) does not take the keyboard away.
+        let first = pads.iter().position(Option::is_some);
         for (slot, pad) in pads.into_iter().enumerate() {
+            let pad = if Some(slot) == first {
+                pad.map(|p| with_keys(p, from_keys))
+            } else {
+                pad
+            };
             self.update(devices, slot, pad.map(Value::Pad), now, &mut events);
         }
-        let fallback = (!any_pad).then(|| Value::Pad(fallback(&keys)));
+        let fallback = first.is_none().then_some(Value::Pad(from_keys));
         self.update(devices, FALLBACK, fallback, now, &mut events);
         self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
         events
@@ -1589,6 +1614,52 @@ mod tests {
         release(r);
         // A keyboard reading is no gamepad reading.
         assert_eq!(current(hub, GAMEPAD_KIND, KEYBOARD), Err(READING_NOT_FOUND));
+    }
+
+    #[test]
+    fn keys_also_drive_the_first_connected_pad() {
+        let (hub, host) = fake();
+        let idle = PadState {
+            buttons: B,
+            left_x: 0.25,
+            left_y: -0.5,
+            left_trigger: 0.75,
+            ..Default::default()
+        };
+        {
+            let mut host = host.lock().unwrap();
+            host.pads[1] = Some(idle);
+            host.pads[2] = Some(PadState::default());
+        }
+        hub.poll();
+        // No key held: the pad as it is.
+        let r = current(hub, GAMEPAD_KIND, 1).unwrap();
+        assert_eq!(pad(r), idle);
+        release(r);
+
+        host.lock().unwrap().keys = vec![key(0x0D), key(b'W'), key(b'Z'), key(b'C')];
+        hub.poll();
+        let r = current(hub, GAMEPAD_KIND, 1).unwrap();
+        assert_eq!(
+            pad(r),
+            PadState {
+                buttons: A | B,
+                left_x: 0.25,
+                left_y: 1.0,
+                left_trigger: 1.0,
+                right_trigger: 1.0,
+                ..Default::default()
+            }
+        );
+        release(r);
+        // Only the first pad; the stand-in stays away while a pad is there.
+        let r = current(hub, GAMEPAD_KIND, 2).unwrap();
+        assert_eq!(pad(r), PadState::default());
+        release(r);
+        assert_eq!(
+            current(hub, GAMEPAD_KIND, FALLBACK),
+            Err(DEVICE_DISCONNECTED)
+        );
     }
 
     #[test]

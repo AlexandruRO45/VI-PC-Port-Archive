@@ -256,8 +256,9 @@ are kept under the data folder (default `%LOCALAPPDATA%\victory\data`), derived
 data under the cache folder.
 
 Input: XInput pads. A DualSense or DualSense Edge (USB or Bluetooth) is read
-over HID as well and plays as the first pad when no XInput pad answers. With
-no pad connected the keyboard is a pad while the title's window has focus:
+over HID as well and plays as the first pad when no XInput pad answers. While
+the title's window has focus the keyboard is a pad too: with no pad connected
+it is a pad of its own, otherwise it also drives the first connected pad:
 
 | Keys | Pad |
 |------|-----|
