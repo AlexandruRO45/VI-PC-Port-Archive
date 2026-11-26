@@ -113,6 +113,18 @@ extern "system" fn release(this: This) -> u32 {
 /// Queues the lists' host lists behind what the queue holds, and runs what
 /// may run (`crate::hold`; decision 0007).
 extern "system" fn execute(this: This, count: u32, lists: *const This) {
+    #[cfg(all(windows, feature = "diagnostics"))]
+    let started = std::time::Instant::now();
+    execute_now(this, count, lists);
+    #[cfg(all(windows, feature = "diagnostics"))]
+    {
+        let us = started.elapsed().as_micros() as u64;
+        crate::framelog::add(crate::framelog::T::ExecuteUs, us);
+        crate::framelog::here(crate::framelog::H::ExecuteUs, us);
+    }
+}
+
+fn execute_now(this: This, count: u32, lists: *const This) {
     if lists.is_null() {
         return;
     }
@@ -303,6 +315,8 @@ pub(crate) fn before_sync() {
 #[cfg(windows)]
 fn worker(submitter: std::sync::Arc<Submitter>) {
     SUBMITTING_HERE.set(true);
+    #[cfg(feature = "diagnostics")]
+    crate::framelog::keep_on_fast_cores("victory-submit");
     loop {
         let work = {
             let mut work_queue = submitter.work.lock().unwrap_or_else(|e| e.into_inner());
@@ -313,6 +327,17 @@ fn worker(submitter: std::sync::Arc<Submitter>) {
                 work_queue = submitter.ready.wait(work_queue).unwrap_or_else(|e| e.into_inner());
             }
         };
+        #[cfg(feature = "diagnostics")]
+        let started = std::time::Instant::now();
+        #[cfg(feature = "diagnostics")]
+        let (user, kernel) = crate::framelog::thread_times();
+        #[cfg(feature = "diagnostics")]
+        if crate::framelog::on() {
+            crate::framelog::add(crate::framelog::T::WorkerLooks, 1);
+            if crate::framelog::on_slow_core() {
+                crate::framelog::add(crate::framelog::T::WorkerSlow, 1);
+            }
+        }
         match work {
             Work::Run(lists) => {
                 let runs: Vec<&crate::host::HostList> = lists.iter().map(|l| &**l).collect();
@@ -334,6 +359,13 @@ fn worker(submitter: std::sync::Arc<Submitter>) {
         // may run now (and joins the line before it is counted done, so a
         // submission that follows this one does not pass it).
         pump_held_if_free(Why::Worker);
+        #[cfg(feature = "diagnostics")]
+        {
+            let (user_now, kernel_now) = crate::framelog::thread_times();
+            crate::framelog::add(crate::framelog::T::WorkerUs, started.elapsed().as_micros() as u64);
+            crate::framelog::add(crate::framelog::T::WorkerUserUs, user_now.saturating_sub(user));
+            crate::framelog::add(crate::framelog::T::WorkerKernelUs, kernel_now.saturating_sub(kernel));
+        }
         {
             let mut pending = submitter.pending.lock().unwrap_or_else(|e| e.into_inner());
             *pending = pending.saturating_sub(1);
@@ -677,14 +709,20 @@ extern "system" fn present(
     plane_parameters: *const Plane,
     _parameters: *const u8,
 ) -> HRESULT {
+    #[cfg(all(windows, feature = "diagnostics"))]
+    let presenting = std::time::Instant::now();
     // What may run before the frame is shown does.
     // shortcut: PresentX does not wait behind work the queue still holds (it
     // shows the frame as far as it ran); the frame line names such work.
+    #[cfg(all(windows, feature = "diagnostics"))]
+    let line = std::time::Instant::now();
     pump_held(Why::Present);
     // And what the queues sent without a wait: the frame's draws were on the
     // card (`crate::host::late`). Every present settles, even one with no
     // plane: the title is told the frame is done.
     crate::host::settle_for_present();
+    #[cfg(all(windows, feature = "diagnostics"))]
+    crate::framelog::add(crate::framelog::T::PresentLineUs, line.elapsed().as_micros() as u64);
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
     #[cfg(windows)]
     account_frame(frame);
@@ -780,6 +818,11 @@ extern "system" fn present(
     }
     #[cfg(not(windows))]
     let _ = (planes, plane_parameters);
+    #[cfg(all(windows, feature = "diagnostics"))]
+    {
+        crate::framelog::add(crate::framelog::T::PresentUs, presenting.elapsed().as_micros() as u64);
+        crate::framelog::frame();
+    }
     S_OK
 }
 /// Diagnostics: logs a presented frame that is black after one that was

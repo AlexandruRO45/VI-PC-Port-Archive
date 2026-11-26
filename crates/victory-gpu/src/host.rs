@@ -1416,6 +1416,8 @@ fn declared_writes(runs: &[&HostList]) -> Vec<Declared> {
 /// does not write the copy (the card may be writing it for a later flight);
 /// the ranges are done with per flight afterwards.
 fn relay_hand_back(back: &[Declared]) {
+    #[cfg(feature = "diagnostics")]
+    let (started, mut written) = (std::time::Instant::now(), 0u64);
     // Per copy, the span of the declared ranges, joined: the world declares
     // dozens of overlapping views of its heap and comparing each whole was
     // gigabytes a frame.
@@ -1432,9 +1434,18 @@ fn relay_hand_back(back: &[Declared]) {
     for (shadow, spans) in &work {
         for &(from, to) in spans {
             for (at, n) in shadow.relay_differing(from, to) {
-                shadow.relay_merge(at, n, &mut now, &mut title);
+                let _written = shadow.relay_merge(at, n, &mut now, &mut title) as u64;
+                #[cfg(feature = "diagnostics")]
+                {
+                    written += _written;
+                }
             }
         }
+    }
+    #[cfg(feature = "diagnostics")]
+    {
+        crate::framelog::add(crate::framelog::T::CopyBackUs, started.elapsed().as_micros() as u64);
+        crate::framelog::add(crate::framelog::T::CopyBackBytes, written);
     }
 }
 
@@ -1540,6 +1551,8 @@ fn relay_worker() {
     let Some(host) = host() else {
         return;
     };
+    #[cfg(feature = "diagnostics")]
+    crate::framelog::keep_on_fast_cores("victory-relay");
     // SAFETY: a plain event of our own.
     let Ok(event) = (unsafe { CreateEventW(None, false, false, None) }) else {
         fail(format_args!("no event for the thread that lands submissions sent ahead (VICTORY_RELAY=1)"));
@@ -1886,6 +1899,12 @@ impl Host {
         let gpu = prepared.elapsed();
         SUBMISSION_US[0].fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
         SUBMISSION_US[1].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
+        #[cfg(feature = "diagnostics")]
+        {
+            crate::framelog::add(crate::framelog::T::PrepareUs, (prepared - started).as_micros() as u64);
+            crate::framelog::add(crate::framelog::T::CardWaitUs, gpu.as_micros() as u64);
+            crate::framelog::add(crate::framelog::T::Submissions, 1);
+        }
         // The host resets a device whose submission runs for about 2 s.
         if gpu > std::time::Duration::from_millis(250) {
             let pipelines: std::collections::BTreeSet<String> = runs
@@ -1984,6 +2003,8 @@ impl Host {
             if *goes_back {
                 let written = shadow.copy_back(address, len);
                 COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+                #[cfg(feature = "diagnostics")]
+                crate::framelog::add(crate::framelog::T::CopyBackBytes, written as u64);
             } else {
                 shadow.keep_writes(address, len);
                 crate::memory::note_withheld(len as u64);
@@ -2009,7 +2030,10 @@ impl Host {
                 work();
             }
         }
-        COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
+        let copying_us = copying.elapsed().as_micros() as u64;
+        COPY_BACK[0].fetch_add(copying_us, Ordering::Relaxed);
+        #[cfg(feature = "diagnostics")]
+        crate::framelog::add(crate::framelog::T::CopyBackUs, copying_us);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::FaultsBack, crate::copystat::page_faults().saturating_sub(faults));
         for list in runs {
@@ -2054,7 +2078,11 @@ impl Host {
         if !late() || !relay() {
             return;
         }
+        #[cfg(feature = "diagnostics")]
+        let waiting = std::time::Instant::now();
         relay_wait(why, |line| line.line.is_empty() && !line.settling);
+        #[cfg(feature = "diagnostics")]
+        crate::framelog::add(crate::framelog::T::CardWaitUs, waiting.elapsed().as_micros() as u64);
         let (marked, memory) = {
             let mut guard = line();
             (std::mem::take(&mut guard.marked), std::mem::replace(&mut guard.memory_withheld, false))
@@ -2150,6 +2178,11 @@ impl Host {
             command_lists.push(list.list.cast().ok());
         }
         batch.flush();
+        #[cfg(feature = "diagnostics")]
+        {
+            crate::framelog::add(crate::framelog::T::PrepareUs, _started.elapsed().as_micros() as u64);
+            crate::framelog::add(crate::framelog::T::Submissions, 1);
+        }
         // One value for the whole submission, signalled behind all its
         // lists: the flight's fence.
         *submitted += 1;
@@ -3310,8 +3343,14 @@ impl HostList {
                     continue;
                 }
             };
-            PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+            let us = started.elapsed().as_micros() as u64;
+            PREPARING[0].fetch_add(us, Ordering::Relaxed);
             PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            {
+                crate::framelog::add(crate::framelog::T::CopyUs, us);
+                crate::framelog::add(crate::framelog::T::CopyBytes, copied as u64);
+            }
         }
     }
 }
@@ -3384,6 +3423,11 @@ impl Batch {
             crate::copystat::range(from, to - from, us, 0);
             PREPARING[0].fetch_add(us, Ordering::Relaxed);
             PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            {
+                crate::framelog::add(crate::framelog::T::CopyUs, us);
+                crate::framelog::add(crate::framelog::T::CopyBytes, copied as u64);
+            }
             total += copied;
             // Kept: the union with what was current if they touch, else
             // the larger.
@@ -4118,13 +4162,18 @@ impl Host {
     /// captures are on). `None` if nothing was shown; else, in diagnostics
     /// builds, whether the frame was black.
     pub(crate) fn present(&self, planes: &[(&ID3D12Resource, u32)], frame: u64) -> Option<bool> {
-        self.present_with_compositor(
+        #[cfg(feature = "diagnostics")]
+        let showing = std::time::Instant::now();
+        let shown = self.present_with_compositor(
             planes,
             frame,
             Compositor::new,
             #[cfg(all(test, feature = "diagnostics"))]
             |_, _| {},
-        )
+        );
+        #[cfg(feature = "diagnostics")]
+        crate::framelog::add(crate::framelog::T::PresentShowUs, showing.elapsed().as_micros() as u64);
+        shown
     }
 
     fn present_with_compositor(
