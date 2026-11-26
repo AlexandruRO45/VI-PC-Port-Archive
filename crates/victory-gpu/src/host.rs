@@ -587,6 +587,21 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn copy_statistics_count_all_frames_since_the_last_log() {
+        use std::time::{Duration, Instant};
+
+        let start = Instant::now();
+        let mut log = LogWindow::new(start);
+        for second in 1..=10 {
+            for _ in 0..10 {
+                log.frame();
+            }
+            let expected = (second % 5 == 0).then_some(50);
+            assert_eq!(log.take(start + Duration::from_secs(second)), expected);
+        }
+    }
+
     /// A list with no work before its waits, as the title's queues meet one
     /// another halfway: each write goes as soon as the waits before it are
     /// met, and work holds the later ones back.
@@ -3582,13 +3597,37 @@ impl Presenter {
     }
 }
 
+/// The frames since the last periodic log.
+struct LogWindow {
+    since: std::time::Instant,
+    frames: u64,
+}
+
+impl LogWindow {
+    fn new(since: std::time::Instant) -> Self {
+        Self { since, frames: 0 }
+    }
+
+    fn frame(&mut self) {
+        self.frames += 1;
+    }
+
+    fn take(&mut self, now: std::time::Instant) -> Option<u64> {
+        if now - self.since < std::time::Duration::from_secs(5) {
+            return None;
+        }
+        self.since = now;
+        Some(std::mem::take(&mut self.frames))
+    }
+}
+
 /// The frame rate, shown in the window's caption every second and logged
 /// every few seconds.
 struct Meter {
     since: std::time::Instant,
     frames: u32,
     drawn: u64,
-    logged: std::time::Instant,
+    log_window: LogWindow,
     /// The caption the window had, once read.
     caption: Option<Vec<u16>>,
     /// The frames a second and milliseconds a frame of the last second.
@@ -3602,7 +3641,7 @@ impl Meter {
             since: now,
             frames: 0,
             drawn: crate::draw::drawn(),
-            logged: now,
+            log_window: LogWindow::new(now),
             caption: None,
             shown: None,
         }
@@ -3613,6 +3652,7 @@ impl Meter {
         #[cfg(feature = "diagnostics")]
         tracing::debug!(target: "victory_gpu::frame", token = crate::frame::current(), "present");
         self.frames += 1;
+        self.log_window.frame();
         #[cfg(feature = "diagnostics")]
         TIMED_FRAMES.fetch_add(1, Ordering::Relaxed);
         let elapsed = self.since.elapsed();
@@ -3644,8 +3684,7 @@ impl Meter {
         // Over the same frames as the counts above.
         #[cfg(feature = "diagnostics")]
         let drops = crate::pipeline::take_drops();
-        if self.logged.elapsed() >= std::time::Duration::from_secs(5) {
-            self.logged = std::time::Instant::now();
+        if let Some(_copy_frames) = self.log_window.take(std::time::Instant::now()) {
             #[cfg(feature = "diagnostics")]
             tracing::info!("sparse writes since: {}", crate::shadow::sparse_writes_text());
             #[cfg(feature = "diagnostics")]
@@ -3679,7 +3718,7 @@ impl Meter {
                         crate::resource::placed_census();
                     }
                 }
-                crate::copystat::log(frames);
+                crate::copystat::log(_copy_frames as f64);
                 for (why, n) in drops.iter().take(40) {
                     tracing::info!(
                         "dropped {:.1}/frame without a host pipeline: {why}",
