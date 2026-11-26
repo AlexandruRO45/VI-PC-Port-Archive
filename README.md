@@ -104,6 +104,10 @@ numbers are estimates until a run carries them.**
   recording thread remembers the copies it was answered with until a buffer is added, taken out or
   loses its copy. Every view of every draw asks; in that tree the table's mutex was 32 ms a frame
   of the recording threads, 15 of them waiting for one another.
+- **`VICTORY_BURY_ASIDE=1`** (from Steenax6/VIctory-NVID `2e21055`; compiled here, not run): the
+  host objects that waited for a landed flight are released on a thread of their own, not in the
+  landing, and the ones that still wait are no longer moved at every landing. In that tree: about
+  3 ms a frame off the thread that lands flights.
 - `diagnostics/timing-run-295s-2026-11-25.txt`: a 295 s timing run with breadcrumbs.
 
 ### Before that (2026-11-25, night UTC)
