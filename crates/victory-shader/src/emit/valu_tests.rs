@@ -2249,10 +2249,12 @@ fn relative_moves_reach_only_what_their_clamped_index_can() {
     );
 }
 
-fn build_wave_prefix_cs(vop2_op: u8, ident: u32, inclusive: bool) -> HostShader {
+fn build_wave_prefix_cs(vop2_op: u8, ident: u32, inclusive: bool, wave64: bool) -> HostShader {
     let sop1 = |sdst: u8, op: u8, src0: u8| -> u32 {
         0xBE80_0000 | (sdst as u32) << 16 | (op as u32) << 8 | src0 as u32
     };
+    // s_mov_b64 exec, src (wave64) or s_mov_b32 exec_lo, src (wave32).
+    let mov_exec = |src: u8| sop1(126, if wave64 { 0x04 } else { 0x03 }, src);
     let vop2_rr = |op: u8, vdst: u8, src0: u16, vsrc1: u8| -> u32 {
         (op as u32) << 25 | (vdst as u32) << 17 | (vsrc1 as u32) << 9 | (src0 as u32 & 0x1FF)
     };
@@ -2287,8 +2289,9 @@ fn build_wave_prefix_cs(vop2_op: u8, ident: u32, inclusive: bool) -> HostShader 
     w.push(vop2_rr(0x1B, 4, 131, 0));
     w.push(0x7DAA_0880);
 
-    // Whole-wave section: s_or_saveexec_b64 s[0:1], -1 (wave64=true avoids [WaveSize(32)] on WARP)
-    w.push(sop1(0, 0x25, 193));
+    // Whole-wave section: s_or_saveexec_b64 s[0:1], -1 (wave64) or
+    // s_or_saveexec_b32 s0, -1 (wave32). The wave32 variant only touches exec_lo.
+    w.push(sop1(0, if wave64 { 0x25 } else { 0x3D }, 193));
     w.extend_from_slice(&vop3(0x101, 1, 255, vgpr(3), 0));
     w.push(ident);
     for shift in [1u16, 2, 4, 8] {
@@ -2298,49 +2301,57 @@ fn build_wave_prefix_cs(vop2_op: u8, ident: u32, inclusive: bool) -> HostShader 
     w.extend_from_slice(&vop3(0x360, 2, vgpr(1), 128 + 15, 0));
     w.push(sop1(126, 0x03, 255));
     w.push(0xFFFF_0000);
-    w.push(sop1(127, 0x03, 128));
+    if wave64 {
+        w.push(sop1(127, 0x03, 128));
+    }
     w.push(vop2_rr(vop2_op, 1, sgpr(2), 1));
-    w.extend_from_slice(&vop3(0x360, 2, vgpr(1), 128 + 31, 0));
-    w.push(sop1(126, 0x03, 128));
-    w.push(sop1(127, 0x03, 255));
-    w.push(0x0000_FFFF);
-    w.push(vop2_rr(vop2_op, 1, sgpr(2), 1));
-    w.extend_from_slice(&vop3(0x360, 2, vgpr(1), 128 + 47, 0));
-    w.push(sop1(126, 0x03, 128));
-    w.push(sop1(127, 0x03, 255));
-    w.push(0xFFFF_0000);
-    w.push(vop2_rr(vop2_op, 1, sgpr(2), 1));
+    if wave64 {
+        w.extend_from_slice(&vop3(0x360, 2, vgpr(1), 128 + 31, 0));
+        w.push(sop1(126, 0x03, 128));
+        w.push(sop1(127, 0x03, 255));
+        w.push(0x0000_FFFF);
+        w.push(vop2_rr(vop2_op, 1, sgpr(2), 1));
+        w.extend_from_slice(&vop3(0x360, 2, vgpr(1), 128 + 47, 0));
+        w.push(sop1(126, 0x03, 128));
+        w.push(sop1(127, 0x03, 255));
+        w.push(0xFFFF_0000);
+        w.push(vop2_rr(vop2_op, 1, sgpr(2), 1));
+    }
 
     if inclusive {
-        w.push(sop1(126, 0x04, 0));
+        w.push(mov_exec(0));
         w.push(vop1(0x001, 0, vgpr(1)));
     } else {
-        w.push(sop1(126, 0x04, 193));
+        w.push(mov_exec(193));
         w.push(vop1(0x001, 3, 255));
         w.push(ident);
         w.push(vop1(0x001, 4, 0xFA));
         w.push(dpp16(1, 0x111, 0xF, 0xF, false));
-        w.push(sop1(126, 0x04, 194));
+        w.push(mov_exec(194));
         w.push(vop1(0x001, 3, vgpr(4)));
 
         w.extend_from_slice(&vop3(0x360, 2, vgpr(1), 128 + 15, 0));
         w.push(sop1(126, 0x03, 255));
         w.push(0x0001_0000);
-        w.push(sop1(127, 0x03, 128));
+        if wave64 {
+            w.push(sop1(127, 0x03, 128));
+        }
         w.push(vop1(0x001, 3, sgpr(2)));
 
-        w.extend_from_slice(&vop3(0x360, 2, vgpr(1), 128 + 31, 0));
-        w.push(sop1(126, 0x03, 128));
-        w.push(sop1(127, 0x03, 129));
-        w.push(vop1(0x001, 3, sgpr(2)));
+        if wave64 {
+            w.extend_from_slice(&vop3(0x360, 2, vgpr(1), 128 + 31, 0));
+            w.push(sop1(126, 0x03, 128));
+            w.push(sop1(127, 0x03, 129));
+            w.push(vop1(0x001, 3, sgpr(2)));
 
-        w.extend_from_slice(&vop3(0x360, 2, vgpr(1), 128 + 47, 0));
-        w.push(sop1(126, 0x03, 128));
-        w.push(sop1(127, 0x03, 255));
-        w.push(0x0001_0000);
-        w.push(vop1(0x001, 3, sgpr(2)));
+            w.extend_from_slice(&vop3(0x360, 2, vgpr(1), 128 + 47, 0));
+            w.push(sop1(126, 0x03, 128));
+            w.push(sop1(127, 0x03, 255));
+            w.push(0x0001_0000);
+            w.push(vop1(0x001, 3, sgpr(2)));
+        }
 
-        w.push(sop1(126, 0x04, 0));
+        w.push(mov_exec(0));
         w.push(vop1(0x001, 0, vgpr(3)));
     }
 
@@ -2353,7 +2364,7 @@ fn build_wave_prefix_cs(vop2_op: u8, ident: u32, inclusive: bool) -> HostShader 
     let code: Vec<u8> = w.iter().flat_map(|x| x.to_le_bytes()).collect();
     let native = NativeProgram {
         stage: HwStage::Cs,
-        wave64: true,
+        wave64,
         vgprs: 16,
         layout: vec![
             RootParam {
@@ -2497,15 +2508,25 @@ fn wave_prefix_non_sum_ops_match_scan_across_lanes() {
 
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let mut checked = 0u32;
+    // Per variant (wave64, wave32) and host (hardware, warp): lane comparisons
+    // run, PSOs built and PSOs refused.
+    let mut ran = [[0u32; 2]; 2];
+    let mut built = [[0u32; 2]; 2];
+    let mut refused = [[0u32; 2]; 2];
     let seeds = [
         [0x1234_5678, 0x8000_0001, 0, 0],
         [0xFFFF_FFFF, 0x7F7F_FFFF, 0, 0],
     ];
 
     for (name, vop2_op, ident, combine) in ops {
-        for inclusive in [true, false] {
-            let shader = build_wave_prefix_cs(vop2_op, ident, inclusive);
-            for (label, warp) in [("hardware", false), ("warp", true)] {
+        for (wave64, inclusive) in [(true, true), (true, false), (false, true), (false, false)] {
+            let variant = if wave64 { "wave64" } else { "wave32" };
+            let vi = usize::from(!wave64);
+            let shader = build_wave_prefix_cs(vop2_op, ident, inclusive, wave64);
+            for (hi, (label, warp)) in [("hardware", false), ("warp", true)]
+                .into_iter()
+                .enumerate()
+            {
                 let host = match Host::new(warp) {
                     Ok(host) => host,
                     Err(e) => {
@@ -2516,10 +2537,12 @@ fn wave_prefix_non_sum_ops_match_scan_across_lanes() {
                 let (root, pso) = match host.compute_pipeline(&shader) {
                     Ok(p) => p,
                     Err(e) => {
-                        eprintln!("{label} ({name}, inc={inclusive}): PSO skipped ({e})");
+                        eprintln!("{label} {variant} ({name}, inc={inclusive}): PSO skipped ({e})");
+                        refused[vi][hi] += 1;
                         continue;
                     }
                 };
+                built[vi][hi] += 1;
                 for inputs in seeds {
                     let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
                     for u in &shader.user_data {
@@ -2560,15 +2583,38 @@ fn wave_prefix_non_sum_ops_match_scan_across_lanes() {
                         let got = out.first().unwrap()[lane as usize];
                         assert_eq!(
                             got, want,
-                            "{label} ({name}, inclusive={inclusive}) lane {lane}: got {got:#010x}, want {want:#010x}"
+                            "{label} {variant} ({name}, inclusive={inclusive}) lane {lane}: got {got:#010x}, want {want:#010x}"
                         );
                         checked += 1;
+                        ran[vi][hi] += 1;
                     }
                 }
             }
         }
     }
-    eprintln!("wave prefix: {checked} lane comparisons ran");
+    for (vi, variant) in ["wave64", "wave32"].into_iter().enumerate() {
+        for (hi, label) in ["hardware", "warp"].into_iter().enumerate() {
+            let (n, ok, no) = (ran[vi][hi], built[vi][hi], refused[vi][hi]);
+            let state = if ok > 0 {
+                "ran"
+            } else if no > 0 {
+                "skipped"
+            } else {
+                "no device"
+            };
+            eprintln!(
+                "wave prefix {variant} on {label}: {state}, {n} lane comparisons \
+                 ({ok} PSOs built, {no} refused)"
+            );
+        }
+    }
+    eprintln!("wave prefix: {checked} lane comparisons ran in total");
+    if std::env::var("VICTORY_REQUIRE_HW").is_ok_and(|v| v == "1") {
+        assert!(
+            checked > 0,
+            "VICTORY_REQUIRE_HW=1 but no wave prefix lane comparisons ran"
+        );
+    }
 }
 #[test]
 fn v_mul_legacy_f32_treats_denormals_as_zero() {
