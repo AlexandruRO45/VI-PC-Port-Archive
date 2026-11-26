@@ -923,30 +923,48 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_w
     let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::MarkedUs);
     marked.sort_unstable();
     marked.dedup();
-    let page_of = |m: &Marks, n: u32| {
-        let (&base, copy) = m.owners.range(..=n).next_back()?;
-        let copy = copy.upgrade()?;
+    // Collect upgraded copies under the lock, then release the lock before
+    // processing.  copy.upgrade() must not be called while holding the locks
+    // guard: if the returned Arc<Shadow> is dropped inside the closure
+    // (because the closure returns None), Shadow::drop would take the same
+    // lock -> deadlock.
+    let entries: Vec<(Arc<Shadow>, u32, u32)> = {
+        let m = marks();
+        marked.iter().filter_map(|&n| {
+            let (&base, copy) = m.owners.range(..=n).next_back()?;
+            copy.upgrade().map(|copy| (copy, n, base))
+        }).collect()
+    };
+    // m is dropped here, releasing the lock.
+    let page_entries: Vec<(Arc<Shadow>, usize)> = entries.into_iter().filter_map(|(copy, n, base)| {
         let k = n - base;
         (k < pages(copy.start, copy.len)).then(|| {
             let page = (((copy.start >> 16) + u64::from(k)) << 16) as usize;
             (copy, page)
         })
-    };
+    }).collect();
     // Held back: dropped from the copies (`crate::memory::drop_withheld`).
-    if !held.is_empty() {
+    // Collect upgraded copies under the lock, then drop outside to avoid
+    // dropping Arc<Shadow> inside the lock (Shadow::drop takes the same lock).
+    let held_entries: Vec<(Arc<Shadow>, u32, u32)> = {
         let m = marks();
-        for (_, page) in held.into_iter().filter_map(|n| page_of(&m, n)) {
+        held.into_iter().filter_map(|n| {
+            let (&base, copy) = m.owners.range(..=n).next_back()?;
+            copy.upgrade().map(|copy| (copy, n, base))
+        }).collect()
+    };
+    // m is dropped here, releasing the lock.
+    for (copy, n, base) in held_entries {
+        let k = n - base;
+        if k < pages(copy.start, copy.len) {
+            let page = (((copy.start >> 16) + u64::from(k)) << 16) as usize;
             crate::memory::drop_withheld(page, PAGE);
         }
     }
-    if marked.is_empty() {
+    if page_entries.is_empty() {
         return;
     }
-    let pages: Vec<(Arc<Shadow>, usize)> = {
-        let m = marks();
-        marked.iter().filter_map(|&n| page_of(&m, n)).collect()
-    };
-    for (copy, page) in pages {
+    for (copy, page) in page_entries {
         if withheld
             .iter()
             .any(|(c, a, n)| Arc::ptr_eq(c, &copy) && *a < page + PAGE && page < a + n)
