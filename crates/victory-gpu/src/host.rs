@@ -2010,7 +2010,8 @@ impl HostList {
                 copy.state.store(*last, Ordering::Relaxed);
             }
         };
-        if copies.is_empty() && states.values().all(|(first, _, copy)| copy.state.load(Ordering::Relaxed) == *first) {
+        let format_twins = crate::format_twin::any();
+        if !format_twins && copies.is_empty() && states.values().all(|(first, _, copy)| copy.state.load(Ordering::Relaxed) == *first) {
             left();
             return None;
         }
@@ -2020,6 +2021,11 @@ impl HostList {
         let recorded = unsafe {
             allocator.Reset().and_then(|()| {
                 list.Reset(allocator, None)?;
+                // Textures read in a format of another family: their twins
+                // take the bytes the lists before left.
+                if format_twins {
+                    crate::format_twin::refresh(list);
+                }
                 for (depth, to_depth) in &copies {
                     let Some(Some(twin)) = depth.twin.get() else { continue };
                     // From each texture's real state to the copy's and back.

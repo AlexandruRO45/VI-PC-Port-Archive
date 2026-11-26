@@ -202,7 +202,7 @@ static SCRATCH: std::sync::Mutex<Scratch> = std::sync::Mutex::new(Scratch(Vec::n
 /// The shared scratch buffer of at least `size` bytes: the one of `size`'s
 /// power-of-two class, made on first use. All of them together hold at
 /// most twice the largest.
-fn shared_scratch(size: u64) -> Option<ID3D12Resource> {
+pub(crate) fn shared_scratch(size: u64) -> Option<ID3D12Resource> {
     let class = size.max(1 << 16).next_power_of_two();
     let mut all = SCRATCH.lock().unwrap_or_else(|e| e.into_inner());
     if let Some((_, buffer)) = all.0.iter().find(|(c, _)| *c == class) {

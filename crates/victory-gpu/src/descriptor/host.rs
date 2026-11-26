@@ -1573,6 +1573,23 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 {
                     desc.Format = DXGI_FORMAT(format as i32);
                 }
+                // A view in a format of another family of the same texel
+                // size (R9G9B9E5 of an R32_UINT texture) reads a twin in
+                // that format (`crate::format_twin`).
+                if let Some(d) = desc.as_ref() {
+                    // SAFETY: a live resource.
+                    let own = unsafe { texture.GetDesc() }.Format.0 as u32;
+                    let view = d.Format.0 as u32;
+                    if !copy.castable.contains(&view)
+                        && crate::resource::view_on(view, own) != own
+                        && crate::format_twin::wanted(own, view)
+                        && let Some(twin) = crate::format_twin::twin(&copy, view)
+                    {
+                        // SAFETY: a live texture and a slot of our heap.
+                        unsafe { device.CreateShaderResourceView(&twin.texture, Some(d), at) };
+                        return Some(Some((twin.texture.clone(), None)));
+                    }
+                }
                 if !fits(texture, &copy.castable, desc.as_mut().map(|d| &mut d.Format), false) {
                     return None;
                 }
