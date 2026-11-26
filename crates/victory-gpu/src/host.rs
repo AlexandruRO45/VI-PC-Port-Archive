@@ -78,6 +78,17 @@ static PREWARM_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::
 /// waited for and its results put back.
 static FINISHED_FENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+struct DeviceRemoved;
+
+/// D3D12 returns `UINT64_MAX` and wakes fence waits when the device is removed.
+fn completed_fence_value(value: u64) -> Result<u64, DeviceRemoved> {
+    if value == u64::MAX {
+        Err(DeviceRemoved)
+    } else {
+        Ok(value)
+    }
+}
+
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
     pub(crate) depth_bounds_supported: bool,
@@ -1133,9 +1144,9 @@ impl Host {
     /// Finishes the unwaited submissions that have run, oldest first, and
     /// buries objects retired before them. The caller holds `submitted`:
     /// finishing puts back what shaders wrote, as a submission does.
-    fn reap_completed(&self) {
+    fn reap_completed(&self) -> Result<(), DeviceRemoved> {
         // SAFETY: a plain fence query.
-        let completed = unsafe { self.fence.GetCompletedValue() };
+        let completed = completed_fence_value(unsafe { self.fence.GetCompletedValue() })?;
         let mut last_sub = 0u64;
         loop {
             let done = {
@@ -1164,6 +1175,27 @@ impl Host {
             FINISHED.fetch_max(last_sub, Ordering::AcqRel);
             bury(last_sub);
         }
+        Ok(())
+    }
+
+    /// Reports removal with the pending lists. The caller releases `submitted`
+    /// before diagnostics inspect the lists and other GPU state.
+    fn fail_in_flight(&self) -> ! {
+        let lists: Vec<_> = self
+            .in_flight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter_map(|pending| pending.finish.as_ref())
+            .flat_map(|finish| finish.lists.iter().cloned())
+            .collect();
+        let runs: Vec<&HostList> = lists.iter().map(|list| &**list).collect();
+        fail(format_args!(
+            "host GPU device removed while waiting for asynchronous submissions ({} pending lists){}{}",
+            runs.len(),
+            self.removal_data(&runs),
+            last_notes(&runs)
+        ));
     }
 
     /// Whether a submission is still to be waited for and finished.
@@ -1176,7 +1208,7 @@ impl Host {
         if target == 0 || FINISHED_FENCE.load(Ordering::Acquire) >= target {
             return;
         }
-        let _guard = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        let submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
         // SAFETY: the fence and event are ours; guarded by `submitted`.
         unsafe {
             if self.fence.GetCompletedValue() < target {
@@ -1187,7 +1219,10 @@ impl Host {
                 }
             }
         }
-        self.reap_completed();
+        if self.reap_completed().is_err() {
+            drop(submitted);
+            self.fail_in_flight();
+        }
     }
 
     /// Waits for all in-flight asynchronous submissions to complete.
@@ -1205,7 +1240,7 @@ impl Host {
     }
 
     /// Waits for any in-flight async submission while `self.submitted` is already held.
-    fn drain_in_flight_locked(&self) {
+    fn drain_in_flight_locked(&self) -> Result<(), DeviceRemoved> {
         let target = self
             .in_flight
             .lock()
@@ -1214,7 +1249,7 @@ impl Host {
             .map(|f| f.fence)
             .unwrap_or(0);
         if target == 0 {
-            return;
+            return Ok(());
         }
         // SAFETY: the fence and event are ours; caller holds `submitted`.
         unsafe {
@@ -1228,7 +1263,7 @@ impl Host {
                 SUBMISSION_US[1].fetch_add(waited.elapsed().as_micros() as u64, Ordering::Relaxed);
             }
         }
-        self.reap_completed();
+        self.reap_completed()
     }
 
     /// Runs closed lists; waits synchronously when CPU copy-back, readbacks, or
@@ -1291,7 +1326,10 @@ impl Host {
         if keep.is_some() && self.has_in_flight() {
             self.prewarm(runs);
         }
-        self.drain_in_flight_locked();
+        if self.drain_in_flight_locked().is_err() {
+            drop(submitted);
+            self.fail_in_flight();
+        }
         let this_submission = STARTED.fetch_add(1, Ordering::AcqRel) + 1;
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
@@ -4355,6 +4393,15 @@ fn pump() {
             let _ = TranslateMessage(&message);
             DispatchMessageW(&message);
         }
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn removed_device_fence_is_not_a_completion() {
+    assert!(matches!(completed_fence_value(u64::MAX), Err(DeviceRemoved)));
+    for value in [0, 1, u64::MAX - 1] {
+        assert_eq!(completed_fence_value(value).ok(), Some(value));
     }
 }
 
