@@ -227,8 +227,9 @@ struct Mode {
 }
 const _: () = assert!(size_of::<Mode>() == 32);
 
-/// The console's mode list: one 4K mode at 60 Hz (Grand Theft Auto VI looks
-/// for a 120 Hz one to allow 120 Hz frame intervals).
+/// The console's mode list: one mode at 60 Hz, the size its console paces
+/// (Grand Theft Auto VI looks for a 120 Hz one to allow 120 Hz frame
+/// intervals): 4K on Series X, 2560×1440 on Series S.
 /// shortcut: fixed mode, not the host display's; report the host's rates if
 /// a title paces by them.
 extern "system" fn modes(
@@ -250,9 +251,10 @@ extern "system" fn modes(
         return MORE_DATA;
     }
     *count = 1;
+    let (width, height) = crate::console::mode_size(crate::console::current());
     let mode = Mode {
-        width: 3840,
-        height: 2160,
+        width,
+        height,
         refresh: [60, 1],
         format: 0,
         scanlines: 1, // progressive
@@ -323,6 +325,44 @@ mod tests {
         assert_eq!(outputs(adapter, 0, &mut output), S_OK);
         assert!(!output.is_null());
         assert_eq!(outputs(adapter, 1, &mut output), NOT_FOUND);
+    }
+
+    /// The single mode the console's display lists matches the console it
+    /// is on at the moment of the question (the global console is raced
+    /// by no test, so none is set here).
+    #[test]
+    fn the_listed_mode_follows_the_console() {
+        let expected = crate::console::mode_size(crate::console::current());
+        type Modes = extern "system" fn(This, u32, u32, *mut u32, *mut Mode) -> HRESULT;
+        let modes = slot::<Modes>(&OUTPUT_OBJECT as This, 0xa8);
+        // The count first (as the title always asks).
+        let mut count = 0;
+        assert_eq!(
+            modes(
+                &OUTPUT_OBJECT as This,
+                0,
+                0,
+                &mut count,
+                std::ptr::null_mut()
+            ),
+            S_OK
+        );
+        assert_eq!(count, 1);
+        // The mode: the size the console paces.
+        let mut mode = Mode {
+            width: 0,
+            height: 0,
+            refresh: [0, 1],
+            format: 0,
+            scanlines: 1,
+            scaling: 0,
+            flags: 0,
+        };
+        assert_eq!(
+            modes(&OUTPUT_OBJECT as This, 0, 0, &mut count, &mut mode),
+            S_OK
+        );
+        assert_eq!((mode.width, mode.height), expected);
     }
 
     #[test]
