@@ -52,6 +52,11 @@ unsafe impl Send for Pending {}
 unsafe impl Sync for Pending {}
 
 impl Pending {
+    /// What identifies it across runs.
+    pub(crate) fn key(&self) -> &str {
+        &self.key
+    }
+
     pub(crate) fn new(shaders: Vec<Arc<Shader>>, graphics: Option<Box<GraphicsState>>) -> Pending {
         let mut key = blake3::Hasher::new();
         for s in &shaders {
@@ -142,6 +147,7 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     let made = p.made.get()?.as_ref();
     if made.is_some() && !p.used.swap(true, Ordering::Relaxed) {
         super::library::note_used(&p.key);
+        super::record::record(&p.shaders, p.graphics.as_deref());
     }
     made
 }

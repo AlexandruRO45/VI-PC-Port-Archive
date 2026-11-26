@@ -60,6 +60,11 @@ impl<'a> Reader<'a> {
 
 /// Writes one pipeline: its shaders' containers and its graphics state.
 pub(crate) fn record(shaders: &[Arc<Shader>], graphics: Option<&GraphicsState>) {
+    tracing::info!(
+        enabled = enabled(),
+        shaders = shaders.len(),
+        "pso record entry"
+    );
     if !enabled() {
         return;
     }
@@ -117,6 +122,11 @@ fn prebuild_all() {
             continue;
         };
         let pending = Arc::new(super::make::Pending::new(shaders, graphics));
+        // Only what an earlier run actually drew: the recordings hold every
+        // pipeline the title made, most of which it never uses.
+        if !super::library::wanted_early(pending.key()) {
+            continue;
+        }
         super::make::start(&pending);
         made += 1;
     }
@@ -125,7 +135,10 @@ fn prebuild_all() {
         "recorded pipelines started before the title"
     );
     if cfg!(feature = "diagnostics") {
-        eprintln!("recorded pipelines started before the title: {made}");
+        tracing::info!(
+            pipelines = made,
+            "recorded pipelines started (stderr mirror)"
+        );
     }
 }
 
