@@ -1087,6 +1087,14 @@ fn v_fract_f16_never_returns_one() {
             ),
         }
     });
+
+    let upward = build_valu_cs(&[
+        0xBFA4_0004, // s_round_mode 4
+        vop1(0x05F, 0, vgpr(1)),
+    ]);
+    run_cases(&upward, &[[0x8E00, 0, 0, 0]], |backend, _, _, got| {
+        assert_eq!(got as u16, below_one, "{backend}: fract(-3 * 2^-13)");
+    });
 }
 
 /// RDNA2's flt16_to_snorm16 / flt16_to_unorm16: clamp, scale by 32767 or

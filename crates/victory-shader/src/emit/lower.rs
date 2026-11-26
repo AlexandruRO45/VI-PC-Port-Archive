@@ -2212,10 +2212,17 @@ impl<'a> Lower<'a> {
         )
     }
 
-    /// `f` as an f16 in the low bits, rounded on the bits according to MODE.
-    /// f32 denormals read as zero. An unknown MODE uses nearest even.
+    /// Narrow a computed result with the rounding modes modelled by the
+    /// arithmetic paths. Only a direct conversion uses directed rounding.
     fn narrow16(&mut self, f: V) -> V {
-        let rtz = self.mode16 == Some(3);
+        let mode = if self.mode16 == Some(3) { 3 } else { 0 };
+        self.narrow16_in_mode(f, mode)
+    }
+
+    /// `f` as an f16 in the low bits, rounded on the bits. f32 denormals
+    /// read as zero.
+    fn narrow16_in_mode(&mut self, f: V, mode: u8) -> V {
+        let rtz = mode == 3;
         let c = self.cur;
         let x = self.as_int(f);
         let k = |l: &mut Self, v: u32| l.s.m.i32(v);
@@ -2224,8 +2231,8 @@ impl<'a> Lower<'a> {
         let m = k(self, 0x8000);
         let sign = self.s.m.bin(c, Bin::And, t, m);
         // A directed mode increases the magnitude only toward its own sign.
-        let away = match self.mode16 {
-            Some(mode @ (1 | 2)) => {
+        let away = match mode {
+            1 | 2 => {
                 let zero = k(self, 0);
                 let p = if mode == 1 { pred::EQ } else { pred::NE };
                 Some(self.s.m.cmp(c, p, sign, zero))
@@ -7013,7 +7020,11 @@ impl<'a> Lower<'a> {
             if v.clamp {
                 f = l.unary(7, f);
             }
-            let h = l.narrow16(f);
+            let h = if name == "v_cvt_f16_f32" {
+                l.narrow16_in_mode(f, l.mode16.unwrap_or_default())
+            } else {
+                l.narrow16(f)
+            };
             l.write_half(inst, h, guard)
         };
         if name == "v_cvt_f16_f32" {
