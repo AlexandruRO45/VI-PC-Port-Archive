@@ -1240,6 +1240,34 @@ impl State {
             return;
         };
         if let Some(view) = host.mirror(index, handle, true) {
+            // `VICTORY_DUMP_VIEWS` with `VICTORY_TRACE_SHADERS`: the dwords
+            // of the memory each constant or placed buffer view names, at
+            // submission (after the refresh fills the copy) - the data a
+            // shader's loops read, which no read-back reports once it hangs.
+            #[cfg(feature = "diagnostics")]
+            if crate::switch::on("VICTORY_DUMP_VIEWS")
+                && crate::host::is_traced(&crate::pipeline::shaders_of(self.pipeline as This))
+            {
+                let address = match view {
+                    View::Constant(address, _) => Some(address),
+                    View::Placed(_, _, words) => {
+                        Some(u64::from(words[10]) | u64::from(words[11]) << 32)
+                    }
+                    _ => None,
+                };
+                if let Some(address) = address
+                    && let Some(shadow) = crate::shadow::find(address, 64)
+                {
+                    let name = crate::pipeline::shaders_of(self.pipeline as This);
+                    list.defer(move || {
+                        tracing::info!(
+                            address,
+                            dwords = ?shadow.dwords_at(address, 16),
+                            "traced view {name}"
+                        );
+                    });
+                }
+            }
             readable(list, u, &view, true);
         }
     }
