@@ -173,6 +173,9 @@ pub(crate) struct HostHeap {
     /// 45), under the lock all of them need. (A free run that lies across
     /// the place the search starts from is seen by neither.)
     too_long: std::sync::atomic::AtomicU32,
+    /// The fewest dynamic slots free since [`HostHeap::dynamic_census`]
+    /// last asked (changed under `next`'s lock).
+    fewest_free: std::sync::atomic::AtomicU32,
     /// View heaps: the bytes per element of the buffer view at each title
     /// slot, for shaders that pick a buffer by an index they compute
     /// (`victory_shader::emit::SLOT_STRIDES`): an upload buffer of
@@ -1327,6 +1330,86 @@ pub(crate) fn near_heaps(va: u64) -> String {
     text
 }
 
+/// Diagnostics for a host that caps view heaps below the title's (NVIDIA:
+/// 1,000,000 views against the title's 1,245,184): which of the title's
+/// slots get host slots written, and where the tables made afresh in
+/// dynamic slots lie, by blocks of [`map::BLOCK`] title slots, since the
+/// start.
+///
+/// Written slots are counted where every slot is written
+/// ([`HostHeap::copy_to`], [`HostHeap::copy_from`]), not in
+/// [`HostHeap::mirror`]: a texture shown only once its upload has run
+/// ([`show_after`]) is written without it. Counted in `mirror` alone, an
+/// RTX 4070 run showed nothing written from 114,688 to 327,680; dynamic
+/// slots put there (2026-11-26, an experiment) turned a face to noise,
+/// for its textures lie there.
+#[cfg(feature = "diagnostics")]
+pub(crate) mod map {
+    use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
+
+    pub(crate) const BLOCK: u32 = 1 << 14;
+    const BLOCKS: usize = 128;
+
+    /// The blocks some slot of which was written (one bit each).
+    static WRITTEN: [AtomicU64; BLOCKS / 64] = [const { AtomicU64::new(0) }; BLOCKS / 64];
+    /// The highest title slot written.
+    static HIGHEST: AtomicU32 = AtomicU32::new(0);
+    /// Tables made afresh, by the block of their first title slot.
+    static FRESH: [AtomicU64; BLOCKS] = [const { AtomicU64::new(0) }; BLOCKS];
+
+    /// The host slot of title slot `index` is written. (A load first: this
+    /// is asked for every slot written.)
+    pub(crate) fn written(index: u32) {
+        let block = (index / BLOCK) as usize;
+        if let Some(word) = WRITTEN.get(block / 64) {
+            let bit = 1u64 << (block % 64);
+            if word.load(Relaxed) & bit == 0 {
+                word.fetch_or(bit, Relaxed);
+            }
+        }
+        if HIGHEST.load(Relaxed) < index {
+            HIGHEST.fetch_max(index, Relaxed);
+        }
+    }
+
+    /// A table whose first title slot is `index` is made afresh.
+    pub(crate) fn fresh(index: u32) {
+        if let Some(count) = FRESH.get((index / BLOCK) as usize) {
+            count.fetch_add(1, Relaxed);
+        }
+    }
+
+    /// The runs of blocks with slots written, the highest such slot, and the
+    /// blocks with tables made afresh.
+    pub(crate) fn line() -> String {
+        let mut runs: Vec<(usize, usize)> = Vec::new();
+        for block in 0..BLOCKS {
+            if WRITTEN[block / 64].load(Relaxed) & (1u64 << (block % 64)) == 0 {
+                continue;
+            }
+            match runs.last_mut() {
+                Some((_, end)) if *end == block => *end = block + 1,
+                _ => runs.push((block, block + 1)),
+            }
+        }
+        let slot = |block: usize| block as u64 * u64::from(BLOCK);
+        let written: Vec<String> = runs.iter().map(|&(a, b)| format!("{}-{}", slot(a), slot(b))).collect();
+        let fresh: Vec<String> = (0..BLOCKS)
+            .filter_map(|block| {
+                let count = FRESH[block].load(Relaxed);
+                (count > 0).then(|| format!("{}+: {count}", slot(block)))
+            })
+            .collect();
+        format!(
+            "title slots written, since the start, in blocks of {BLOCK}: {} (the highest {}); tables made afresh by \
+             the block of their first title slot: {}",
+            written.join(", "),
+            HIGHEST.load(Relaxed),
+            fresh.join(", ")
+        )
+    }
+}
+
 /// The host's limit for shader-visible view heaps on resource binding
 /// tiers 1 and 2; tier 3 hardware may take more.
 const PORTABLE_VIEWS: u32 = 1_000_000;
@@ -1545,6 +1628,7 @@ impl HostHeap {
             next: Mutex::new((0, vec![false; extra as usize])),
             free: std::sync::atomic::AtomicU32::new(extra),
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
+            fewest_free: std::sync::atomic::AtomicU32::new(extra),
             strides,
             buffers: Slots::new(count as usize),
             changed: Slots::new(count as usize),
@@ -1693,6 +1777,10 @@ impl HostHeap {
             {
                 use crate::copystat::{C, add};
                 add(C::DynamicRefused, 1);
+                add(C::DynamicRefusedSlots, n as u64);
+                if self.free.load(std::sync::atomic::Ordering::Relaxed) as usize >= n {
+                    add(C::DynamicRefusedPieces, 1);
+                }
                 add(C::DynamicNs, started.elapsed().as_nanos() as u64);
             }
             return None;
@@ -1700,9 +1788,20 @@ impl HostHeap {
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::DynamicNs, started.elapsed().as_nanos() as u64);
         taken[first..first + n].fill(true);
-        self.free.fetch_sub(n as u32, std::sync::atomic::Ordering::Relaxed);
+        let left = self.free.fetch_sub(n as u32, std::sync::atomic::Ordering::Relaxed) - n as u32;
+        self.fewest_free.fetch_min(left, std::sync::atomic::Ordering::Relaxed);
         *next = ((first + n) % end) as u32;
         Some(self.count + first as u32)
+    }
+
+    /// The title slots this heap has host slots for, its dynamic slots, how
+    /// many of those are free now and the fewest that were free since the
+    /// last call (diagnostics).
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn dynamic_census(&self) -> (u32, u32, u32, u32) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let free = self.free.load(Relaxed);
+        (self.count, self.dynamic, free, self.fewest_free.swap(free, Relaxed))
     }
 
     /// The title slots this heap has host slots for; fewer than the title's
@@ -2610,6 +2709,10 @@ impl HostHeap {
         if let Some(written) = self.written.get(to as usize) {
             written.store(crate::host::coarse_ms() as u32, std::sync::atomic::Ordering::Relaxed);
         }
+        #[cfg(feature = "diagnostics")]
+        if to < self.count {
+            map::written(to);
+        }
         let Some(host) = host() else { return };
         // SAFETY: a slot of our heap, and one of this thread's heap.
         unsafe { host.device.CopyDescriptorsSimple(1, self.cpu(to), from, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) };
@@ -2867,6 +2970,10 @@ impl HostHeap {
         if let Some(written) = self.written.get(to as usize) {
             written.store(crate::host::coarse_ms() as u32, std::sync::atomic::Ordering::Relaxed);
         }
+        #[cfg(feature = "diagnostics")]
+        if !self.sampler && to < self.count {
+            map::written(to);
+        }
         let (Some(from), Some(host)) = (staged(self.sampler, which), host()) else {
             return; // made in place
         };
@@ -2961,8 +3068,11 @@ impl HostHeap {
         if index >= self.count {
             // Diagnostic (NVIDIA heap cap): the highest title slot past the
             // host heap seen so far.
+            // (Logged once per 16,384 slots: a title may write its slots
+            // one after another.)
             static HIGHEST: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-            if HIGHEST.fetch_max(index, std::sync::atomic::Ordering::Relaxed) < index {
+            let before = HIGHEST.fetch_max(index, std::sync::atomic::Ordering::Relaxed);
+            if before < index && (before == 0 || before >> 14 != index >> 14) {
                 tracing::warn!(
                     index,
                     count = self.count,

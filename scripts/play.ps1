@@ -4,13 +4,15 @@
 # -RayTracing   the title's own ray-traced indirect light: lit interiors, about a third slower
 # -Build        target\diag (the default, the build all measurements are of) or target\release
 # -More         other settings: -More @{VICTORY_PANEL='1'}
+# -Log          also write what the window shows to this file (UTF-8)
 # Run it from a normal window, not as administrator: the driver then keeps its shader cache elsewhere.
 param(
     [Parameter(Mandatory)][string]$Exe,
     [switch]$Safe,
     [switch]$RayTracing,
     [ValidateSet('diag', 'release')][string]$Build = 'diag',
-    [hashtable]$More = @{}
+    [hashtable]$More = @{},
+    [string]$Log
 )
 $settings = @{
     VICTORY_TEXTURE_NO_WAIT = '1'; VICTORY_RELAY = '2'; VICTORY_WIDE_BACK = '1'; VICTORY_CARD_REHASH_RUNS = '1'
@@ -35,4 +37,17 @@ Get-ChildItem Env:VICTORY_* | Where-Object { $_.Name -notin $paths } | ForEach-O
 foreach ($k in $settings.Keys) { Set-Item "Env:$k" $settings[$k] }
 $Exe = (Resolve-Path $Exe).Path
 Push-Location (Join-Path $PSScriptRoot '..')   # victory.toml is looked for here
-try { & $victory run $Exe --execute } finally { Pop-Location }
+try {
+    if ($Log) {
+        New-Item -ItemType Directory -Force (Split-Path -Parent ([IO.Path]::GetFullPath($Log))) | Out-Null
+        $writer = New-Object IO.StreamWriter([IO.Path]::GetFullPath($Log), $false, (New-Object Text.UTF8Encoding($false)))
+        $writer.AutoFlush = $true
+        Write-Host "Log: $Log"
+        try {
+            # (Each line of the error stream comes as an error record; "$_" is its text.)
+            & $victory run $Exe --execute 2>&1 | ForEach-Object { $line = "$_"; $writer.WriteLine($line); $line }
+        } finally { $writer.Dispose() }
+    } else {
+        & $victory run $Exe --execute
+    }
+} finally { Pop-Location }

@@ -129,8 +129,24 @@ pub(crate) enum C {
     WaitsForGroups,
     WaitsForBuffers,
     IndirectBounded,
+    /// Dynamic descriptor slots (`descriptor::host::HostHeap::dynamic`):
+    /// the slots the tables asked for, how many of those tables hold a
+    /// constant buffer, how many reach past the host heap (a host that caps
+    /// it below the title's, NVIDIA), and the tables by length: up to 8
+    /// slots, 9 to 32, 33 to 128, longer.
+    DynamicSlots,
+    DynamicCbv,
+    DynamicPast,
+    DynamicN8,
+    DynamicN32,
+    DynamicN128,
+    DynamicNMore,
+    /// Of the refused tables: their slots, and how many were refused while
+    /// at least that many slots were free, in pieces.
+    DynamicRefusedSlots,
+    DynamicRefusedPieces,
 }
-const COUNTERS: usize = 80;
+const COUNTERS: usize = 88;
 /// One of some sets of counters, each in lines of the processor's memory of
 /// its own: a set for all threads had them wait for each other's lines at
 /// every list call (what counts here is summed up for the log alone).
@@ -1204,6 +1220,30 @@ pub(crate) fn log(frames: f64) {
         c[C::GpuWritesLeftOut as usize],
         mb(c[C::GpuWritesLeftOutBytes as usize]),
     );
+    #[cfg(all(windows, feature = "diagnostics"))]
+    {
+        let (count, dynamic, free, fewest) =
+            crate::descriptor::with_view_heap(crate::descriptor::host::HostHeap::dynamic_census).unwrap_or_default();
+        tracing::info!(
+            "dynamic descriptor slots per frame: {:.0} slots asked by {:.0} tables ({:.0} of up to 8 slots, {:.0} of \
+             9-32, {:.0} of 33-128, {:.0} longer), {:.0} of them with a constant buffer, {:.0} reaching past the host \
+             heap; refused {:.0} tables of {:.0} slots, {:.0} of them while as many slots were free in pieces; the \
+             host view heap: {count} title slots, {dynamic} dynamic, {free} free now and {fewest} at the fewest since \
+             the last line; {}",
+            c[C::DynamicSlots as usize],
+            c[C::DynamicAsked as usize],
+            c[C::DynamicN8 as usize],
+            c[C::DynamicN32 as usize],
+            c[C::DynamicN128 as usize],
+            c[C::DynamicNMore as usize],
+            c[C::DynamicCbv as usize],
+            c[C::DynamicPast as usize],
+            c[C::DynamicRefused as usize],
+            c[C::DynamicRefusedSlots as usize],
+            c[C::DynamicRefusedPieces as usize],
+            crate::descriptor::host::map::line(),
+        );
+    }
     let [together, written, mapped] =
         [0, 1, 2].map(|n| crate::watch::ALIASES[n].load(std::sync::atomic::Ordering::Relaxed));
     tracing::info!(

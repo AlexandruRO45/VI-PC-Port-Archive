@@ -3298,6 +3298,30 @@ impl State {
                 made.push((slot, first * 32));
                 continue;
             }
+            #[cfg(feature = "diagnostics")]
+            {
+                use crate::copystat::{C, add};
+                add(C::DynamicSlots, u64::from(n));
+                if entries().any(|u| u.kind == ResourceType::Cbv) {
+                    add(C::DynamicCbv, 1);
+                }
+                let at = heap.index(table);
+                if at.is_none_or(|first| first + n > host.count()) {
+                    add(C::DynamicPast, 1);
+                }
+                add(
+                    match n {
+                        0..=8 => C::DynamicN8,
+                        9..=32 => C::DynamicN32,
+                        33..=128 => C::DynamicN128,
+                        _ => C::DynamicNMore,
+                    },
+                    1,
+                );
+                if let Some(first) = at {
+                    crate::descriptor::host::map::fresh(first);
+                }
+            }
             let Some(first) = host.dynamic(n) else {
                 // No room: the draw must not run with the title's own
                 // offsets (slots never made for it); `bind` drops it.
