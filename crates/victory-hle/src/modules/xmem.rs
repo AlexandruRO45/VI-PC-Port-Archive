@@ -405,16 +405,20 @@ impl Slice {
 pub fn aliases(at: usize, len: usize, out: &mut Vec<(usize, usize)>) {
     let physical = physical();
     let end = at.saturating_add(len);
+    // Empty query: nothing can alias a zero-length range.
+    if end <= at {
+        return;
+    }
     let first = physical
         .views
         .range(..=at)
         .next_back()
-        .filter(|(base, (size, _))| *base + size > at)
+        .filter(|(base, (size, _))| base.saturating_add(*size) > at)
         .map(|(base, _)| *base);
     let starts = first.into_iter().chain(physical.views.range(at.saturating_add(1)..end).map(|(b, _)| *b));
     for base in starts.collect::<Vec<_>>() {
         let (size, slice) = &physical.views[&base];
-        let (from, to) = (at.max(base), end.min(base + size));
+        let (from, to) = (at.max(base), end.min(base.saturating_add(*size)));
         for page in (from / PAGE..to.div_ceil(PAGE)).map(|p| p * PAGE) {
             let k = (page - base) / PAGE;
             if let Some(addresses) = physical.shown.get(&slice.key(k)) {
@@ -1363,5 +1367,36 @@ mod tests {
         assert!(page_window(&[a[0], b[0]], 0, PAGE).is_some());
         assert_eq!(XMemFreePhysicalPages(3, a.as_ptr()), 1);
         assert_eq!(XMemFreePhysicalPages(1, b.as_ptr()), 1);
+    }
+
+    #[test]
+    fn aliases_empty_query_returns_early() {
+        let a = allocate(1);
+        // Zero-length query at a valid address: nothing aliases.
+        let mut out = Vec::new();
+        aliases(a[0], 0, &mut out);
+        assert!(out.is_empty(), "zero-length query must return nothing");
+        // Empty query at usize::MAX: no overflow, no panic.
+        let mut out = Vec::new();
+        aliases(usize::MAX, 0, &mut out);
+        assert!(out.is_empty(), "empty query at usize::MAX must return nothing");
+        // Query whose end wraps to at: nothing aliases.
+        let mut out = Vec::new();
+        aliases(usize::MAX, 1, &mut out);
+        assert!(out.is_empty(), "wrapping query must return nothing");
+    }
+
+    #[test]
+    fn aliases_overflow_saturates_and_skips() {
+        let a = allocate(1);
+        // Query starting at usize::MAX with nonzero len: end == at, nothing aliases.
+        let mut out = Vec::new();
+        aliases(usize::MAX, PAGE, &mut out);
+        assert!(out.is_empty(), "saturating overflow must return nothing");
+        // A query past the end of a real view: nothing aliases.
+        let mut out = Vec::new();
+        aliases(a[0] + PAGE, PAGE, &mut out);
+        assert!(out.is_empty(), "query past view end must return nothing");
+        assert_eq!(XMemFreePhysicalPages(1, a.as_ptr()), 1);
     }
 }
