@@ -1227,7 +1227,10 @@ impl HostHeap {
         }
         let end = total.min(at + budget);
         for i in at..end {
-            self.mirror(i, start + u64::from(i) * u64::from(step), true);
+            // Not for a draw: buffer data is copied only when a draw actually
+            // uses the slot, so the sweep never reads a sparse title buffer
+            // the title has not mapped (run 56's world-entry crash).
+            self.mirror(i, start + u64::from(i) * u64::from(step), false);
         }
         self.scan_at
             .store(if end == total { 0 } else { end }, Ordering::Relaxed);
