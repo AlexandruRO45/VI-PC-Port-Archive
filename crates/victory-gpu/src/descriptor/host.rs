@@ -103,16 +103,43 @@ const MIN_DYNAMIC: u32 = 1 << 16;
 /// a host's cap; more pairs take dynamic slots.
 const CAPPED_PAIRS: u32 = 1 << 14;
 
+/// The shader-visible view heap size the device reports (D3D12 options
+/// 19, `MaxViewDescriptorHeapSize`), where its runtime and driver report one
+/// at least [`PORTABLE_VIEWS`] (the size every binding tier takes); none
+/// otherwise, and a heap of that size is tried instead.
+fn reported_view_limit(device: &ID3D12Device) -> Option<u32> {
+    let mut o = D3D12_FEATURE_DATA_D3D12_OPTIONS19::default();
+    // SAFETY: a plain feature query into a struct of the size given.
+    unsafe {
+        device.CheckFeatureSupport(
+            D3D12_FEATURE_D3D12_OPTIONS19,
+            (&raw mut o).cast(),
+            size_of_val(&o) as u32,
+        )
+    }
+    .ok()?;
+    (o.MaxViewDescriptorHeapSize >= PORTABLE_VIEWS).then_some(o.MaxViewDescriptorHeapSize)
+}
+
 /// Asks once, before the first shader is translated, whether the host takes
 /// a view heap of `HEAP_VIEWS` slots, and if not lowers the view limit
 /// translated shaders clamp their indices below to its cap (NVIDIA:
 /// 1,000,000): an index past the heap's end faults the device. The title
-/// makes pipelines before its heap, so the heap cannot tell first.
+/// makes pipelines before its heap, so the heap cannot tell first. The size
+/// the device reports comes first ([`reported_view_limit`]): trying a heap
+/// it does not take is an error in the debug layer.
 pub(crate) fn probe_view_limit() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         let Some(host) = host() else { return };
         let views = victory_shader::emit::HEAP_VIEWS;
+        if let Some(cap) = reported_view_limit(&host.device) {
+            if cap < views {
+                tracing::warn!(cap, "host view heaps capped (as reported): shaders clamp view indices below it");
+                victory_shader::emit::set_view_heap_limit(cap);
+            }
+            return;
+        }
         let make = |count: u32| {
             // SAFETY: plain heap creation; the heap is dropped at once.
             unsafe {
@@ -1883,6 +1910,41 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A device that reports its view heap size (options 19) gets that as
+    /// the view limit, without trying a heap it does not take (with
+    /// `VICTORY_D3D12_DEBUG=1`, no debug layer error about it); and a heap of
+    /// the limit is made.
+    #[test]
+    fn a_reported_view_heap_size_is_the_limit() {
+        let Some(host) = host() else {
+            eprintln!("no host device; skipped");
+            return;
+        };
+        let _ = host.log_messages();
+        probe_view_limit();
+        let limit = victory_shader::emit::view_heap_limit();
+        match reported_view_limit(&host.device) {
+            Some(cap) => {
+                eprintln!("reported view heap size {cap}; limit {limit}");
+                assert_eq!(limit, cap.min(victory_shader::emit::HEAP_VIEWS), "the reported size");
+                if let Some(e) = host.log_messages() {
+                    assert!(!e.contains("NumDescriptors"), "the debug layer saw a heap tried: {e}");
+                }
+            }
+            None => eprintln!("no reported view heap size; the probe set {limit}"),
+        }
+        // SAFETY: plain heap creation.
+        let heap = unsafe {
+            host.device.CreateDescriptorHeap::<ID3D12DescriptorHeap>(&D3D12_DESCRIPTOR_HEAP_DESC {
+                Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                NumDescriptors: limit,
+                Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                NodeMask: 0,
+            })
+        };
+        assert!(heap.is_ok(), "no heap of the limit ({limit}): {heap:?}");
+    }
 
     /// Typed buffer views of integer formats carry their kind in the
     /// view-stride table; float, normalized, raw and structured ones none.

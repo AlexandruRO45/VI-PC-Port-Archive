@@ -117,8 +117,22 @@ fn create_device(warp: bool) -> Result<ID3D12Device, String> {
                 NodeMask: 0,
             })
         };
-        if heap(super::HEAP_VIEWS).is_err() && heap(PORTABLE_VIEWS).is_ok() {
-            super::set_view_heap_limit(PORTABLE_VIEWS);
+        // The size the device reports first (options 19): trying a heap it
+        // does not take is an error in the debug layer.
+        let mut o19 = D3D12_FEATURE_DATA_D3D12_OPTIONS19::default();
+        let reported = device
+            .CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS19, (&raw mut o19).cast(), size_of_val(&o19) as u32)
+            .ok()
+            .map(|()| o19.MaxViewDescriptorHeapSize)
+            .filter(|&n| n >= PORTABLE_VIEWS);
+        match reported {
+            Some(cap) if cap < super::HEAP_VIEWS => super::set_view_heap_limit(cap),
+            Some(_) => {}
+            None => {
+                if heap(super::HEAP_VIEWS).is_err() && heap(PORTABLE_VIEWS).is_ok() {
+                    super::set_view_heap_limit(PORTABLE_VIEWS);
+                }
+            }
         }
         Ok(device)
     }
