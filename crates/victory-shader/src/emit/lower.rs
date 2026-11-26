@@ -6084,10 +6084,14 @@ impl<'a> Lower<'a> {
                     "v_cubesc_f32" => {
                         let (ix, iz) = (self.as_int(rx), self.as_int(rz));
                         let (nz, nx) = (neg(self, z), neg(self, x));
-                        let (mx, mz) = (neg_bits(self, ix), neg_bits(self, iz));
-                        let zf = self.s.m.select(c, nz, mx, ix);
-                        let xf = self.s.m.select(c, nx, iz, mz);
-                        let bits = pick(self, zf, ix, xf);
+                        // Select the coordinate and its sign adjustment separately, so
+                        // the selected result stays integer data even when subnormal.
+                        let (sign, keep) = (self.s.m.i32(0x8000_0000), self.s.m.i32(0));
+                        let zmask = self.s.m.select(c, nz, sign, keep);
+                        let xmask = self.s.m.select(c, nx, keep, sign);
+                        let raw = pick(self, ix, ix, iz);
+                        let mask = pick(self, zmask, keep, xmask);
+                        let bits = self.s.m.bin(c, Bin::Xor, raw, mask);
                         self.as_float(bits)
                     }
                     "v_cubetc_f32" => {
