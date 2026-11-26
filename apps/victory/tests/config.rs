@@ -1,5 +1,45 @@
-use std::path::Path;
-use std::process::{Command, Output};
+use std::fs;
+use std::io::{self, ErrorKind};
+use std::path::{Path, PathBuf};
+use std::process::{self, Command, Output};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+struct ScratchDir(PathBuf);
+
+impl ScratchDir {
+    fn new() -> io::Result<Self> {
+        static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
+        let temp = std::env::temp_dir();
+        let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+        loop {
+            let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+            let path = temp.join(format!(
+                "victory-config-{}-{}-{id}",
+                process::id(),
+                timestamp.as_nanos(),
+            ));
+            match fs::create_dir(&path) {
+                Ok(()) => return Ok(Self(path)),
+                Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
+            }
+        }
+    }
+}
+
+impl Drop for ScratchDir {
+    fn drop(&mut self) {
+        if let Err(error) = fs::remove_dir_all(&self.0) {
+            let message = format!("remove scratch directory {}: {error}", self.0.display());
+            if std::thread::panicking() {
+                eprintln!("{message}");
+            } else {
+                panic!("{message}");
+            }
+        }
+    }
+}
 
 fn run_config(root: &Path, violations: &[&str]) -> Output {
     let config = root.join("config.toml");
@@ -40,8 +80,9 @@ test_titles = ["test-title"]
 }
 
 fn assert_config(violations: &[&str]) {
-    let root = tempfile::tempdir().unwrap();
-    let output = run_config(root.path(), violations);
+    let scratch = ScratchDir::new().expect("create config test scratch directory");
+    let root = scratch.0.as_path();
+    let output = run_config(root, violations);
     let stdout = std::str::from_utf8(&output.stdout).unwrap();
     let stderr = std::str::from_utf8(&output.stderr).unwrap();
     let (code, summary) = if violations.is_empty() {
@@ -61,10 +102,7 @@ fn assert_config(violations: &[&str]) {
         "expected {summary:?}, got {stderr:?}"
     );
 
-    let config_line = format!(
-        "config file : {}",
-        root.path().join("config.toml").display()
-    );
+    let config_line = format!("config file : {}", root.join("config.toml").display());
     for line in [
         config_line.as_str(),
         "game_dir    : game",
