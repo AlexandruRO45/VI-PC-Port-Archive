@@ -860,6 +860,7 @@ const STAMPS: u32 = 4096;
 /// to close overwrites the rest (they all resolved at offset 0), and per
 /// command times could only be read when every list was submitted alone -
 /// which is the mode that made them 10x wrong.
+#[cfg(feature = "diagnostics")]
 const STAMP_SLOTS: u64 = 64;
 
 /// A marker's text and the host range its command reads (diagnostics).
