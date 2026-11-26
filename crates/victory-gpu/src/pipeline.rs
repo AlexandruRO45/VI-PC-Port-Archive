@@ -62,6 +62,15 @@ pub(crate) struct Shader {
     pub(crate) hash: String,
     container: Vec<u8>,
     #[cfg(windows)]
+    pub(crate) resolves_light: bool,
+    /// True for `ACCC` (`FSPX`) FidelityFX compute shaders (used by FSR4 on Series S).
+    #[cfg(windows)]
+    pub(crate) is_accc: bool,
+    /// True for ray-tracing preparation / BVH-skinning compute shaders that produce
+    /// unused results while `VICTORY_BVH_HOLD=1` suppresses ray traversal.
+    #[cfg(windows)]
+    pub(crate) rt_prep: bool,
+    #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
     /// Whether its code walks the ray-tracing structures, once looked at
     /// ([`Shader::walks`]).
@@ -115,6 +124,20 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 stage,
                 hash: full.to_hex()[..16].to_owned(),
                 container: bytes.to_vec(),
+                #[cfg(windows)]
+                resolves_light: bytes
+                    .windows(crate::ambient::PROGRAM.len())
+                    .any(|w| w == crate::ambient::PROGRAM),
+                #[cfg(windows)]
+                is_accc: stage == "compute"
+                    && victory_shader::Container::parse(bytes)
+                        .is_ok_and(|c| c.part(victory_shader::FourCC::ACCC).is_some()),
+                #[cfg(windows)]
+                rt_prep: stage == "compute"
+                    && !bytes
+                        .windows(crate::ambient::PROGRAM.len())
+                        .any(|w| w == crate::ambient::PROGRAM)
+                    && is_rt_prep_container(bytes),
                 #[cfg(windows)]
                 translated: OnceLock::new(),
                 #[cfg(windows)]
@@ -180,14 +203,11 @@ impl Shader {
 
 #[cfg(windows)]
 fn translate(container: &[u8]) -> Result<Translated, String> {
-    use victory_shader::{Container, FourCC, HwStage};
+    use victory_shader::{Container, HwStage};
     // The translation depends on it (a view index past a capped heap).
     crate::descriptor::host::probe_view_limit();
     let c = Container::parse(container).map_err(|e| e.to_string())?;
-    let programs = match c.part(FourCC::DXIL) {
-        Some(part) => victory_shader::native_programs(part.data).map_err(|e| e.to_string())?,
-        None => Vec::new(),
-    };
+    let programs = victory_shader::container_programs(&c).map_err(|e| e.to_string())?;
     let host = crate::shader_cache::host_shader(container)?;
     let stores = programs.is_empty() || programs.iter().any(stores);
     let used = programs
@@ -242,7 +262,7 @@ static BUILDER: Mutex<Builder> = Mutex::new(Builder {
 /// Whether `shaders` are a pipeline of the structure builder.
 #[cfg(windows)]
 fn of_builder(shaders: &[Arc<Shader>]) -> bool {
-    use victory_shader::{Container, FourCC};
+    use victory_shader::Container;
     let [shader] = shaders else { return false };
     if shader.stage != "compute" {
         return false;
@@ -250,9 +270,8 @@ fn of_builder(shaders: &[Arc<Shader>]) -> bool {
     let Ok(c) = Container::parse(&shader.container) else {
         return false;
     };
-    c.part(FourCC::DXIL)
-        .and_then(|part| victory_shader::native_programs(part.data).ok())
-        .is_some_and(|programs| programs.iter().any(victory_shader::spill::is_spilled))
+    victory_shader::container_programs(&c)
+        .is_ok_and(|programs| programs.iter().any(victory_shader::spill::is_spilled))
 }
 
 /// `VICTORY_BVH_QUARANTINE=1`: what the structure builder's stages store
@@ -283,13 +302,12 @@ impl Shader {
 /// ray-tracing structure.
 #[cfg(windows)]
 fn container_walks(container: &[u8]) -> bool {
-    use victory_shader::{Container, FourCC};
+    use victory_shader::Container;
     let Ok(c) = Container::parse(container) else {
         return false;
     };
-    c.part(FourCC::DXIL)
-        .and_then(|part| victory_shader::native_programs(part.data).ok())
-        .is_some_and(|programs| programs.iter().any(|p| code_walks(&p.code)))
+    victory_shader::container_programs(&c)
+        .is_ok_and(|programs| programs.iter().any(|p| code_walks(&p.code)))
 }
 
 /// Whether native code has a ray-tracing node test.
@@ -321,6 +339,34 @@ pub(crate) static WALKS_HELD: std::sync::atomic::AtomicU64 = std::sync::atomic::
 /// fixed (runs 208 and 224) came within a second of the first use of the
 /// programs that shade those rays' hits (`CS_RaytracingResolve`).
 ///
+/// Container name prefixes of heavy ray-tracing prep / BVH-skinning compute
+/// passes that do no visible work while `VICTORY_BVH_HOLD=1` holds back ray
+/// traversal (identified via `VICTORY_GPU_TIMING` + `VICTORY_SHADER_CENSUS`).
+#[cfg(windows)]
+const RT_PREP_PREFIXES: [&[u8]; 6] = [
+    b"CSComputeSkinning",
+    b"CS_ScreenProbes_EvaluateRayRequests",
+    b"CS_Primary_RegisterAllocationRequests",
+    b"CS_RaytracingResolve",
+    b"CS_RTDistantShadow",
+    b"CS_IrradianceCache_",
+];
+
+#[cfg(windows)]
+fn is_rt_prep_container(bytes: &[u8]) -> bool {
+    RT_PREP_PREFIXES
+        .iter()
+        .any(|prefix| bytes.windows(prefix.len()).any(|w| w == *prefix))
+}
+
+/// Whether `VICTORY_BVH_HOLD=1` is enabled and the BVH builder has not run whole.
+#[cfg(windows)]
+pub(crate) fn bvh_held_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_HOLD").is_some_and(|v| v == "1"))
+        && !BUILDER.lock().unwrap_or_else(|e| e.into_inner()).whole
+}
+
 /// With the switch such a dispatch is dropped until the builder has run
 /// whole. What the passes would have written stays as the title left it
 /// (their targets are not cleared by us): the picture has to be looked at.

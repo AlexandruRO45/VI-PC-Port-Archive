@@ -315,10 +315,11 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
 
 fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
     let c = Container::parse(container)?;
-    let dxil = c
-        .part(FourCC::DXIL)
-        .ok_or(ShaderError::Malformed("no DXIL part"))?;
-    let native = crate::native_programs(dxil.data)?
+    let programs = crate::container_programs(&c)?;
+    if programs.is_empty() && c.part(FourCC::DXIL).is_none() && c.part(FourCC::ACCC).is_none() {
+        return Err(ShaderError::Malformed("no DXIL part"));
+    }
+    let native = programs
         .into_iter()
         .find(|p| {
             matches!(

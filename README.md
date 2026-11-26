@@ -10,6 +10,39 @@ correctly and playably on one particular PC.
 copy of the game. It is not affiliated with or endorsed by the game's
 developer or publisher.
 
+## Series S & 6 GB VRAM Fork Notes (2026-11-26)
+
+This fork extends [`fxceless/victory-fork`](https://github.com/fxceless/victory-fork) with experimental `--console series-s` and 6 GB VRAM support (tested on Windows with an NVIDIA RTX 2060 6 GB):
+
+- **Series S shader & wave32 translation** (`crates/victory-shader/`): fixes native Wave32 lowering, VALU/wave ops, and resource binding needed for `--console series-s` gameplay rendering.
+- **Fast FSR4 bilinear bypass** (`VICTORY_FAST_FSR4=1`, auto-enabled with `VICTORY_FAST_COMPUTE=1`, [`fsr4.rs`](crates/victory-gpu/src/fsr4.rs)): skips intermediate `ACCC`/`FSPX` neural-network upscaler passes and replaces the final postpass with a bilinear compute upscale honoring active DRS `renderSize`.
+- **Heavy compute throttling & RT-prep skip** (`VICTORY_FAST_COMPUTE=1`, [`draw.rs`](crates/victory-gpu/src/draw.rs)): throttles expensive non-essential compute passes and skips unused ray-tracing prep passes when `VICTORY_BVH_HOLD=1`.
+- **Indirect-diffuse ambient floor** (`VICTORY_AMBIENT=<level|off>`, default `0.6`, [`ambient.rs`](crates/victory-gpu/src/ambient.rs)): replaces uninitialized screen-probe diffuse resolve output so shadowed areas are visible while ray tracing is held.
+- **6 GB VRAM & Series S texture-room fixes** ([`resource.rs`](crates/victory-gpu/src/resource.rs), [`tiles.rs`](crates/victory-gpu/src/tiles.rs), [`descriptor/host.rs`](crates/victory-gpu/src/descriptor/host.rs)): sizes `default_targets_room` to `1024 MiB` for `Console::SeriesS`, accounts for free tiles already allocated in `tiles::POOL`, prevents retry-backlog starvation in the texture queue, and caps on-demand mip allocations on `< 7 GiB` GPUs via `VICTORY_LEVELS_MAX_TILES` (default `4` tiles = `256 KiB`/mip; `0` = uncapped).
+
+### Example Launch (PowerShell, `--console series-s`, 6 GB GPU)
+
+```powershell
+$env:VICTORY_HOST_WAVE="32"
+$env:VICTORY_FAST_COMPUTE="1"
+$env:VICTORY_FAST_FSR4="1"
+$env:VICTORY_BVH_HOLD="1"
+$env:VICTORY_LEVELS_ON_DEMAND="1"
+$env:VICTORY_RELAY="2"
+$env:VICTORY_QUEUE2="1"
+$env:VICTORY_COPY_PLAIN="1"
+$env:VICTORY_CARD_REHASH_RUNS="1"
+$env:VICTORY_MERGE_RUNS="65536"
+$env:VICTORY_CARD_BUFFERS_MB="256"
+$env:VICTORY_CARD_BUFFERS_MIN_MB="1"
+$g = "C:\path\to\game_scarlett_master.exe"
+.\target\release\victory.exe run --execute --console series-s $g
+```
+
+### Known Issues (WIP)
+
+- **Intermittent GPU device removal (`nvlddmkm` Event 153 / `0x887A0006`)** can still occur during extended interactive gameplay on 6 GB NVIDIA GPUs. A `diag` build (`cargo build --locked --profile diag --features diagnostics -p victory`) with `$env:VICTORY_D3D12_DRED="1"` and stderr redirected (`2> dred.log`) is recommended for capturing the faulting command/allocation.
+
 ## Credits
 
 - **[VIctory](https://github.com/Marvisak/VIctory)** by Marvisak and its

@@ -143,6 +143,7 @@ pub(crate) enum Shape {
 pub(crate) struct Section {
     pub end: usize,
     pub shapes: HashMap<Value, Shape>,
+    pub lane_shapes: HashMap<(Value, u32), Shape>,
 }
 
 /// Every whole-wave section of `block`, by start index.
@@ -180,8 +181,8 @@ pub(crate) fn sections(p: &Program, block: usize) -> HashMap<usize, Section> {
         let Some(end) = end else {
             break;
         };
-        let shapes = simulate(&insts[i + 1..end], wave, saved);
-        out.insert(i, Section { end, shapes });
+        let (shapes, lane_shapes) = simulate(&insts[i + 1..end], wave, saved);
+        out.insert(i, Section { end, shapes, lane_shapes });
         i = end + 1;
     }
     out
@@ -268,7 +269,7 @@ fn combine(op: Op, a: Sym, b: Sym) -> Sym {
     }
 }
 
-fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
+fn simulate(insts: &[Inst], wave: u32, saved: Value) -> (HashMap<Value, Shape>, HashMap<(Value, u32), Shape>) {
     let all = if wave == 64 {
         u64::MAX
     } else {
@@ -688,18 +689,20 @@ fn constant(inst: &Inst) -> Option<u64> {
     }
 }
 
-/// The shape of each value, where every lane agrees on one.
+/// The shape of each value where every lane agrees on one, plus per-lane
+/// shapes for reductions left in a subset of lanes (e.g. lane 63 for `v_readlane`).
 fn shapes(
     vec: HashMap<Value, Vec<Sym>>,
     uni: HashMap<Value, Sym>,
     wave: u32,
-) -> HashMap<Value, Shape> {
+) -> (HashMap<Value, Shape>, HashMap<(Value, u32), Shape>) {
     let all = if wave == 64 {
         u64::MAX
     } else {
         u64::from(u32::MAX)
     };
     let mut out = HashMap::new();
+    let mut lane_shapes = HashMap::new();
     let single = |s: Sym| match s {
         Sym::K(k) => Some(Shape::K(k)),
         Sym::Own(x) | Sym::Uni(x) => Some(Shape::Value(x)),
@@ -727,9 +730,15 @@ fn shapes(
     for (v, lanes) in vec {
         if let Some(sh) = per_lane(&lanes, all) {
             out.insert(v, sh);
+        } else {
+            for (l, &s) in lanes.iter().enumerate() {
+                if let Some(sh) = single(s) {
+                    lane_shapes.insert((v, l as u32), sh);
+                }
+            }
         }
     }
-    out
+    (out, lane_shapes)
 }
 
 fn per_lane(lanes: &[Sym], all: u64) -> Option<Shape> {
@@ -1120,6 +1129,40 @@ mod tests {
         // (x0 + x2) + (x1 + x3) rounds differently from (x0 + x1) + (x2 + x3)
         let (found, _) = shape(&words(quads, pairs));
         assert_eq!(found, None);
+    }
+
+    #[test]
+    fn partial_lane_reduction_records_lane_shapes_when_other_lanes_collide() {
+        let words = [
+            0xBE84_25C1, // s_or_saveexec_b64 s[4:5], -1
+            0xD501_0001,
+            0x0012_0E80, // v_cndmask_b32 v1, 0, v7, s[4:5]
+            0x6402_02E9,
+            0xDE54_C101, // v_add_f16 v1, v1, v1 dpp8:[1,0,3,2,5,4,7,6]
+            0x6402_02E9,
+            0x9360_1201, // v_add_f16 v1, v1, v1 dpp8:[2,2,0,0,6,6,4,4]
+            0x6402_02E9,
+            0x0009_2401, // v_add_f16 v1, v1, v1 dpp8:[4,4,4,4,0,0,0,0]
+            0x6402_02FA,
+            0xFF09_4001, // v_add_f16 v1, v1, v1 row_mirror bound_ctrl:1
+            0xD778_0002,
+            0x0201_0101, // v_permlanex16_b32 v2, v1, 0, 0
+            0x6402_0302, // v_add_f16 v1, v2, v1
+            0xD760_0007,
+            0x0001_4101, // v_readlane_b32 s7, v1, 32
+            0x6402_0207, // v_add_f16 v1, s7, v1
+            0xBEFE_0404, // s_mov_b64 exec, s[4:5]
+        ];
+        let p = build(&words, true);
+        let insts = &p.blocks[0].insts;
+        let saved = insts[0].write(Reg::S(4)).unwrap();
+        let v7 = p.inputs.iter().find_map(|&(r, v)| (r == Reg::V(7)).then_some(v)).unwrap();
+        // v_add_f16 v1, s7, v1 leaves the full-wave sum in lanes 0..31 only.
+        let v1_final = insts[insts.len() - 3].write(Reg::V(1)).unwrap();
+        let sec = &sections(&p, 0)[&0];
+        assert_eq!(sec.shapes.get(&v1_final), None);
+        assert_eq!(sec.lane_shapes.get(&(v1_final, 0)).copied(), Some(Shape::Active(Op::AddH, v7, saved, 0)));
+        assert_eq!(sec.lane_shapes.get(&(v1_final, 32)), None);
     }
 
     #[test]

@@ -122,6 +122,20 @@ const MS_CLIP_CNTL: usize = 0x194;
 const MS_INFO: usize = 0x448;
 /// Unpacked blobs are a few KiB; refuse to allocate for absurd sizes.
 const MAX_UNPACKED: u64 = 16 << 20;
+const FSPX_VERSION: u32 = 1;
+const FSPX_HEADER: usize = 16;
+const FSPX_RECORD_SIZE: usize = 16;
+const FSPX_MAX_RECORDS: usize = 64;
+const FSPX_KIND_META: u32 = 0;
+const FSPX_KIND_CODE: u32 = 6;
+const FSPX_KIND_RESOURCES: u32 = 7;
+const FSPX_META_SIZE: usize = 28;
+const FSPX_RES_HEADER: usize = 24;
+const FSPX_RES_ENTRY: usize = 32;
+const FSPX_ENTRY_RESOURCE: u32 = 0x41;
+const FSPX_ENTRY_META: u32 = 0x42;
+const FSPX_ENTRY_HASH: u32 = 0x43;
+const FSPX_FLAG_WAVE32: u32 = 1 << 20;
 
 /// Hardware shader stage a native program runs as.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -394,6 +408,18 @@ pub enum ResourceType {
     Other(u8),
 }
 
+impl ResourceType {
+    fn from_raw(raw: u8) -> Self {
+        match raw {
+            0 => ResourceType::Srv,
+            1 => ResourceType::Sampler,
+            2 => ResourceType::Cbv,
+            3 => ResourceType::Uav,
+            n => ResourceType::Other(n),
+        }
+    }
+}
+
 /// A descriptor range the program reads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UsedResource {
@@ -407,6 +433,136 @@ pub struct UsedResource {
     pub dwords: u8,
     pub user_data: u8,
     pub slot: u8,
+}
+
+/// The native programs carried by a container's `DXIL` (`XDAT`/`FSSM`) or `ACCC` (`FSPX`) part.
+pub fn container_programs(c: &crate::Container) -> Result<Vec<NativeProgram>, ShaderError> {
+    if let Some(dxil) = c.part(crate::FourCC::DXIL) {
+        let progs = native_programs(dxil.data)?;
+        if !progs.is_empty() {
+            return Ok(progs);
+        }
+    }
+    if let Some(accc) = c.part(crate::FourCC::ACCC) {
+        return Ok(vec![accc_program(accc.data)?]);
+    }
+    Ok(Vec::new())
+}
+
+/// Parses an `ACCC` (`FSPX` v1) compute shader part produced by the FidelityFX Xbox shader compiler.
+pub fn accc_program(part: &[u8]) -> Result<NativeProgram, ShaderError> {
+    if part.get(0..4) != Some(b"FSPX") {
+        return Err(Malformed("ACCC part lacks FSPX magic"));
+    }
+    if u32_at(part, 4)? != FSPX_VERSION {
+        return Err(Malformed("unknown FSPX version"));
+    }
+    let count = u32_at(part, 8)? as usize;
+    if count > FSPX_MAX_RECORDS {
+        return Err(Malformed("implausible FSPX record count"));
+    }
+    let total_size = u32_at(part, 12)? as usize;
+    if total_size > part.len() || FSPX_HEADER + count * FSPX_RECORD_SIZE > part.len() {
+        return Err(Malformed("FSPX header out of bounds"));
+    }
+    let mut meta = None;
+    let mut code = None;
+    let mut res = None;
+    for i in 0..count {
+        let at = FSPX_HEADER + i * FSPX_RECORD_SIZE;
+        let kind = u32_at(part, at)?;
+        let offset = u32_at(part, at + 4)?.into();
+        let size = u32_at(part, at + 8)?.into();
+        let slice = bytes(part, offset, size).ok_or(Malformed("FSPX record out of bounds"))?;
+        match kind {
+            FSPX_KIND_META => meta = Some(slice),
+            FSPX_KIND_CODE => code = Some(slice),
+            FSPX_KIND_RESOURCES => res = Some(slice),
+            _ => {}
+        }
+    }
+    let meta = meta.ok_or(Malformed("FSPX missing metadata record"))?;
+    if meta.len() < FSPX_META_SIZE {
+        return Err(Malformed("FSPX metadata record too short"));
+    }
+    let code = code.ok_or(Malformed("FSPX missing code record"))?;
+    let res = res.ok_or(Malformed("FSPX missing resource record"))?;
+    if res.len() < FSPX_RES_HEADER {
+        return Err(Malformed("FSPX resource record too short"));
+    }
+
+    let w3 = u32_at(meta, 12)?;
+    let w4 = u32_at(meta, 16)?;
+    let rsrc1 = u32_at(meta, 20)?;
+    let rsrc2 = u32_at(meta, 24)?;
+    let wave64 = w4 & FSPX_FLAG_WAVE32 == 0;
+    // COMPUTE_PGM_RSRC1.VGPRS encodes (vgprs / granule) - 1, granule 4 (wave64) or 8 (wave32).
+    let vgprs = (((rsrc1 & 0x3F) + 1) * if wave64 { 4 } else { 8 }) as u16;
+    if vgprs > 256 {
+        return Err(Malformed("implausible FSPX VGPR count"));
+    }
+    let threads = [w3 & 0xFFFF, w3 >> 16, w4 & 0xFFFF];
+
+    let mut layout = Vec::<RootParam>::new();
+    let mut used = Vec::new();
+    let entries = &res[FSPX_RES_HEADER..];
+    if entries.len() % FSPX_RES_ENTRY != 0 {
+        return Err(Malformed("FSPX resource table unaligned"));
+    }
+    for e in entries.chunks_exact(FSPX_RES_ENTRY) {
+        let tag = le32(e, 0);
+        match tag {
+            FSPX_ENTRY_RESOURCE => {
+                let kind = ResourceType::from_raw(e[4]);
+                let root = RootType::from_raw(e[5].into());
+                let table_offset_dwords = le32(e, 8);
+                let lower_bound = le32(e, 12);
+                let stride = le32(e, 16);
+                let dwords = e[20];
+                let user_data = e[21];
+                let slot = e[22];
+                used.push(UsedResource {
+                    kind,
+                    root,
+                    table_offset_dwords,
+                    lower_bound,
+                    stride,
+                    dwords,
+                    user_data,
+                    slot,
+                });
+                if !layout
+                    .iter()
+                    .any(|p| p.user_data == user_data && p.root == root && p.slot == slot)
+                {
+                    let sgprs = match root {
+                        RootType::Table | RootType::ResourceHeap | RootType::SamplerHeap => 1,
+                        _ => u32::from(dwords),
+                    };
+                    layout.push(RootParam {
+                        root,
+                        table_offset_dwords: 0,
+                        sgprs,
+                        base_register: lower_bound,
+                        user_data,
+                        slot,
+                    });
+                }
+            }
+            FSPX_ENTRY_META | FSPX_ENTRY_HASH => {}
+            _ => return Err(Malformed("unknown FSPX resource entry tag")),
+        }
+    }
+
+    Ok(NativeProgram {
+        stage: HwStage::Cs,
+        wave64,
+        vgprs,
+        layout,
+        used,
+        io: StageIo::Cs(ComputeIo { rsrc2, threads }),
+        code: code.to_vec(),
+    })
 }
 
 /// The native programs in a `DXIL` part's data; empty for the PC layout.
@@ -557,13 +713,7 @@ fn programs(fssm: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
             .0
             .iter()
             .map(|e| UsedResource {
-                kind: match e[0] {
-                    0 => ResourceType::Srv,
-                    1 => ResourceType::Sampler,
-                    2 => ResourceType::Cbv,
-                    3 => ResourceType::Uav,
-                    n => ResourceType::Other(n),
-                },
+                kind: ResourceType::from_raw(e[0]),
                 root: RootType::from_raw(e[1].into()),
                 table_offset_dwords: le32(e, 4),
                 lower_bound: le32(e, 8),
@@ -1099,5 +1249,156 @@ mod tests {
         let mut bad_adler = good.clone();
         *bad_adler.last_mut().unwrap() ^= 1;
         assert!(unpack(&bad_adler).is_err());
+    }
+
+    fn fspx(meta: &[u32; 7], code: &[u8], res_entries: &[[u8; 32]]) -> Vec<u8> {
+        let count = 3u32;
+        let header_size = FSPX_HEADER + count as usize * FSPX_RECORD_SIZE;
+        let meta_off = header_size;
+        let code_off = meta_off + meta.len() * 4;
+        let res_off = code_off + code.len();
+        let res_size = FSPX_RES_HEADER + res_entries.len() * FSPX_RES_ENTRY;
+        let total = res_off + res_size;
+        let mut out = Vec::with_capacity(total);
+        out.extend_from_slice(b"FSPX");
+        out.extend_from_slice(&FSPX_VERSION.to_le_bytes());
+        out.extend_from_slice(&count.to_le_bytes());
+        out.extend_from_slice(&(total as u32).to_le_bytes());
+        for (kind, off, sz) in [
+            (FSPX_KIND_META, meta_off, meta.len() * 4),
+            (FSPX_KIND_CODE, code_off, code.len()),
+            (FSPX_KIND_RESOURCES, res_off, res_size),
+        ] {
+            out.extend_from_slice(&kind.to_le_bytes());
+            out.extend_from_slice(&(off as u32).to_le_bytes());
+            out.extend_from_slice(&(sz as u32).to_le_bytes());
+            out.extend_from_slice(&0u32.to_le_bytes());
+        }
+        for w in meta {
+            out.extend_from_slice(&w.to_le_bytes());
+        }
+        out.extend_from_slice(code);
+        out.resize(out.len() + FSPX_RES_HEADER, 0);
+        for e in res_entries {
+            out.extend_from_slice(e);
+        }
+        out
+    }
+
+    fn fspx_entry(
+        kind: ResourceType,
+        (root, table_off): (u8, u32),
+        lower_bound: u32,
+        stride: u32,
+        dwords: u8,
+        user_data: u8,
+        slot: u8,
+    ) -> [u8; 32] {
+        let mut e = [0u8; 32];
+        e[0..4].copy_from_slice(&FSPX_ENTRY_RESOURCE.to_le_bytes());
+        e[4] = match kind {
+            ResourceType::Srv => 0,
+            ResourceType::Sampler => 1,
+            ResourceType::Cbv => 2,
+            ResourceType::Uav => 3,
+            ResourceType::Other(n) => n,
+        };
+        e[5] = root;
+        e[8..12].copy_from_slice(&table_off.to_le_bytes());
+        e[12..16].copy_from_slice(&lower_bound.to_le_bytes());
+        e[16..20].copy_from_slice(&stride.to_le_bytes());
+        e[20] = dwords;
+        e[21] = user_data;
+        e[22] = slot;
+        e
+    }
+
+    #[test]
+    fn parses_accc_fspx_compute_program() {
+        let meta = [
+            0x4005_cf00,
+            0x6c09_0102,
+            0,
+            64 | (2 << 16),        // threads = [64, 2, 1]
+            1 | FSPX_FLAG_WAVE32,  // wave32
+            7,                     // (7 + 1) * 8 = 64 VGPRs
+            0x12_039c,             // COMPUTE_PGM_RSRC2
+        ];
+        let mut meta_entry = [0u8; 32];
+        meta_entry[0..4].copy_from_slice(&FSPX_ENTRY_META.to_le_bytes());
+        let mut hash_entry = [0u8; 32];
+        hash_entry[0..4].copy_from_slice(&FSPX_ENTRY_HASH.to_le_bytes());
+        let blob = fspx(
+            &meta,
+            &PS_CODE,
+            &[
+                fspx_entry(ResourceType::Uav, (3, 8), 1, 4, 8, 4, 0),
+                fspx_entry(ResourceType::Srv, (3, 24), 3, 4, 8, 5, 1),
+                fspx_entry(ResourceType::Srv, (3, 136), 17, 1, 4, 5, 1),
+                fspx_entry(ResourceType::Cbv, (1, 0), 0, 0, 2, 6, 2),
+                meta_entry,
+                hash_entry,
+            ],
+        );
+        let p = accc_program(&blob).unwrap();
+        assert_eq!(p.stage, HwStage::Cs);
+        assert!(!p.wave64);
+        assert_eq!(p.vgprs, 64);
+        assert_eq!(
+            p.io,
+            StageIo::Cs(ComputeIo {
+                rsrc2: 0x12_039c,
+                threads: [64, 2, 1],
+            })
+        );
+        assert_eq!(p.code, PS_CODE);
+        assert_eq!(
+            p.layout,
+            [
+                RootParam {
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    sgprs: 1,
+                    base_register: 1,
+                    user_data: 4,
+                    slot: 0,
+                },
+                RootParam {
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    sgprs: 1,
+                    base_register: 3,
+                    user_data: 5,
+                    slot: 1,
+                },
+                RootParam {
+                    root: RootType::Descriptor,
+                    table_offset_dwords: 0,
+                    sgprs: 2,
+                    base_register: 0,
+                    user_data: 6,
+                    slot: 2,
+                },
+            ]
+        );
+        assert_eq!(p.used.len(), 4);
+    }
+
+    #[test]
+    fn rejects_malformed_accc_fspx() {
+        assert!(accc_program(b"NOPE").is_err());
+        let meta = [0, 0, 0, 64, 1, 3, 0x10];
+        let mut bad_ver = fspx(&meta, &PS_CODE, &[]);
+        bad_ver[4] = 2;
+        assert!(accc_program(&bad_ver).is_err());
+        let mut wave64 = fspx(&[0, 0, 0, 64, 1, 3, 0x10], &PS_CODE, &[]);
+        let wave64_bytes = crate::dxbc::build(&[(crate::FourCC::ACCC, &wave64)]);
+        let c = crate::dxbc::Container::parse(&wave64_bytes).unwrap();
+        let progs = container_programs(&c).unwrap();
+        assert_eq!(progs.len(), 1);
+        assert!(progs[0].wave64);
+        assert_eq!(progs[0].vgprs, 16);
+        wave64.truncate(12);
+        assert!(accc_program(&wave64).is_err());
     }
 }

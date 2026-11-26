@@ -24,6 +24,56 @@ use crate::host::HostList;
 use crate::object::This;
 use crate::pipeline::host::HostPipeline;
 
+fn parse_fast_compute(value: Option<&str>) -> u64 {
+    let Some(raw) = value else {
+        return 0;
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty()
+        || trimmed == "0"
+        || trimmed.eq_ignore_ascii_case("false")
+        || trimmed.eq_ignore_ascii_case("off")
+    {
+        return 0;
+    }
+    if trimmed == "1"
+        || trimmed.eq_ignore_ascii_case("true")
+        || trimmed.eq_ignore_ascii_case("on")
+    {
+        return 8;
+    }
+    trimmed.parse::<u64>().unwrap_or(0)
+}
+
+fn fast_compute_stride() -> u64 {
+    static STRIDE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *STRIDE.get_or_init(|| {
+        let stride = parse_fast_compute(std::env::var("VICTORY_FAST_COMPUTE").ok().as_deref());
+        if stride > 1 {
+            tracing::info!(
+                stride,
+                "VICTORY_FAST_COMPUTE active: throttling heavy GI compute dispatches"
+            );
+        }
+        stride
+    })
+}
+
+fn should_skip_heavy_compute_at(frame: u64, stride: u64) -> bool {
+    // Wait past early warmup frames so GI buffers initialize cleanly.
+    stride > 1 && frame > 16 && !frame.is_multiple_of(stride)
+}
+
+fn should_skip_heavy_compute() -> bool {
+    should_skip_heavy_compute_at(crate::frame::current(), fast_compute_stride())
+}
+
+fn should_skip_rt_prep() -> bool {
+    fast_compute_stride() > 1
+        && crate::frame::current() > 16
+        && crate::pipeline::bvh_held_on()
+}
+
 /// A root argument as the title set it.
 #[derive(Debug, Clone, Default)]
 enum Root {
@@ -1911,10 +1961,24 @@ impl State {
         // half a frame per second, while the title streams by the clock.
         // (About a second before the runtime told of the memory it maps:
         // the looks are now only for what that does not tell.)
+        // Only advance the frame-interval clock on the main per-frame pass so
+        // `early_textures` does not shrink `took` to ~1 ms and clamp `most` to 256 frames.
         static PASSED: AtomicU64 = AtomicU64::new(0);
-        let now = crate::host::now_ms();
-        let took = now.saturating_sub(PASSED.swap(now, Ordering::Relaxed)).max(1);
-        let most = (4000 / took).clamp(16, 256);
+        static LAST_MOST: AtomicU64 = AtomicU64::new(32);
+        let most = if PASS_BUDGET.get().is_none() {
+            let now = crate::host::now_ms();
+            let prev = PASSED.swap(now, Ordering::Relaxed);
+            let most = if prev == 0 {
+                32
+            } else {
+                let took = now.saturating_sub(prev).max(1);
+                (4000 / took).clamp(8, 32)
+            };
+            LAST_MOST.store(most, Ordering::Relaxed);
+            most
+        } else {
+            LAST_MOST.load(Ordering::Relaxed)
+        };
         // What a table entry of a texture a shader samples says.
         let sampled = UsedResource {
             kind: ResourceType::Srv,
@@ -2201,6 +2265,51 @@ impl State {
         crate::pipeline::host_pipeline(self.pipeline as This).is_none_or(|p| p.stages.iter().any(|stage| stage.translated().stores))
     }
 
+    /// Raises the indoor ambient indirect-light floor after the title's
+    /// light resolver finishes its temporal resolve pass.
+    fn ambient(&self, list: &HostList, p: &HostPipeline) -> bool {
+        if !p.stages.iter().any(|s| s.shader.resolves_light) {
+            return false;
+        }
+        let (slot, offset) = crate::ambient::LIGHT;
+        let Some(&Root::Table(table)) = self.roots_ref(true).get(usize::from(slot)) else {
+            return false;
+        };
+        let handle = table + u64::from(offset) * 4;
+        let Some(View::Unordered(light, _, _)) = crate::descriptor::view(handle) else {
+            return false;
+        };
+        crate::list::ensure_state(list, light as This, 0x8);
+        crate::ambient::raise(list, light as This)
+    }
+
+    /// Replaces the FSR4 neural-network postpass with a bilinear upscale from
+    /// `r_input_color` to `rw_mlsr_output_color`.
+    fn fsr4_upscale(&self, list: &HostList) -> bool {
+        let roots = self.roots_ref(true);
+        let (src_slot, src_off) = crate::fsr4::INPUT_COLOR;
+        let (dst_slot, dst_off) = crate::fsr4::OUTPUT_COLOR;
+        let Some(&Root::Table(src_table)) = roots.get(usize::from(src_slot)) else {
+            return false;
+        };
+        let Some(&Root::Table(dst_table)) = roots.get(usize::from(dst_slot)) else {
+            return false;
+        };
+        let Some(View::Shader(src, _)) = crate::descriptor::view(src_table + u64::from(src_off) * 4) else {
+            return false;
+        };
+        let Some(View::Unordered(dst, _, _)) = crate::descriptor::view(dst_table + u64::from(dst_off) * 4) else {
+            return false;
+        };
+        let cb0 = match roots.get(2) {
+            Some(&Root::View(addr)) => Some(addr),
+            _ => None,
+        };
+        crate::list::ensure_state(list, src as This, 0x40);
+        crate::list::ensure_state(list, dst as This, 0x8);
+        crate::fsr4::upscale(list, src as This, dst as This, cb0)
+    }
+
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
         // It may write the arguments a window holds clamped.
@@ -2245,6 +2354,26 @@ impl State {
             once!("a dispatch with a graphics pipeline");
             return;
         }
+        if crate::fsr4::enabled() {
+            match p.fsr4 {
+                crate::fsr4::PassKind::None => {}
+                crate::fsr4::PassKind::Model => return,
+                crate::fsr4::PassKind::Postpass => {
+                    if self.fsr4_upscale(list) {
+                        self.host_heaps = [0; 2];
+                        self.host_pipeline = 0;
+                        self.host_roots[1] = 0;
+                        DISPATCHED.fetch_add(1, Ordering::Relaxed);
+                        return;
+                    }
+                }
+            }
+        }
+        if (p.heavy_compute && should_skip_heavy_compute())
+            || (p.rt_prep && should_skip_rt_prep())
+        {
+            return;
+        }
         if !self.bind(list, p, true) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             // A stage of the structure builder that cannot be bound is a
@@ -2259,6 +2388,11 @@ impl State {
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+        if self.ambient(list, p) {
+            self.host_heaps = [0; 2];
+            self.host_pipeline = 0;
+            self.host_roots[1] = 0;
+        }
     }
 
     /// What a draw or dispatch runs, for the device-removed report
@@ -3757,5 +3891,23 @@ mod tests {
         assert_eq!(jump_window(remembered, (7, 0, 12), 1 << 20), None);
         assert_eq!(jump_window(remembered, (7, 10, 16), 1 << 20), None);
         assert_eq!(jump_window(None, (7, 10, 12), 1 << 20), None);
+    }
+
+    #[test]
+    fn fast_compute_parsing_and_temporal_throttling() {
+        assert_eq!(parse_fast_compute(None), 0);
+        assert_eq!(parse_fast_compute(Some("")), 0);
+        assert_eq!(parse_fast_compute(Some("0")), 0);
+        assert_eq!(parse_fast_compute(Some("off")), 0);
+        assert_eq!(parse_fast_compute(Some("false")), 0);
+        assert_eq!(parse_fast_compute(Some("1")), 8);
+        assert_eq!(parse_fast_compute(Some("on")), 8);
+        assert_eq!(parse_fast_compute(Some("true")), 8);
+        assert_eq!(parse_fast_compute(Some(" 4 ")), 4);
+
+        assert!(!should_skip_heavy_compute_at(16, 4));
+        assert!(should_skip_heavy_compute_at(17, 4));
+        assert!(!should_skip_heavy_compute_at(20, 4));
+        assert!(!should_skip_heavy_compute_at(17, 1));
     }
 }

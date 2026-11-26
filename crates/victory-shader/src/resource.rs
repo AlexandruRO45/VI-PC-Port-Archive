@@ -2066,7 +2066,8 @@ impl<'a> Tracer<'a> {
         Ok(out)
     }
 
-    /// Consecutive dwords of one scalar load.
+    /// Consecutive dwords of one scalar load, or a 4-dword buffer descriptor
+    /// from one scalar load whose stride/type fields were normalized for raw access.
     fn loaded(&self, words: &[Term]) -> Option<Source> {
         let Term::Value(v0) = words[0] else {
             return None;
@@ -2082,10 +2083,72 @@ impl<'a> Tracer<'a> {
                 .get(first + k)
                 .is_some_and(|x| *w == Term::Value(x.1))
         });
-        same.then_some(Source::Loaded {
+        let raw_normalized = !same
+            && words.len() == 4
+            && inst.writes.get(first + 3).is_some()
+            && {
+                let tail = [
+                    inst.writes[first + 1].1,
+                    inst.writes[first + 2].1,
+                    inst.writes[first + 3].1,
+                ];
+                words[1..].iter().all(|w| match *w {
+                    Term::Value(v) => self.only_buffer_meta(v, &tail),
+                    Term::Const(_) => true,
+                })
+            };
+        (same || raw_normalized).then_some(Source::Loaded {
             load,
             first: first as u8,
         })
+    }
+
+    /// True when `start` is computed exclusively from constants and the
+    /// metadata dwords `allowed` of the same loaded buffer descriptor.
+    fn only_buffer_meta(&self, start: Value, allowed: &[Value]) -> bool {
+        let (mut seen, mut work) = (Vec::new(), vec![start]);
+        while let Some(v) = work.pop() {
+            if allowed.contains(&v) || seen.contains(&v) {
+                continue;
+            }
+            if seen.len() == MAX_COPIES {
+                return false;
+            }
+            seen.push(v);
+            let Some(inst) = self.def(v) else {
+                return false;
+            };
+            let Fields::Sop { src, .. } = &inst.fields else {
+                return false;
+            };
+            if !matches!(
+                inst.name(),
+                "s_and_b32"
+                    | "s_or_b32"
+                    | "s_xor_b32"
+                    | "s_bfe_u32"
+                    | "s_max_u32"
+                    | "s_min_u32"
+                    | "s_mul_i32"
+                    | "s_lshl_b32"
+                    | "s_lshr_b32"
+                    | "s_add_u32"
+                    | "s_add_i32"
+                    | "s_sub_u32"
+                    | "s_sub_i32"
+            ) {
+                return false;
+            }
+            for op in src {
+                let Some(term) = self.term(inst, op) else {
+                    return false;
+                };
+                if let Term::Value(u) = term {
+                    work.push(u);
+                }
+            }
+        }
+        true
     }
 
     /// A descriptor the code keeps per lane: every dword of `words` is the
@@ -2331,14 +2394,24 @@ fn copy_source(inst: &Inst, k: usize) -> Option<Moved> {
     if inst.name() == "s_movk_i32" {
         return Some(Moved::Const(i32::from((*imm)? as i16) as u32));
     }
-    let src = src.first()?;
-    match (inst.name(), *src) {
+    let first = src.first()?;
+    match (inst.name(), *first) {
         ("s_mov_b32" | "s_mov_b64", Operand::Scalar { code, .. }) if code != NULL => {
             inst.read(Reg::S(code + k as u8)).map(Moved::Value)
         }
         ("s_mov_b32" | "s_mov_b64", Operand::Scalar { .. }) => Some(Moved::Const(0)),
         ("s_mov_b32", Operand::Literal(x)) => Some(Moved::Const(x)),
+        ("s_mov_b64", Operand::Literal(x)) => Some(Moved::Const(if k == 0 { x } else { 0 })),
         ("s_mov_b32", Operand::Const(c)) => inline(c).map(Moved::Const),
+        ("s_bfm_b32", Operand::Const(c)) => {
+            let w = inline(c)? & 31;
+            let off = match src.get(1)? {
+                Operand::Const(c1) => inline(*c1)?,
+                Operand::Literal(x) => *x,
+                _ => return None,
+            } & 31;
+            Some(Moved::Const(1u32.wrapping_shl(w).wrapping_sub(1).wrapping_shl(off)))
+        }
         // shortcut: only the one-operand ways the compiler makes a constant
         // that has no inline form; fold more if descriptors need it.
         ("s_brev_b32", Operand::Const(c)) => inline(c).map(|x| Moved::Const(x.reverse_bits())),
@@ -2791,6 +2864,41 @@ pub(crate) mod tests {
             ShaderError::Unsupported {
                 offset: 36,
                 what: "a descriptor changed after loading"
+            }
+        );
+    }
+
+    #[test]
+    fn raw_buffer_stride_normalization_keeps_loaded_source() {
+        let code: Vec<u8> = [
+            0xBE88_0304, // s_mov_b32 s8, s4
+            0xBE89_0380, // s_mov_b32 s9, 0
+            0xF408_0204,
+            0xFA00_0160, // s_load_dwordx4 s[8:11], s[8:9], 0x160
+            0x938C_FF09,
+            0x000E_0010, // s_bfe_u32 s12, s9, 0x000e0010
+            0x848C_810C, // s_max_u32 s12, s12, 1
+            0x870B_FF0B,
+            0xCFFF_FFFF, // s_and_b32 s11, s11, 0xcfffffff
+            0x930A_0C0A, // s_mul_i32 s10, s10, s12
+            0x880B_FF0B,
+            0x3000_0000, // s_or_b32 s11, s11, 0x30000000
+            0x8709_FF09,
+            0xC000_FFFF, // s_and_b32 s9, s9, 0xc000ffff
+            0xE038_1000,
+            0x8002_0000, // buffer_load_dwordx4 v[0:3], v0, s[8:11], 0 offen
+            S_ENDPGM,
+        ]
+        .iter()
+        .flat_map(|w: &u32| w.to_le_bytes())
+        .collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        let r = track(&p, &[param(Table, 4, 0)], HwStage::Cs, lanes(&p).as_ref()).unwrap();
+        assert_eq!(
+            r.descriptors[0].source,
+            Source::Loaded {
+                load: (0, 2),
+                first: 0,
             }
         );
     }

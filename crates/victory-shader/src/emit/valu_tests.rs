@@ -1622,3 +1622,87 @@ fn whole_wave_f64_sum_and_cvt_f32_f64() {
         }
     }
 }
+
+#[test]
+fn packed_fmac_f16_and_dot4_i8_compute_expected_values() {
+    let vop2 = |op: u8, vdst: u8, src0: u16, vsrc1: u8| {
+        (u32::from(op) << 25)
+            | (u32::from(vdst) << 17)
+            | (u32::from(vsrc1) << 9)
+            | u32::from(src0 & 0x1FF)
+    };
+    let vop3p = |op: u16, vdst: u8, src0: u16, src1: u16, src2: u16, opsel: u32, opsel_hi: u32| -> [u32; 2] {
+        [
+            (0x33 << 26)
+                | (u32::from(op) << 16)
+                | ((opsel_hi >> 2 & 1) << 14)
+                | ((opsel & 7) << 11)
+                | u32::from(vdst),
+            ((opsel_hi & 3) << 27)
+                | u32::from(src0 & 0x1FF)
+                | (u32::from(src1 & 0x1FF) << 9)
+                | (u32::from(src2 & 0x1FF) << 18),
+        ]
+    };
+    let pack_f16 = |lo: f32, hi: f32| -> u32 {
+        let to_f16 = |x: f32| -> u32 {
+            // Simple finite test values: 0.5, -1.5, 2.0, 3.0, 4.0 -> encode exact IEEE f16.
+            let b = x.to_bits();
+            let sign = (b >> 16) & 0x8000;
+            let exp = ((b >> 23) & 0xFF) as i32 - 127 + 15;
+            let mant = (b >> 13) & 0x3FF;
+            if x == 0.0 {
+                sign
+            } else {
+                sign | ((exp as u32) << 10) | mant
+            }
+        };
+        to_f16(lo) | (to_f16(hi) << 16)
+    };
+
+    // v_pk_fmac_f16: v0 = v3 (acc) -> v0 += v1 * v2 (low and high halves independently).
+    let pk_fmac_shader = build_valu_cs(&[
+        vop1(0x001, 0, vgpr(3)),        // v_mov_b32 v0, v3
+        vop2(0x3c, 0, vgpr(1), 2),      // v_pk_fmac_f16 v0, v1, v2
+    ]);
+    let pk_in = vec![[
+        pack_f16(2.0, -3.0),
+        pack_f16(4.0, 2.0),
+        pack_f16(1.5, 0.5),
+        0,
+    ]];
+    run_cases(&pk_fmac_shader, &pk_in, |backend, _, _, got| {
+        let want = pack_f16(9.5, -5.5); // 2*4 + 1.5 = 9.5, (-3)*2 + 0.5 = -5.5
+        assert_eq!(got, want, "{backend}: v_pk_fmac_f16 = {got:#x}, want {want:#x}");
+    });
+
+    let pack_i8 = |b: [i8; 4]| u32::from_le_bytes(b.map(|x| x as u8));
+    let dot4_shader = build_valu_cs(&vop3p(0x16, 0, vgpr(1), vgpr(2), vgpr(3), 0, 7));
+    let dot4_sel_hi_lo_shader = build_valu_cs(&vop3p(0x16, 0, vgpr(1), vgpr(2), vgpr(3), 0b010, 0b101));
+    let dot4_sel_lo_shader = build_valu_cs(&vop3p(0x16, 0, vgpr(1), vgpr(2), vgpr(3), 0b000, 0b101));
+    let dot4c_shader = build_valu_cs(&[vop1(0x001, 0, vgpr(3)), vop2(0x0d, 0, vgpr(1), 2)]);
+    let dot_cases = [
+        ([1i8, -2, 3, -4], [5i8, 6, -7, 8], 100i32), // 5 - 12 - 21 - 32 + 100 = 40
+        ([-128i8, 127, -1, 0], [-1i8, 2, -3, 127], -50i32), // 128 + 254 + 3 + 0 - 50 = 335
+    ];
+    let dot_in: Vec<[u32; 4]> = dot_cases
+        .iter()
+        .map(|&(a, b, acc)| [pack_i8(a), pack_i8(b), acc as u32, 0])
+        .collect();
+    for (name, shader, perm) in [
+        ("v_dot4_i32_i8", &dot4_shader, [0usize, 1, 2, 3]),
+        ("v_dot4_i32_i8_sel_hi_lo", &dot4_sel_hi_lo_shader, [2, 3, 0, 1]),
+        ("v_dot4_i32_i8_sel_lo", &dot4_sel_lo_shader, [0, 1, 0, 1]),
+        ("v_dot4c_i32_i8", &dot4c_shader, [0, 1, 2, 3]),
+    ] {
+        run_cases(shader, &dot_in, |backend, i, _, got| {
+            let (a, b, acc) = dot_cases[i];
+            let want = acc
+                + a.iter()
+                    .zip(perm.map(|k| b[k]))
+                    .map(|(&x, y)| i32::from(x) * i32::from(y))
+                    .sum::<i32>();
+            assert_eq!(got as i32, want, "{backend}/{name}[{i}]: got {}, want {want}", got as i32);
+        });
+    }
+}

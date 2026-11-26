@@ -575,7 +575,11 @@ impl TextureQueue {
         let newest_first = |a: &(u64, u32, u64), b: &(u64, u32, u64)| b.2.cmp(&a.2);
         again.sort_unstable_by(newest_first);
         fresh.sort_unstable_by(newest_first);
-        let mut order: Vec<(u32, u64)> = again.iter().map(|&(_, index, write)| (index, write)).collect();
+        // Reserve at least half the pass for newly written slots so a large
+        // unmapped retry backlog cannot starve newly visible scene textures.
+        let again_cap = if fresh.is_empty() { max } else { max / 2 };
+        let mut order: Vec<(u32, u64)> =
+            again.iter().take(again_cap).map(|&(_, index, write)| (index, write)).collect();
         let (mut new, mut old) = (0, fresh.len());
         while new < old && order.len() < max {
             order.push((fresh[new].1, fresh[new].2));
@@ -584,6 +588,14 @@ impl TextureQueue {
                 old -= 1;
                 order.push((fresh[old].1, fresh[old].2));
             }
+        }
+        if order.len() < max && again.len() > again_cap {
+            order.extend(
+                again[again_cap..]
+                    .iter()
+                    .take(max - order.len())
+                    .map(|&(_, index, write)| (index, write)),
+            );
         }
         order.truncate(max);
         order
@@ -1300,7 +1312,14 @@ impl HostHeap {
         // made anew here, with the card full. `made` first, then `kept`,
         // as `mirror` takes them.
         let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
-        made.get(index as usize).is_some_and(|&made| made != 0 && made == key)
+        let same_host = made.get(index as usize).is_some_and(|&old| {
+            old != 0
+                && (old == key
+                    || view_at(old as u32, (old >> 32) as u32)
+                        .zip(view_at(key as u32, (key >> 32) as u32))
+                        .is_some_and(|(a, b)| same_placed_texture(&a, &b)))
+        });
+        same_host
             && self
                 .kept
                 .lock()
@@ -1370,7 +1389,7 @@ impl HostHeap {
     /// ([`HostHeap::texture_slots_waiting`]): the first ones given tiles
     /// may take the room the others were asked for, and an upload that
     /// gives nothing is a whole texture staged and copied for nothing.
-    const WAITING_A_PASS: usize = 128;
+    const WAITING_A_PASS: usize = 512;
 
     pub(crate) fn texture_views_remade(&self) -> usize {
         if self.sampler {
@@ -3640,5 +3659,25 @@ mod own_copy_tests {
         assert_eq!(own_bytes_if(true, 8, base, 2, 0, 32, 32, true), None);
         assert_eq!(own_bytes_if(true, 8, base, 2, 4, 0, 0, false), None);
         assert_eq!(own_bytes_if(false, 8, base, 2, 4, 32, 32, true), None);
+    }
+}
+
+#[cfg(test)]
+mod texture_queue_tests {
+    use super::TextureQueue;
+
+    #[test]
+    fn fresh_slots_are_not_starved_behind_large_retry_backlog() {
+        let mut q = TextureQueue::default();
+        for i in 0..6u32 {
+            q.changed(i, 1, 1);
+            q.later(i, 1, 1, 1);
+        }
+        q.changed(100, 1, 2);
+        q.changed(101, 1, 3);
+        let picked = q.due(10, 4);
+        assert_eq!(picked.len(), 4);
+        let indices: Vec<u32> = picked.iter().map(|&(idx, _)| idx).collect();
+        assert!(indices.contains(&100) && indices.contains(&101), "got {indices:?}");
     }
 }

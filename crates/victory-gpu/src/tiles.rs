@@ -117,13 +117,67 @@ fn parse_floor(value: Option<&str>) -> u64 {
 /// tiles at most, and most of the calls for nothing.)
 pub(crate) fn floor() -> u64 {
     static BYTES: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *BYTES.get_or_init(|| parse_floor(std::env::var("VICTORY_LEVELS_MIN_KB").ok().as_deref()))
+    *BYTES.get_or_init(|| match std::env::var("VICTORY_LEVELS_MIN_KB").ok() {
+        Some(value) => parse_floor(Some(value.as_str())),
+        None => {
+            if crate::host::host()
+                .and_then(|h| h.video_memory())
+                .is_some_and(|[budget, ..]| budget > 0 && budget < (7 << 30))
+            {
+                128 << 10
+            } else {
+                parse_floor(None)
+            }
+        }
+    })
 }
 
 /// The bytes of the tiles given to textures now: the card's memory they
 /// hold (`resource.rs` `room` counts it with the other host copies).
 pub(crate) fn given_total() -> u64 {
     STATS[2].load(Ordering::Relaxed)
+}
+
+/// Already-allocated free bytes sitting inside the tile pool's heaps
+/// (counted in DXGI `used` even though no texture holds them yet).
+pub(crate) fn free_total() -> u64 {
+    STATS[3]
+        .load(Ordering::Relaxed)
+        .saturating_sub(STATS[2].load(Ordering::Relaxed))
+}
+
+fn parse_max_level_tiles(value: Option<&str>, video_memory: Option<[u64; 4]>) -> u32 {
+    if let Some(v) = value
+        && let Ok(n) = v.trim().parse::<u32>()
+    {
+        return if n == 0 { u32::MAX } else { n };
+    }
+    match video_memory {
+        Some([budget, ..]) if budget > 0 && budget < (7 << 30) => 4,
+        _ => u32::MAX,
+    }
+}
+
+/// Maximum 64 KiB tiles mapped for any single standard mip level on demand
+/// (`VICTORY_LEVELS_MAX_TILES`, `0` = uncapped). On `< 7 GiB` GPUs this
+/// defaults to `4` tiles (256 KiB/mip, up to 512x512 BC7 / 1024x1024 BC1) so
+/// thousands of scene textures fit cleanly inside 6 GB VRAM without starving
+/// walls or characters.
+pub(crate) fn max_level_tiles() -> u32 {
+    static MAX: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *MAX.get_or_init(|| {
+        let env = std::env::var("VICTORY_LEVELS_MAX_TILES").ok();
+        let vm = crate::host::host().and_then(|h| h.video_memory());
+        let max = parse_max_level_tiles(env.as_deref(), vm);
+        if max != u32::MAX {
+            tracing::info!(
+                max_tiles = max,
+                max_kib = u64::from(max) * (TILE >> 10),
+                "capping on-demand texture mip size to fit VRAM (VICTORY_LEVELS_MAX_TILES)"
+            );
+        }
+        max
+    })
 }
 
 /// One heap of the pool and its free runs of tiles (first tile, tiles), in
@@ -355,9 +409,61 @@ impl Tiled {
     /// whether a level named is still without tiles (no room, or no heap
     /// could be had): the caller has the upload recorded again later, or
     /// the level would stay empty until the title writes the texture.
+    /// Drops oversized top mip levels above `max_tiles` (keeping packed mips and
+    /// at least the smallest held level so no texture is ever left completely
+    /// unmapped/black).
+    fn cap_held(&self, held: u32, max_tiles: u32) -> u32 {
+        let held = held & self.every_level();
+        if max_tiles == u32::MAX || held == 0 {
+            return held;
+        }
+        let first_packed = self.standard.len() as u32;
+        let mut kept = 0u32;
+        for level in 0..self.levels.min(32) {
+            if held & (1 << level) == 0 {
+                continue;
+            }
+            if level >= first_packed || self.standard[level as usize] <= max_tiles {
+                kept |= 1 << level;
+            }
+        }
+        if kept == 0 {
+            kept = 1 << held.ilog2();
+        }
+        kept
+    }
+
+    /// Whether the unmapped tiles needed by `held` already fit inside an
+    /// existing pool heap without allocating any new VRAM.
+    fn fits_in_pool(&self, held: u32) -> bool {
+        let missing = self.without(held);
+        if missing == 0 {
+            return true;
+        }
+        let first_packed = self.standard.len() as u32;
+        let mut needed = 0u32;
+        for level in 0..first_packed {
+            if missing & (1 << level) != 0 {
+                needed = needed.saturating_add(self.standard[level as usize]);
+            }
+        }
+        if self.packed > 0 && (first_packed..self.levels.min(32)).any(|l| missing & (1 << l) != 0) {
+            needed = needed.saturating_add(self.packed);
+        }
+        if needed == 0 {
+            return true;
+        }
+        let pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+        pool.iter()
+            .flatten()
+            .any(|h| h.free_tiles() >= needed)
+    }
+
     pub(crate) fn uploaded(&self, texture: &ID3D12Resource, held: u32, room: bool) -> (bool, bool) {
+        let held = self.cap_held(held, max_level_tiles());
+        let allow = room || self.fits_in_pool(held);
         match host() {
-            Some(host) => self.uploaded_on(host.queue(), &host.device, texture, held, room),
+            Some(host) => self.uploaded_on(host.queue(), &host.device, texture, held, allow),
             None => (false, false),
         }
     }
@@ -1583,5 +1689,37 @@ void look() {
         assert!(!changed && waiting);
         assert!(!tiled.has_tiles(0));
         assert_eq!(tiled.given_bytes(), 0);
+    }
+
+    #[test]
+    fn cap_held_drops_oversized_mips_and_keeps_smallest_fallback() {
+        assert_eq!(parse_max_level_tiles(None, None), u32::MAX);
+        assert_eq!(parse_max_level_tiles(None, Some([12 << 30, 0, 0, 0])), u32::MAX);
+        assert_eq!(parse_max_level_tiles(None, Some([5000 << 20, 0, 0, 0])), 4);
+        assert_eq!(parse_max_level_tiles(Some("0"), Some([5000 << 20, 0, 0, 0])), u32::MAX);
+        assert_eq!(parse_max_level_tiles(Some("8"), Some([12 << 30, 0, 0, 0])), 8);
+
+        let tiled = Tiled {
+            standard: vec![64, 16, 4, 1],
+            packed: 1,
+            levels: 6,
+            full: 86 * TILE,
+            given: Mutex::new(Given {
+                levels: vec![false; 4],
+                packed: false,
+                runs: Vec::new(),
+            }),
+            shown: AtomicU32::new(u32::MAX),
+            held: AtomicU32::new(0),
+            card: AtomicU32::new(0),
+            claimed: AtomicU32::new(0),
+        };
+        // Levels 0 (64 tiles) and 1 (16 tiles) are capped; levels 2 (4), 3 (1), and packed 4..5 remain.
+        assert_eq!(tiled.cap_held(0b11_1111, 4), 0b11_1100);
+        // If only oversized levels 0 and 1 are held, keep the smallest held level (level 1).
+        assert_eq!(tiled.cap_held(0b00_0011, 4), 0b00_0010);
+        // Uncapped leaves all held levels intact.
+        assert_eq!(tiled.cap_held(0b11_1111, u32::MAX), 0b11_1111);
+        assert_eq!(tiled.cap_held(0, 4), 0);
     }
 }

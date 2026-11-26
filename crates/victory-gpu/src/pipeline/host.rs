@@ -300,9 +300,25 @@ impl Stage {
     }
 }
 
+/// Heavy half-res GI/probe compute shaders identified via GPU timestamp
+/// profiling. Throttled when `VICTORY_FAST_COMPUTE` is enabled (never matches
+/// `resolves_light` shaders so the ambient lighting floor always runs).
+const HEAVY_COMPUTE: [&str; 4] = [
+    "3932709b61f074d0",
+    "9afd549c4f530901",
+    "f22a76fcb967ee59",
+    "cfd83392ec9ae408",
+];
+
 pub(crate) struct HostPipeline {
     /// A compute pipeline (else graphics).
     pub(crate) compute: bool,
+    /// True for heavy GI/lighting compute shaders eligible for `VICTORY_FAST_COMPUTE`.
+    pub(crate) heavy_compute: bool,
+    /// True for RT/BVH prep compute shaders skippable under `VICTORY_BVH_HOLD=1` + `VICTORY_FAST_COMPUTE`.
+    pub(crate) rt_prep: bool,
+    /// FSR4 neural-upscaler pass role (`None` for ordinary pipelines).
+    pub(crate) fsr4: crate::fsr4::PassKind,
     /// A mesh pipeline (graphics without vertex input).
     pub(crate) mesh: bool,
     pub(crate) pso: ID3D12PipelineState,
@@ -545,6 +561,13 @@ impl HostPipeline {
             crate::host::name(&pso, || format!("{shaders:?}"));
             return Some(HostPipeline {
                 compute: true,
+                heavy_compute: compute.is_some_and(|cs| {
+                    !cs.resolves_light && HEAVY_COMPUTE.contains(&cs.hash.as_str())
+                }),
+                rt_prep: compute.is_some_and(|cs| cs.rt_prep),
+                fsr4: compute.map_or(crate::fsr4::PassKind::None, |cs| {
+                    crate::fsr4::classify(cs.is_accc, &bound[0].translated().used)
+                }),
                 mesh: false,
                 pso,
                 root,
@@ -598,6 +621,9 @@ impl HostPipeline {
             crate::host::name(&pso, || format!("{shaders:?}"));
             return Some(HostPipeline {
                 compute: false,
+                heavy_compute: false,
+                rt_prep: false,
+                fsr4: crate::fsr4::PassKind::None,
                 mesh: true,
                 pso,
                 root,
@@ -714,6 +740,9 @@ impl HostPipeline {
         );
         Some(HostPipeline {
             compute: false,
+            heavy_compute: false,
+            rt_prep: false,
+            fsr4: crate::fsr4::PassKind::None,
             mesh: false,
             pso,
             root,

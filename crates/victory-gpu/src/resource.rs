@@ -1413,9 +1413,16 @@ pub(crate) fn host_made<'a>(
 /// limit on those copies' bytes instead). Past the budget the system moves
 /// the card's memory into the PC's, which ended runs 20 and 24.
 #[cfg(windows)]
+fn default_texture_floor(video_memory: Option<[u64; 4]>) -> u64 {
+    match video_memory {
+        Some([budget, ..]) if budget > 0 && budget < (7 << 30) => 384 << 20,
+        _ => 2 << 30,
+    }
+}
+
+#[cfg(windows)]
 pub(crate) fn room() -> bool {
     use std::sync::atomic::Ordering::Relaxed;
-    const FLOOR: u64 = 2 << 30;
     const WITHOUT_BUDGET: u64 = 4 << 30;
     static LIMIT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
     let limit = *LIMIT.get_or_init(|| {
@@ -1428,16 +1435,20 @@ pub(crate) fn room() -> bool {
     if let Some(limit) = limit {
         return filled < limit;
     }
-    if filled < FLOOR {
+    let video_memory = crate::host::host().and_then(|h| h.video_memory());
+    if filled < default_texture_floor(video_memory) {
         return true;
     }
-    match crate::host::host().and_then(|h| h.video_memory()) {
+    match video_memory {
         // What is kept for card copies of title buffers not made yet
         // (`crate::shadow::card_room_kept`) and for the render targets a
         // world makes in its first frame ([`targets_room_kept`]) counts as
-        // used.
+        // used; free tiles already sitting in `tiles::POOL` are already
+        // included in `used` and can back new levels at zero extra VRAM.
         Some([budget, used, ..]) => {
-            used + crate::shadow::card_room_kept() + targets_room_kept() < budget / 100 * room_percent()
+            let effective_used = used.saturating_sub(crate::tiles::free_total());
+            effective_used + crate::shadow::card_room_kept() + targets_room_kept()
+                < budget / 100 * room_percent()
         }
         None => filled < WITHOUT_BUDGET,
     }
@@ -1461,6 +1472,24 @@ pub(crate) fn room() -> bool {
 /// their room kept, the queue stops that much earlier while the world
 /// loads and gets it back as the targets are made.
 #[cfg(windows)]
+fn default_targets_room(video_memory: Option<[u64; 4]>, console: crate::console::Console) -> u64 {
+    if console == crate::console::Console::SeriesS {
+        // Series S renders 720p/1080p targets (~1.0-1.3 GiB total, far less
+        // than Series X's 4K targets); reserving 2-3 GiB permanently starves
+        // the texture queue on 6 GB GPUs even with ~800 MB of free VRAM.
+        return 1024 << 20;
+    }
+    let Some([budget, ..]) = video_memory else {
+        return 3072 << 20;
+    };
+    if budget > 0 && budget < (7 << 30) {
+        (budget * 40 / 100).min(3072 << 20)
+    } else {
+        3072 << 20
+    }
+}
+
+#[cfg(windows)]
 pub(crate) fn targets_room_kept() -> u64 {
     use std::sync::atomic::Ordering::Relaxed;
     static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
@@ -1468,7 +1497,15 @@ pub(crate) fn targets_room_kept() -> u64 {
         std::env::var("VICTORY_CARD_ROOM_FOR_TARGETS_MB")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
-            .map_or(3072 << 20, |mb| mb.min(8192) << 20)
+            .map_or_else(
+                || {
+                    default_targets_room(
+                        crate::host::host().and_then(|h| h.video_memory()),
+                        crate::console::current(),
+                    )
+                },
+                |mb| mb.min(8192) << 20,
+            )
     });
     // Every host texture's bytes less those of the copies the title fills.
     let targets = HOST_TEXTURES[1].load(Relaxed).saturating_sub(KINDS[1].load(Relaxed));
@@ -1501,13 +1538,24 @@ pub(crate) fn room_lately() -> bool {
 /// 1 MiB up take 449 MB more of the card than before (941 against 492),
 /// and 94 gives the textures about that much back.
 #[cfg(windows)]
+fn default_room_percent(video_memory: Option<[u64; 4]>) -> u64 {
+    match video_memory {
+        Some([budget, ..]) if budget > 0 && budget < (7 << 30) => 88,
+        _ => 90,
+    }
+}
+
+#[cfg(windows)]
 fn room_percent() -> u64 {
     static PERCENT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *PERCENT.get_or_init(|| {
         std::env::var("VICTORY_TEXTURE_ROOM_PERCENT")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
-            .map_or(90, |percent| percent.clamp(50, 97))
+            .map_or_else(
+                || default_room_percent(crate::host::host().and_then(|h| h.video_memory())),
+                |percent| percent.clamp(50, 97),
+            )
     })
 }
 
@@ -3986,5 +4034,29 @@ float4 lit() : SV_Target { return 1.0; }
         // The resource keeps the heap alive.
         assert_eq!(slot::<Release>(heap, 0x10)(heap), 1);
         assert_eq!(slot::<Release>(placed, 0x10)(placed), 0);
+    }
+
+    #[test]
+    fn vram_room_defaults_scale_for_smaller_cards() {
+        use crate::console::Console;
+        assert_eq!(super::default_targets_room(None, Console::SeriesX), 3072 << 20);
+        assert_eq!(
+            super::default_targets_room(Some([12 << 30, 0, 0, 0]), Console::SeriesX),
+            3072 << 20
+        );
+        assert_eq!(
+            super::default_targets_room(Some([5000 << 20, 0, 0, 0]), Console::SeriesX),
+            (5000 << 20) * 40 / 100
+        );
+        assert_eq!(
+            super::default_targets_room(Some([5000 << 20, 0, 0, 0]), Console::SeriesS),
+            1024 << 20
+        );
+        assert_eq!(super::default_room_percent(None), 90);
+        assert_eq!(super::default_room_percent(Some([12 << 30, 0, 0, 0])), 90);
+        assert_eq!(super::default_room_percent(Some([5000 << 20, 0, 0, 0])), 88);
+        assert_eq!(super::default_texture_floor(None), 2 << 30);
+        assert_eq!(super::default_texture_floor(Some([12 << 30, 0, 0, 0])), 2 << 30);
+        assert_eq!(super::default_texture_floor(Some([5000 << 20, 0, 0, 0])), 384 << 20);
     }
 }

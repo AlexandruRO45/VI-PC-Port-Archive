@@ -1103,14 +1103,14 @@ impl Staging {
             crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
             let changed = with_read(size, |read| {
                 crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
+                if read.iter().all(|&b| b == 0) {
+                    return false;
+                }
                 let hash = blake3::hash(read);
                 if last.hash == Some(hash) {
                     return false;
                 }
                 last.hash = Some(hash);
-                if read.iter().all(|&b| b == 0) {
-                    return false;
-                }
                 self.detile(read);
                 true
             });

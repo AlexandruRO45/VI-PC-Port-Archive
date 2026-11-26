@@ -18,6 +18,8 @@
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
 #[cfg(windows)]
+mod ambient;
+#[cfg(windows)]
 mod cardmeter;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod renderdoc;
@@ -32,6 +34,8 @@ pub mod device;
 mod drvwatch;
 #[cfg(windows)]
 mod fpsbox;
+#[cfg(windows)]
+mod fsr4;
 #[cfg(windows)]
 mod spread;
 #[cfg(windows)]
