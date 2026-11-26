@@ -836,11 +836,13 @@ fn lazy_can_take(g: &Guards, page: usize) -> bool {
 pub(crate) fn arm_lazy(
     pages: &[(std::sync::Arc<crate::shadow::Shadow>, usize)],
 ) -> Vec<(std::sync::Arc<crate::shadow::Shadow>, usize)> {
+    use std::sync::atomic::Ordering::Relaxed;
     use windows_sys::Win32::System::Memory::{PAGE_NOACCESS, VirtualProtect};
     let mut eager = Vec::new();
     let mut g = guards();
     for (copy, page) in pages {
         if !lazy_can_take(&g, *page) {
+            ARM_REFUSED_GUARD.fetch_add(1, Relaxed);
             eager.push((copy.clone(), *page));
             continue;
         }
@@ -855,13 +857,30 @@ pub(crate) fn arm_lazy(
                     "the host refuses no-access inside its write-watched pools: the marked pages go back eagerly (logged once)"
                 );
             });
+            ARM_REFUSED_HOST.fetch_add(1, Relaxed);
             eager.push((copy.clone(), *page));
         } else {
+            ARM_SEALED.fetch_add(1, Relaxed);
             g.lazy.insert(*page, copy.clone());
         }
     }
     eager
 }
+
+/// Diagnostics of the arming so far — (sealed, refused by the guard state,
+/// refused sealing by the host) — so a test's failure names its stage.
+pub(crate) fn lazy_arms() -> (usize, usize, usize) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        ARM_SEALED.load(Relaxed),
+        ARM_REFUSED_GUARD.load(Relaxed),
+        ARM_REFUSED_HOST.load(Relaxed),
+    )
+}
+
+static ARM_SEALED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static ARM_REFUSED_GUARD: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static ARM_REFUSED_HOST: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Whether any page is armed — nothing to drain otherwise ([`take_lazy`]).
 pub(crate) fn lazy_armed() -> bool {

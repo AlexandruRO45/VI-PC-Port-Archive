@@ -1637,8 +1637,17 @@ pub(crate) mod tests {
             assert!(n != 0);
             info.Protect
         };
+        let (before_sealed, before_guard, before_host) = crate::watch::lazy_arms();
         copy_back_marks_with(&[], false, true);
-        assert!(crate::watch::lazy_armed(), "the marked pages wait behind their seals");
+        let (sealed, guard, host) = crate::watch::lazy_arms();
+        assert_eq!(
+            (sealed - before_sealed, guard - before_guard, host - before_host),
+            (3, 0, 0),
+            "sealed {}, refused by the guard state {}, by the host {}",
+            sealed - before_sealed,
+            guard - before_guard,
+            host - before_host
+        );
         // SAFETY: bytes of our pool.
         unsafe {
             let read = |at: usize| ((p + at) as *const u8).read_volatile();
