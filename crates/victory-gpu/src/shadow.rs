@@ -926,13 +926,14 @@ fn drain_lazy(address: usize, len: usize) {
     service_lazy(crate::watch::take_lazy(first, last));
 }
 
-/// Pages that waited for their reader ([`crate::watch::take_lazy`])
-/// go back now, one page at a time, as [`copy_back_marks_with`] would
-/// have copied them, and the seal returns to the read-only guard the wait
-/// arming made of it ([`crate::watch::repaged`]).
+/// Pages that waited for their reader ([`crate::watch::take_lazy`]) go
+/// back now, one page at a time, as [`copy_back_marks_with`] would have
+/// copied them, and the seal returns to the read-only guard the wait
+/// arming made of it ([`crate::watch::repaged`]). They are page numbers;
+/// the copy-back works with the page's address.
 pub(crate) fn service_lazy(pages: Vec<(Arc<Shadow>, usize)>) {
     for (copy, page) in pages {
-        copy_back_one(&copy, page, true);
+        copy_back_one(&copy, page * PAGE, true);
     }
 }
 
@@ -941,7 +942,7 @@ pub(crate) fn service_lazy(pages: Vec<(Arc<Shadow>, usize)>) {
 /// needs the guard made again first ([`crate::watch::repaged`]).
 fn copy_back_one(copy: &Arc<Shadow>, page: usize, lazy: bool) {
     if lazy {
-        crate::watch::repaged(page);
+        crate::watch::repaged(page / PAGE);
     }
     let written = copy.copy_back_marked(page);
     #[cfg(feature = "diagnostics")]
@@ -1024,7 +1025,7 @@ fn copy_back_marks_with(
         let (start, len) = copy.range();
         let held_whole = page >= start as usize && page + PAGE <= (start + len) as usize;
         if lazy && held_whole {
-            armed.push((copy, page));
+            armed.push((copy, page / PAGE));
         } else {
             copy_back_one(&copy, page, false);
         }
@@ -1034,7 +1035,7 @@ fn copy_back_marks_with(
         // copies' bytes waiting for a reader; the ones a view of the same
         // pages shows elsewhere cannot wait and go back now.
         for (copy, page) in crate::watch::arm_lazy(&armed) {
-            copy_back_one(&copy, page, false);
+            copy_back_one(&copy, page * PAGE, false);
         }
     }
 }
