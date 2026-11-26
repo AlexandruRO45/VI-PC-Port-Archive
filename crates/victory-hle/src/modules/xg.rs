@@ -484,6 +484,10 @@ extern "system" fn tiling(
     if l.thick {
         return E_NOTIMPL;
     }
+    // SAFETY: `count` is null or points to a caller-owned `u32`.
+    if unsafe { count.as_ref() }.is_some_and(|&n| n > 0) && out.is_null() {
+        return E_INVALIDARG;
+    }
     let standard = l.first_tail_mip;
     let tail = standard < c.mips;
     let tail_tiles = match standard {
@@ -780,5 +784,55 @@ mod tests {
         let bad = desc(256, 256, 1, 28, 0x103);
         assert_eq!(XGCreateTextureComputer(&bad, &mut c), E_INVALIDARG);
         assert!(module().exports.len() == 2);
+    }
+
+    #[test]
+    fn tiling_rejects_null_out_when_count_nonzero() {
+        type Tiling = extern "system" fn(
+            This,
+            *mut u32,
+            *mut PackedMips,
+            *mut [u32; 3],
+            *mut u32,
+            u32,
+            *mut SubresourceTiling,
+        ) -> HRESULT;
+        let c = create(&desc(256, 256, 0, 98, 0x10a));
+        let tiling: Tiling = slot(c, 10);
+        let mut tiles = 0xDEAD_BEEFu32;
+        let mut n = 4u32;
+        assert_eq!(
+            tiling(
+                c,
+                &mut tiles,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut n,
+                0,
+                std::ptr::null_mut(),
+            ),
+            E_INVALIDARG
+        );
+        // Output parameters remain untouched on error.
+        assert_eq!(tiles, 0xDEAD_BEEF);
+        assert_eq!(n, 4);
+
+        // A zero count with a null output array is valid and writes 0 entries.
+        n = 0;
+        assert_eq!(
+            tiling(
+                c,
+                &mut tiles,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut n,
+                0,
+                std::ptr::null_mut(),
+            ),
+            S_OK
+        );
+        assert_eq!(n, 0);
+        assert!(tiles > 0);
+        assert_eq!(release(c), 0);
     }
 }
