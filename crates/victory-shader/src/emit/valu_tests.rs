@@ -2197,6 +2197,45 @@ fn packed_fmac_accepts_inline_constants() {
     }
 }
 
+#[test]
+fn packed_fmac_inline_integer_and_float_encodings_reach_both_halves() {
+    // GFX10 sign-extends inline integers. Its FP16 inline floats occupy only
+    // the low half. Code 248 encodes the nearest half to 1/(2*pi).
+    let encodings: [(u32, u32); 5] = [
+        (129, 1),
+        (192, 64),
+        (193, u32::MAX),
+        (208, 0xFFFF_FFF0),
+        (248, 0x0000_3118),
+    ];
+    // Multiplying by 1024 makes a positive subnormal low half normal without
+    // rounding. On the high half, 0 * infinity + 1 must produce a NaN.
+    let inputs = |(src0, bits)| {
+        [0x4000_6400, 0x7C00_6400].map(|b| [bits, b, 0x3C00_0000, src0])
+    };
+    let shader = |source| {
+        build_valu_cs(&[vop1(0x001, 0, vgpr(3)), 0x3C << 25 | 2 << 9 | source])
+    };
+    let check = |backend: &str, _: usize, [bits, b, c, src0]: [u32; 4], got: u32| {
+        for shift in [0, 16] {
+            let half = |word: u32| f16_to_f32((word >> shift) as u16);
+            let expected = half(bits).mul_add(half(b), half(c));
+            let actual = half(got);
+            assert!(
+                actual.to_bits() == expected.to_bits() || actual.is_nan() && expected.is_nan(),
+                "{backend}: src0 {src0}, multiplier {b:#010x}, shift {shift}, got {got:#010x}, expected {expected}"
+            );
+        }
+    };
+    // Load the same packed bits from v1 as a runtime control before testing
+    // their inline encodings. Each expected finite result is exactly representable.
+    let register_inputs: Vec<_> = encodings.into_iter().flat_map(inputs).collect();
+    run_cases(&shader(u32::from(vgpr(1))), &register_inputs, check);
+    for (src0, bits) in encodings {
+        run_cases(&shader(src0), &inputs((src0, bits)), check);
+    }
+}
+
 /// `src_scc` reads SCC as 0 or 1, in scalar and vector instructions.
 #[test]
 fn src_scc_reads_as_zero_or_one() {
