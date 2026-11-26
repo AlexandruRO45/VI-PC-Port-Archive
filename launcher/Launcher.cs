@@ -1,6 +1,7 @@
 // Minimal game launcher: pick the game's .exe once, pick a runtime, press PLAY. Side tabs: Launcher, Conversion
 // (the runtime), Settings. Slideshow of the pictures in backgrounds\ (drop more on the window), music from the game's own audio.
-// Runtimes: the archive top 3 (AnyXboxX left out, ztrx always 3rd) plus Hyphen (hyphenn, was victory-fork), VIctory and xcl.
+// Runtimes: the archive top 3 (AnyXboxX left out, ztrx always 3rd) plus Hyphen (hyphenn, was victory-fork), VIctory and xcl,
+// each installed in runtimes\<key> and built into its target\release.
 // Build: build.bat (uses the C# compiler that ships with Windows, C# 5).
 using System;
 using System.Collections.Generic;
@@ -23,8 +24,8 @@ using System.Xml;
 [assembly: AssemblyTitle("GTA VI Launcher")]
 [assembly: AssemblyDescription("Runs your game dump through the PC port runtimes")]
 [assembly: AssemblyProduct("GTA VI Launcher")]
-[assembly: AssemblyVersion("1.5.0.0")]
-[assembly: AssemblyFileVersion("1.5.0.0")]
+[assembly: AssemblyVersion("1.6.0.0")]
+[assembly: AssemblyFileVersion("1.6.0.0")]
 
 // One runtime project, as the archive's site describes it.
 class Runtime
@@ -33,22 +34,11 @@ class Runtime
     public int Reached, Top, Rank; // Top: the archive's pinned place (0 = none); Rank: 1-3 in the launcher's top 3, else 0
     public bool Gone; // removed from GitHub; the archive keeps its last copy
 
-    public string Dir
-    {
-        get
-        {
-            // The victory-fork checkout that already sits next to the launcher.
-            string legacy = Path.GetFullPath(Path.Combine(Launcher.Here, @"..\victory-fork"));
-            string own = Path.Combine(Launcher.Here, "runtimes", Key);
-            return (Key == "hyphenn" || Key == "victory-fork") && !Directory.Exists(own) && Directory.Exists(legacy) ? legacy : own;
-        }
-    }
+    // Every runtime installs next to the launcher, in runtimes\<key>, and builds into its target\release.
+    public string Dir { get { return Path.Combine(Launcher.Here, "runtimes", Key); } }
 
     // shortcut: a runtime without a recipe here is assumed to build like VIctory (cargo -p victory); add one when the archive's top 3 gains one that doesn't.
-    public string Exe
-    {
-        get { return Path.Combine(Dir, Key == "victory-7900xtx" ? @"target\diag\victory.exe" : @"target\release\" + (Key == "xcl" ? "xcl.exe" : "victory.exe")); }
-    }
+    public string Exe { get { return Path.Combine(Dir, @"target\release\" + (Key == "xcl" ? "xcl.exe" : "victory.exe")); } }
     public bool Installed { get { return File.Exists(Exe); } }
 
     public string Build
@@ -58,7 +48,8 @@ class Runtime
             if (Key == "xcl") return "cargo build --release -p xcl";
             if (Key == "dexnom") // its BCPack tables are fetched and hash-checked first
                 return "powershell -NoProfile -ExecutionPolicy Bypass -File Initialize-FormatTables.ps1 && cargo build --locked --release -p victory --features diagnostics --bins";
-            if (Key == "victory-7900xtx") return "cargo build --locked --profile diag -p victory --features diagnostics";
+            if (Key == "victory-7900xtx") return "cargo build --locked --release -p victory --features diagnostics"; // its play.ps1 -Build release
+            if (Key == "cool-fox") return "cargo build --release --locked -p victory";
             return "cargo build --release -p victory";
         }
     }
@@ -71,7 +62,9 @@ class Runtime
         if (Key == "dexnom") return exe + "run \"" + game + "\" --execute --console series-x --unimplemented trap";
         // Its play.ps1 sets the tuned VICTORY_* switches and keeps our paths; exit with victory's code so a failure stays readable.
         if (Key == "victory-7900xtx")
-            return "powershell -NoProfile -ExecutionPolicy Bypass -Command \"& '" + Path.Combine(Dir, @"scripts\play.ps1") + "' -Exe '" + game + "'; exit $LASTEXITCODE\"";
+            return "powershell -NoProfile -ExecutionPolicy Bypass -Command \"& '" + Path.Combine(Dir, @"scripts\play.ps1") + "' -Exe '" + game + "' -Build release; exit $LASTEXITCODE\"";
+        // Its launcher sets the RTX-tested Series S settings and runs target\release\victory.exe on VICTORY_GAME_DIR's game_scarlett_master.exe.
+        if (Key == "cool-fox") return "\"" + Path.Combine(Dir, "Play-VIctory.cmd") + "\" pareto-residency";
         return exe + "run \"" + game + "\" --execute";
     }
 }
@@ -88,6 +81,7 @@ static class Launcher
     static readonly Dictionary<string, string> Names = new Dictionary<string, string>
     {
         { "hyphenn", "Hyphen" }, { "victory-fork", "Hyphen" }, { "dexnom", "DexNom" }, { "belobug", "Belobug" }, { "victory-7900xtx", "7900XTX" },
+        { "cool-fox", "cool_fox" },
     };
     const string Third = "ztrx"; // the user's pick for 3rd place, wherever the archive ranks it
 
@@ -152,13 +146,14 @@ static class Launcher
         return pick;
     }
 
-    // Offline fallback: the archive on 25 Nov 2026, after victory-fork became hyphenn and ztrx left GitHub.
+    // Offline fallback: the archive on 26 Nov 2026, after cool_fox took first place.
     const string Builtin =
-        "  \"victory-7900xtx\": { repo: \"avatarmanz/VIctory-7900XTX\", name: \"VIctory-7900XTX\", top: 1, branch: \"victory-7900xtx\", reached: 5, note: \"Prologue and first mission at 13-22 fps. Needs about 64 GB of RAM.\" },\n" +
+        "  \"cool-fox\": { repo: \"codec-d/cool_fox\", name: \"cool_fox\", top: 1, branch: \"cool-fox\", reached: 5, note: \"VIctory-7900XTX with settings tested on RTX cards. Prologue and first mission at 13-22 fps.\" },\n" +
+        "  \"victory-7900xtx\": { repo: \"avatarmanz/VIctory-7900XTX\", name: \"VIctory-7900XTX\", top: 2, branch: \"victory-7900xtx\", reached: 5, note: \"Prologue and first mission at 13-22 fps. Needs about 64 GB of RAM.\" },\n" +
         "  ztrx: { repo: \"Zettrox/ztrx\", gone: \"25 Nov 2026\", name: \"ztrx\", branch: \"ztrx\", reached: 5, note: \"The prologue is playable. NVIDIA only.\" },\n" +
-        "  hyphenn: { repo: \"fxceless/victory-fork\", name: \"hyphenn\", top: 4, branch: \"hyphenn\", reached: 4, note: \"First gameplay scene at 2-4 fps.\" },\n" +
-        "  dexnom: { repo: \"DexNom/VIctory\", name: \"DexNom Runtime\", top: 2, branch: \"dexnom\", reached: 4, note: \"VIctory fork tuned on Radeon, experimental ray tracing.\" },\n" +
-        "  belobug: { repo: \"Belobug/VIctory-Belobug-AMD\", name: \"VIctory-Belobug-AMD\", top: 3, branch: \"belobug\", reached: 4, note: \"The world renders lit at 5-7 fps on an RX 9070 XT.\" },\n" +
+        "  hyphenn: { repo: \"fxceless/victory-fork\", name: \"hyphenn\", top: 5, branch: \"hyphenn\", reached: 4, note: \"First gameplay scene at 2-4 fps.\" },\n" +
+        "  dexnom: { repo: \"DexNom/VIctory\", name: \"DexNom Runtime\", top: 3, branch: \"dexnom\", reached: 4, note: \"VIctory fork tuned on Radeon, experimental ray tracing.\" },\n" +
+        "  belobug: { repo: \"Belobug/VIctory-Belobug-AMD\", name: \"VIctory-Belobug-AMD\", top: 4, branch: \"belobug\", reached: 4, note: \"The world renders lit at 5-7 fps on an RX 9070 XT.\" },\n" +
         "  victory: { repo: \"Marvisak/VIctory\", name: \"VIctory\", branch: \"victory\", reached: 3, note: \"Menus and the world intro.\" },\n" +
         "  xcl: { repo: \"ivall/xcl\", name: \"xcl\", branch: \"xcl\", reached: 2, note: \"Its own code, not VIctory. Menus at 30 fps; gameplay not reached yet.\" },\n";
 
@@ -232,7 +227,9 @@ static class Launcher
             "  tuxbox: { repo: \"brcly/TuxBox\", name: \"TuxBox\", branch: \"tuxbox\", reached: 2 },\n" +
             "  \"leonida-old\": { repo: \"x/L\", gone: \"23 Nov 2026\", name: \"Leonida\", reached: 9 },\n";
         var keys = string.Join(",", Choose(ParseArchive(site)).Select(r => r.Key + r.Rank).ToArray());
-        if (keys != "victory-7900xtx1,dexnom2,ztrx3,belobug0,hyphenn0,victory0,xcl0") return 5;
+        if (keys != "cool-fox1,victory-7900xtx2,ztrx3,dexnom0,hyphenn0,victory0,xcl0") return 5;
+        foreach (var r in Choose(ParseArchive(Builtin))) // every runtime builds into runtimes\<key>\target\release
+            if (!r.Exe.StartsWith(Path.Combine(Here, "runtimes", r.Key, @"target\release\"))) return 9;
         if (Choose(ParseArchive(Builtin)).First(r => r.Key == "hyphenn").Name != "Hyphen") return 6;
 
         // Opus packet lengths: 20 ms CELT, 2x10 ms SILK, 3x20 ms CELT (code 3, count in byte 2).
