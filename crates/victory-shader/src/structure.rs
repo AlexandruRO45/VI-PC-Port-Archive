@@ -63,6 +63,10 @@ pub enum Atom {
     /// The register pair of an [`Atom::Opaque`] mask is not zero: the same
     /// in every lane (`s_cbranch_vccz`/`vccnz` test VCC whole).
     Nonzero(Value, Value),
+    /// The mask this diagram gives lane by lane, over atoms held in
+    /// scalars (opaque masks, constants, SCC and the above), has some bit
+    /// set: the same in every lane. Lowered as the scalar mask's words.
+    Any(Bool),
 }
 
 /// Reduced ordered binary decision diagrams over [`Atom`]s.
@@ -348,6 +352,35 @@ impl Bools {
         }
     }
 
+    /// Whether some lane below `lanes` holds `b`, which tests constant
+    /// masks beside atoms the same in every lane: a condition over the
+    /// latter, each constant replaced by its bit for the lane.
+    fn some_lane(&mut self, b: Bool, lanes: u32) -> Bool {
+        let mut masks: Vec<(u32, u64)> = self
+            .vars(b)
+            .into_iter()
+            .filter_map(|v| match self.atoms[v as usize] {
+                Atom::Constant(k) => Some((v, k)),
+                _ => None,
+            })
+            .collect();
+        if masks.is_empty() {
+            return b;
+        }
+        masks.sort_unstable();
+        let mut any = Bool::FALSE;
+        for lane in 0..lanes {
+            let values: Vec<(u32, bool)> =
+                masks.iter().map(|&(v, k)| (v, k >> lane & 1 != 0)).collect();
+            let r = self.restrict(b, &values, &mut Map::default());
+            any = self.or(any, r);
+            if any == Bool::TRUE {
+                break;
+            }
+        }
+        any
+    }
+
     fn implies(&mut self, a: Bool, b: Bool) -> bool {
         let nb = self.not(b);
         self.and(a, nb) == Bool::FALSE
@@ -433,7 +466,8 @@ impl Bools {
 pub enum LaneExit {
     Jump(usize),
     /// To `taken` in lanes where `when` holds. A condition over
-    /// [`Atom::Uniform`]s and [`Atom::Nonzero`]s only is a uniform branch.
+    /// [`Atom::Uniform`]s, [`Atom::Nonzero`]s and [`Atom::Any`]s only is a
+    /// uniform branch.
     Branch {
         when: Bool,
         taken: usize,
@@ -1349,6 +1383,35 @@ impl<'a> Lanes<'a> {
         false
     }
 
+    /// VCC as a whole is not zero, one condition for the wave, when it is
+    /// held in scalars: masks the pass cannot see into, constants and SCC
+    /// selections, however combined (`s_not_b64`, `s_cselect_b64`,
+    /// `s_and_b64` ...). `None` when a lane result or a join feeds it.
+    fn whole(&mut self, vcc: Bool) -> Option<Bool> {
+        let support = self.b.support(vcc);
+        let scalar = |a: &Atom| {
+            matches!(
+                a,
+                Atom::Opaque(..) | Atom::Constant(_) | Atom::Uniform(_) | Atom::Nonzero(..)
+            )
+        };
+        if !support.iter().all(scalar) {
+            return None;
+        }
+        if let Some((Atom::Opaque(lo, hi), Bool::FALSE, Bool::TRUE)) = self.b.node(vcc) {
+            let born = self.born(lo).max(self.born(hi));
+            return Some(self.b.atom(Atom::Nonzero(lo, hi), born));
+        }
+        if !support.iter().any(|a| matches!(a, Atom::Opaque(..))) {
+            // Constants and wave values only: decided here, lane by lane.
+            let lanes = if self.p.wave64 { 64 } else { 32 };
+            return Some(self.b.some_lane(vcc, lanes));
+        }
+        let vars = self.b.vars(vcc);
+        let born = vars.iter().map(|&v| self.b.born[v as usize]).max().unwrap_or(0);
+        Some(self.b.atom(Atom::Any(vcc), born))
+    }
+
     /// The per-lane condition under which a block's closing branch is taken.
     fn branch(&mut self, inst: &Inst) -> Bool {
         let exec = self.exec(inst);
@@ -1361,22 +1424,13 @@ impl<'a> Lanes<'a> {
                     None => Bool::FALSE,
                 };
                 // VCCZ is whether VCC as a whole is zero (RDNA2 ISA, 12.5),
-                // one decision for the wave. A mask held in scalars (a pair
-                // the pass cannot see into, or a constant) is tested so,
-                // whatever EXEC holds.
-                // shortcut: a mask from lane results (compares) still takes
-                // the branch in the lanes whose own bit is set; the same
-                // while the program sets VCC only in lanes of EXEC and the
-                // block it skips does nothing in lanes whose bit is clear.
-                let whole = match self.b.node(vcc) {
-                    Some((Atom::Opaque(lo, hi), Bool::FALSE, Bool::TRUE)) => {
-                        let born = self.born(lo).max(self.born(hi));
-                        Some(self.b.atom(Atom::Nonzero(lo, hi), born))
-                    }
-                    // Neither all lanes nor none, so some bit is set.
-                    Some((Atom::Constant(_), Bool::FALSE, Bool::TRUE)) => Some(Bool::TRUE),
-                    _ => None,
-                };
+                // one decision for the wave, whatever EXEC holds.
+                // shortcut: a mask from lane results (compares) or a join
+                // still takes the branch in the lanes whose own bit is set;
+                // the same while the program sets VCC only in lanes of EXEC
+                // and the block it skips does nothing in lanes whose bit is
+                // clear.
+                let whole = self.whole(vcc);
                 let any = match whole {
                     Some(w) => w,
                     None => self.b.and(vcc, exec),
@@ -1785,6 +1839,51 @@ mod tests {
             ),
             LaneExit::Jump(_) => {}
             ref e => panic!("{e:?}"),
+        }
+    }
+
+    /// VCC built by scalar operations over masks, constants and SCC
+    /// (`s_mov_b64`, `s_cselect_b64`, `s_not_b64`, `s_and_b64`) is tested
+    /// as a whole too: one condition for the wave, not each lane's bit.
+    #[test]
+    fn vcc_branches_on_scalar_expressions_are_uniform() {
+        const VCCZ: u32 = 6;
+        const VCCNZ: u32 = 7;
+        const SCC1: u32 = 0xBF06_8080; // s_cmp_eq_u32 0, 0
+        const SCC0: u32 = 0xBF06_8180; // s_cmp_eq_u32 0, 1
+        let branch = |setup: &[u32], op: u32| {
+            let mut words = setup.to_vec();
+            words.extend([
+                0xBF80_0001 | op << 16, // s_cbranch_vccz/vccnz +1
+                0x7E02_0280,            // v_mov_b32 v1, 0
+                S_ENDPGM,
+            ]);
+            let s = structure(&build(&words, true)).unwrap();
+            assert_eq!(guarded(&s), 0, "{setup:x?}");
+            let when = match s.exits[0] {
+                LaneExit::Branch { when, .. } => when,
+                // Decided: into the skipped block (never taken) or past it.
+                LaneExit::Jump(1) => Bool::FALSE,
+                LaneExit::Jump(_) => Bool::TRUE,
+                ref e => panic!("{e:?}"),
+            };
+            (when, s.bools.support(when))
+        };
+        // s_mov_b64 vcc, 1: a constant other than zero.
+        assert_eq!(branch(&[0xBEEA_0481], VCCNZ).0, Bool::TRUE);
+        assert_eq!(branch(&[0xBEEA_0481], VCCZ).0, Bool::FALSE);
+        // s_cselect_b64 vcc, 1, 2: not zero whatever SCC holds.
+        assert_eq!(branch(&[SCC0, 0x85EA_8281], VCCNZ).0, Bool::TRUE);
+        assert_eq!(branch(&[SCC1, 0x85EA_8281], VCCZ).0, Bool::FALSE);
+        // s_cselect_b64 vcc, 1, 0: not zero where SCC is set.
+        let (_, support) = branch(&[SCC1, 0x85EA_8081], VCCNZ);
+        assert!(matches!(support[..], [Atom::Uniform(_)]), "{support:?}");
+        // s_not_b64 vcc, s[12:13] and s_and_b64 vcc, s[12:13], 3 over a
+        // pair written by halves: its words, built once for the wave.
+        let pair = [0xBE8C_03C1, 0xBE8D_03C2]; // s12 = -1, s13 = -2
+        for (op, inst) in [(VCCZ, 0xBEEA_080C), (VCCNZ, 0x87EA_830C)] {
+            let (_, support) = branch(&[pair[0], pair[1], inst], op);
+            assert!(matches!(support[..], [Atom::Any(_)]), "{support:?}");
         }
     }
 

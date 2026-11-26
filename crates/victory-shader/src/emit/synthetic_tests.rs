@@ -1050,6 +1050,14 @@ fn vcc_branch_program(op: u32, lo: u32, hi: u32) -> Vec<u32> {
     ]
 }
 
+/// [`vcc_branch_program`] with `setup` writing VCC in place of the two
+/// `s_mov_b32`.
+fn vcc_setup_program(op: u32, setup: &[u32]) -> Vec<u32> {
+    let mut words = vcc_branch_program(op, 0x80, 0x80);
+    words.splice(6..8, setup.iter().copied());
+    words
+}
+
 #[test]
 fn vcc_branch_refuses_a_lane_local_scalar_source() {
     for (low, high) in [(0xbeea_030c, 0xbeeb_0380), (0xbeea_0380, 0xbeeb_030c)] {
@@ -1075,7 +1083,8 @@ fn vcc_branch_refuses_a_lane_local_scalar_source() {
 
 /// `s_cbranch_vccz` and `s_cbranch_vccnz` test VCC as a whole (RDNA2 ISA,
 /// 12.5: one decision for the wave), also when only its high dword holds a
-/// bit and VCC was written by halves: every lane takes the same path.
+/// bit and VCC was written by halves, or by scalar operations over masks,
+/// constants and SCC: every lane takes the same path.
 #[test]
 fn vcc_branches_test_the_whole_mask() {
     let range = UsedResource {
@@ -1088,23 +1097,42 @@ fn vcc_branches_test_the_whole_mask() {
         user_data: 0,
         slot: 0,
     };
-    // (op, vcc_lo, vcc_hi as inline constants 0x80 + n, value when taken).
     const VCCZ: u32 = 6;
     const VCCNZ: u32 = 7;
-    let cases = [
-        (VCCZ, 0x80, 0x81, 43),  // VCC_HI = 1: not zero, not taken
-        (VCCZ, 0x80, 0x80, 17),  // VCC = 0: taken
-        (VCCZ, 0x81, 0x80, 43),  // VCC_LO = 1
-        (VCCNZ, 0x80, 0x81, 17), // VCC_HI = 1: taken
-        (VCCNZ, 0x80, 0x80, 43), // VCC = 0: not taken
-        (VCCNZ, 0x81, 0x80, 17), // VCC_LO = 1
+    // VCC by halves: vcc_lo, vcc_hi as inline constants 0x80 + n.
+    let halves = |lo: u32, hi: u32| vec![0xBEEA_0300 | lo, 0xBEEB_0300 | hi];
+    let pair = |lo: u32, hi: u32| [0xBE8C_0300 | lo, 0xBE8D_0300 | hi]; // s12, s13
+    let [s1, s0] = [0xBF06_8080, 0xBF06_8180]; // s_cmp_eq_u32 0, 0 / 0, 1
+    // (op, the writes of VCC, what it holds, value stored when taken).
+    let cases: Vec<(u32, Vec<u32>, &str, u32)> = vec![
+        (VCCZ, halves(0x80, 0x81), "hi 1", 43), // VCC_HI = 1: not zero, not taken
+        (VCCZ, halves(0x80, 0x80), "0", 17),    // VCC = 0: taken
+        (VCCZ, halves(0x81, 0x80), "lo 1", 43),
+        (VCCNZ, halves(0x80, 0x81), "hi 1", 17), // VCC_HI = 1: taken
+        (VCCNZ, halves(0x80, 0x80), "0", 43),    // VCC = 0: not taken
+        (VCCNZ, halves(0x81, 0x80), "lo 1", 17),
+        (VCCZ, vec![0xBEEA_0481], "s_mov_b64 1", 43),
+        (VCCNZ, vec![0xBEEA_0481], "s_mov_b64 1", 17),
+        // s_cselect_b64 vcc, 1, 2 with SCC clear: 2, lane 1's bit alone.
+        (VCCNZ, vec![s0, 0x85EA_8281], "s_cselect_b64 2", 17),
+        // s_cselect_b64 vcc, 0, 1 with SCC set: 0.
+        (VCCZ, vec![s1, 0x85EA_8180], "s_cselect_b64 0", 17),
+        // s_not_b64 vcc, s[12:13] of (-1, -2): lane 32's bit alone.
+        (VCCZ, [&pair(0xC1, 0xC2)[..], &[0xBEEA_080C]].concat(), "s_not_b64 hi 1", 43),
+        (VCCNZ, [&pair(0xC1, 0xC2)[..], &[0xBEEA_080C]].concat(), "s_not_b64 hi 1", 17),
+        (VCCZ, [&pair(0xC1, 0xC1)[..], &[0xBEEA_080C]].concat(), "s_not_b64 0", 17),
+        // s_and_b64 vcc, s[12:13], 3 of (2, 0): lane 1's bit alone.
+        (VCCNZ, [&pair(0x82, 0x80)[..], &[0x87EA_830C]].concat(), "s_and_b64 2", 17),
     ];
     let _one = super::valu_tests::ONE_AT_A_TIME
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    let mut ran = 0;
-    for (op, lo, hi, want) in cases {
-        let words = vcc_branch_program(op, lo, hi);
+    // Per adapter: a device that runs one case runs them all, so a case
+    // whose pipeline fails cannot pass unseen.
+    let mut ran = [0usize; 2];
+    for (op, setup, held, want) in &cases {
+        let (op, want) = (*op, *want);
+        let words = vcc_setup_program(op, setup);
         let native = NativeProgram {
             stage: HwStage::Cs,
             wave64: true,
@@ -1125,7 +1153,7 @@ fn vcc_branches_test_the_whole_mask() {
             code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
         };
         let name = if op == VCCZ { "vccz" } else { "vccnz" };
-        let label = format!("{name} lo {} hi {}", lo - 0x80, hi - 0x80);
+        let label = format!("{name}, VCC {held}");
         let l = lowered(&native).unwrap_or_else(|e| panic!("{label}: lower: {e:?}"));
         let shader = HostShader {
             stage: HwStage::Cs,
@@ -1149,7 +1177,7 @@ fn vcc_branches_test_the_whole_mask() {
             panic!("{label}: DXIL validation failed: {e:?}");
         }
         let views = [View::RawUav(64 * 4)];
-        for (adapter, warp) in [("hardware", false), ("warp", true)] {
+        for (i, (adapter, warp)) in [("hardware", false), ("warp", true)].into_iter().enumerate() {
             let Ok(host) = Host::new(warp) else {
                 eprintln!("no SM 6.6 {adapter} device; skipped");
                 continue;
@@ -1171,7 +1199,7 @@ fn vcc_branches_test_the_whole_mask() {
                     },
                 )
                 .unwrap_or_else(|e| panic!("{label} {adapter}: dispatch failed: {e}"));
-            ran += 1;
+            ran[i] += 1;
             let got = &out[0][..64];
             let taken = got.iter().filter(|&&x| x == 17).count();
             eprintln!("{label} {adapter}: {taken} of 64 lanes took the branch");
@@ -1181,5 +1209,12 @@ fn vcc_branches_test_the_whole_mask() {
             );
         }
     }
-    assert!(ran > 0, "no host device ran the test");
+    for (adapter, n) in ["hardware", "warp"].into_iter().zip(ran) {
+        assert!(
+            n == 0 || n == cases.len(),
+            "{adapter}: {n} of {} cases ran; the others made no pipeline",
+            cases.len()
+        );
+    }
+    assert!(ran.iter().sum::<usize>() > 0, "no host device ran the test");
 }

@@ -2631,6 +2631,7 @@ impl<'a> Lower<'a> {
                 let z = self.s.m.i32(0);
                 Ok(self.s.m.cmp(at, pred::NE, x, z))
             }
+            Atom::Any(mask) => self.any_bit(at, mask),
         }
     }
 
@@ -8240,7 +8241,7 @@ impl<'a> Lower<'a> {
                 st.bools
                     .support(when)
                     .iter()
-                    .all(|a| matches!(a, Atom::Uniform(_) | Atom::Nonzero(..)))
+                    .all(|a| matches!(a, Atom::Uniform(_) | Atom::Nonzero(..) | Atom::Any(_)))
             }
             _ => true,
         })
@@ -10429,6 +10430,9 @@ impl<'a> Lower<'a> {
                     None
                 }
                 Atom::Constant(_) => None,
+                // Every atom of the mask is read to build its words.
+                Atom::Any(mask) if self.touches(mask, &HashMap::new(), tainted) => return true,
+                Atom::Any(_) => None,
             };
             if v.is_some_and(|v| tainted.contains(&v)) {
                 return true;
