@@ -243,8 +243,12 @@ The window caption shows the framerate. Saves, settings and `crashes.log`
 are kept under the data folder (default `%LOCALAPPDATA%\victory\data`), derived
 data under the cache folder.
 
-Set `VICTORY_WINDOW_MAX=1920x1080` before launching to limit the title's
-top-level window to that bounding box. Smaller windows keep their size,
+Set `VICTORY_FULLSCREEN=1` before launching to fill the game's monitor in
+borderless fullscreen. This changes the window size. The title still chooses
+its own render resolution.
+
+In windowed mode, set `VICTORY_WINDOW_MAX=1920x1080` before launching to limit
+the title's top-level window to that bounding box. Smaller windows keep their size,
 larger windows keep their proportions, and the monitor's work area still
 limits them. This scales the displayed image; it does not change the
 console render resolution or the swap-chain buffers. With the variable

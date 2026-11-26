@@ -14,6 +14,9 @@ use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
 use windows_sys::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows_sys::Win32::Graphics::Gdi::{
+    GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow,
+};
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, TerminateProcess};
 use windows_sys::Win32::UI::WindowsAndMessaging::{self as wm, HMENU};
 use windows_sys::core::{PCSTR, PCWSTR, w};
@@ -118,6 +121,7 @@ pub extern "system" fn CreateWindowExW(
         )
     };
     hook(hwnd);
+    maybe_fullscreen(hwnd, parent, style);
     hwnd
 }
 
@@ -144,7 +148,66 @@ pub extern "system" fn CreateWindowExA(
         )
     };
     hook(hwnd);
+    maybe_fullscreen(hwnd, parent, style);
     hwnd
+}
+
+fn maybe_fullscreen(hwnd: HWND, parent: HWND, style: u32) {
+    if hwnd.is_null()
+        || !parent.is_null()
+        || style & wm::WS_CAPTION != wm::WS_CAPTION
+        || style & wm::WS_THICKFRAME == 0
+        || !std::env::var_os("VICTORY_FULLSCREEN").is_some_and(|value| value == "1")
+    {
+        return;
+    }
+    // SAFETY: `hwnd` is a top-level window just created on this thread.
+    unsafe { fullscreen(hwnd) };
+}
+
+/// Removes the frame and uses the entire monitor, including the taskbar area.
+unsafe fn fullscreen(hwnd: HWND) {
+    let mut info = MONITORINFO {
+        cbSize: size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: `hwnd` is a window owned by this thread and `info` is initialized.
+    unsafe {
+        let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        if GetMonitorInfoW(monitor, &mut info) == 0 {
+            tracing::warn!("could not find the monitor for borderless fullscreen");
+            return;
+        }
+        let RECT {
+            left,
+            top,
+            right,
+            bottom,
+        } = info.rcMonitor;
+        let original = wm::GetWindowLongW(hwnd, wm::GWL_STYLE) as u32;
+        let frame = wm::WS_CAPTION | wm::WS_THICKFRAME | wm::WS_SYSMENU;
+        let borderless = (original & !frame) | wm::WS_POPUP;
+        if wm::SetWindowLongW(hwnd, wm::GWL_STYLE, borderless as i32) == 0 {
+            tracing::warn!("could not remove the frame for borderless fullscreen");
+            return;
+        }
+        let (width, height) = (right - left, bottom - top);
+        if wm::SetWindowPos(
+            hwnd,
+            std::ptr::null_mut(),
+            left,
+            top,
+            width,
+            height,
+            wm::SWP_FRAMECHANGED | wm::SWP_NOZORDER | wm::SWP_NOACTIVATE,
+        ) == 0
+        {
+            wm::SetWindowLongW(hwnd, wm::GWL_STYLE, original as i32);
+            tracing::warn!("could not resize the window for borderless fullscreen");
+            return;
+        }
+        tracing::info!(width, height, "borderless fullscreen enabled");
+    }
 }
 
 /// A console title sizes its window to its render target (
@@ -558,6 +621,47 @@ mod tests {
             assert!(!wm::GetPropW(hwnd, TITLE_PROC).is_null());
             wm::DestroyWindow(hwnd);
         }
+    }
+
+    #[test]
+    fn a_borderless_window_fills_its_monitor() {
+        let null = std::ptr::null_mut();
+        // SAFETY: create a hidden window owned by this test thread and destroy it after reading it.
+        let (style, rect, monitor) = unsafe {
+            let hwnd = wm::CreateWindowExW(
+                0,
+                w!("STATIC"),
+                w!("fullscreen"),
+                wm::WS_OVERLAPPEDWINDOW,
+                0,
+                0,
+                640,
+                480,
+                null,
+                null,
+                null,
+                std::ptr::null(),
+            );
+            assert!(!hwnd.is_null());
+            let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+            let mut info = MONITORINFO {
+                cbSize: size_of::<MONITORINFO>() as u32,
+                ..Default::default()
+            };
+            assert_ne!(GetMonitorInfoW(monitor, &mut info), 0);
+            fullscreen(hwnd);
+            let style = wm::GetWindowLongW(hwnd, wm::GWL_STYLE) as u32;
+            let mut rect = RECT::default();
+            assert_ne!(wm::GetWindowRect(hwnd, &mut rect), 0);
+            wm::DestroyWindow(hwnd);
+            (style, rect, info.rcMonitor)
+        };
+        assert_ne!(style & wm::WS_POPUP, 0);
+        assert_eq!(style & (wm::WS_CAPTION | wm::WS_THICKFRAME), 0);
+        assert_eq!(
+            (rect.left, rect.top, rect.right, rect.bottom),
+            (monitor.left, monitor.top, monitor.right, monitor.bottom),
+        );
     }
 
     thread_local! {
