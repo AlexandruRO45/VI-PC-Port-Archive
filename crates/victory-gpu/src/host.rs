@@ -141,6 +141,18 @@ const KEEP_FRAMES: u64 = 32;
 /// shortcut: a time, not a count of what still names the object.
 const KEEP_TIME: std::time::Duration = std::time::Duration::from_secs(8);
 
+/// Diagnostics (`VICTORY_KEEP_SECS`): a longer floor, to tell a retire delay
+/// that is too short from a free that must never happen.
+fn keep_time() -> std::time::Duration {
+    if cfg!(feature = "diagnostics")
+        && let Ok(s) = std::env::var("VICTORY_KEEP_SECS")
+        && let Ok(n) = s.parse::<u64>()
+    {
+        return std::time::Duration::from_secs(n);
+    }
+    KEEP_TIME
+}
+
 /// A retired object, dropped on whatever thread finishes the submission.
 struct Retired {
     /// The submission count it waits for.
@@ -189,7 +201,7 @@ fn bury(finished: u64) {
             .take_while(|r| {
                 r.submission <= finished
                     && now.saturating_sub(r.frame) >= KEEP_FRAMES
-                    && r.at.elapsed() >= KEEP_TIME
+                    && r.at.elapsed() >= keep_time()
             })
             .count();
         retired.drain(..n).collect()

@@ -77,9 +77,26 @@ fn open(device: &ID3D12Device1, blob: Vec<u8>) -> Option<Library> {
     let make = |bytes: &[u8]| -> windows::core::Result<ID3D12PipelineLibrary1> {
         // SAFETY: the bytes outlive the library (kept beside it).
         unsafe {
-            device
-                .CreatePipelineLibrary::<ID3D12PipelineLibrary>(bytes)?
-                .cast()
+            // An empty seed must reach the host as a null pointer: vkd3d
+            // refuses a non-null pointer with a zero length, and the
+            // pointer of an empty slice is dangling, not null.
+            let lib = if bytes.is_empty() {
+                let mut out: *mut std::ffi::c_void = std::ptr::null_mut();
+                let hr = (device.vtable().CreatePipelineLibrary)(
+                    device.as_raw(),
+                    std::ptr::null(),
+                    0,
+                    &ID3D12PipelineLibrary::IID,
+                    &mut out,
+                );
+                if hr.is_err() {
+                    return Err(hr.into());
+                }
+                ID3D12PipelineLibrary::from_raw(out)
+            } else {
+                device.CreatePipelineLibrary::<ID3D12PipelineLibrary>(bytes)?
+            };
+            lib.cast()
         }
     };
     if !blob.is_empty() {
@@ -544,6 +561,21 @@ pub(crate) fn note_used(key: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(windows)]
+    fn an_empty_pipeline_library_opens() {
+        let host = crate::host::host().expect("host device");
+        let device = host.device.cast::<ID3D12Device1>().expect("device1");
+        let lib = open(&device, Vec::new()).expect("empty pipeline library refused");
+        // SAFETY: the library open just made.
+        let size = unsafe { lib.library.GetSerializedSize() };
+        let mut buf = vec![0u8; size];
+        // SAFETY: a buffer of the size the library asked for.
+        let serialized = unsafe { lib.library.Serialize(&mut buf) };
+        println!("serialize hr: {serialized:?} size {size}");
+        assert!(serialized.is_ok());
+    }
 
     #[test]
     fn names_change_with_what_goes_into_the_pipeline() {
