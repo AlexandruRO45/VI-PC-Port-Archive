@@ -1200,6 +1200,8 @@ impl Host {
         #[cfg(feature = "diagnostics")]
         let traced = crate::capture::listed(crate::queue::presented() + 1);
         #[cfg(feature = "diagnostics")]
+        let traced_sub = *submitted + 1;
+        #[cfg(feature = "diagnostics")]
         if traced {
             for (i, r) in runs.iter().enumerate() {
                 let notes = r.notes.lock().unwrap_or_else(|e| e.into_inner());
@@ -1207,7 +1209,7 @@ impl Host {
                     tracing::info!(
                         target: "victory_gpu::trace",
                         "s{} l{i}/{} #{k}: {note}",
-                        *submitted + 1,
+                        traced_sub,
                         runs.len()
                     );
                 }
@@ -1217,8 +1219,8 @@ impl Host {
         // Where each run's lists start in `lists`.
         let mut firsts = Vec::with_capacity(runs.len());
         let mut batch = Batch::default();
-        for list in runs {
-            list.run_deferred(&mut batch);
+        for (at, list) in runs.iter().enumerate() {
+            list.run_deferred(&mut batch, at);
             firsts.push(lists.len());
             #[cfg(feature = "diagnostics")]
             let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::PreludeUs);
@@ -1231,65 +1233,205 @@ impl Host {
         let prepared = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::FaultsPrep, crate::copystat::page_faults().saturating_sub(faults));
-        // Diagnostics: each list on its own, timed (`VICTORY_GPU_TIMING`).
-        #[cfg(feature = "diagnostics")]
-        let groups: Vec<&[Option<ID3D12CommandList>]> = if timing() {
-            firsts
-                .iter()
-                .zip(firsts.iter().skip(1).chain([&lists.len()]))
-                .map(|(&a, &b)| &lists[a..b])
-                .collect()
-        } else {
-            vec![&lists[..]]
-        };
-        #[cfg(not(feature = "diagnostics"))]
-        let groups = [&lists[..]];
+        // A list whose steps read a deferred copy's destination needs the
+        // copy's bytes before it runs: the submission splits before it,
+        // so the earlier lists run first, what they wrote goes back and
+        // the copy lands (`Batch::split_points`).
+        let splits = batch.split_points(runs.len());
+        let mut segments: Vec<(usize, usize)> = Vec::with_capacity(splits.len() + 1);
+        let mut start = 0;
+        for &point in &splits {
+            segments.push((start, point));
+            start = point;
+        }
+        segments.push((start, runs.len()));
         let mut removed_in = None;
-        for (i, group) in groups.iter().enumerate() {
-            *submitted += 1;
-            let started = std::time::Instant::now();
-            #[cfg(feature = "diagnostics")]
-            crate::resource::life::note(0, crate::resource::life::SUBMITTED, *submitted, 0);
-            // SAFETY: closed lists; the fence and event are ours.
-            unsafe {
-                self.queue.ExecuteCommandLists(group);
-                let waited = self
-                    .queue
-                    .Signal(&self.fence, *submitted)
-                    .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
-                match waited {
-                    Ok(()) => {
-                        WaitForSingleObject(self.event, INFINITE);
-                    }
-                    Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
+        // Late copies run once the list they were deferred from has run,
+        // out of `batch` in record order.
+        let mut late_done = 0;
+        let mut back: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize, bool)> = Vec::new();
+        let mut withheld: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
+        let mut gpu = std::time::Duration::ZERO;
+        let copying = std::time::Instant::now();
+        #[cfg(feature = "diagnostics")]
+        let faults_back = crate::copystat::page_faults();
+        for &(seg_start, seg_end) in &segments {
+            let seg = &runs[seg_start..seg_end];
+            // A reader in this segment asked for a range a deferred copy
+            // writes: the earlier segments' copies have run, so the
+            // range's host copy takes their bytes before the list does.
+            // A range this submission's shaders write is theirs anyway:
+            // copying over it would lose their output.
+            for (shadow, address, len, reader) in &batch.late_refresh {
+                if seg_start <= *reader && *reader < seg_end && !batch.gpu_written(*address, *len) {
+                    let copied = shadow.update(*address, *len);
+                    PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
                 }
             }
+            let seg_end_in_lists = if seg_end < runs.len() { firsts[seg_end] } else { lists.len() };
+            let seg_lists = &lists[firsts[seg_start]..seg_end_in_lists];
+            // Diagnostics: each list on its own, timed (`VICTORY_GPU_TIMING`).
             #[cfg(feature = "diagnostics")]
-            crate::resource::life::note(0, crate::resource::life::RAN, *submitted, 0);
-            #[cfg(feature = "diagnostics")]
-            if groups.len() > 1 {
+            let groups: Vec<&[Option<ID3D12CommandList>]> = if timing() {
+                (seg_start..seg_end)
+                    .map(|i| &lists[firsts[i]..if i + 1 < runs.len() { firsts[i + 1] } else { lists.len() }])
+                    .collect()
+            } else {
+                vec![seg_lists]
+            };
+            #[cfg(not(feature = "diagnostics"))]
+            let groups = [seg_lists];
+            for (i, group) in groups.iter().enumerate() {
+                let at = seg_start + i;
+                *submitted += 1;
+                let started = std::time::Instant::now();
+                #[cfg(feature = "diagnostics")]
+                crate::resource::life::note(0, crate::resource::life::SUBMITTED, *submitted, 0);
+                // SAFETY: closed lists; the fence and event are ours.
+                unsafe {
+                    self.queue.ExecuteCommandLists(group);
+                    let waited = self
+                        .queue
+                        .Signal(&self.fence, *submitted)
+                        .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
+                    match waited {
+                        Ok(()) => {
+                            WaitForSingleObject(self.event, INFINITE);
+                        }
+                        Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
+                    }
+                }
+                gpu += started.elapsed();
+                #[cfg(feature = "diagnostics")]
+                crate::resource::life::note(0, crate::resource::life::RAN, *submitted, 0);
+                #[cfg(feature = "diagnostics")]
+                if groups.len() > 1 {
+                    // SAFETY: a plain query.
+                    let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
+                    gpu_times(started.elapsed(), &runs[at].slowest(frequency, usize::MAX));
+                }
+                #[cfg(feature = "diagnostics")]
+                if groups.len() > 1 && started.elapsed() > std::time::Duration::from_millis(50) {
+                    // SAFETY: a plain query.
+                    let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
+                    let commands = runs[at].notes.lock().unwrap_or_else(|e| e.into_inner()).len();
+                    tracing::warn!(ms = started.elapsed().as_millis(), commands, "slow host list");
+                    for (ms, op) in runs[at].slowest(frequency, 6) {
+                        tracing::warn!("slow list command, {ms:.1} ms: {op}");
+                    }
+                }
                 // SAFETY: a plain query.
-                let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
-                gpu_times(started.elapsed(), &runs[i].slowest(frequency, usize::MAX));
-            }
-            #[cfg(feature = "diagnostics")]
-            if groups.len() > 1 && started.elapsed() > std::time::Duration::from_millis(50) {
-                // SAFETY: a plain query.
-                let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
-                let commands = runs[i].notes.lock().unwrap_or_else(|e| e.into_inner()).len();
-                tracing::warn!(ms = started.elapsed().as_millis(), commands, "slow host list");
-                for (ms, op) in runs[i].slowest(frequency, 6) {
-                    tracing::warn!("slow list command, {ms:.1} ms: {op}");
+                if groups.len() > 1 && removed_in.is_none() && unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
+                    removed_in = Some(at);
                 }
             }
             // SAFETY: a plain query.
-            if groups.len() > 1 && removed_in.is_none() && unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
-                removed_in = Some(i);
+            if unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
+                fail(format_args!(
+                    "host GPU device removed after a submission of {} lists{}{}{}",
+                    runs.len(),
+                    self.removal_data(runs),
+                    last_notes(runs),
+                    removed_during(runs, removed_in)
+                ));
             }
-            let _ = (i, started);
+            // What shaders wrote goes back before the bottom-of-pipe
+            // writes, which tell the title the GPU is done; each range
+            // once per submission, however many dispatches declared it
+            // (the world's passes declare the same big ranges dozens of
+            // times).
+            // One list's lock at a time: a submission may name a list twice.
+            let mut seg_back: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize, bool)> = Vec::new();
+            let mut index: std::collections::HashMap<(usize, usize, usize), usize> = std::collections::HashMap::new();
+            // Shaders that read memory with no copy computed something else
+            // than the console's: it stays out of title memory, where it
+            // broke the title's own data (runs c1, c4), and so does what
+            // every program using title memory wrote while any misses
+            // (`crate::memory::withholding`). Only lists with such programs
+            // have checks; all are asked before anything goes back. Other
+            // programs in those lists write through bounded views from
+            // their own inputs: their ranges go back (the imposter
+            // transforms beside the BVH builder in one list, run light13).
+            let missed: Vec<bool> = seg
+                .iter()
+                .map(|list| list.deferred().missed.iter().any(|check| check()))
+                .collect();
+            crate::memory::note_submission(missed.contains(&true));
+            let withholding = crate::memory::withholding();
+            for (list, &missed) in seg.iter().zip(&missed) {
+                let deferred = list.deferred();
+                let missed = missed || withholding && !deferred.missed.is_empty();
+                for step in &deferred.copies {
+                    if let Step::GpuWrite(shadow, address, len, _, memory) = step {
+                        let key = (std::sync::Arc::as_ptr(shadow) as usize, *address, *len);
+                        // A range both kinds declare is withheld whole.
+                        let goes_back = !(missed && *memory);
+                        match index.get(&key) {
+                            Some(&i) => seg_back[i].3 &= goes_back,
+                            None => {
+                                index.insert(key, seg_back.len());
+                                seg_back.push((shadow.clone(), *address, *len, goes_back));
+                            }
+                        }
+                    }
+                }
+            }
+            // A range overlapping a withheld one of the same copy is
+            // withheld too: its copy-back would take the other's bytes
+            // along (pages a program using title memory and another both
+            // wrote).
+            let held: Vec<(usize, usize, usize)> = seg_back
+                .iter()
+                .filter(|b| !b.3)
+                .map(|(s, a, n, _)| (std::sync::Arc::as_ptr(s) as usize, *a, *n))
+                .collect();
+            for b in seg_back.iter_mut().filter(|b| b.3) {
+                let copy = std::sync::Arc::as_ptr(&b.0) as usize;
+                b.3 = !held.iter().any(|&(c, a, n)| c == copy && a < b.1 + b.2 && b.1 < a + n);
+            }
+            // Pages shaders marked first: the copy-backs below end what
+            // the copies keep for them.
+            let seg_withheld: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = seg_back
+                .iter()
+                .filter(|b| !b.3)
+                .map(|(s, a, n, _)| (s.clone(), *a, *n))
+                .collect();
+            crate::shadow::copy_back_marks(&seg_withheld, withholding);
+            // Texture views left null that shaders read: made for what
+            // follows.
+            let read = crate::shadow::take_reads();
+            if !read.is_empty() {
+                crate::descriptor::make_read(&read);
+            }
+            for (shadow, address, len, goes_back) in &seg_back {
+                let (address, len) = (*address, *len);
+                if *goes_back {
+                    let written = shadow.copy_back(address, len);
+                    COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+                } else {
+                    shadow.keep_writes(address, len);
+                    crate::memory::note_withheld(len as u64);
+                    crate::memory::drop_withheld(address, len);
+                }
+            }
+            // Copies kept past the lists' run: what the shaders wrote
+            // reached title memory in the copy-backs above, so a deferred
+            // copy's source is new now (and its destination is not
+            // overwritten by them). A range the copy-back withheld is
+            // still old.
+            while late_done < batch.late.len() && batch.late[late_done].4 < seg_end {
+                let &(dst, src, len, title_dst, _) = &batch.late[late_done];
+                copy_mapped(dst as *mut u8, src as *const u8, len, title_dst);
+                late_done += 1;
+            }
+            for list in seg {
+                for work in &list.deferred().after {
+                    work();
+                }
+            }
+            back.extend(seg_back);
+            withheld.extend(seg_withheld);
         }
-        let _ = &firsts;
-        let gpu = prepared.elapsed();
         SUBMISSION_US[0].fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
         SUBMISSION_US[1].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
         // The host resets a device whose submission runs for about 2 s.
@@ -1300,115 +1442,16 @@ impl Host {
                 .collect();
             tracing::warn!(ms = gpu.as_millis(), lists = runs.len(), ?pipelines, "slow host submission");
         }
-        // SAFETY: a plain query.
-        if unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
-            fail(format_args!(
-                "host GPU device removed after a submission of {} lists{}{}{}",
-                runs.len(),
-                self.removal_data(runs),
-                last_notes(runs),
-                removed_during(runs, removed_in)
-            ));
-        }
-        // What shaders wrote goes back before the bottom-of-pipe writes,
-        // which tell the title the GPU is done; each range once per
-        // submission, however many dispatches declared it (the world's
-        // passes declare the same big ranges dozens of times).
-        let copying = std::time::Instant::now();
+        COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
-        let faults = crate::copystat::page_faults();
-        // One list's lock at a time: a submission may name a list twice.
-        let mut back: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize, bool)> = Vec::new();
-        let mut index: std::collections::HashMap<(usize, usize, usize), usize> = std::collections::HashMap::new();
-        // Shaders that read memory with no copy computed something else than
-        // the console's: it stays out of title memory, where it broke the
-        // title's own data (runs c1, c4), and so does what every program
-        // using title memory wrote while any misses
-        // (`crate::memory::withholding`). Only lists with such programs have
-        // checks; all are asked before anything goes back. Other programs in
-        // those lists write through bounded views from their own inputs:
-        // their ranges go back (the imposter transforms beside the BVH
-        // builder in one list, run light13).
-        let missed: Vec<bool> = runs
-            .iter()
-            .map(|list| list.deferred().missed.iter().any(|check| check()))
-            .collect();
-        crate::memory::note_submission(missed.contains(&true));
-        let withholding = crate::memory::withholding();
-        for (list, &missed) in runs.iter().zip(&missed) {
-            let deferred = list.deferred();
-            let missed = missed || withholding && !deferred.missed.is_empty();
-            for step in &deferred.copies {
-                if let Step::GpuWrite(shadow, address, len, _, memory) = step {
-                    let key = (std::sync::Arc::as_ptr(shadow) as usize, *address, *len);
-                    // A range both kinds declare is withheld whole.
-                    let goes_back = !(missed && *memory);
-                    match index.get(&key) {
-                        Some(&i) => back[i].3 &= goes_back,
-                        None => {
-                            index.insert(key, back.len());
-                            back.push((shadow.clone(), *address, *len, goes_back));
-                        }
-                    }
-                }
-            }
-        }
-        // A range overlapping a withheld one of the same copy is withheld
-        // too: its copy-back would take the other's bytes along (pages a
-        // program using title memory and another both wrote).
-        let held: Vec<(usize, usize, usize)> = back
-            .iter()
-            .filter(|b| !b.3)
-            .map(|(s, a, n, _)| (std::sync::Arc::as_ptr(s) as usize, *a, *n))
-            .collect();
-        for b in back.iter_mut().filter(|b| b.3) {
-            let copy = std::sync::Arc::as_ptr(&b.0) as usize;
-            b.3 = !held.iter().any(|&(c, a, n)| c == copy && a < b.1 + b.2 && b.1 < a + n);
-        }
-        // Pages shaders marked first: the copy-backs below end what the
-        // copies keep for them.
-        let withheld: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = back
-            .iter()
-            .filter(|b| !b.3)
-            .map(|(s, a, n, _)| (s.clone(), *a, *n))
-            .collect();
-        crate::shadow::copy_back_marks(&withheld, withholding);
-        // Texture views left null that shaders read: made for what follows.
-        let read = crate::shadow::take_reads();
-        if !read.is_empty() {
-            crate::descriptor::make_read(&read);
-        }
-        for (shadow, address, len, goes_back) in &back {
-            let (address, len) = (*address, *len);
-            if *goes_back {
-                let written = shadow.copy_back(address, len);
-                COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
-            } else {
-                shadow.keep_writes(address, len);
-                crate::memory::note_withheld(len as u64);
-                crate::memory::drop_withheld(address, len);
-            }
-        }
-        // Copies kept past the lists' run: what the shaders wrote reached
-        // title memory in the copy-backs above, so a deferred copy's source
-        // is new now (and its destination is not overwritten by them).
-        // A range the copy-back withheld is still old.
-        for &(dst, src, len, title_dst) in &batch.late {
-            copy_mapped(dst as *mut u8, src as *const u8, len, title_dst);
-        }
-        // Refreshes deferred with them see their bytes now.
-        for (shadow, address, len) in batch.late_refresh.drain(..) {
+        crate::copystat::add(crate::copystat::C::FaultsBack, crate::copystat::page_faults().saturating_sub(faults_back));
+        // Refreshes deferred with the late copies see their bytes now
+        // (again where a segment's readers already ran: a copy deferred
+        // from the same segment landed only now).
+        for (shadow, address, len, _) in batch.late_refresh.drain(..) {
             let copied = shadow.update(address, len);
             PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
         }
-        for list in runs {
-            for work in &list.deferred().after {
-                work();
-            }
-        }
-        COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
-        #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::FaultsBack, crate::copystat::page_faults().saturating_sub(faults));
         for list in runs {
             for &(at, what, bytes) in &list.deferred().writes {
                 what.write(at as *mut u8, bytes);
@@ -1423,7 +1466,7 @@ impl Host {
         // (the dumps submit lists of their own).
         #[cfg(feature = "diagnostics")]
         if traced {
-            let sub = *submitted;
+            let sub = traced_sub;
             drop(submitted);
             let mut targets: Vec<(usize, String)> = Vec::new();
             for r in runs {
@@ -2281,8 +2324,10 @@ impl HostList {
 
     /// Runs the list's submission-time steps; refreshes go into `batch`
     /// (the title's big buffers, a 174 MB one among them, are read by most
-    /// lists of a submission, through many ranges).
-    fn run_deferred(&self, batch: &mut Batch) {
+    /// lists of a submission, through many ranges). `at` is the list's
+    /// index in the submission: deferred copies and reads of their
+    /// destinations are tagged with it for `Batch::split_points`.
+    fn run_deferred(&self, batch: &mut Batch, at: usize) {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
         for step in &self.deferred().copies {
@@ -2313,13 +2358,15 @@ impl HostList {
                     // lands in title memory in the copy-back), and a
                     // destination they write would lose their bytes to
                     // it. Either way it runs after the copy-backs; a range
-                    // an earlier deferred copy writes chains the same way.
+                    // an earlier deferred copy writes or still reads
+                    // chains the same way.
                     if batch.gpu_written(src, len)
                         || batch.gpu_written(dst, len)
                         || batch.late_pending(src, len)
                         || batch.late_pending(dst, len)
+                        || batch.late_sourced(dst, len)
                     {
-                        batch.late.push((dst, src, len, true));
+                        batch.late.push((dst, src, len, true, at));
                         0
                     } else {
                         copy_mapped(dst as *mut u8, src as *const u8, len, true);
@@ -2344,7 +2391,7 @@ impl HostList {
                         add(C::Refreshes, 1);
                         add(C::RefreshBytes, *len as u64);
                     }
-                    batch.add_or_late(shadow, *address, *len);
+                    batch.add_or_late(shadow, *address, *len, at);
                     continue;
                 }
                 Step::Host(work) => {
@@ -2372,11 +2419,11 @@ impl HostList {
                 // Brought up to date before the submission's lists were made.
                 Step::Texture(..) => continue,
                 Step::Heap(viewed) => {
-                    crate::bindless::refresh(viewed, |s, a, l| batch.add_or_late(s, a, l));
+                    crate::bindless::refresh(viewed, |s, a, l| batch.add_or_late(s, a, l, at));
                     continue;
                 }
                 &Step::Memory(heap) => {
-                    crate::memory::prepare(heap, |s, a, l| batch.add_or_late(s, a, l));
+                    crate::memory::prepare(heap, |s, a, l| batch.add_or_late(s, a, l, at));
                     continue;
                 }
             };
@@ -2414,11 +2461,14 @@ struct Batch {
     gpu_writes: Vec<(usize, usize)>,
     /// Deferred copies kept past the lists' run, in record order (they run
     /// after the copy-backs): destination, source, bytes, whether the
-    /// destination is title memory.
-    late: Vec<(usize, usize, usize, bool)>,
+    /// destination is title memory, the submitting list's index.
+    late: Vec<(usize, usize, usize, bool, usize)>,
     /// Refreshes whose range a deferred copy's destination touches: done
-    /// after the late copies, which is where its bytes are.
-    late_refresh: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+    /// after the late copies, which is where its bytes are. The last field
+    /// is the reading list's index: a reader in the same submission must
+    /// see the copy's bytes before it runs, so the submission splits
+    /// before it (`Batch::split_points`).
+    late_refresh: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize, usize)>,
 }
 
 impl Batch {
@@ -2474,18 +2524,51 @@ impl Batch {
     fn late_pending(&self, at: usize, len: usize) -> bool {
         self.late
             .iter()
-            .any(|&(d, _, l, t)| t && d < at + len && at < d + l)
+            .any(|&(d, _, l, t, _)| t && d < at + len && at < d + l)
+    }
+
+    /// Whether `len` bytes at `at` touch a deferred copy's source: the
+    /// copy still has those bytes to read once the lists run, so a copy
+    /// recorded later that writes them defers too (it lands after the
+    /// read, in record order). Clipped parts of a deferred copy shrink
+    /// what this keeps pending along with the destination.
+    fn late_sourced(&self, at: usize, len: usize) -> bool {
+        self.late
+            .iter()
+            .any(|&(_, s, l, ..)| s < at + len && at < s + l)
     }
 
     /// `add`, or deferred past the submission's late copies when the range
     /// a deferred copy's destination covers: its title bytes are new only
-    /// after they run.
-    fn add_or_late(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
+    /// after they run. `reader` is the list whose steps asked: the
+    /// submission splits before it so its shaders see the bytes too.
+    fn add_or_late(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize, reader: usize) {
         if !shadow.clean() && self.late_pending(address, len) {
-            self.late_refresh.push((shadow.clone(), address, len));
+            self.late_refresh.push((shadow.clone(), address, len, reader));
         } else {
             self.add(shadow, address, len);
         }
+    }
+
+    /// The run indices a submission splits before: a list whose steps
+    /// read a deferred copy's destination needs its bytes in the host
+    /// copy, which land only after the earlier lists ran, their writes
+    /// went back and the deferred copy ran. A range the submission's
+    /// shaders write anyway needs no split: their output is what it
+    /// holds. A reader in the list the copy is deferred from stays stale
+    /// (the list's commands cannot be parted); its refresh still runs
+    /// for the next submission.
+    fn split_points(&self, runs: usize) -> Vec<usize> {
+        let mut points: Vec<usize> = self
+            .late_refresh
+            .iter()
+            .filter(|&(_, a, l, _)| !self.gpu_written(*a, *l))
+            .map(|&(.., reader)| reader)
+            .collect();
+        points.sort_unstable();
+        points.dedup();
+        points.retain(|&i| 0 < i && i < runs);
+        points
     }
 
     /// Drops the parts of pending deferred copies a write recorded later
@@ -2493,18 +2576,18 @@ impl Batch {
     /// there must not land after it (`Step::GpuWrite`).
     fn clip_late(&mut self, at: usize, len: usize) {
         let (w0, w1) = (at, at + len);
-        let mut kept: Vec<(usize, usize, usize, bool)> = Vec::with_capacity(self.late.len());
-        for &(dst, src, l, t) in &self.late {
+        let mut kept: Vec<(usize, usize, usize, bool, usize)> = Vec::with_capacity(self.late.len());
+        for &(dst, src, l, t, p) in &self.late {
             if !t || w1 <= dst || dst + l <= w0 {
-                kept.push((dst, src, l, t));
+                kept.push((dst, src, l, t, p));
                 continue;
             }
             // The parts outside the write keep their sources' offsets.
             if dst < w0 {
-                kept.push((dst, src, w0 - dst, t));
+                kept.push((dst, src, w0 - dst, t, p));
             }
             if w1 < dst + l {
-                kept.push((w1, src + (w1 - dst), dst + l - w1, t));
+                kept.push((w1, src + (w1 - dst), dst + l - w1, t, p));
             }
         }
         self.late = kept;
@@ -4320,6 +4403,150 @@ mod copy_order {
         crate::shadow::unregister(pools[4], pools[4] as u64);
         drop(copy0);
         drop(copy4);
+        for &p in &pools {
+            crate::watch::tests::free(p);
+        }
+    }
+
+    /// A copy deferred on its GPU-written destination still has its
+    /// source to read once the lists ran: a copy recorded later that
+    /// writes that source defers too, landing after the read in record
+    /// order, so the deferred copy takes the old bytes.
+    #[test]
+    fn a_late_copy_keeps_its_source_until_it_reads_it() {
+        use crate::watch::PAGE;
+        let Some(host) = super::host() else {
+            return; // no host GPU here
+        };
+        // A destination the shaders write, the deferred copy's source,
+        // and the source a later copy writes the source with.
+        let pools = [
+            crate::watch::tests::pool(1),
+            crate::watch::tests::pool(1),
+            crate::watch::tests::pool(1),
+        ];
+        // SAFETY: our pools, not guarded yet.
+        unsafe {
+            (pools[1] as *mut u8).write_volatile(0xAA);
+            (pools[2] as *mut u8).write_volatile(0xDD);
+        }
+        crate::shadow::register(pools[0], pools[0] as u64, PAGE as u64);
+        let copy0 = crate::shadow::find(pools[0] as u64, PAGE as u64).unwrap();
+        let list = host.new_list().unwrap();
+        copy0.refresh(&list, pools[0] as u64, PAGE as u64);
+        copy0.gpu_writes(&list, pools[0] as u64, PAGE as u64, false);
+        let c0 = copy0.clone();
+        list.defer_host(move || c0.write_host(pools[0] as u64, &[0xEE]));
+        // pools 1 -> 0 defers (its destination is written); pools 2 -> 1
+        // writes the deferred copy's source, so it defers too: on the
+        // console the first copy reads before the second writes.
+        list.defer_copy(pools[0] as *mut u8, pools[1] as *const u8, PAGE);
+        list.defer_copy(pools[1] as *mut u8, pools[2] as *const u8, PAGE);
+        list.close();
+        host.execute(&[&list]);
+        // SAFETY: bytes of our pools.
+        let at = |k: usize| unsafe { (pools[k] as *const u8).read_volatile() };
+        assert_eq!(at(0), 0xAA, "the deferred copy reads the old source");
+        assert_eq!(at(1), 0xDD, "the source's writer lands after it");
+        crate::shadow::unregister(pools[0], pools[0] as u64);
+        drop(copy0);
+        for &p in &pools {
+            crate::watch::tests::free(p);
+        }
+    }
+
+    /// A list whose steps read a deferred copy's destination needs the
+    /// copy's bytes in its host copy before it runs: the submission
+    /// splits before it, so the earlier list runs, its writes go back
+    /// and the copy lands first. What each list's `after` sees of the
+    /// destination's host copy shows the boundary: the first list ends
+    /// its segment on the stale bytes, the reader starts its own on the
+    /// copy's. A reader in the list the copy is deferred from cannot be
+    /// parted: it takes the title's own bytes at the boundary — the
+    /// copy's land only after the list ran.
+    #[test]
+    fn a_read_of_a_late_copy_sees_it_in_a_split_submission() {
+        use crate::watch::PAGE;
+        let Some(host) = super::host() else {
+            return; // no host GPU here
+        };
+        let pools = [crate::watch::tests::pool(1), crate::watch::tests::pool(1)];
+        for &p in &pools {
+            crate::shadow::register(p, p as u64, PAGE as u64);
+        }
+        // SAFETY: our pool, watched: the title's byte keeps pool 1's copy
+        // out of `Shadow::clean`, so its reads reach the submission's
+        // refreshes.
+        unsafe { (pools[1] as *mut u8).write_volatile(0x55) };
+        let copy0 = crate::shadow::find(pools[0] as u64, PAGE as u64).unwrap();
+        let copy1 = crate::shadow::find(pools[1] as u64, PAGE as u64).unwrap();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let samples = |copy: &std::sync::Arc<crate::shadow::Shadow>| {
+            let copy = copy.clone();
+            let seen = seen.clone();
+            move || {
+                let mut seen = seen.lock().unwrap_or_else(|e| e.into_inner());
+                seen.push(copy.read_host(pools[1] as u64, 1)[0] as u8);
+            }
+        };
+        // The first list writes pool 0, defers pools 0 -> 1 on it, and
+        // keeps pool 1's old bytes in its host copy (0x55); the title
+        // meanwhile writing pool 1 again keeps the reader's read a real
+        // refresh.
+        let list = host.new_list().unwrap();
+        copy0.refresh(&list, pools[0] as u64, PAGE as u64);
+        copy0.gpu_writes(&list, pools[0] as u64, PAGE as u64, false);
+        let c0 = copy0.clone();
+        list.defer_host(move || c0.write_host(pools[0] as u64, &[0xBB]));
+        copy1.refresh(&list, pools[1] as u64, PAGE as u64);
+        list.defer_copy(pools[1] as *mut u8, pools[0] as *const u8, PAGE);
+        let p = pools[1];
+        // SAFETY: a byte of our pool.
+        list.defer_host(move || unsafe { (p as *mut u8).write_volatile(0x99) });
+        list.defer_after(samples(&copy1));
+        let reader = host.new_list().unwrap();
+        copy1.refresh(&reader, pools[1] as u64, PAGE as u64);
+        reader.defer_after(samples(&copy1));
+        list.close();
+        reader.close();
+        host.execute(&[&list, &reader]);
+        assert_eq!(
+            *seen.lock().unwrap_or_else(|e| e.into_inner()),
+            vec![0x55, 0xBB],
+            "stale at the first list's end, the copy's at the reader's"
+        );
+        // SAFETY: a byte of our pool.
+        let at = unsafe { (pools[1] as *const u8).read_volatile() };
+        assert_eq!(at, 0xBB, "the deferred copy still lands");
+        seen.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        // Producer, deferred copy and reader in one list: nothing to
+        // split before; the reader keeps the stale bytes this submission
+        // (0xBB from the split above), the copy's are for the next.
+        let alone = host.new_list().unwrap();
+        copy0.refresh(&alone, pools[0] as u64, PAGE as u64);
+        copy0.gpu_writes(&alone, pools[0] as u64, PAGE as u64, false);
+        let c0 = copy0.clone();
+        alone.defer_host(move || c0.write_host(pools[0] as u64, &[0xCC]));
+        alone.defer_copy(pools[1] as *mut u8, pools[0] as *const u8, PAGE);
+        let p = pools[1];
+        // SAFETY: a byte of our pool.
+        alone.defer_host(move || unsafe { (p as *mut u8).write_volatile(0x77) });
+        copy1.refresh(&alone, pools[1] as u64, PAGE as u64);
+        alone.defer_after(samples(&copy1));
+        alone.close();
+        host.execute(&[&alone]);
+        assert_eq!(
+            *seen.lock().unwrap_or_else(|e| e.into_inner()),
+            vec![0x77],
+            "a reader beside its copy takes the title's own bytes at the boundary, not the copy's"
+        );
+        // SAFETY: a byte of our pool.
+        let at = unsafe { (pools[1] as *const u8).read_volatile() };
+        assert_eq!(at, 0xCC, "the deferred copy still lands");
+        crate::shadow::unregister(pools[0], pools[0] as u64);
+        crate::shadow::unregister(pools[1], pools[1] as u64);
+        drop(copy0);
+        drop(copy1);
         for &p in &pools {
             crate::watch::tests::free(p);
         }
