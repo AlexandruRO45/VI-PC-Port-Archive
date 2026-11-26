@@ -1,14 +1,14 @@
 # VIctory-7900XTX GitHub export
 
-Issues, pull requests and comments from `avatarmanz/VIctory-7900XTX`, exported from the GitHub REST API on 2026-11-25.
+Issues, pull requests and comments from `avatarmanz/VIctory-7900XTX`, exported from the GitHub REST API on 2026-11-26.
 
 Each file in `data/` is gzipped JSON Lines: one API object per line, unchanged.
 
 | File | Contents | Items |
 |---|---|---|
-| `issues_and_prs.jsonl.gz` | every issue and PR (title, body, labels, state, author) | 9 |
-| `pulls.jsonl.gz` | PR details (head and base branch, merge state) | 8 |
-| `issue_comments.jsonl.gz` | conversation comments on issues and PRs | 23 |
+| `issues_and_prs.jsonl.gz` | every issue and PR (title, body, labels, state, author) | 36 |
+| `pulls.jsonl.gz` | PR details (head and base branch, merge state) | 19 |
+| `issue_comments.jsonl.gz` | conversation comments on issues and PRs | 68 |
 | `review_comments.jsonl.gz` | inline code-review comments | 0 |
 | `labels.jsonl.gz` | labels | 10 |
 
