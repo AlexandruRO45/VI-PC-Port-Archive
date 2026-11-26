@@ -2469,7 +2469,7 @@ mod tests {
                 }
             }
             if note {
-                crate::capture::note_target(&list, resource);
+                crate::capture::note_test_target(&list, resource);
             }
             list.close();
             host.execute(&[&list]);

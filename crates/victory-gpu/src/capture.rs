@@ -357,13 +357,12 @@ pub(crate) fn note_target(list: &crate::host::HostList, resource: crate::object:
             return;
         }
     }
-    with_targets(|targets| {
-        if !targets.iter().any(|(r, _, _)| *r == resource as usize)
-            && let Some(copy) = crate::resource::host_copy(resource)
-        {
-            targets.push((resource as usize, copy, by));
-        }
-    });
+    let mut targets = TARGETS.lock().unwrap_or_else(|e| e.into_inner());
+    if !targets.iter().any(|(r, _, _)| *r == resource as usize)
+        && let Some(copy) = crate::resource::host_copy(resource)
+    {
+        targets.push((resource as usize, copy, by));
+    }
 }
 
 /// Whether textures wait to be dumped at this present.
@@ -1043,6 +1042,15 @@ static LEVELS: std::sync::Mutex<std::collections::VecDeque<u8>> =
 pub(crate) fn recent_levels() -> Vec<u8> {
     let levels = LEVELS.lock().unwrap_or_else(|e| e.into_inner());
     levels.iter().copied().collect()
+}
+
+#[cfg(test)]
+pub(crate) fn note_test_target(list: &crate::host::HostList, resource: crate::object::This) {
+    let copy = crate::resource::host_copy(resource).expect("host texture for the capture test");
+    let address = resource as usize;
+    list.note_target(address, "");
+    with_test_state(|capture| capture.targets.push((address, copy, String::new())))
+        .expect("capture test scope");
 }
 
 #[cfg(test)]
