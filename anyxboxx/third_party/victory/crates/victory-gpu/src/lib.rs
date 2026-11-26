@@ -24,6 +24,7 @@ pub mod descriptor;
 pub mod device;
 #[cfg(windows)]
 mod alloc_backoff;
+mod commit_gate;
 #[cfg(windows)]
 mod ambient;
 #[cfg(windows)]
