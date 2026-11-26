@@ -362,7 +362,7 @@ mod tests {
             return; // no dxil.dll on this machine: nothing to ask.
         };
         let (major, minor) = v.version().expect("IDxcValidator answers GetVersion");
-        assert!(major >= 1 && major <= 9, "engine {major}.{minor}");
+        assert!((1..=9).contains(&major), "engine {major}.{minor}");
         if let Some((file_major, file_minor)) = v.file_version() {
             // The two agree on this machine's SDK; what matters is that the
             // engine is what a report uses, and that the stamp is not lost.
@@ -416,3 +416,4 @@ mod tests {
         );
     }
 }
+
