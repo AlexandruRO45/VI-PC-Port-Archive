@@ -748,6 +748,75 @@ pub fn save_pipeline_cache() {
     library::save(true);
 }
 
+/// A title pipeline from a stream, as a title makes it: a vertex shader
+/// (taken as translated, its code as the host's) placing three vertices,
+/// no depth, triangles; its shader may write memory or not
+/// ([`Translated::writes_memory`]), for tests of what such draws do.
+#[cfg(all(test, windows))]
+pub(crate) fn test_pipeline(writes_memory: bool) -> This {
+    use windows::Win32::Graphics::Direct3D::{Fxc::D3DCompile, ID3DBlob};
+    use windows::Win32::Graphics::Direct3D12::D3D12_DEPTH_STENCIL_DESC1;
+    use windows::core::{PCSTR, s};
+    // A source of its own for each, so that no other test's container
+    // (shared by content) is translated otherwise.
+    let source: &[u8] = if writes_memory {
+        b"float4 main(uint id : SV_VertexID) : SV_Position { return float4(id, 0.125, 0.5, 1); }"
+    } else {
+        b"float4 main(uint id : SV_VertexID) : SV_Position { return float4(id, 0.375, 0.5, 1); }"
+    };
+    let mut code: Option<ID3DBlob> = None;
+    // SAFETY: the arguments are live and `code` is the output pointer.
+    unsafe {
+        D3DCompile(
+            source.as_ptr().cast(), source.len(), PCSTR::null(), None, None,
+            s!("main"), s!("vs_5_1"), 0, 0, &mut code, None,
+        )
+        .expect("the test vertex shader compiles");
+    }
+    let code = code.expect("compiled code");
+    // SAFETY: the blob owns these bytes.
+    let bytes = unsafe { std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize()) };
+    let vertex = shader("vertex", bytes);
+    vertex.translated.get_or_init(|| {
+        Some(Translated {
+            resource_heap: false,
+            writes_memory,
+            host: victory_shader::emit::HostShader {
+                stage: victory_shader::HwStage::Vs,
+                dxil: bytes.to_vec(),
+                user_data: Vec::new(),
+                samplers: Vec::new(),
+                static_samplers: Vec::new(),
+                root_cbvs: Vec::new(),
+                root_srvs: Vec::new(),
+                root_uavs: Vec::new(),
+                stride_table: false,
+            },
+            used: Vec::new(),
+        })
+    });
+    #[repr(C, align(8))]
+    struct Depth(u32, D3D12_DEPTH_STENCIL_DESC1);
+    #[repr(C)]
+    struct Stream {
+        vertex_kind: u64,
+        vertex: Bytecode,
+        depth: Depth,
+        topology: [u32; 2],
+    }
+    const TRIANGLES: u32 = 3;
+    let stream = Stream {
+        vertex_kind: 1,
+        vertex: Bytecode { code: vertex.container.as_ptr(), size: vertex.container.len() },
+        depth: Depth(21, D3D12_DEPTH_STENCIL_DESC1::default()),
+        topology: [14, TRIANGLES],
+    };
+    let desc = StreamDesc { size: size_of_val(&stream), stream: (&raw const stream).cast() };
+    let mut out = std::ptr::null();
+    assert_eq!(create_stream(std::ptr::null(), &desc, &PIPELINE_IIDS[0], &mut out), object::S_OK);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     #[cfg(all(windows, feature = "diagnostics"))]

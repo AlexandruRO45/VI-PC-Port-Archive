@@ -66,7 +66,8 @@ unsafe impl Send for Fixed {}
 
 /// Where the clamps of a run of indirect draws go: the list `clamps`, open,
 /// that runs before the host list at `into`, as long as that one has
-/// `writes` dispatches and copies (a later one may write the arguments).
+/// `writes` dispatches, copies and draws whose shaders store (a later one
+/// may write the arguments).
 pub(crate) struct Hoist {
     pub(crate) clamps: std::sync::Arc<HostList>,
     pub(crate) into: usize,
@@ -79,6 +80,10 @@ pub(crate) struct State {
     /// The list before the host list recorded into that holds the clamps of
     /// its indirect draws (`crate::indirect::hoisting`), still open.
     hoist: Option<Hoist>,
+    /// The budget the pieces of this title list cut for hoisted clamps
+    /// charge, the first piece's (`HostList::budget_to_lend`), since that
+    /// piece began.
+    pub(crate) budget_of: Option<(ID3D12Resource, u64)>,
     pipeline: usize,
     /// View heap, sampler heap.
     heaps: [usize; 2],
@@ -1226,6 +1231,7 @@ impl State {
                     // SAFETY: an open list with everything set.
                     unsafe { l6.DispatchMesh(x, 1, 1) };
                     list.count_work();
+                    self.count_stores(list);
                     DRAWN.fetch_add(1, Ordering::Relaxed);
                     true
                 }
@@ -1551,6 +1557,7 @@ impl State {
                     .DrawInstanced(count, instances, from, first_instance)
             };
             list.count_work();
+            self.count_stores(list);
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         if !ran {
@@ -1648,6 +1655,7 @@ impl State {
                     .DrawIndexedInstanced(indices, instances, first, base, first_instance)
             };
             list.count_work();
+            self.count_stores(list);
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         if !ran {
@@ -1962,9 +1970,23 @@ impl State {
             }
         } else {
             list.count_work();
+            self.count_stores(list);
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         true
+    }
+
+    /// After a draw: one whose shaders may write memory (the rule of
+    /// `Translated::writes_memory`) may write the arguments of a later
+    /// indirect draw, so it ends a run of hoisted clamps
+    /// (`crate::indirect::hoisting`) as dispatches and copies do.
+    fn count_stores(&self, list: &HostList) {
+        if crate::indirect::hoisting()
+            && crate::pipeline::host_pipeline(self.pipeline as This)
+                .is_some_and(|p| p.stages.iter().any(|s| s.translated().writes_memory))
+        {
+            list.count_write();
+        }
     }
 }
 

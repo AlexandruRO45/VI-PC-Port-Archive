@@ -1108,4 +1108,253 @@ void main() {
         host.execute(&[&list]);
         list.reset();
     }
+
+    /// A title's list (`crate::list`) and its allocator, called through
+    /// their method tables as a title calls them, for the tests of hoisted
+    /// clamps; released when dropped.
+    struct TitleList {
+        allocator: crate::object::This,
+        list: crate::object::This,
+    }
+
+    impl TitleList {
+        fn new() -> TitleList {
+            use crate::object::{S_OK, guid};
+            let iid = |g: windows::core::GUID| guid(g.data1, g.data2, g.data3, g.data4);
+            let null = std::ptr::null();
+            let (mut allocator, mut list) = (null, null);
+            let made = crate::list::create_allocator(null, 0, &iid(ID3D12CommandAllocator::IID), &mut allocator);
+            assert_eq!(made, S_OK);
+            let made =
+                crate::list::create_list(null, 0, 0, allocator, null, &iid(ID3D12GraphicsCommandList::IID), &mut list);
+            assert_eq!(made, S_OK);
+            TitleList { allocator, list }
+        }
+
+        fn method<F: Copy>(&self, offset: usize) -> F {
+            crate::object::slot(self.list, offset)
+        }
+
+        /// The host list recorded into now.
+        fn host(&self) -> &'static HostList {
+            crate::list::host_list(self.list).expect("a host list")
+        }
+
+        /// The host lists a submission of it runs, in order.
+        fn pieces(&self) -> Vec<crate::list::Submitted> {
+            crate::list::submitted(self.list)
+        }
+
+        fn set_pipeline(&self, pipeline: crate::object::This) {
+            self.method::<extern "system" fn(crate::object::This, crate::object::This)>(0xc8)(self.list, pipeline);
+        }
+
+        fn draw(&self, vertices: u32) {
+            self.method::<extern "system" fn(crate::object::This, u32, u32, u32, u32)>(0x60)(self.list, vertices, 1, 0, 0);
+        }
+
+        /// One record of `signature` at the start of `arguments`, no count.
+        fn execute_indirect(&self, signature: crate::object::This, arguments: crate::object::This) {
+            type Execute = extern "system" fn(
+                crate::object::This,
+                crate::object::This,
+                u32,
+                crate::object::This,
+                u64,
+                crate::object::This,
+                u64,
+            );
+            let at = if crate::list::has_newer_table(self.list) { 0x1e8 } else { 0x1d8 };
+            self.method::<Execute>(at)(self.list, signature, 1, arguments, 0, std::ptr::null(), 0);
+        }
+
+        fn close(&self) {
+            let close = self.method::<extern "system" fn(crate::object::This) -> crate::object::HRESULT>(0x48);
+            assert_eq!(close(self.list), crate::object::S_OK);
+        }
+
+        fn reset(&self) {
+            type Reset = extern "system" fn(
+                crate::object::This,
+                crate::object::This,
+                crate::object::This,
+            ) -> crate::object::HRESULT;
+            let reset = self.method::<Reset>(0x50);
+            assert_eq!(reset(self.list, self.allocator, std::ptr::null()), crate::object::S_OK);
+        }
+
+        /// Runs every piece of it, in order.
+        fn run(&self, host: &crate::host::Host) {
+            let pieces = self.pieces();
+            host.execute(&pieces.iter().map(|p| &**p).collect::<Vec<_>>());
+        }
+    }
+
+    impl Drop for TitleList {
+        fn drop(&mut self) {
+            for object in [self.list, self.allocator] {
+                crate::object::slot::<extern "system" fn(crate::object::This) -> u32>(object, 0x10)(object);
+            }
+        }
+    }
+
+    /// Hoisted clamps (`hoisting`): a draw whose shaders may write memory
+    /// (`Translated::writes_memory`) may write the arguments of the next
+    /// indirect draw, so it ends the run as dispatches and copies do: the
+    /// next indirect draw cuts the list again, its clamp recorded after
+    /// that draw. A draw that writes no memory leaves the run as it is.
+    #[test]
+    fn a_draw_whose_shaders_store_ends_a_run_of_hoisted_clamps() {
+        let Some(host) = super::host() else {
+            return;
+        };
+        if !hoisting() {
+            return;
+        }
+        let (plain, storing) = (crate::pipeline::test_pipeline(false), crate::pipeline::test_pipeline(true));
+        let made = |p| crate::pipeline::host_pipeline(p).is_some();
+        assert!(made(plain) && made(storing), "the host made the test pipelines");
+        const DRAW: u32 = 0;
+        let signature = crate::signature::test_signature(DRAW, 16);
+        let arguments = crate::resource::test_buffer(64);
+        // Pieces before and after the second of two indirect draws of
+        // `indirect`'s pipeline with a draw of `between`'s in between.
+        let pieces = |indirect, between| {
+            let t = TitleList::new();
+            t.set_pipeline(indirect);
+            // Topology 4: a triangle list.
+            t.method::<extern "system" fn(crate::object::This, u32)>(0xa0)(t.list, 4);
+            t.execute_indirect(signature, arguments);
+            let before = t.pieces().len();
+            t.set_pipeline(between);
+            t.draw(3);
+            t.set_pipeline(indirect);
+            t.execute_indirect(signature, arguments);
+            let after = t.pieces().len();
+            t.close();
+            t.run(host);
+            (before, after)
+        };
+        let (before, after) = pieces(plain, plain);
+        assert_eq!(after, before, "a draw that writes no memory keeps the run");
+        let (before, after) = pieces(plain, storing);
+        assert_eq!(after, before + 2, "a draw whose shaders store ends the run: its list, then the next run's clamps");
+        let (before, after) = pieces(storing, plain);
+        assert_eq!(after, before + 2, "an indirect draw whose shaders store ends its own run");
+        let release = |o: crate::object::This| crate::object::slot::<extern "system" fn(crate::object::This) -> u32>(o, 0x10)(o);
+        for object in [plain, storing, signature, arguments] {
+            assert_eq!(release(object), 0);
+        }
+    }
+
+    /// Hoisted clamps (`hoisting`): the pieces a title list is cut into for
+    /// them charge one budget, the first piece's, as the one host list did
+    /// before it was cut. What a clamp in the first piece spent, neither
+    /// the run's hoisted clamps nor a clamp in the piece after can spend
+    /// again. After the title's reset its list charges a budget of its own.
+    #[test]
+    fn pieces_cut_for_hoisted_clamps_charge_the_first_pieces_budget() {
+        let Some(host) = super::host() else {
+            return;
+        };
+        if !hoisting() {
+            return;
+        }
+        let worker = compile_cs(&host.device, WORKER_CS).expect("worker shader must compile");
+        const KIND_DISPATCH: u32 = 2;
+        const STRIDE: u32 = 12;
+        let signature = {
+            let arg = D3D12_INDIRECT_ARGUMENT_DESC {
+                Type: D3D12_INDIRECT_ARGUMENT_TYPE(KIND_DISPATCH as i32),
+                ..Default::default()
+            };
+            let desc = D3D12_COMMAND_SIGNATURE_DESC {
+                ByteStride: STRIDE,
+                NumArgumentDescs: 1,
+                pArgumentDescs: &arg,
+                NodeMask: 0,
+            };
+            let mut sig: Option<ID3D12CommandSignature> = None;
+            // SAFETY: a valid single-argument command signature description.
+            unsafe { host.device.CreateCommandSignature(&desc, None::<&ID3D12RootSignature>, &mut sig).unwrap() };
+            sig.unwrap()
+        };
+        let (Some((big, big_ptr)), Some((small, small_ptr)), Some((hits_buf, hits_ptr))) =
+            (host.shared_buffer(3 * u64::from(STRIDE)), host.shared_buffer(u64::from(STRIDE)), host.shared_buffer(256))
+        else {
+            return;
+        };
+        // SAFETY: mapped buffers of these sizes; nothing runs yet.
+        unsafe {
+            // Each record clamps to 65,535 x 16 groups: 2^26 threads less
+            // 1,024, so the third saturates the budget (2^27).
+            for i in 0..3 {
+                std::ptr::copy_nonoverlapping([65535u32, 16, 1].as_ptr().cast::<u8>(), big_ptr.add(i * STRIDE as usize), 12);
+            }
+            std::ptr::copy_nonoverlapping([1u32, 1, 1].as_ptr().cast::<u8>(), small_ptr, 12);
+            std::ptr::write_bytes(hits_ptr, 0, 256);
+        }
+        // SAFETY: a live buffer.
+        let hits_gpu = unsafe { hits_buf.GetGPUVirtualAddress() };
+        let hits = || {
+            // SAFETY: the lists have run; a mapped buffer.
+            unsafe { (hits_ptr as *const u32).read_volatile() }
+        };
+        // Runs one group a record of the clamped records at `at` of `args`.
+        let work = |list: &HostList, args: &ID3D12Resource, at: u64| {
+            // SAFETY: an open list; the worker's root signature and pipeline;
+            // buffers the test holds until the lists have run.
+            unsafe {
+                list.list.SetComputeRootSignature(&worker.root);
+                list.list.SetPipelineState(&worker.pso);
+                list.list.SetComputeRootUnorderedAccessView(0, hits_gpu);
+                list.list.ExecuteIndirect(&signature, 1, args, at, None, 0);
+            }
+        };
+        const DRAW: u32 = 0;
+        let draws = crate::signature::test_signature(DRAW, 16);
+        let arguments = crate::resource::test_buffer(64);
+
+        let t = TitleList::new();
+        // The first piece spends the whole budget (clamped, not run) and
+        // has work, so it stays a piece of its own.
+        let first = t.host();
+        let spent = bound(first, (&big, 0), None, (KIND_DISPATCH, STRIDE, 3)).unwrap();
+        done(first, &spent);
+        first.count_work();
+        // The title's indirect draw begins a run: the list is cut (with no
+        // pipeline set the draw itself is dropped).
+        t.execute_indirect(draws, arguments);
+        let pieces = t.pieces();
+        assert_eq!(pieces.len(), 3, "the first piece, the run's clamps, the piece after");
+        // A clamp of the run, hoisted, and an inline one after it.
+        let (hoisted, at) =
+            bound_before(&pieces[1], (&small, 0), None, (KIND_DISPATCH, STRIDE, 1)).expect("a hoisted clamp");
+        let after = &pieces[2];
+        work(after, &hoisted, at);
+        let inline = bound(after, (&small, 0), None, (KIND_DISPATCH, STRIDE, 1)).unwrap();
+        work(after, &inline, 0);
+        done(after, &inline);
+        t.close();
+        t.run(host);
+        assert_eq!(hits(), 0, "the later pieces' records find the first piece's budget spent");
+
+        // After the title's reset: a new first piece, cut again at once
+        // (it holds the run's clamps itself), with a budget of its own.
+        t.reset();
+        t.execute_indirect(draws, arguments);
+        let fresh = t.pieces();
+        assert_eq!(fresh.len(), 2, "the run's clamps, the piece after");
+        let inline = bound(&fresh[1], (&small, 0), None, (KIND_DISPATCH, STRIDE, 1)).unwrap();
+        work(&fresh[1], &inline, 0);
+        done(&fresh[1], &inline);
+        t.close();
+        t.run(host);
+        assert_eq!(hits(), 1, "a list reset charges a budget of its own again");
+        drop((pieces, fresh));
+        let release = |o: crate::object::This| crate::object::slot::<extern "system" fn(crate::object::This) -> u32>(o, 0x10)(o);
+        for object in [draws, arguments] {
+            assert_eq!(release(object), 0);
+        }
+    }
 }

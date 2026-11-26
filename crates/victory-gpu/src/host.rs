@@ -694,8 +694,9 @@ pub(crate) struct HostList {
     indirect_args: Mutex<Option<(ID3D12Resource, u64)>>,
     /// Host fence value signalled by the last submission that ran this list.
     last_fence: std::sync::atomic::AtomicU64,
-    /// Dispatches and buffer copies recorded since the reset: what may have
-    /// written indirect arguments (`crate::indirect` clamps hoisted before).
+    /// Dispatches, buffer copies and draws whose shaders store recorded
+    /// since the reset: what may have written indirect arguments
+    /// (`crate::indirect` clamps hoisted before).
     writes: std::sync::atomic::AtomicU64,
     /// Buffers for clamped indirect arguments when this list holds the
     /// clamps of the list after it (`clamp_room`).
@@ -1004,6 +1005,11 @@ struct Deferred {
     wait_marks: Vec<usize>,
     /// Whether a step zeroes the indirect-work budget.
     budget_zeroed: bool,
+    /// Another list's budget this recording charges instead of its own
+    /// (`crate::list::hoist`: the pieces of a title list cut for hoisted
+    /// clamps share the first piece's): the buffer, kept until the reset,
+    /// and its host address.
+    lent_budget: Option<(ID3D12Resource, u64)>,
 }
 
 impl Host {
@@ -2383,12 +2389,13 @@ impl HostList {
         self.queries.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 
-    /// Counts a dispatch or a copy: what may write indirect arguments.
+    /// Counts a dispatch, a copy or a draw whose shaders store: what may
+    /// write indirect arguments.
     pub(crate) fn count_write(&self) {
         self.writes.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Dispatches and copies since the reset.
+    /// Those writes since the reset.
     pub(crate) fn writes(&self) -> u64 {
         self.writes.load(Ordering::Relaxed)
     }
@@ -2607,8 +2614,14 @@ impl HostList {
     }
 
     /// The host address of the list's indirect-work budget, zeroed at each
-    /// submission of the list from the first use after a reset on.
+    /// submission of the list from the first use after a reset on; or of
+    /// the budget lent to it ([`HostList::lend_budget`]), which its owner
+    /// zeroes.
     pub(crate) fn budget(&self) -> Option<u64> {
+        let lent = self.deferred().lent_budget.as_ref().map(|(_, gpu)| *gpu);
+        if lent.is_some() {
+            return lent;
+        }
         let (buffer, data) = self
             .budget
             .get_or_init(|| {
@@ -2627,6 +2640,25 @@ impl HostList {
         }
         // SAFETY: a live buffer.
         Some(unsafe { buffer.GetGPUVirtualAddress() })
+    }
+
+    /// The budget this recording charges, made ready here if it is not yet,
+    /// for the lists that run after it in the same submission to charge too
+    /// ([`HostList::lend_budget`]): the buffer and its host address.
+    pub(crate) fn budget_to_lend(&self) -> Option<(ID3D12Resource, u64)> {
+        let gpu = self.budget()?;
+        if let Some(lent) = self.deferred().lent_budget.clone() {
+            return Some(lent);
+        }
+        let (buffer, _) = self.budget.get()?.as_ref()?;
+        Some((buffer.clone(), gpu))
+    }
+
+    /// From here until its reset the list's clamps charge `budget`
+    /// ([`HostList::budget_to_lend`] of a list that runs before it) instead
+    /// of a budget of its own.
+    pub(crate) fn lend_budget(&self, budget: (ID3D12Resource, u64)) {
+        self.deferred().lent_budget = Some(budget);
     }
 
     /// A device-local unordered-access buffer of at least `size` bytes for

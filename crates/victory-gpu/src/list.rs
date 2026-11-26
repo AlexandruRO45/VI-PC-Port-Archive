@@ -207,6 +207,9 @@ fn cut(this: This) {
     };
     let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
     state.end_hoist();
+    // Past a wait each part charges a budget of its own again, as the
+    // parts cut at waits did before clamps were hoisted.
+    state.budget_of = None;
     if let Some(old) = host.replace(next) {
         old.close();
         parts.push(old);
@@ -248,11 +251,19 @@ fn hoist(this: This) {
         }
     }
     crate::indirect::CUTS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // Every piece charges one budget, the first piece's, as the one host
+    // list did before it was cut: with a budget of its own each piece
+    // could do 2^27 more work.
+    let budget = state.budget_of.clone().or_else(|| current.budget_to_lend());
     let Some(next) = spare() else { return };
     // What was recorded keeps its place; with no work in it, it holds the
-    // clamps itself (the state set in it does them no harm).
+    // clamps itself (the state set in it does them no harm) and charges
+    // the budget it did.
     let clamps = if current.worked() || crate::indirect::hoist_mode() == 5 {
         let Some(clamps) = spare() else { return };
+        if let Some(budget) = &budget {
+            clamps.lend_budget(budget.clone());
+        }
         if let Some(old) = host.replace(next) {
             old.close();
             parts.push(old);
@@ -264,9 +275,13 @@ fn hoist(this: This) {
     };
     parts.push(clamps.clone());
     if let Some(next) = host {
+        if let Some(budget) = &budget {
+            next.lend_budget(budget.clone());
+        }
         state.continue_in(next);
         state.hoist(clamps, next);
     }
+    state.budget_of = budget;
 }
 
 /// Host lists the title's lists were parted from while a submission of them

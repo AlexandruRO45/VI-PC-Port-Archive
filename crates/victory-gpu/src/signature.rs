@@ -76,6 +76,23 @@ pub(crate) fn layout<'a>(this: This) -> Option<(u32, &'a [[u32; 4]])> {
     Some((s.stride, &s.arguments))
 }
 
+/// A signature of one argument of `kind` (PC numbering) with records
+/// `stride` bytes apart, as a title makes it.
+#[cfg(test)]
+pub(crate) fn test_signature(kind: u32, stride: u32) -> This {
+    let argument = [kind, 0, 0, 0];
+    let desc = Desc {
+        stride,
+        count: 1,
+        arguments: &argument,
+        nodes: 0,
+    };
+    let mut out = std::ptr::null();
+    let hr = create(std::ptr::null(), &desc, std::ptr::null(), &SIGNATURE_IIDS[0], &mut out);
+    assert_eq!(hr, crate::object::S_OK);
+    out
+}
+
 extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
     let found = object::is(iid, &SIGNATURE_IIDS).then_some(this);
     object::answer(COMMAND_SIGNATURE, iid, found, out)
