@@ -679,6 +679,39 @@ fn half_sum_and_packed_lane_cross_host_halves() {
     }
 }
 
+/// Without an adapter (CI, WARP): the scan above leaves one f16 sum whose
+/// high half is the lane it ends in (31 or 63), and it translates for a
+/// partial group too.
+#[test]
+fn half_sum_takes_the_high_half_of_the_lane_it_ends_in() {
+    let nvidia = super::Target {
+        lanes_min: 32,
+        lanes_max: 32,
+    };
+    for (finish_low, lane) in [(true, 31), (false, 63)] {
+        let mut words = reduction_scan_of(0x32, 0x80, None, finish_low);
+        words.push(S_ENDPGM);
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let ir = crate::ir::build(&code, true, 256).unwrap();
+        let sections = super::wave::sections(&ir, 0);
+        let halves: Vec<u32> = sections
+            .values()
+            .flat_map(|s| s.shapes.values())
+            .filter_map(|sh| match *sh {
+                super::wave::Shape::Half(super::wave::Op::AddH, .., hi) => Some(hi),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(halves, [lane], "finish_low {finish_low}");
+        let mut body = reduction_scan_of(0x32, 0x80, None, finish_low);
+        body.push(0x7E04_020A); // v_mov_b32 v2, s10
+        for threads in [32, 48, 64] {
+            emit_for(&program(&body, threads), nvidia)
+                .unwrap_or_else(|e| panic!("{threads} threads: {e:?}"));
+        }
+    }
+}
+
 /// The same sum over a mask that straddles the halves: lanes below 40 (32
 /// in the lower half, 8 in the upper). The other lanes keep their value.
 #[test]
