@@ -7,6 +7,49 @@
 use super::*;
 
 impl<'a> Lower<'a> {
+    /// Console mode's parked lanes ([`Lower::parked`]): a phi of whether a
+    /// lane is parked at every loop header, false on entry. A latch whose
+    /// exit is decided for the wave parks the lanes that would have left
+    /// ([`Lower::wave_branch`]), and every instruction in the loop is then
+    /// guarded by `!parked` too ([`Lower::unparked`]).
+    // shortcut: a lane is parked only at a latch whose other side leaves
+    // the loop (the do-while shape); a branch going round the loop from
+    // the middle keeps its lanes running to the latch.
+    pub(super) fn park_lanes(&mut self, order: &[usize]) {
+        let loops = self.barrier_loops(order);
+        let headers: Vec<usize> = self.counters.keys().copied().collect();
+        for h in headers {
+            let Some(&(_, last, _)) = loops.iter().find(|l| l.0 == h) else {
+                continue;
+            };
+            let blk = self.block[h].expect("reachable");
+            let phi = self.s.m.phi(blk, self.s.t.i1);
+            self.parked.insert(h, (phi, Vec::new(), last));
+        }
+    }
+
+    /// `guard` with the lanes parked in every loop holding block `b` left
+    /// out.
+    pub(super) fn unparked(&mut self, b: usize, guard: Option<V>) -> Option<V> {
+        let parked: Vec<V> = self
+            .parked
+            .iter()
+            .filter(|&(&h, &(_, _, last))| self.rpo[h] <= self.rpo[b] && self.rpo[b] <= self.rpo[last])
+            .map(|(_, &(phi, _, _))| phi)
+            .collect();
+        let mut guard = guard;
+        for phi in parked {
+            let c = self.cur;
+            let yes = self.s.m.bool(true);
+            let running = self.s.m.bin(c, Bin::Xor, phi, yes);
+            guard = Some(match guard {
+                Some(g) => self.s.m.bin(c, Bin::And, g, running),
+                None => running,
+            });
+        }
+        guard
+    }
+
     /// The terminator of block `b`, a per-lane branch decided for the
     /// whole wave ([`Lower::wave_loop_exits`], console mode).
     pub(super) fn wave_branch(
@@ -47,6 +90,30 @@ impl<'a> Lower<'a> {
         } else {
             cond
         };
+        // A latch whose other side leaves the loop: lanes that would have
+        // left while the wave goes round are parked (`Lower::parked`).
+        let latch = [(taken, not_taken, false), (not_taken, taken, true)]
+            .into_iter()
+            .find(|&(round, out, _)| {
+                back(self, round)
+                    && self.parked.get(&round).is_some_and(|p| {
+                        !(self.rpo[round] <= self.rpo[out] && self.rpo[out] <= self.rpo[p.2])
+                    })
+            });
+        if let Some((header, _, leaves_when_taken)) = latch {
+            let c = self.cur;
+            let leaves = if leaves_when_taken {
+                lane
+            } else {
+                let yes = self.s.m.bool(true);
+                self.s.m.bin(c, Bin::Xor, lane, yes)
+            };
+            let phi = self.parked[&header].0;
+            let now = self.s.m.bin(c, Bin::Or, phi, leaves);
+            if let Some(last) = self.parked.get_mut(&header).and_then(|p| p.1.last_mut()) {
+                *last = (now, c);
+            }
+        }
         let (t, f) = (self.edge(b, taken), self.edge(b, not_taken));
         for (to, via) in [(taken, t), (not_taken, f)] {
             if !back(self, to) {

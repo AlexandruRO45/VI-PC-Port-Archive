@@ -25,6 +25,10 @@ mod bvh;
 
 type Why = &'static str;
 
+/// A loop's parked lanes ([`Lower::parked`]): the header's phi, its
+/// incoming (value, DXIL block) pairs, and the loop's last block in RPO.
+type Parked = (V, Vec<(V, usize)>, usize);
+
 #[derive(Debug, Clone, Copy)]
 enum Val {
     I32(V),
@@ -237,6 +241,12 @@ struct Lower<'a> {
     /// every branch on a lane mask decided for the whole wave, every vector
     /// instruction guarded by its EXEC.
     console_mode: bool,
+    /// Console mode's parked lanes, by loop header: lanes the wave keeps
+    /// in a loop past their own exit (its exit decided for the wave), which
+    /// run nothing more in it, as the console's EXEC leaves them out. The
+    /// header's phi, its incoming (value, DXIL block) pairs, and the loop's
+    /// last block in RPO ([`Lower::park_lanes`]).
+    parked: HashMap<usize, Parked>,
     /// Per IR block: a `done` export is behind every lane entering it.
     exported: Vec<bool>,
     /// Reverse-postorder index per IR block.
@@ -699,6 +709,7 @@ impl<'a> Lower<'a> {
             extra_barriers: HashMap::new(),
             wave_branches: HashMap::new(),
             console_mode: false,
+            parked: HashMap::new(),
             exported: vec![false; p.blocks.len()],
             rpo: vec![usize::MAX; p.blocks.len()],
             tail: vec![None; p.blocks.len()],
@@ -1348,6 +1359,7 @@ impl<'a> Lower<'a> {
             Err(_) => {
                 self.console_mode = true;
                 self.wave_branches = self.console_branches(&order);
+                self.park_lanes(&order);
             }
         }
         for &b in &order {
@@ -2737,10 +2749,11 @@ impl<'a> Lower<'a> {
         } else {
             self.x.st.guards[b][i]
         };
-        match guard {
-            None => Ok(None),
-            Some(g) => Ok(Some(self.boolean(g, self.cur)?)),
-        }
+        let guard = match guard {
+            None => None,
+            Some(g) => Some(self.boolean(g, self.cur)?),
+        };
+        Ok(self.unparked(b, guard))
     }
 
     /// Whether every lane outside the guard of the export at (b, i) runs
@@ -10268,6 +10281,10 @@ impl<'a> Lower<'a> {
             let z = self.s.m.i32(0);
             incoming.push((z, via));
         }
+        if let Some((_, incoming, _)) = self.parked.get_mut(&to) {
+            let no = self.s.m.bool(false);
+            incoming.push((no, via));
+        }
     }
 
     /// A back edge to header `to` (a back edge keeps its block, no
@@ -10284,6 +10301,12 @@ impl<'a> Lower<'a> {
             .expect("header")
             .1
             .push((next, c));
+        // Parked lanes stay parked round the loop (`Lower::wave_branch`
+        // may park more).
+        if let Some((parked, incoming, _)) = self.parked.get_mut(&to) {
+            let parked = *parked;
+            incoming.push((parked, c));
+        }
         self.s.m.cmp(c, p, next, limit)
     }
 
@@ -10926,6 +10949,9 @@ impl<'a> Lower<'a> {
             self.s.m.set_phi(v, incoming);
         }
         for (phi, incoming) in std::mem::take(&mut self.counters).into_values() {
+            self.s.m.set_phi(phi, incoming);
+        }
+        for (phi, incoming, _) in std::mem::take(&mut self.parked).into_values() {
             self.s.m.set_phi(phi, incoming);
         }
         while let Some((v, b, i)) = self.pending_masks.pop() {
