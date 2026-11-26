@@ -926,7 +926,6 @@ fn straddling_writes_across_256mib_and_4gib_boundaries_mark_exact_pages() {
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
 }
 
-
 const OFFEN: u32 = 1 << 12;
 const IDXEN: u32 = 1 << 13;
 
@@ -953,8 +952,9 @@ const INDEXED_RECORDS: u32 = 21;
 /// A wave32 program of 32 lanes reading a table after its code through two
 /// descriptors built around `s_getpc_b64`: a raw one (`OOB_SELECT` 3) read
 /// per lane at `lane * 4` as a dword, its byte 1, and two dwords 4 bytes
-/// further through `soffset`; a structured one (`OOB_SELECT` 1, stride 8)
-/// read by `idxen` at the lane's element plus 4. Lane `l` stores the five
+/// further through `soffset`, and a signed halfword at byte 3 (its high
+/// byte in the next dword); a structured one (`OOB_SELECT` 1, stride 8)
+/// read by `idxen` at the lane's element plus 4. Lane `l` stores the six
 /// dwords at `32 * l` of the UAV at heap index 0.
 fn code_table_program() -> Vec<u32> {
     let mut w = vec![s_mov_b32(5, ZERO as u8)];
@@ -975,9 +975,10 @@ fn code_table_program() -> Vec<u32> {
     w.extend(mubuf(0x08, 3, 1, 12, 0x80, OFFEN | 1));
     w.extend(mubuf(0x0C, 4, 0, 16, 0x80, IDXEN | 4));
     w.extend(mubuf(0x0D, 5, 1, 12, 20, OFFEN));
+    w.extend(mubuf(0x0B, 8, 1, 12, 0x80, OFFEN | 3));
     w.push(S_WAITCNT_ALL);
-    for k in 0..5u8 {
-        w.extend(mubuf(0x1C, 2 + k, 7, 8, 0x80, OFFEN | (4 * u32::from(k))));
+    for (k, v) in [2u8, 3, 4, 5, 6, 8].into_iter().enumerate() {
+        w.extend(mubuf(0x1C, v, 7, 8, 0x80, OFFEN | (4 * k as u32)));
     }
     w.push(S_ENDPGM);
     let table = 4 * w.len() as u32;
@@ -991,7 +992,7 @@ fn code_table_program() -> Vec<u32> {
 /// What lane `l` of [`code_table_program`] stores: out of range, a load
 /// reads 0 (a raw load by dword, each checked as `offset + soffset +
 /// size > records`; an indexed one by `index >= records`).
-fn code_table_model(l: u32) -> [u32; 5] {
+fn code_table_model(l: u32) -> [u32; 6] {
     let t = code_table();
     let raw = |byte: u32, size: u32, x: u32| if byte + size > RAW_RECORDS { 0 } else { x };
     [
@@ -1004,6 +1005,11 @@ fn code_table_model(l: u32) -> [u32; 5] {
         },
         raw(4 * l + 4, 4, t[l as usize + 1]),
         raw(4 * l + 8, 4, t[l as usize + 2]),
+        raw(
+            4 * l + 3,
+            2,
+            (t[l as usize] >> 24 | (t[l as usize + 1] & 0xFF) << 8) as u16 as i16 as u32,
+        ),
     ]
 }
 
@@ -1011,7 +1017,7 @@ fn lower_code_table_program(words: &[u32]) -> Result<HostShader, String> {
     let native = NativeProgram {
         stage: HwStage::Cs,
         wave64: false,
-        vgprs: 8,
+        vgprs: 9,
         layout: vec![RootParam {
             root: RootType::Table,
             table_offset_dwords: 0,
@@ -1102,6 +1108,7 @@ fn code_table_buffer_loads_lower() {
         "buffer_load_ubyte v3, v1, s[12:15], 0 offen offset:1".to_owned(),
         "buffer_load_dword v4, v0, s[16:19], 0 idxen offset:4".to_owned(),
         "buffer_load_dwordx2 v[5:6], v1, s[12:15], s20 offen".to_owned(),
+        "buffer_load_sshort v8, v1, s[12:15], 0 offen offset:3".to_owned(),
     ];
     assert_eq!(text[2..2 + want.len()], want[..]);
     let shader = lower_code_table_program(&words).expect("lower");

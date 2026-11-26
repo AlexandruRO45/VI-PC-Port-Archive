@@ -9468,8 +9468,7 @@ impl<'a> Lower<'a> {
                 return Err("a code table descriptor with swizzling or thread ids");
             }
             // OOB_SELECT (dword 3 bits 28-29): 1 checks the index, 2 only
-            // an empty buffer, 3 the offset with soffset, not the index
-            // (measured on RDNA2 by the Leonida project).
+            // an empty buffer, 3 the offset with soffset, not the index.
             let oob = word3 >> 28 & 3;
             if oob == 0 {
                 return Err("a code table descriptor checking offsets against its stride");
@@ -9514,13 +9513,26 @@ impl<'a> Lower<'a> {
                         self.code_dword(byte)?
                     }
                     (_, Some((width, signed))) => {
-                        // shortcut: the field is taken not to cross a dword.
                         let (not3, three) = (self.s.m.i32(!3), self.s.m.i32(3));
                         let aligned = self.s.m.bin(c, Bin::And, at, not3);
                         let w = self.code_dword(aligned)?;
                         let byte = self.s.m.bin(c, Bin::And, at, three);
                         let sh = self.s.m.bin(c, Bin::Shl, byte, three);
-                        let x = self.s.m.bin(c, Bin::LShr, w, sh);
+                        let mut x = self.s.m.bin(c, Bin::LShr, w, sh);
+                        if width > 8 {
+                            // A halfword at byte 3 takes its high byte from the
+                            // next dword: (next << 1) << (31 - sh) is next << (32 - sh),
+                            // and 0 at sh 0 with no shift by 32.
+                            let four = self.s.m.i32(4);
+                            let at_next = self.s.m.bin(c, Bin::Add, aligned, four);
+                            let next = self.code_dword(at_next)?;
+                            let one = self.s.m.i32(1);
+                            let next = self.s.m.bin(c, Bin::Shl, next, one);
+                            let k31 = self.s.m.i32(31);
+                            let rest = self.s.m.bin(c, Bin::Sub, k31, sh);
+                            let hi = self.s.m.bin(c, Bin::Shl, next, rest);
+                            x = self.s.m.bin(c, Bin::Or, x, hi);
+                        }
                         let left = self.s.m.i32(32 - width);
                         let x = self.s.m.bin(c, Bin::Shl, x, left);
                         let shr = if signed { Bin::AShr } else { Bin::LShr };
