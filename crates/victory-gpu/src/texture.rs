@@ -562,11 +562,19 @@ impl Staging {
         if let Some(t) = &self.tracked {
             // Most refreshes find nothing: the tracker's dense bit says so
             // without its lock (123,000 refreshes a frame, run evict3).
+            // A tracker with untracked parts has no clean bit, so this is
+            // false whenever there is untracked memory — and `t.untracked()`
+            // allocates, so we skip it on the clean fast path.
             if t.clean() {
                 return (0, None);
             }
-            let ranges = t.take(start, start + size);
-            if ranges.is_empty() {
+            // Changed tracked pages go through the hash-based skip path;
+            // untracked pages are copied whole at each use (same as buffer
+            // copies, see Tracked::untracked) so they re-upload when their
+            // bytes change.
+            let tracked = t.take(start, start + size);
+            let untracked = t.untracked(start, start + size);
+            if tracked.is_empty() && untracked.is_empty() {
                 return (0, None);
             }
             // Only the subresources in the pages that changed (streamed
@@ -577,7 +585,8 @@ impl Staging {
             let touched: Vec<usize> = (0..n)
                 .filter(|&i| {
                     let (a, b) = span(i);
-                    ranges.iter().any(|&(f, e)| f - start < b && a < e - start)
+                    tracked.iter().any(|&(f, e)| f - start < b && a < e - start)
+                        || untracked.iter().any(|&(f, e)| f - start < b && a < e - start)
                 })
                 .collect();
             // Read through the copy, which stands unmapped pages: memory of
@@ -607,7 +616,7 @@ impl Staging {
                 .filter(|&i| {
                     let (a, b) = span(i);
                     let (a0, b0) = (start + a, start + b);
-                    if ranges.iter().any(|&(f, e)| f.max(a0).next_multiple_of(page) + page <= e.min(b0)) {
+                    if tracked.iter().any(|&(f, e)| f.max(a0).next_multiple_of(page) + page <= e.min(b0)) {
                         last.hashes[i] = None;
                         return true;
                     }
@@ -844,6 +853,7 @@ pub(crate) fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<St
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::watch::PAGE;
 
     #[test]
     fn subresource_len_stays_inside_staging_total() {
@@ -877,5 +887,69 @@ mod tests {
         assert!(committed(rw.cast::<u8>(), 4096));
         // SAFETY: freeing the allocation above.
         unsafe { VirtualFree(rw, 0, MEM_RELEASE) };
+    }
+
+    /// Untracked memory pages overlapping a texture are re-read at every
+    /// refresh: a subresource lying wholly in untracked pages is uploaded
+    /// at first and whenever its bytes change, same as buffer copies
+    /// (see Tracked::untracked).
+    #[test]
+    fn untracked_memory_pages_are_refreshed_like_buffer_copies() {
+        use crate::watch::track;
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+
+        // Reserve a 4 KiB window, then commit one page inside it. The
+        // reserved page is runtime (tracked) memory; the committed page
+        // is untracked memory.
+        const WINDOW: usize = 2 * PAGE;
+        // SAFETY: reserving a fresh 4 KiB window; freed below.
+        let base =
+            unsafe { VirtualAlloc(std::ptr::null(), WINDOW, MEM_RESERVE, PAGE_READWRITE) };
+        assert!(!base.is_null());
+        let base_addr = base as usize;
+        let committed_addr = base_addr + PAGE;
+        // SAFETY: committing one page inside our reservation; freed below.
+        let committed_page =
+            unsafe { VirtualAlloc(committed_addr as *const _, PAGE, MEM_COMMIT, PAGE_READWRITE) };
+        assert!(!committed_page.is_null());
+        let committed = committed_page as usize;
+
+        let t = track(base_addr, WINDOW, true).expect("tracking mixed memory");
+
+        // Untracked pages are reported separately from tracked ones.
+        let untracked = t.untracked(base_addr, base_addr + WINDOW);
+        assert_eq!(
+            untracked,
+            vec![(committed, committed + PAGE)],
+            "untracked pages: {untracked:x?}"
+        );
+
+        // take() does NOT return untracked pages.
+        let taken = t.take(base_addr, base_addr + WINDOW);
+        assert!(
+            taken.iter().all(|&(a, b)| !(a <= committed && committed < b)),
+            "take() must not include untracked pages: {taken:x?}"
+        );
+
+        // A tracker with untracked parts is never clean.
+        assert!(!t.clean(), "tracker with untracked parts must not be clean");
+
+        // Writing to untracked memory is visible through untracked().
+        // SAFETY: writing to our own committed page.
+        unsafe { (committed as *mut u32).write_volatile(0xDEADBEEF) };
+        // untracked() is independent of writes: it always returns the same
+        // ranges. What changes is whether t.take() sees them as changed.
+        let untracked2 = t.untracked(base_addr, base_addr + WINDOW);
+        assert_eq!(
+            untracked2,
+            vec![(committed, committed + PAGE)]
+        );
+
+        // SAFETY: freeing our own committed page; it was allocated by VirtualAlloc.
+        unsafe { VirtualFree(committed as *mut _, 0, MEM_RELEASE) };
+        // SAFETY: freeing our own reservation; it was allocated by VirtualAlloc.
+        unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
     }
 }
