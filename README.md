@@ -1,17 +1,45 @@
-# VIctory on an RX 7900 XTX
+# VIctory — NVIDIA Hybrid Optimization
 
 A fork of [VIctory](https://github.com/Marvisak/VIctory), a compatibility layer
 that runs an Xbox Series title natively on Windows from files the user supplies.
-This one is about **speed on AMD RDNA 3**: the world at 30 frames a second on
-one PC, without giving up the picture. It is not there yet.
+This fork experiments with NVIDIA compatibility while retaining the upstream AMD RDNA 3 renderer. The active hybrid branch is experimental; `main` retains its existing code baseline.
 
 **This repository contains no game files, code or assets.** You need your own
 copy of the game. It is not affiliated with or endorsed by the game's developer
 or publisher.
 
-## Where it stands (2026-11-25)
+## NVIDIA hybrid branch: local test configuration (2026-11-26)
 
-Tested on one machine only: Windows 11, Intel i9-12900K, 64 GB RAM, Radeon
+Active development: [hybrid-nvidia-optimization](https://github.com/spatsariya/victory-7900xtx/tree/hybrid-nvidia-optimization). This is an experimental NVIDIA-focused fork of [avatarmanz/VIctory-7900XTX](https://github.com/avatarmanz/VIctory-7900XTX), with selected compatibility fixes from other VIctory contributors.
+
+| Component | Tested configuration |
+|---|---|
+| CPU | AMD Ryzen 7 3700X, 8 cores, 3.60 GHz |
+| GPU | NVIDIA GeForce RTX 3060, 12 GB VRAM |
+| RAM | 64 GB, 2667 MHz |
+| Operating system | Windows x64 |
+| Runtime | Direct3D 12, Safe launch profile, ray tracing off |
+| Tested source commit | [ea88833](https://github.com/spatsariya/victory-7900xtx/commit/ea888334f360c252962cf55b1c2f184db7e556ec) |
+
+### Observed results
+
+| Test | Result |
+|---|---|
+| Loading-screen artwork | Renders at 30 FPS |
+| Prologue 3D scenes | Render; approximately 1–3 FPS in early testing |
+| Chapter 1 | Reached the boating sequence; approximately 3–4 FPS observed in later diagnostics |
+| Character rendering | Improved in some views; missing facial geometry not fully verified as resolved |
+| Stability | Access violation (0xc0000005, null read) around the boating sequence; root cause unknown |
+| Wave64 mask recovery | Regression test passed; all 14 structure tests passed |
+| Windows diagnostic build | Successful, six compiler warnings |
+
+The hybrid branch includes a selective port of DexNom's Wave64 scalar-mask recovery fix (original commit `76749ce`). It preserves the existing 7900XTX renderer and shader improvements. This is not a stable or fully playable release; FPS varies by scene, shader cache state and hardware. The 30 FPS loading screen is not a gameplay benchmark. Further work targets runtime stability, character rendering, rejected compute pipelines and memory/descriptor overhead.
+
+The upstream Radeon results below are retained for reference and are **not** measurements from the RTX 3060 test system.
+
+## Upstream Radeon results (2026-11-25)
+
+Upstream Radeon test machine: Windows 11, Intel i9-12900K, 64 GB RAM, Radeon
 RX 7900 XTX, 1440p, the Series X profile.
 
 | | |
@@ -43,11 +71,11 @@ model 6.6 and mesh shaders, Rust (the toolchain is pinned), the MSVC build
 tools, and your own dump of the title.
 
 ```powershell
-git clone https://github.com/avatarmanz/VIctory-7900XTX
-cd VIctory-7900XTX
+git clone --branch hybrid-nvidia-optimization https://github.com/spatsariya/victory-7900xtx.git
+cd victory-7900xtx
 copy victory.example.toml victory.toml      # then set your paths, outside this folder
 cargo build --locked --profile diag -p victory --features diagnostics
-scripts\play.ps1 -Exe <path of your copy's executable>
+.\scripts\play.ps1 -Exe 'C:\path\to\your\authorized\title.exe' -Safe
 ```
 
 `scripts\play.ps1 -Safe` leaves out the newest, faster ways; try it first when
@@ -87,6 +115,9 @@ In short; the reasons and the measurements are in [docs/findings.md](docs/findin
   turn by turn ([docs/replay.md](docs/replay.md)).
 
 ## Credits
+
+- **[avatarmanz/VIctory-7900XTX](https://github.com/avatarmanz/VIctory-7900XTX)**: the immediate base of this NVIDIA-focused fork.
+- **DexNom**: original Wave64 scalar-mask recovery fix, selectively ported in `ea88833`.
 
 This is a tree of other people's work with more on top. The history is kept, and
 commits taken from elsewhere name the commit and its author.
