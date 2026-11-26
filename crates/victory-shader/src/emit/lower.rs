@@ -6319,7 +6319,7 @@ impl<'a> Lower<'a> {
                 float(self, r)
             }
             "v_fma_f32" | "v_fmaak_f32" | "v_fmamk_f32" => {
-                // DXIL has no fused f32 multiply-add; compute in f64 for an exact product.
+                // f64 represents the product exactly.
                 let (a, bb, cc) = (f(self, 0)?, f(self, 1)?, f(self, 2)?);
                 let r = self.fma32(a, bb, cc);
                 float(self, r)
@@ -12248,6 +12248,7 @@ mod tests {
                 prims: vec![],
                 mesh_stride: 0,
                 view_marks: false,
+                emulate_fma: false,
             })
             .unwrap();
             assert!(lowered.wave_ops);
