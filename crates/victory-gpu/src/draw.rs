@@ -770,14 +770,36 @@ impl State {
                         Some(&(_, offset)) => offset,
                         None if u.dword == victory_shader::emit::ROOT_VIEW_OFFSET => {
                             // Where the root address lies in the copy its view shows.
-                            let offset = match self.roots_ref(compute).get(usize::from(u.slot)) {
-                                Some(&Root::View(address)) => crate::shadow::find(address, 1)
-                                    .and_then(|s| u32::try_from(s.offset(address)).ok()),
-                                _ => None,
-                            };
+                            let offset = self.root_address(compute, u.slot).and_then(|address| {
+                                crate::shadow::find(address, 1)
+                                    .and_then(|s| u32::try_from(s.offset(address)).ok())
+                            });
                             match offset {
                                 Some(offset) => offset,
                                 None => {
+                                    // Diagnostics: which half of the reason it is -
+                                    // a slot that holds no view, or a view whose
+                                    // address lies in no host copy (the two need
+                                    // different fixes).
+                                    #[cfg(feature = "diagnostics")]
+                                    {
+                                        use std::sync::atomic::{AtomicU64, Ordering};
+                                        static NO_VIEW: AtomicU64 = AtomicU64::new(0);
+                                        static NO_COPY: AtomicU64 = AtomicU64::new(0);
+                                        let n = match self.roots_ref(compute).get(usize::from(u.slot)) {
+                                            Some(&Root::View(_)) => NO_COPY.fetch_add(1, Ordering::Relaxed) + 1,
+                                            _ => NO_VIEW.fetch_add(1, Ordering::Relaxed) + 1,
+                                        };
+                                        if n.is_power_of_two() {
+                                            tracing::warn!(
+                                                slot = u.slot,
+                                                root = ?self.roots_ref(compute).get(usize::from(u.slot)),
+                                                no_view = NO_VIEW.load(Ordering::Relaxed),
+                                                no_copy = NO_COPY.load(Ordering::Relaxed),
+                                                "a shader reads a root view's offset that cannot be given: dropped"
+                                            );
+                                        }
+                                    }
                                     not_run("a root view's offset: no root view, or outside title buffers");
                                     return false;
                                 }
@@ -945,12 +967,36 @@ impl State {
     /// fetch's streams sit at offsets in the root view's own header).
     /// shortcut: what shaders write through a root UAV goes back to title
     /// memory for 1 MiB from its address, as before the views.
+    ///
+    /// The title address a root parameter stands for is its view's, or the
+    /// first dword of the constants it was given when those name a buffer
+    /// the host copies: the console lets a title pass a *descriptor* as root
+    /// constants, such a descriptor holds its buffer's address in dword 0,
+    /// and where that address lies in a copy it serves as well as a view.
+    /// Before this the draw or dispatch was dropped for want of a view
+    /// ("a root view's offset: no root view, or outside title buffers",
+    /// 1-2.4 a frame in the prologue's loading and in its credits scene).
+    fn root_address(&self, compute: bool, slot: u8) -> Option<u64> {
+        match self.roots_ref(compute).get(usize::from(slot))? {
+            Root::View(address) => Some(*address),
+            Root::Constants(words) => {
+                let address = u64::from(*words.first()?);
+                crate::shadow::find(address, 1).map(|_| address)
+            }
+            _ => None,
+        }
+    }
+
     fn root_view(&mut self, list: &HostList, compute: bool, slot: u8, uav: bool) -> Option<(u32, u32)> {
-        let Some(&Root::View(address)) = self.roots_ref(compute).get(usize::from(slot)) else {
+        let Some(address) = self.root_address(compute, slot) else {
             once!(slot, "a shader reads a root view the title did not set: dropped");
             not_run("a root view the title did not set");
             return None;
         };
+        self.root_view_at(list, address, uav)
+    }
+
+    fn root_view_at(&mut self, list: &HostList, address: u64, uav: bool) -> Option<(u32, u32)> {
         let Some(shadow) = crate::shadow::find(address, 1) else {
             not_run("a root view outside title buffers");
             return None;
