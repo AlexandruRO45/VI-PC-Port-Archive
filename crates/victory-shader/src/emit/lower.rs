@@ -127,9 +127,8 @@ pub(crate) fn lower_with(
     }
 }
 
-// Approximately lowered loops stop after `super::wave64_approx_loops`
-// iterations: they can wait for the console wave's other half, which never
-// comes (shortcut: genuine longer loops are cut too).
+// Approximate loops stop after `super::wave64_approx_loops` iterations
+// (the other half they may wait for never comes; shortcut: real ones too).
 
 thread_local! {
     /// A lower iteration limit for programs lowered on this thread now
@@ -304,6 +303,8 @@ struct Lower<'a> {
     heap: [bool; 2],
     /// src0 of the current instruction as DPP fetched it.
     src0: Option<V>,
+    /// EXEC's lanes for the VALU op (`v_readfirstlane`'s, scalar too).
+    exec_lanes: Option<V>,
     /// Compute code that reads other lanes: thread ids follow the host
     /// lanes, so lane n is console lane n.
     console_lanes: bool,
@@ -769,6 +770,7 @@ impl<'a> Lower<'a> {
             writes_uavs,
             heap: [false; 2],
             src0: None,
+            exec_lanes: None,
             console_lanes,
             pops: matches!(x.native.io, StageIo::Ps { db_shader_control, .. }
                 if db_shader_control & 1 << 16 != 0),
@@ -5902,9 +5904,10 @@ impl<'a> Lower<'a> {
         }
         // A scalar result (`v_readlane`, `v_readfirstlane`) is written
         // whatever EXEC holds.
+        let lanes = self.guard(b, i)?;
         let mut guard = match v.dst {
             Some(Operand::Scalar { .. }) => None,
-            _ => self.guard(b, i)?,
+            _ => lanes,
         };
         if let Some(d) = v.dpp {
             let (x, enable) = self.dpp(inst, d, guard)?;
@@ -5914,8 +5917,10 @@ impl<'a> Lower<'a> {
             };
             self.src0 = Some(x);
         }
+        self.exec_lanes = lanes;
         let r = self.valu_op(inst, guard);
         self.src0 = None;
+        self.exec_lanes = None;
         r
     }
 
@@ -6782,7 +6787,7 @@ impl<'a> Lower<'a> {
             }
             "v_readfirstlane_b32" => {
                 let a = s(self, 0)?;
-                let r = self.first_lane(a, guard)?;
+                let r = self.first_lane(a, guard.or(self.exec_lanes))?;
                 let r = self.helper_reads_own(a, r);
                 int(self, r)
             }

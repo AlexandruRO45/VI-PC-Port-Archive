@@ -37,7 +37,7 @@ pub fn parse_patches(value: &str) -> Result<Vec<(usize, Vec<u8>)>, String> {
             let rva = usize::from_str_radix(rva.trim().trim_start_matches("0x"), 16)
                 .map_err(|e| format!("{p}: rva: {e}"))?;
             let hex: String = hex.chars().filter(|c| !c.is_whitespace()).collect();
-            if hex.is_empty() || hex.len() % 2 != 0 {
+            if hex.is_empty() || !hex.len().is_multiple_of(2) {
                 return Err(format!("{p}: bytes must be pairs of hex digits"));
             }
             let bytes = (0..hex.len())

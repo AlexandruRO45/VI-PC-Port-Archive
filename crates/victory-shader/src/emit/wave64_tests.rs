@@ -620,9 +620,10 @@ const fn ds_bpermute_b32(vdst: u8, addr: u8, data0: u8) -> [u32; 2] {
 /// What the permutes start from in the lanes outside their EXEC.
 const PERMUTE_OLD: u32 = 0xDEAD_0000;
 
-/// `ds_bpermute_b32` of lane `(l + 37) & 63` (half the lanes read the
-/// other half), with every lane in EXEC, then under the lanes whose x has
-/// bit 0 (lanes outside EXEC read 0).
+/// `ds_bpermute_b32` of lane `(l + 37) & 63`, with every lane in EXEC,
+/// then under the lanes whose x has bit 0 (lanes outside EXEC read 0). A
+/// wave64 permute reads within its own 32-lane half (RDNA 2 ISA, 10.4.4):
+/// the lane named, taken in the reader's half.
 fn permute_program(threads: u32) -> Vec<u32> {
     let mut w = prologue();
     w.push(vop2(V_ADD, 3, k(37), 0));
@@ -646,7 +647,7 @@ fn permute_model(threads: u32) -> Vec<u32> {
     for wave in waves(threads) {
         let odd = mask(&wave, |t| data(t) & 1 != 0);
         for t in wave.clone() {
-            let from = (t % 64 + 37) & 63;
+            let from = (t % 64 & 32) | ((t % 64 + 37) & 31);
             let src = wave.start + from;
             let all = if src < wave.end { data(src) } else { 0 };
             want[t as usize] = all;
@@ -749,7 +750,7 @@ fn a_ballot_after_a_branch_joins_the_halves() {
 }
 
 #[test]
-fn permutes_read_lanes_of_the_other_half() {
+fn permutes_read_lanes_of_their_own_half() {
     let mut ran32 = 0;
     for threads in GROUPS {
         ran32 += run_everywhere(
