@@ -13,7 +13,8 @@
 use std::mem::offset_of;
 
 use crate::object::{
-    self, ALLOCATOR, E_INVALIDARG, HRESULT, Iid, LIST, Object, S_OK, Table, This, guid,
+    self, ALLOCATOR, E_INVALIDARG, E_OUTOFMEMORY, HRESULT, Iid, LIST, Object, S_OK, Table, This,
+    guid,
 };
 use crate::queue::Written;
 use crate::resource::PAGEABLE_IIDS;
@@ -124,6 +125,10 @@ struct List {
     /// Which of them the calls record into.
     #[cfg(windows)]
     segment: std::sync::atomic::AtomicUsize,
+    /// A wait found no host list to go on in (memory ran out): what the
+    /// list records until its next reset is lost, and Close says so.
+    #[cfg(windows)]
+    lost: std::sync::atomic::AtomicBool,
     #[cfg(windows)]
     state: std::sync::Mutex<crate::draw::State>,
 }
@@ -141,7 +146,7 @@ pub(crate) fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut
 }
 
 /// The host list a title list's calls record into (its current segment),
-/// if there is a host GPU.
+/// if there is a host GPU and one could be made.
 #[cfg(windows)]
 pub(crate) fn host_list<'a>(this: This) -> Option<&'a crate::host::HostList> {
     if this.is_null() {
@@ -149,6 +154,9 @@ pub(crate) fn host_list<'a>(this: This) -> Option<&'a crate::host::HostList> {
     }
     // SAFETY: the title passes one of our lists.
     let list = unsafe { &*this.cast::<List>() };
+    if list.lost.load(std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
     let k = list.segment.load(std::sync::atomic::Ordering::Relaxed);
     let hosts = list.hosts.lock().unwrap_or_else(|e| e.into_inner());
     let current: *const crate::host::HostList = std::sync::Arc::as_ptr(hosts.get(k)?);
@@ -158,7 +166,8 @@ pub(crate) fn host_list<'a>(this: This) -> Option<&'a crate::host::HostList> {
     Some(unsafe { &*current })
 }
 
-/// A title list's host lists, in order: what a submission of it runs.
+/// A title list's host lists, in order: what a submission of it runs
+/// (nothing, if its recording was lost).
 #[cfg(windows)]
 pub(crate) fn segments(this: This) -> Vec<std::sync::Arc<crate::host::HostList>> {
     if this.is_null() {
@@ -166,6 +175,9 @@ pub(crate) fn segments(this: This) -> Vec<std::sync::Arc<crate::host::HostList>>
     }
     // SAFETY: the title passes one of our lists.
     let list = unsafe { &*this.cast::<List>() };
+    if list.lost.load(std::sync::atomic::Ordering::Relaxed) {
+        return Vec::new();
+    }
     let k = list.segment.load(std::sync::atomic::Ordering::Relaxed);
     let hosts = list.hosts.lock().unwrap_or_else(|e| e.into_inner());
     hosts.iter().take(k + 1).cloned().collect()
@@ -205,7 +217,16 @@ fn wait(this: This, wait: crate::hold::ValueWait) {
     {
         let Some(current) = host_list(this) else { return };
         if !current.is_empty() {
-            let Some(next) = next_segment(this) else { return };
+            let Some(next) = next_segment(this) else {
+                // Without the wait, what follows would run too early: the
+                // recording is lost (closed, so the next reset can reset
+                // it in place).
+                current.close();
+                // SAFETY: the title passes one of our lists.
+                let list = unsafe { &*this.cast::<List>() };
+                list.lost.store(true, std::sync::atomic::Ordering::Relaxed);
+                return;
+            };
             CUTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             current.close();
             // SAFETY: the title passes one of our lists.
@@ -270,6 +291,7 @@ fn next_segment<'a>(this: This) -> Option<&'a crate::host::HostList> {
 fn restart(this: This) -> Option<std::sync::Arc<crate::host::HostList>> {
     // SAFETY: the title passes one of our lists.
     let list = unsafe { &*this.cast::<List>() };
+    list.lost.store(false, std::sync::atomic::Ordering::Relaxed);
     let used = list.segment.swap(0, std::sync::atomic::Ordering::Relaxed);
     let mut hosts = list.hosts.lock().unwrap_or_else(|e| e.into_inner());
     if hosts.is_empty() {
@@ -445,6 +467,8 @@ fn new_list(
         #[cfg(windows)]
         segment: Default::default(),
         #[cfg(windows)]
+        lost: Default::default(),
+        #[cfg(windows)]
         state: {
             let mut state = crate::draw::State::default();
             state.set_pipeline(pipeline);
@@ -495,10 +519,15 @@ extern "system" fn list_type(this: This) -> u32 {
     // SAFETY: `this` is one of our lists.
     unsafe { (*this.cast::<List>()).kind }
 }
+/// A list with no host list to record into (none could be made: memory
+/// ran out, or a wait could not go on in a new one) ran out of memory
+/// recording, as D3D12 says it.
 extern "system" fn close(this: This) -> HRESULT {
     #[cfg(windows)]
-    if let Some(host) = host_list(this) {
-        host.close();
+    match host_list(this) {
+        Some(host) => host.close(),
+        None if crate::host::host().is_some() => return E_OUTOFMEMORY,
+        None => {}
     }
     S_OK
 }
@@ -519,12 +548,17 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
         state.reset(pipeline);
         drop(state);
         leave(held, uploads, old);
+        // Nothing to record into: the title should know, as from D3D12.
+        if host_list(this).is_none() && crate::host::host().is_some() {
+            return E_OUTOFMEMORY;
+        }
     }
     #[cfg(not(windows))]
-    drop(uploads);
+    {
+        drop(uploads);
+        let _ = this;
+    }
     crate::pipeline::bound(pipeline);
-    #[cfg(not(windows))]
-    let _ = this;
     S_OK
 }
 
@@ -1775,6 +1809,12 @@ fn defer_write(this: This, address: u64, what: Written, bytes: usize) {
         list.defer_write(address as *mut u8, what, bytes);
         return;
     }
+    // A list with no host list (none could be made: memory ran out) runs
+    // nothing; writing now would tell the title it had run.
+    #[cfg(windows)]
+    if crate::host::host().is_some() {
+        return;
+    }
     let _ = this;
     // Without a host GPU nothing runs later: write now.
     what.write(address as *mut u8, bytes);
@@ -2078,7 +2118,9 @@ mod tests {
 
     /// An early reset when no replacement host list can be allocated (under
     /// memory pressure) must detach the closed, queue-held host list instead of
-    /// leaving it in place to be closed again, and recover on the next reset.
+    /// leaving it in place to be closed again, say so (E_OUTOFMEMORY, from
+    /// Reset and Close, and no bottom-of-pipe write lands now as if the list
+    /// had run), and recover on the next reset.
     #[cfg(windows)]
     #[test]
     fn early_reset_without_a_new_host_list_does_not_keep_the_closed_one() {
@@ -2098,9 +2140,12 @@ mod tests {
         NO_NEW_LIST.with(|f| f.set(true));
         let hr = reset(list, allocator, null);
         NO_NEW_LIST.with(|f| f.set(false));
-        assert_eq!(hr, S_OK);
+        assert_eq!(hr, E_OUTOFMEMORY);
         assert!(host_list(list).is_none(), "closed queue-held list must not stay attached");
-        assert_eq!(close(list), S_OK, "closing without a host list must not fail");
+        let mut value = 0u64;
+        write64(list, std::ptr::from_mut(&mut value) as u64, 1, 0, 0);
+        assert_eq!(value, 0, "nothing runs, so nothing is written as if it had");
+        assert_eq!(close(list), E_OUTOFMEMORY, "the recording was lost");
         // Once the queue finishes and recycles it, the next reset recovers.
         held.into_iter().for_each(recycle);
         assert_eq!(reset(list, allocator, null), S_OK);
@@ -2143,7 +2188,7 @@ mod tests {
             NO_NEW_LIST.with(|f| f.set(true));
             let hr = reset(list, allocator, null);
             NO_NEW_LIST.with(|f| f.set(false));
-            assert_eq!(hr, S_OK);
+            assert_eq!(hr, E_OUTOFMEMORY, "the title list has no host list left");
         };
         // Three host lists, reset: all open again. Then two recorded (the
         // third still open) and both held by a queue.
@@ -2177,6 +2222,47 @@ mod tests {
         assert_eq!(reset(list, allocator, null), S_OK);
         assert!(host_list(list).is_some(), "the next reset takes a spare or makes one");
         assert_eq!(close(list), S_OK);
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        assert_eq!(release(list), 0);
+        assert_eq!(release(allocator), 0);
+    }
+
+    /// A wait after commands that finds no host list to go on in (memory
+    /// ran out) loses the recording: nothing after it is recorded or
+    /// written early, Close says E_OUTOFMEMORY, a submission runs nothing,
+    /// and the next reset starts again in place (the host list it was
+    /// recording into is closed, so resetting it does not fail).
+    #[cfg(windows)]
+    #[test]
+    fn a_wait_without_a_new_host_list_loses_the_recording() {
+        if crate::host::host().is_none() {
+            return;
+        }
+        let null = std::ptr::null();
+        let mut allocator = null;
+        assert_eq!(create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator), S_OK);
+        let mut list = null;
+        assert_eq!(create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list), S_OK);
+        let (mut first, mut before, mut after, fence) = (0u64, 0u64, 0u64, 0u64);
+        // One cut that works (a second host list), then one that does not.
+        write64(list, std::ptr::from_mut(&mut first) as u64, 1, 0, 0);
+        wait64(list, std::ptr::from_ref(&fence) as u64, 0, 0, 0);
+        write64(list, std::ptr::from_mut(&mut before) as u64, 1, 0, 0);
+        let recorded: Vec<_> = segments(list).iter().map(std::sync::Arc::as_ptr).collect();
+        assert_eq!(recorded.len(), 2);
+        NO_NEW_LIST.with(|f| f.set(true));
+        wait64(list, std::ptr::from_ref(&fence) as u64, 0, 0, 0);
+        assert!(host_list(list).is_none(), "nothing records past the lost wait");
+        write64(list, std::ptr::from_mut(&mut after) as u64, 1, 0, 0);
+        assert_eq!(close(list), E_OUTOFMEMORY);
+        assert!(segments(list).is_empty(), "a submission runs none of it");
+        assert_eq!([first, before, after], [0, 0, 0], "nothing was written as if it had run");
+        // Still no new host list to be had: the reset reuses its own.
+        assert_eq!(reset(list, allocator, null), S_OK);
+        NO_NEW_LIST.with(|f| f.set(false));
+        assert_eq!(host_list(list).map(std::ptr::from_ref), Some(recorded[0]), "the reset starts again in place");
+        assert_eq!(close(list), S_OK);
+        assert_eq!(segments(list).len(), 1);
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
         assert_eq!(release(list), 0);
         assert_eq!(release(allocator), 0);
