@@ -36,7 +36,6 @@ Each column represents one run on its named host, provider and hardware. Each re
 | Virtual-address BC1 cubes and R8 textures across page changes | Pass | Pass | Pass | Pass | — | Pass | Pass | Pass | — | — | — | Pending |
 | Whole-buffer and multi-mip texture copies through Xbox command-list slot 84 | Pass | Pass | Pass | Pass | — | Pass | Pass | Pass | — | — | — | Pending |
 | Scissored triangle through Xbox graphics pipeline and draw slots | Pass | Pass | Pass | Pass | — | Pass | Pass | Pass | — | — | — | Pending |
-| Mesh and amplification shader dispatch on a mesh-tier adapter | Pass | — | Pass | — | — | — | — | Pass | — | — | — | Pending |
 | Frame origins, timeout tokens, completed presentation events and display statistics | Pass | Pass | Pass | Pass | — | Pass | Pass | Pass | — | — | — | Pending |
 | Shader reads and writes through tables, including a late-copied texture view | Pass | Pass | Pass | Pass | — | Pass | Pass | Pass | — | — | — | Pending |
 | Direct, compute and copy queue synchronization | Pass | Pass | Pass | Pass | — | Pass | Pass | Pass | — | — | — | Pending |
@@ -53,27 +52,34 @@ Each column represents one run on its named host, provider and hardware. Each re
 | 4K RGB10 display fitted to the title window’s monitor | Pass | Pass | Pass | Pass | — | Pass | Pass | Pass | — | — | — | Pending |
 | 4K RGB10 display scaled inside a smaller title window | Pass | Pass | Pass | Pass | — | Pass | Pass | Pass | — | — | — | Pending |
 | Lanes Xbox imports, course, board readback and gameplay replay | Pass | Pass | Pass | Pass | — | Pass | Pass | Pass | — | — | — | Pending |
+| Bottom-of-pipe label writes with and without a flush | Pass | — | — | — | — | Pass | Pass | — | — | — | — | Pending |
+| Compute and direct queues waiting on each other's labels | Pass | — | — | — | — | Pass | Pass | — | — | — | — | Pending |
+| Compute queue frame submission | Pass | — | — | — | — | Pass | Pass | — | — | — | — | Pending |
+| A skipped command leaving its list and fence write intact | Pass | — | — | — | — | Pass | Pass | — | — | — | — | Pending |
+| CopyMemoryToMemoryX direction and contents | Pass | — | — | — | — | Pass | Pass | — | — | — | — | Pending |
+| A waiting queue reading a texture another queue writes | Pass | — | — | — | — | Pass | Pass | — | — | — | — | Pending |
+| ExecuteIndirect matching a direct dispatch | Pass | — | — | — | — | Pass | Pass | — | — | — | — | Pending |
+| GPU-written arguments controlling an indirect dispatch | Pass | — | — | — | — | — | — | — | — | — | — | Pending |
+| A memory wait before and after a compute dispatch | Pass | — | — | — | — | — | — | — | — | — | — | Pending |
+| A direct queue waiting before and after a buffer copy | Pass | — | — | — | — | — | — | — | — | — | — | Pending |
+| A guest texture copied back to title memory | Pass | — | — | — | — | Pass | Pass | — | — | — | — | Pending |
+| Single, copied and batched builds through XboxBvhBuilder | Pass | — | — | — | — | Pass | Pass | — | — | — | — | Pending |
+| Slot 80 thread-dimension dispatch converted using the bound PSO group size | Pass | — | — | — | — | — | Pass | — | — | — | — | Pending |
+| Shader-visible descriptor slot reclamation across completed, in-flight, ClearState, and OOM lists | Pass | — | — | — | — | — | Pass | — | — | — | — | Pending |
+| Lanes frame, submission, fence handover, copy and pipeline timings | Pass | — | — | — | — | Pass | Pass | — | — | — | — | Pending |
+| A console shader translated before launch, loaded from the prepared cache | Pass | — | — | — | — | Pass | Pass | — | — | — | — | Pending |
+| A console shader translated by the host worker while the game runs | Pass | — | — | — | — | Pass | Pass | — | — | — | — | Pending |
+| The worker's translation reused on the next launch without compiling | Pass | — | — | — | — | Pass | Pass | — | — | — | — | Pending |
+| A 64-lane console shader translated for 32-lane waves while the game runs | Pass | — | — | — | — | — | — | — | — | — | — | Pending |
+| A 64-lane console shader with the translation this graphics card needs | Pass | — | — | — | — | — | — | — | — | — | — | Pending |
+| Console raster programs drawn under the root reflected from their two descriptor tables | Pass | — | — | — | — | — | — | — | — | — | — | Pending |
 | 8,388,608-move CPU replay | Pass | Pass | Pass | Pass | Pass | Pass | Pass | — | Pass | Pass | Pass | Pending |
+| Mesh and amplification shader dispatch on a mesh-tier adapter | — | — | Pass | — | — | — | — | Pass | — | — | — | Pending |
 | Xbox DXC utilities and binary blob lifetime | — | — | — | — | Pass | Pass | — | Pass | Pass | Pass | Pass | Pending |
 | Native Scarlett XG texture layouts with Rust XMem | — | — | — | — | Pass | — | — | — | Pass | Pass | Pass | Pending |
 | Lanes gameplay replay (earlier guest with desktop graphics) | — | — | — | — | Pass | — | — | — | Pass | Pass | Pass | Pending |
 | Xbox DXC caller allocator and factory ordinals | — | — | — | — | — | Pass | — | Pass | — | — | — | Pending |
 | Scarlett DXC compute shader and compiler diagnostics | — | — | — | — | — | Pass | — | Pass | — | — | — | Pending |
 | xdxr-link | — | — | — | — | — | Pass | — | Pass | — | — | — | Pending |
-| Bottom-of-pipe label writes with and without a flush | — | — | — | — | — | Pass | Pass | — | — | — | — | Pending |
-| Compute and direct queues waiting on each other's labels | — | — | — | — | — | Pass | Pass | — | — | — | — | Pending |
-| Compute queue frame submission | — | — | — | — | — | Pass | Pass | — | — | — | — | Pending |
-| A skipped command leaving its list and fence write intact | — | — | — | — | — | Pass | Pass | — | — | — | — | Pending |
-| CopyMemoryToMemoryX direction and contents | — | — | — | — | — | Pass | Pass | — | — | — | — | Pending |
-| A waiting queue reading a texture another queue writes | — | — | — | — | — | Pass | Pass | — | — | — | — | Pending |
-| ExecuteIndirect matching a direct dispatch | — | — | — | — | — | Pass | Pass | — | — | — | — | Pending |
-| A guest texture copied back to title memory | — | — | — | — | — | Pass | Pass | — | — | — | — | Pending |
-| Single, copied and batched builds through XboxBvhBuilder | — | — | — | — | — | Pass | Pass | — | — | — | — | Pending |
-| Lanes frame, submission, fence handover, copy and pipeline timings | — | — | — | — | — | Pass | Pass | — | — | — | — | Pending |
-| A console shader translated before launch, loaded from the prepared cache | — | — | — | — | — | Pass | Pass | — | — | — | — | Pending |
-| A console shader translated by the host worker while the game runs | — | — | — | — | — | Pass | Pass | — | — | — | — | Pending |
-| The worker's translation reused on the next launch without compiling | — | — | — | — | — | Pass | Pass | — | — | — | — | Pending |
-| Slot 80 thread-dimension dispatch converted using the bound PSO group size | — | — | — | — | — | — | Pass | — | — | — | — | Pending |
-| Shader-visible descriptor slot reclamation across completed, in-flight, ClearState, and OOM lists | — | — | — | — | — | — | Pass | — | — | — | — | Pending |
 
 Rebuild this table from the repository root with `python tuxbox.py status > docs/RESULTS.md`. A dash means that the gate was omitted from that run. [Current Lanes replay](../examples/lanes/README.md#deterministic-replay) · [Xbox DLL checks](LIBRARIES.md#run-the-provider-checks) · [Retail results and priorities](PROGRESS.md)
