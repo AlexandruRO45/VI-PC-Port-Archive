@@ -908,9 +908,9 @@ fn read_back(list: &crate::host::HostList, dst: &CopyLocation, at: [u32; 3], src
     )
     .map(|fetch| list.defer_fetch(fetch))
     .is_some();
-    // SAFETY: an open list; both locations in the host's layout, naming live
-    // resources; the region lies in the footprint (checked).
     if !queued {
+        // SAFETY: an open list; both locations in the host's layout, naming live
+        // resources; the region lies in the footprint (checked).
         unsafe {
             list.list.CopyTextureRegion(
                 (&raw const to).cast(),

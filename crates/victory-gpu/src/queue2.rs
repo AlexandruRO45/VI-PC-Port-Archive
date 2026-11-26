@@ -99,7 +99,9 @@ impl Lists {
         // SAFETY: plain object creation.
         unsafe {
             let allocator = device.CreateCommandAllocator(kind)?;
-            let list = device.CreateCommandList(0, kind, &allocator, None)?;
+            let list: ID3D12GraphicsCommandList = device.CreateCommandList(0, kind, &allocator, None)?;
+            // It comes back open, and the first batch resets it first.
+            list.Close()?;
             Ok(Self { allocator, list })
         }
     }
