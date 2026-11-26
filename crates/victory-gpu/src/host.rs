@@ -9131,6 +9131,8 @@ impl Host {
             let swap_chain = factory
                 .CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)?
                 .cast::<IDXGISwapChain3>()?;
+            // Keep the presenter windowed when the user presses Alt+Enter.
+            factory.MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER)?;
             let copy = self.new_list()?;
             copy.close();
             tracing::info!(width, height, format = format.0, "presenting to a window");
