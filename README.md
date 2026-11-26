@@ -1,3 +1,16 @@
+# victorymini: VIctory on a laptop with an 8 GB NVIDIA GPU
+
+A fork of [avatarmanz/VIctory-7900XTX](https://github.com/avatarmanz/VIctory-7900XTX)
+for laptops and 8 GB NVIDIA cards (32-lane waves): the Series S profile by default
+with `-Light`, 393 compute programs NVIDIA refused now running, DualShock 4 pads
+without XInput. Measured on one machine: RTX PRO 2000 Blackwell laptop GPU (8 GB),
+Intel Core Ultra 9 285H, 31 GB RAM, Windows 11. World frame rate in the opening
+cutscene went from 1.4 to about 3 fps (4.3 at best); not playable yet. Details and
+what is still wrong: [On a laptop or an 8 GB NVIDIA card](#on-a-laptop-or-an-8-gb-nvidia-card).
+The upstream fork's own description follows.
+
+---
+
 # VIctory on an RX 7900 XTX
 
 A fork of [VIctory](https://github.com/Marvisak/VIctory), a compatibility layer
@@ -52,6 +65,36 @@ scripts\play.ps1 -Exe <path of your copy's executable>
 
 `scripts\play.ps1 -Safe` leaves out the newest, faster ways; try it first when
 something is wrong. `-RayTracing` turns the title's ray-traced indirect light on.
+
+### On a laptop or an 8 GB NVIDIA card
+
+`scripts\play.ps1 -Exe <...> -Light` runs the Series S profile at a 1080p display
+mode. Measured on an RTX PRO 2000 Blackwell laptop GPU (8 GB), 31 GB RAM, in the
+opening cutscene (world frames over about 4 minutes):
+
+| | world fps |
+|---|---|
+| Series X profile, 1080p | 1.4 |
+| Series X profile, 720p | 1.2 |
+| Series S profile | 1.9 |
+| Series S, wave64 programs with LDS in lane branches run in waves of 32 | 2.2 |
+| the same, key presses only until the world starts (same shots every run) | 3.0 (4.3 at best) |
+
+- On GPUs with 32-lane waves (NVIDIA) 404 compute programs (culling, shadows,
+  lighting, TAA) kept 64-lane waves and the driver refused them; 393 of them now run
+  (`VICTORY_LDS_REGION_RACE`, on by default there; `0` turns it off).
+- Going over the card's memory budget is far worse than textures waiting for room:
+  a smaller `VICTORY_CARD_ROOM_FOR_TARGETS_MB` took the card to 10.5 GB of 7.1 GB and
+  0.6 fps. Leave the defaults.
+- Set Windows' power mode to *Best performance* and NVIDIA's *Power management mode*
+  to *Prefer maximum performance*: in *Best power efficiency* the card stayed in P4
+  (memory at 9 of 12 GHz, 33 of 56 W).
+- DualShock 4 pads (and pads that report themselves as one) work without XInput.
+- Still wrong: a dark rectangle over the opening skyline shot in the Series S
+  profile; some faces black in dark scenes; textures of what comes into view late;
+  11 compute programs (water volumetrics, three of the console upscaler's) still do
+  not translate in waves of 32. A lower `VICTORY_SHADER_LOOP_LIMIT` (1024) and
+  `VICTORY_PAGE_WRITES=1` did not help here.
 
 Before the first run, ahead of time (both can be stopped and go on later):
 

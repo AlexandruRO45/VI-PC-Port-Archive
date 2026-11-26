@@ -1030,6 +1030,15 @@ fn lane_constant_masks(st: &Structured) -> bool {
 /// [`set_host_max_wave`].
 static HOST_MAX_WAVE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
+/// `VICTORY_LDS_REGION_RACE` (on unless `0`): a console wave64 program whose LDS accesses in
+/// lane branches can get no meeting of the two host waves runs in waves of 32 anyway, with a
+/// barrier before the LDS accesses every lane makes; only asked on hosts of 32-lane waves, where
+/// the other answer is a pipeline the driver refuses.
+fn lds_region_race() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LDS_REGION_RACE").is_none_or(|v| v != "0"))
+}
+
 /// The host GPU's `WaveLaneCountMax`: 32 lets console wave64 compute programs whose cross-lane
 /// code stays inside 32-lane halves run in waves of 32 instead of being refused.
 pub fn set_host_max_wave(lanes: u32) {
@@ -1467,6 +1476,17 @@ impl<'a> Lower<'a> {
                                     need(b);
                                 }
                             }
+                        }
+                        if !lds_ok && lds_region_race() {
+                            // shortcut: LDS accesses in lane branches go without the two host
+                            // waves meeting (no barrier can stand there: some threads never get
+                            // to it); those in blocks every lane runs keep theirs. On a host of
+                            // 32-lane waves the program otherwise keeps 64-lane waves and the
+                            // driver refuses its pipeline, which drops the pass (culling,
+                            // shadows, lighting) altogether: a race between the halves there is
+                            // the smaller fault.
+                            lds_meet = Some((all.clone(), vec![(false, false); p.blocks.len()]));
+                            lds_ok = true;
                         }
                         if lds_ok {
                             wave = 32;
