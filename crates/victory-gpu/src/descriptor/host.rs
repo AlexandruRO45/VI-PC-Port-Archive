@@ -1914,12 +1914,28 @@ mod tests {
         assert!(crate::resource::made_copy(texture).is_some(), "with a host texture again");
     }
 
-    /// Work to run while a view's texture is prepared, once (tests).
-    pub(crate) static WHILE_PREPARING: std::sync::Mutex<Option<crate::descriptor::tests::Work>> = std::sync::Mutex::new(None);
+    thread_local! {
+        /// Work to run while a view's texture is prepared on this thread,
+        /// once (tests). Per thread: tests run in parallel, and any of them
+        /// preparing a view would otherwise take another test's work (the
+        /// work then never ran where it was meant to, and that test failed
+        /// at random in CI).
+        static WHILE_PREPARING: std::cell::RefCell<Option<crate::descriptor::tests::Work>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// Runs `work` the next time this thread prepares a view's texture.
+    fn on_prepare(work: crate::descriptor::tests::Work) {
+        WHILE_PREPARING.with_borrow_mut(|w| *w = Some(work));
+    }
+
+    /// Whether work set with [`on_prepare`] on this thread is still waiting.
+    fn prepare_pending() -> bool {
+        WHILE_PREPARING.with_borrow(Option::is_some)
+    }
 
     pub(crate) fn while_preparing() {
-        let work = WHILE_PREPARING.lock().unwrap_or_else(|e| e.into_inner()).take();
-        if let Some(work) = work {
+        if let Some(work) = WHILE_PREPARING.with_borrow_mut(Option::take) {
             work();
         }
     }
@@ -1952,7 +1968,7 @@ mod tests {
         let host = title_heap.host().expect("a host view heap");
         let (done, waited) = std::sync::mpsc::channel();
         let second_view = view_of(second);
-        *WHILE_PREPARING.lock().unwrap() = Some(Box::new(move || {
+        on_prepare(Box::new(move || {
             // The title writes the other record into the slot meanwhile.
             std::thread::spawn(move || {
                 crate::descriptor::create_placed_srv(std::ptr::null(), &words, &second_view, at);
@@ -1995,7 +2011,7 @@ mod tests {
         let heap_at = title_heap.start;
         let heap = heap as usize;
         let (done, waited) = std::sync::mpsc::channel();
-        *WHILE_PREPARING.lock().unwrap() = Some(Box::new(move || {
+        on_prepare(Box::new(move || {
             std::thread::spawn(move || {
                 let h = crate::descriptor::heap(heap as crate::object::This);
                 h.host().unwrap().mirror(second, heap_at + u64::from(second) * 32, true);
@@ -2007,7 +2023,7 @@ mod tests {
             );
         }));
         assert!(host.mirror(first, slot(first), true).is_some());
-        assert!(WHILE_PREPARING.lock().unwrap().is_none(), "the prepare ran");
+        assert!(!prepare_pending(), "the prepare ran");
         assert!(host.kept(first) && host.kept(second), "both made");
     }
 
