@@ -7,6 +7,87 @@
 use super::*;
 
 impl<'a> Lower<'a> {
+    /// The terminator of block `b`, a per-lane branch decided for the
+    /// whole wave ([`Lower::wave_loop_exits`], console mode).
+    pub(super) fn wave_branch(
+        &mut self,
+        b: usize,
+        when: Bool,
+        taken: usize,
+        not_taken: usize,
+        offset: usize,
+    ) -> Result<Term, Stop> {
+        // The console's wave-wide test (`Lower::wave_loop_exits`):
+        // the per-lane condition in all (or any) active lanes.
+        let all = self.wave_branches[&b];
+        // In console mode lanes reach blocks off their own paths:
+        // the condition as the lane has it there, not simplified
+        // by the path it would have taken.
+        let when = if self.console_mode {
+            self.x.st.whens[b].unwrap_or(when)
+        } else {
+            when
+        };
+        let lane = self
+            .boolean(when, self.cur)
+            .map_err(|w| unsupported(offset, w))?;
+        let i1 = self.s.t.i1;
+        let (name, opcode) = if all { ("waveAllTrue", 114) } else { ("waveAnyTrue", 113) };
+        let cond = self
+            .s
+            .op(self.cur, name, Attr::NoUnwind, i1, opcode, &[lane]);
+        self.s.flags |= flags::WAVE_OPS;
+        let back = |l: &Self, to: usize| l.counters.contains_key(&to) && l.rpo[to] <= l.rpo[b];
+        let cond = if back(self, taken) {
+            let ok = self.count_iteration(taken, pred::IULT);
+            self.s.m.bin(self.cur, Bin::And, cond, ok)
+        } else if back(self, not_taken) {
+            let stop = self.count_iteration(not_taken, pred::IUGE);
+            self.s.m.bin(self.cur, Bin::Or, cond, stop)
+        } else {
+            cond
+        };
+        let (t, f) = (self.edge(b, taken), self.edge(b, not_taken));
+        for (to, via) in [(taken, t), (not_taken, f)] {
+            if !back(self, to) {
+                let from = if Some(via) == self.block[to] { self.cur } else { via };
+                self.enter_loop(b, to, from);
+            }
+        }
+        Ok(Term::CondBr(cond, t, f))
+    }
+
+    /// Whether block `b`'s branch on a lane condition is taken when all
+    /// active lanes have it (else when any has), as the console decides it;
+    /// `None` for a block not ending in such a branch.
+    ///
+    /// The lane condition is a mask's bit per lane: a branch on VCC or EXEC
+    /// being zero is taken when no lane has it, and SCC of a mask
+    /// (`s_and_b64` and the like, `s_cmp_lg` of two masks) is set when any
+    /// lane has it. `s_cmp_eq` of two masks sets SCC when all lanes are
+    /// equal, so there the test is the other way round.
+    // shortcut: only SCC set in `b` itself is looked at; one set in an
+    // earlier block keeps the usual sense.
+    pub(super) fn wave_test(&self, b: usize) -> Option<bool> {
+        let insts = &self.x.p.blocks[b].insts;
+        let (branch, before) = insts.split_last()?;
+        let mut all = match branch.name() {
+            "s_cbranch_vccz" | "s_cbranch_execz" | "s_cbranch_scc0" => true,
+            "s_cbranch_vccnz" | "s_cbranch_execnz" | "s_cbranch_scc1" => false,
+            _ => return None,
+        };
+        if branch.name().starts_with("s_cbranch_scc")
+            && before
+                .iter()
+                .rev()
+                .find(|i| i.write(Reg::Scc).is_some())
+                .is_some_and(|i| i.name().starts_with("s_cmp_eq_"))
+        {
+            all = !all;
+        }
+        Some(all)
+    }
+
     /// A group barrier (`s_barrier`): thread-group sync with a shared-memory
     /// fence, and a UAV fence when the program writes UAVs (the waits before
     /// an s_barrier make those writes visible on the console).
@@ -23,9 +104,8 @@ impl<'a> Lower<'a> {
     /// no lane of the wave needs it, and the wave runs the block, barrier
     /// included, with the other lanes masked off. On the host each lane
     /// takes its own branch, so lanes skipping a block with a barrier never
-    /// arrive at it and the lanes inside wait for them forever (a GPU hang;
-    /// the title's compute_graph_ops, sky scattering and blendshape
-    /// programs, in hung submissions). A host barrier counts arrivals, not
+    /// arrive at it and the lanes inside wait for them forever (a GPU hang).
+    /// A host barrier counts arrivals, not
     /// instructions, so the lighter side of such a branch gets as many
     /// barriers as the sides' counts to the program's end differ.
     ///
@@ -83,9 +163,9 @@ impl<'a> Lower<'a> {
     /// decides `s_cbranch_vccz`/`execz` (taken if the mask is empty: the
     /// lanes' condition in all active lanes) and `vccnz`/`execnz` (in any):
     /// by IR block, true for all. Per lane, lanes leaving such a loop at
-    /// different iterations leave the others waiting at its barrier (the
-    /// title's compute_graph_ops CS_FormulaOperation loops until any lane
-    /// reaches its own count). Only where the wave's decision makes lanes
+    /// different iterations leave the others waiting at its barrier (a loop
+    /// going round until each lane reaches a count of its own). Only where
+    /// the wave's decision makes lanes
     /// leave the loop sooner, never stay longer: what follows the loop is
     /// reached by every lane per lane too, so its guards hold, and no lane
     /// runs an iteration its guards were not made for. Other loop exits
@@ -109,12 +189,8 @@ impl<'a> Lower<'a> {
             if !lane {
                 continue;
             }
-            let name = self.x.p.blocks[b].insts.last().map_or("", |i| i.name());
-            // Taken when the mask is empty (all lanes), or when it is not (any).
-            let all = match name {
-                "s_cbranch_vccz" | "s_cbranch_execz" | "s_cbranch_scc0" => true,
-                "s_cbranch_vccnz" | "s_cbranch_execnz" | "s_cbranch_scc1" => false,
-                _ => continue,
+            let Some(all) = self.wave_test(b) else {
+                continue;
             };
             let mut safe = None;
             for &(h, l, barrier) in &loops {
@@ -170,10 +246,8 @@ impl<'a> Lower<'a> {
             if !lane {
                 continue;
             }
-            let all = match self.x.p.blocks[b].insts.last().map_or("", |i| i.name()) {
-                "s_cbranch_vccz" | "s_cbranch_execz" | "s_cbranch_scc0" => true,
-                "s_cbranch_vccnz" | "s_cbranch_execnz" | "s_cbranch_scc1" => false,
-                _ => continue,
+            let Some(all) = self.wave_test(b) else {
+                continue;
             };
             out.insert(b, all);
         }
@@ -225,15 +299,23 @@ impl<'a> Lower<'a> {
                 if !inside(r, b) {
                     continue;
                 }
-                let (ti, ni) = (inside(r, taken) && !back(b, taken), inside(r, not_taken) && !back(b, not_taken));
+                let (tb, nb) = (back(b, taken), back(b, not_taken));
+                let (ti, ni) = (inside(r, taken) && !tb, inside(r, not_taken) && !nb);
                 if ti && ni {
+                    continue;
+                }
+                // Both sides leave this loop: a branch after it, not about it.
+                if !tb && !nb && !inside(r, taken) && !inside(r, not_taken) {
                     continue;
                 }
                 if barrier {
                     return Err((offset(b), "a loop with a group barrier left per lane"));
                 }
-                // The side leaving the loop (or not going round it).
-                out = Some(if ti { not_taken } else { taken });
+                // The forward side, whose count is the loop's way out: the
+                // other side of a back edge (a latch, or a branch going
+                // round), else the side leaving the loop. A back edge's own
+                // count is 0 (counts are over forward edges).
+                out = Some(if tb || (!nb && inside(r, taken)) { not_taken } else { taken });
             }
             Ok(out)
         };
@@ -279,11 +361,11 @@ impl<'a> Lower<'a> {
                         // A side meeting no more barriers on any path goes
                         // on to its end and exits; a host barrier does not
                         // wait for threads that exited (an early return
-                        // before a barrier, which the title's meshlet
-                        // culling does per lane, works on the host too).
+                        // per lane before a barrier works on the host too).
                         // shortcut: D3D12 leaves barriers after a thread's
                         // exit undefined; NVIDIA and AMD count exited
-                        // threads out.
+                        // threads out, and `barrier_tests` checks it on the
+                        // hardware adapter and WARP.
                         if lo[..] == [0] && (lo.len() != hi.len() || shift(lo, n) != *hi) {
                             let mut both = shift(hi, here);
                             both.dedup();

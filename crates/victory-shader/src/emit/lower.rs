@@ -1341,9 +1341,7 @@ impl<'a> Lower<'a> {
         }
         // Barriers lanes could part at: loop exits decided for the wave,
         // other branches balanced where the barriers can be counted, else
-        // the program runs as the console runs it (53 of the title's, the
-        // luminance histograms, shadow classification and shadow-map
-        // culling among them).
+        // the program runs as the console runs it (`barrier_tests`).
         self.wave_branches = self.wave_loop_exits(&order);
         match self.barrier_balance(&order) {
             Ok(extra) => self.extra_barriers = extra,
@@ -10195,44 +10193,7 @@ impl<'a> Lower<'a> {
                 taken,
                 not_taken,
             } if self.wave_branches.contains_key(&b) => {
-                // The console's wave-wide test (`Lower::wave_loop_exits`):
-                // the per-lane condition in all (or any) active lanes.
-                let all = self.wave_branches[&b];
-                // In console mode lanes reach blocks off their own paths:
-                // the condition as the lane has it there, not simplified
-                // by the path it would have taken.
-                let when = if self.console_mode {
-                    self.x.st.whens[b].unwrap_or(when)
-                } else {
-                    when
-                };
-                let lane = self
-                    .boolean(when, self.cur)
-                    .map_err(|w| unsupported(offset, w))?;
-                let i1 = self.s.t.i1;
-                let (name, opcode) = if all { ("waveAllTrue", 114) } else { ("waveAnyTrue", 113) };
-                let cond = self
-                    .s
-                    .op(self.cur, name, Attr::NoUnwind, i1, opcode, &[lane]);
-                self.s.flags |= flags::WAVE_OPS;
-                let back = |l: &Self, to: usize| l.counters.contains_key(&to) && l.rpo[to] <= l.rpo[b];
-                let cond = if back(self, taken) {
-                    let ok = self.count_iteration(taken, pred::IULT);
-                    self.s.m.bin(self.cur, Bin::And, cond, ok)
-                } else if back(self, not_taken) {
-                    let stop = self.count_iteration(not_taken, pred::IUGE);
-                    self.s.m.bin(self.cur, Bin::Or, cond, stop)
-                } else {
-                    cond
-                };
-                let (t, f) = (self.edge(b, taken), self.edge(b, not_taken));
-                for (to, via) in [(taken, t), (not_taken, f)] {
-                    if !back(self, to) {
-                        let from = if Some(via) == self.block[to] { self.cur } else { via };
-                        self.enter_loop(b, to, from);
-                    }
-                }
-                Term::CondBr(cond, t, f)
+                self.wave_branch(b, when, taken, not_taken, offset)?
             }
             LaneExit::Branch {
                 when,
