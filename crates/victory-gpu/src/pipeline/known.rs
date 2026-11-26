@@ -122,28 +122,57 @@ pub(super) fn note(key: &str, shaders: &[Arc<Shader>], graphics: Option<&Graphic
     book.added += 1;
 }
 
-/// Writes what was noted.
-fn flush() {
+/// Writes what was noted: every two seconds, at the end of a run and when
+/// the host GPU fails. What a failed write left out stays to be written the
+/// next time: those pipelines are already known, so they are not noted again.
+pub(crate) fn flush() {
     let Some(Some(book)) = BOOK.get() else { return };
-    let (dir, new, added) = {
+    // One flush at a time: two would add to the same file at once.
+    static WRITING: Mutex<()> = Mutex::new(());
+    let _writing = WRITING.lock().unwrap_or_else(|e| e.into_inner());
+    let (dir, mut new, added) = {
         let mut book = book.lock().unwrap_or_else(|e| e.into_inner());
         if book.added == 0 {
             return;
         }
         (book.dir.clone(), std::mem::take(&mut book.new), std::mem::take(&mut book.added))
     };
-    for (file, bytes) in [SHADERS, PIPELINES].iter().zip(&new) {
-        let written = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(dir.join(file))
-            .and_then(|mut f| f.write_all(bytes));
-        if let Err(e) = written {
-            tracing::warn!(error = %e, file, "title pipelines not written down");
-            return;
+    let Err((from, e)) = write_down(&dir, &new) else {
+        tracing::info!(pipelines = added, "title pipelines written down");
+        return;
+    };
+    tracing::warn!(error = %e, file = [SHADERS, PIPELINES][from], "title pipelines not written down yet");
+    let mut book = book.lock().unwrap_or_else(|e| e.into_inner());
+    keep_unwritten(&mut book.new, &mut new, from);
+    book.added += added;
+}
+
+/// Adds the shaders, then the pipelines, to their files; on a failure, the
+/// first of them not written and why.
+fn write_down(dir: &Path, new: &[Vec<u8>; 2]) -> Result<(), (usize, std::io::Error)> {
+    for (at, (file, bytes)) in [SHADERS, PIPELINES].iter().zip(new).enumerate() {
+        if !bytes.is_empty() {
+            append(&dir.join(file), bytes).map_err(|e| (at, e))?;
         }
     }
-    tracing::info!(pipelines = added, "title pipelines written down");
+    Ok(())
+}
+
+/// Adds `bytes` to the end of `path`. A write that fails part of the way is
+/// cut off again, so what is added later does not follow a torn entry.
+fn append(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut f = std::fs::OpenOptions::new().create(true).write(true).truncate(false).open(path)?;
+    let end = f.seek(SeekFrom::End(0))?;
+    f.write_all(bytes).inspect_err(|_| drop(f.set_len(end)))
+}
+
+/// Puts what was not written (`taken`, from file `from` on) back in front of
+/// what was noted since (`book`).
+fn keep_unwritten(book: &mut [Vec<u8>; 2], taken: &mut [Vec<u8>; 2], from: usize) {
+    for (book, taken) in book.iter_mut().zip(taken.iter_mut()).skip(from) {
+        taken.append(book);
+        std::mem::swap(book, taken);
+    }
 }
 
 /// Calls `f` with each container's stage, hash, place and length; where the
@@ -475,6 +504,34 @@ mod tests {
         let mut seen = Vec::new();
         assert_eq!(walk_shaders(&dir, |stage, hash, at, len| seen.push((stage, hash[0], at, len))), one);
         assert_eq!(seen, [(5, 9, 37, 4)]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn what_is_not_written_is_kept() {
+        let dir = std::env::temp_dir().join(format!("victory-known-kept-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let new = [vec![1, 2], vec![3]];
+        // The pipelines' file cannot be opened: the shaders are written, the
+        // pipelines are not.
+        std::fs::create_dir(dir.join(PIPELINES)).unwrap();
+        let (from, _) = write_down(&dir, &new).unwrap_err();
+        assert_eq!(from, 1);
+        assert_eq!(std::fs::read(dir.join(SHADERS)).unwrap(), [1, 2]);
+        std::fs::remove_dir(dir.join(PIPELINES)).unwrap();
+        // Noted meanwhile goes after what is put back.
+        let mut book = [vec![7], vec![8, 9]];
+        let mut taken = new;
+        keep_unwritten(&mut book, &mut taken, from);
+        assert_eq!(book, [vec![7], vec![3, 8, 9]]);
+        // The next flush adds both, after what is there.
+        write_down(&dir, &book).unwrap();
+        assert_eq!(std::fs::read(dir.join(SHADERS)).unwrap(), [1, 2, 7]);
+        assert_eq!(std::fs::read(dir.join(PIPELINES)).unwrap(), [3, 8, 9]);
+        let mut all = [vec![4], vec![5]];
+        keep_unwritten(&mut all, &mut [vec![1], vec![2]], 0);
+        assert_eq!(all, [vec![1, 4], vec![2, 5]]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

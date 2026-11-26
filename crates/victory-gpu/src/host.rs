@@ -797,6 +797,9 @@ pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
         }
     }
     tracing::error!("{text}");
+    // The report ends the process: the pipelines noted since the last
+    // flush would be lost with it.
+    crate::pipeline::known::flush();
     // Tests have no log: the reason goes to their output.
     #[cfg(test)]
     eprintln!("host GPU failure: {text}");
