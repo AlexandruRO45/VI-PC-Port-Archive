@@ -137,12 +137,11 @@ fn prefer_warp() -> bool {
     })
 }
 
-/// Selects the shader variant from the active adapter, or the configured
-/// adapter for offline translation. This query does not create a device.
+/// Selects the same adapter variant for offline warming and runtime lookup.
+/// The first translation may initialize the host. Offline translation can
+/// still use the explicit setting when a D3D12 device is unavailable.
 pub(crate) fn uses_software_adapter() -> bool {
-    HOST.get()
-        .and_then(Option::as_ref)
-        .map_or_else(prefer_warp, |host| host.software)
+    host().map_or_else(prefer_warp, |host| host.software)
 }
 
 /// The host GPU, created on first use; `None` without one (a run then
