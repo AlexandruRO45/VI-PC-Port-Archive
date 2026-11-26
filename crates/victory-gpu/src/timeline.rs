@@ -79,6 +79,129 @@ fn finish() {
     crate::host::wait_in_flight_if_ready();
 }
 
+/// Whether a title fence signalled behind an unwaited host submission is
+/// signalled when that submission is finished, the title's `Signal`
+/// returning at once as the console's does (`VICTORY_LATE_SIGNALS=1`; off
+/// by default, the call then waits for the host GPU there and then).
+///
+/// Off by default: it gained 5 to 8 % of the frame time on a Radeon 8060S
+/// (two alternating pairs of runs), and one run of three with it ended in a
+/// device removal after 85 s in the world (DXGI_ERROR_DEVICE_HUNG after a
+/// submission of one list), cause not found. Something the title's thread
+/// does while a submission is still with the host GPU is not safe yet.
+///
+/// The title's thread then goes on to its next submission while the host
+/// GPU still runs the last, and that submission's preparation (what
+/// `Host::execute_inner` does ahead of its wait) overlaps the GPU's work.
+/// Until now the processor's part and the card's part of every submission
+/// came one after the other: a third of the submitting thread's time in a
+/// sampled world frame was the wait.
+fn late() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    cfg!(windows)
+        && !cfg!(test)
+        && *ON.get_or_init(|| std::env::var_os("VICTORY_LATE_SIGNALS").is_some_and(|v| v == "1"))
+}
+
+/// Title fence signals owed once the host fence reaches a value: (host
+/// fence value, title fence, its value), in the order they were asked for.
+static LATE: Mutex<VecDeque<(u64, Held, u64)>> = Mutex::new(VecDeque::new());
+
+/// Signals `fence` now if no host submission is unwaited, else when the
+/// last of them is finished ([`deliver`]).
+fn signal_late(fence: Held, value: u64) {
+    #[cfg(windows)]
+    let target = crate::host::in_flight_fence();
+    #[cfg(not(windows))]
+    let target = 0;
+    {
+        let mut owed = LATE.lock().unwrap_or_else(|e| e.into_inner());
+        // Behind signals still owed even when nothing is unwaited any
+        // more: a fence's values are signalled in order.
+        if target != 0 || !owed.is_empty() {
+            owed.push_back((target, fence, value));
+            drop(owed);
+            // Finished between the look and the note: nobody else would
+            // signal it.
+            #[cfg(windows)]
+            if crate::host::finished_fence() >= target {
+                deliver(crate::host::finished_fence());
+            }
+            // The title may now wait for the fence and submit nothing more:
+            // somebody has to finish what the host GPU runs.
+            finisher::ask();
+            return;
+        }
+    }
+    fence.signal(value);
+}
+
+/// The host finished its submissions up to host fence value `finished`
+/// (their shaders' writes are back in title memory, their bottom-of-pipe
+/// writes done): the title fences waiting for that are signalled. Called
+/// with the host's submission lock held, so it runs no queue.
+pub(crate) fn deliver(finished: u64) {
+    let mut due = Vec::new();
+    {
+        let mut owed = LATE.lock().unwrap_or_else(|e| e.into_inner());
+        while owed.front().is_some_and(|(target, ..)| *target <= finished) {
+            due.extend(owed.pop_front());
+        }
+    }
+    if due.is_empty() {
+        return;
+    }
+    for (_, fence, value) in due {
+        fence.signal(value);
+    }
+    crate::fence::wake();
+    // What waited for those fences runs on the finishing thread.
+    finisher::ask();
+}
+
+/// The thread that finishes unwaited host submissions when title fences are
+/// owed for them and the title's threads may not come back to do it, and
+/// runs what the fences held back.
+mod finisher {
+    use std::sync::{Condvar, Mutex, Once};
+
+    static ASKED: Mutex<bool> = Mutex::new(false);
+    static MORE: Condvar = Condvar::new();
+
+    /// Title fences are owed, or were signalled.
+    pub(super) fn ask() {
+        static START: Once = Once::new();
+        START.call_once(|| {
+            if let Err(error) = std::thread::Builder::new().name("victory-finish".into()).spawn(run) {
+                tracing::warn!(%error, "no thread to finish host submissions");
+            }
+        });
+        *ASKED.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        MORE.notify_one();
+    }
+
+    fn run() {
+        loop {
+            {
+                let mut asked = ASKED.lock().unwrap_or_else(|e| e.into_inner());
+                while !*asked {
+                    asked = MORE.wait(asked).unwrap_or_else(|e| e.into_inner());
+                }
+                *asked = false;
+            }
+            // First what a signal just given held back, then the wait.
+            super::pump();
+            #[cfg(windows)]
+            {
+                crate::host::finish_in_flight_apart();
+                // A fence noted just as its submission was finished.
+                super::deliver(crate::host::finished_fence());
+            }
+            super::pump();
+        }
+    }
+}
+
 /// Whether any queue is held back.
 pub(crate) fn held() -> bool {
     HELD.load(Ordering::Acquire) > 0
@@ -168,6 +291,9 @@ impl Timeline {
                 }
                 Some(Op::Signal(..) | Op::Work(_)) => match s.ops.pop_front() {
                     Some(Op::Signal(fence, value)) => Box::new(move || {
+                        if late() {
+                            return signal_late(fence, value);
+                        }
                         #[cfg(windows)]
                         crate::host::wait_in_flight_if_ready();
                         fence.signal(value);

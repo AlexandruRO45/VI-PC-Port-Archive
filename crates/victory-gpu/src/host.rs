@@ -73,6 +73,12 @@ fn async_submit() -> bool {
 /// Microseconds spent bringing buffer copies up to date while the
 /// submission before ran ([`Host::prewarm`]), since the last frame line.
 static PREWARM_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Bytes of the lists' fills done ahead of their submission (diagnostics).
+static EARLY_FILLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Microseconds of bindless plans made ahead, and slots they staged that
+/// were then copied into the shader-visible heaps (diagnostics).
+static EARLY_PLAN_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static EARLY_SLOTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// The newest unwaited submission (its fence value) that is finished:
 /// waited for and its results put back.
@@ -310,6 +316,30 @@ pub(crate) fn has_in_flight() -> bool {
 pub(crate) fn wait_in_flight_if_ready() {
     if let Some(Some(h)) = HOST.get() {
         h.wait_in_flight();
+    }
+}
+
+/// The host fence value of the last unwaited submission, 0 if there is none.
+pub(crate) fn in_flight_fence() -> u64 {
+    let Some(Some(h)) = HOST.get() else { return 0 };
+    h.in_flight.lock().unwrap_or_else(|e| e.into_inner()).back().map_or(0, |f| f.fence)
+}
+
+/// The host fence value up to which submissions are finished.
+pub(crate) fn finished_fence() -> u64 {
+    FINISHED_FENCE.load(Ordering::Acquire)
+}
+
+/// As [`wait_in_flight_if_ready`] for the timeline's finishing thread, the
+/// only caller: see [`Host::finish_in_flight_apart`].
+pub(crate) fn finish_in_flight_apart() {
+    static EVENT: OnceLock<Option<usize>> = OnceLock::new();
+    let Some(Some(h)) = HOST.get() else { return };
+    // SAFETY: plain creation of an unnamed auto-reset event.
+    let event = EVENT.get_or_init(|| unsafe { CreateEventW(None, false, false, None) }.ok().map(|e| e.0 as usize));
+    match event {
+        Some(event) => h.finish_in_flight_apart(windows::Win32::Foundation::HANDLE(*event as *mut _)),
+        None => h.wait_in_flight(),
     }
 }
 
@@ -966,6 +996,9 @@ struct Readback {
 struct Deferred {
     /// Destination, source, bytes.
     copies: Vec<Step>,
+    /// How many of the first steps had their fills done ahead of the
+    /// submission ([`Host::prewarm`]); taken by the submission.
+    prefilled: usize,
     /// Post-submission readbacks from GPU textures into title buffers.
     readbacks: Vec<Readback>,
     uploads: Vec<ID3D12Resource>,
@@ -1164,6 +1197,8 @@ impl Host {
             FINISHED.fetch_max(last_sub, Ordering::AcqRel);
             bury(last_sub);
         }
+        // Title fences signalled behind what is now finished.
+        crate::timeline::deliver(FINISHED_FENCE.load(Ordering::Acquire));
     }
 
     /// Whether a submission is still to be waited for and finished.
@@ -1202,6 +1237,38 @@ impl Host {
         if target != 0 {
             self.wait_fence(target);
         }
+    }
+
+    /// [`Host::wait_in_flight`] for the thread that finishes submissions
+    /// apart from the title's (`crate::timeline`): `submitted` is not held
+    /// while the host GPU works, only to finish, so that a title thread may
+    /// prepare its next submission meanwhile. `event` is that thread's own.
+    fn finish_in_flight_apart(&self, event: windows::Win32::Foundation::HANDLE) {
+        let target = self
+            .in_flight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .back()
+            .map(|f| f.fence)
+            .unwrap_or(0);
+        if target == 0 || FINISHED_FENCE.load(Ordering::Acquire) >= target {
+            return;
+        }
+        // SAFETY: the fence is ours and free-threaded; the event is the
+        // caller's alone.
+        unsafe {
+            if self.fence.GetCompletedValue() < target {
+                let waited = std::time::Instant::now();
+                if let Err(e) = self.fence.SetEventOnCompletion(target, event) {
+                    tracing::warn!(error = %e, "host fence wait failed");
+                } else {
+                    WaitForSingleObject(event, INFINITE);
+                }
+                SUBMISSION_US[1].fetch_add(waited.elapsed().as_micros() as u64, Ordering::Relaxed);
+            }
+        }
+        let _guard = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        self.reap_completed();
     }
 
     /// Waits for any in-flight async submission while `self.submitted` is already held.
@@ -1264,18 +1331,94 @@ impl Host {
     /// steps make, early. The ranges that submission's shaders write are
     /// left alone (`Shadow::update` goes around them), and the steps in
     /// their order do it all again after the wait, finding little left.
-    fn prewarm(&self, runs: &[&HostList]) {
+    ///
+    /// Returns the heaps whose plans were made ahead into their staging
+    /// heaps: the caller flushes them after the wait.
+    #[allow(clippy::type_complexity)]
+    fn prewarm(
+        &self,
+        runs: &[&HostList],
+    ) -> Vec<(
+        std::sync::Arc<crate::descriptor::host::HostHeap>,
+        Option<std::sync::Arc<crate::descriptor::host::BindlessPlan>>,
+    )> {
         let started = std::time::Instant::now();
         let mut batch = Batch::default();
+        // The lists' fills too (`VICTORY_EARLY_FILLS=0`: not them): title
+        // memory copied into a list's own upload memory, which nothing that
+        // runs reads. Up to the first step that writes title memory, in any
+        // list (a fill after it may read what it wrote), and not from memory
+        // the submissions still running write back: those are left to the
+        // steps in their order.
+        static FILLS: OnceLock<bool> = OnceLock::new();
+        let mut filling = *FILLS.get_or_init(|| std::env::var_os("VICTORY_EARLY_FILLS").is_none_or(|v| v != "0"));
+        let owed: Vec<(usize, usize)> = if filling {
+            let flights = self.in_flight.lock().unwrap_or_else(|e| e.into_inner());
+            flights
+                .iter()
+                .filter_map(|f| f.finish.as_ref())
+                .flat_map(|f| f.back.iter().map(|&(_, at, len)| (at, at + len)))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let (mut filled, mut fill_us) = (0u64, 0u64);
         for list in runs {
-            for step in &list.deferred().copies {
-                if let Step::Refresh(shadow, address, len) = step {
-                    batch.add(shadow, *address, *len);
+            let mut deferred = list.deferred();
+            let mut done = 0;
+            for (k, step) in deferred.copies.iter().enumerate() {
+                match step {
+                    Step::Refresh(shadow, address, len) => batch.add(shadow, *address, *len),
+                    Step::Copy(..) | Step::Run(_) => filling = false,
+                    &Step::Fill(dst, src, len) if filling => {
+                        if owed.iter().any(|&(from, to)| src < to && from < src + len) {
+                            filling = false;
+                        } else {
+                            let at = std::time::Instant::now();
+                            copy_mapped(dst as *mut u8, src as *const u8, len, false);
+                            fill_us += at.elapsed().as_micros() as u64;
+                            filled += len as u64;
+                        }
+                    }
+                    _ => {}
+                }
+                if filling {
+                    done = k + 1;
                 }
             }
+            deferred.prefilled = done;
+            for (heap, writes) in &deferred.bindless {
+                batch.bindless(heap, *writes);
+            }
+        }
+        if filled > 0 {
+            PREPARING[0].fetch_add(fill_us, Ordering::Relaxed);
+            PREPARING[1].fetch_add(filled, Ordering::Relaxed);
+            EARLY_FILLS.fetch_add(filled, Ordering::Relaxed);
         }
         batch.flush();
+        // The directly indexed heaps' plans too (`VICTORY_EARLY_PLAN=1`; off
+        // by default until it has run long enough): the slots a plan makes
+        // go to a staging heap no shader sees, and the caller copies them
+        // into the shader-visible heap once the submission before has run
+        // (`HostHeap::flush_staged`). Making the plan straight into the
+        // shader-visible heap here rewrote slots that submission still
+        // indexed, and the host GPU stopped (DXGI_ERROR_DEVICE_HUNG while
+        // the world loaded, two runs of two on a Radeon 8060S, 2026-11-25).
+        static PLANS: OnceLock<bool> = OnceLock::new();
+        let mut ahead = Vec::new();
+        if *PLANS.get_or_init(|| std::env::var_os("VICTORY_EARLY_PLAN").is_some_and(|v| v == "1")) {
+            for (heap, _) in std::mem::take(&mut batch.bindless) {
+                let planning = std::time::Instant::now();
+                let plan = heap.plan_ahead();
+                let us = planning.elapsed().as_micros() as u64;
+                BINDLESS_US[0].fetch_add(us, Ordering::Relaxed);
+                EARLY_PLAN_US.fetch_add(us, Ordering::Relaxed);
+                ahead.push((heap, plan));
+            }
+        }
         PREWARM_US.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+        ahead
     }
 
     fn execute_inner(&self, runs: &[&HostList], keep: Option<&[std::sync::Arc<HostList>]>) {
@@ -1288,10 +1431,17 @@ impl Host {
         // buffers in `prepare`. During the gap between submissions, the GPU
         // ran in parallel with the title's CPU command-list recording, and
         // runs on while this submission's buffer copies are refreshed.
-        if keep.is_some() && self.has_in_flight() {
-            self.prewarm(runs);
-        }
+        let ahead = if keep.is_some() && self.has_in_flight() {
+            self.prewarm(runs)
+        } else {
+            Vec::new()
+        };
         self.drain_in_flight_locked();
+        // What the plans made ahead reaches the shader-visible heaps now
+        // that nothing running indexes them.
+        for (heap, _) in &ahead {
+            EARLY_SLOTS.fetch_add(heap.flush_staged() as u64, Ordering::Relaxed);
+        }
         let this_submission = STARTED.fetch_add(1, Ordering::AcqRel) + 1;
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
@@ -1299,7 +1449,10 @@ impl Host {
         let mut lists: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(2 * runs.len());
         // Where each run's lists start in `lists`.
         let mut firsts = Vec::with_capacity(runs.len());
-        let mut batch = Batch::default();
+        let mut batch = Batch {
+            ahead: ahead.into_iter().filter_map(|(_, plan)| plan).collect(),
+            ..Batch::default()
+        };
         let mut early = Early::default();
         if !runs.is_empty() {
             early.take(&mut batch, runs, false);
@@ -2736,7 +2889,9 @@ impl HostList {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
         let mut uploads = Vec::new();
-        let deferred = self.deferred();
+        let mut deferred = self.deferred();
+        // The fills among these first steps were done ahead ([`Host::prewarm`]).
+        let prefilled = std::mem::take(&mut deferred.prefilled);
         for (heap, writes) in &deferred.bindless {
             batch.bindless(heap, *writes);
         }
@@ -2748,7 +2903,7 @@ impl HostList {
         let mut refresh_count = 0u64;
         #[cfg(feature = "diagnostics")]
         let mut refresh_bytes = 0u64;
-        for step in &deferred.copies {
+        for (k, step) in deferred.copies.iter().enumerate() {
             match step {
                 &Step::Copy(dst, src, len) => {
                     #[cfg(feature = "diagnostics")]
@@ -2761,6 +2916,7 @@ impl HostList {
                     copy_us += started.elapsed().as_micros() as u64;
                     copy_bytes += len as u64;
                 }
+                Step::Fill(..) if k < prefilled => {}
                 &Step::Fill(dst, src, len) => {
                     #[cfg(feature = "diagnostics")]
                     {
@@ -2845,6 +3001,9 @@ struct Batch {
     plans: Vec<std::sync::Arc<crate::descriptor::host::BindlessPlan>>,
     /// Bindless unordered access ranges, copied back after the submission.
     bindless_writes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+    /// Plans made ahead of the wait for the submission before
+    /// ([`Host::prewarm`]): what they list as new is copied with the rest.
+    ahead: Vec<std::sync::Arc<crate::descriptor::host::BindlessPlan>>,
 }
 
 impl Batch {
@@ -2921,13 +3080,8 @@ impl Batch {
     /// for copy-back only when a shader that may write memory uses the heap.
     fn prepare_bindless(&mut self) {
         self.flush();
-        for (heap, writes) in std::mem::take(&mut self.bindless) {
-            let started = std::time::Instant::now();
-            let plan = heap.bindless_plan();
-            BINDLESS_US[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
-            let Some(plan) = plan else {
-                continue;
-            };
+        // A plan's bounces copied and its reads refreshed.
+        let copy = |plan: &crate::descriptor::host::BindlessPlan| {
             let (reads, all) = plan.copy_constants();
             if !reads.is_empty() {
                 let started = std::time::Instant::now();
@@ -2947,6 +3101,21 @@ impl Batch {
                 PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
                 PREPARING[1].fetch_add(copied.into_inner(), Ordering::Relaxed);
             }
+        };
+        // First the plans made ahead: the heap's plan below may be a newer
+        // one, which lists as new only what it made itself.
+        for plan in std::mem::take(&mut self.ahead) {
+            copy(&plan);
+            self.plans.push(plan);
+        }
+        for (heap, writes) in std::mem::take(&mut self.bindless) {
+            let started = std::time::Instant::now();
+            let plan = heap.bindless_plan();
+            BINDLESS_US[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+            let Some(plan) = plan else {
+                continue;
+            };
+            copy(&plan);
             // shortcut: what shaders write through directly indexed slots into
             // copied memory stays in the copy (title memory used in place
             // needs no copy back); copying all of it back cost ~0.3 s a frame.
@@ -3650,6 +3819,14 @@ impl Meter {
             tracing::info!("sparse writes since: {}", crate::shadow::sparse_writes_text());
             #[cfg(feature = "diagnostics")]
             log_gpu_waits();
+            #[cfg(feature = "diagnostics")]
+            tracing::info!(
+                "prewarm since: {:.1} ms, {:.2} MB of fills done ahead, {:.1} ms of plans made ahead, {} slots staged and copied",
+                PREWARM_US.swap(0, Ordering::Relaxed) as f64 / 1e3,
+                EARLY_FILLS.swap(0, Ordering::Relaxed) as f64 / 1e6,
+                EARLY_PLAN_US.swap(0, Ordering::Relaxed) as f64 / 1e3,
+                EARLY_SLOTS.swap(0, Ordering::Relaxed)
+            );
             #[cfg(feature = "diagnostics")]
             log_gpu_times();
             tracing::info!(

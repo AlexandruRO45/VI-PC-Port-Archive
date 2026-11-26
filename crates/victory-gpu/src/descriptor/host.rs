@@ -38,6 +38,14 @@ pub(crate) struct HostHeap {
     /// slot viewing a pooled texture, so the backing heap cannot be freed while
     /// a shader-visible descriptor slot still points into it.
     kept_textures: Mutex<HashMap<u32, Arc<crate::resource::HostTexture>>>,
+    /// A heap of ours no shader sees, with the title's slots: views made
+    /// ahead of a submission ([`HostHeap::plan_ahead`]) are made here, and
+    /// copied into the shader-visible heap once the submission before has
+    /// run ([`HostHeap::flush_staged`]). Made when first asked for.
+    staging: std::sync::OnceLock<Option<(ID3D12DescriptorHeap, usize)>>,
+    /// The title's slots whose newest view is the staged one (a bit each).
+    staged: Vec<AtomicU64>,
+    staged_any: std::sync::atomic::AtomicBool,
     /// Where the search for free dynamic slots starts, and which are taken
     /// (by lists not yet reset).
     /// Where the next search starts, the slots taken, and the smallest run
@@ -604,6 +612,12 @@ fn same_ranges(a: &SlotUse, b: &SlotUse) -> bool {
         && a.retained.as_ref().map(Interface::as_raw) == b.retained.as_ref().map(Interface::as_raw)
 }
 
+thread_local! {
+    /// Whether this thread plans ahead: its writes of title slots go to
+    /// the staging heap ([`HostHeap::cpu`]).
+    static STAGING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 fn plan_note(part: usize, started: std::time::Instant, walked: usize, found: usize) {
     let n = &PLAN_NOTES[part];
     n[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
@@ -754,6 +768,9 @@ impl HostHeap {
             made: Mutex::new(vec![0; count as usize]),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
             kept_textures: Mutex::default(),
+            staging: std::sync::OnceLock::new(),
+            staged: (0..(count as usize).div_ceil(64)).map(|_| AtomicU64::new(0)).collect(),
+            staged_any: std::sync::atomic::AtomicBool::new(false),
             next: Mutex::new((0, vec![false; extra as usize], usize::MAX)),
             strides,
             bindless: Mutex::default(),
@@ -1139,10 +1156,126 @@ impl HostHeap {
         };
     }
 
+    /// Where slot `index` is written. For a title slot while this thread
+    /// plans ahead ([`HostHeap::plan_ahead`]), the staging heap, the slot
+    /// noted staged; else the shader-visible heap, and what was staged for
+    /// the slot is forgotten: this write is the newer one.
     fn cpu(&self, index: u32) -> D3D12_CPU_DESCRIPTOR_HANDLE {
+        if index < self.count && !self.sampler {
+            let (word, bit) = (index as usize / 64, 1u64 << (index % 64));
+            if STAGING.get() {
+                if let Some(at) = self.staging_cpu() {
+                    self.staged[word].fetch_or(bit, Ordering::AcqRel);
+                    self.staged_any.store(true, Ordering::Release);
+                    return D3D12_CPU_DESCRIPTOR_HANDLE { ptr: at + index as usize * self.step as usize };
+                }
+            } else if self.staged_any.load(Ordering::Acquire) {
+                self.staged[word].fetch_and(!bit, Ordering::AcqRel);
+            }
+        }
         D3D12_CPU_DESCRIPTOR_HANDLE {
             ptr: self.cpu + index as usize * self.step as usize,
         }
+    }
+
+    /// The staging heap's first slot, the heap made at the first call.
+    fn staging_cpu(&self) -> Option<usize> {
+        self.staging
+            .get_or_init(|| {
+                let host = host()?;
+                // SAFETY: plain heap creation; a live heap.
+                unsafe {
+                    let heap: ID3D12DescriptorHeap = host
+                        .device
+                        .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                            Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                            NumDescriptors: self.count,
+                            Flags: D3D12_DESCRIPTOR_HEAP_FLAG_NONE,
+                            NodeMask: 0,
+                        })
+                        .inspect_err(|error| tracing::warn!(%error, count = self.count, "no staging descriptor heap"))
+                        .ok()?;
+                    let at = heap.GetCPUDescriptorHandleForHeapStart().ptr;
+                    Some((heap, at))
+                }
+            })
+            .as_ref()
+            .map(|(_, at)| *at)
+    }
+
+    /// Makes the heap's plan while a submission that indexes the heap still
+    /// runs: every slot it makes goes to the staging heap, so nothing that
+    /// submission reads changes. [`HostHeap::flush_staged`] must follow
+    /// once that submission has run.
+    ///
+    /// The plan is returned for the submission to copy what it lists as
+    /// new: a later plan made before those copies would list only what is
+    /// new to it, and the slots made here would view host copies never
+    /// filled.
+    pub(crate) fn plan_ahead(&self) -> Option<Arc<BindlessPlan>> {
+        struct Staging;
+        impl Drop for Staging {
+            fn drop(&mut self) {
+                STAGING.set(false);
+            }
+        }
+        STAGING.set(true);
+        let _staging = Staging;
+        self.bindless_plan()
+    }
+
+    /// Copies the staged slots into the shader-visible heap, in runs, under
+    /// the lock on `made` (a title thread writing a slot in place holds it,
+    /// and forgets what was staged for the slot). Returns how many.
+    pub(crate) fn flush_staged(&self) -> usize {
+        if !self.staged_any.swap(false, Ordering::AcqRel) {
+            return 0;
+        }
+        let (Some(host), Some(staging)) = (host(), self.staging_cpu()) else {
+            return 0;
+        };
+        // Held while the slots are copied: a title thread writing one in
+        // place takes it.
+        let _made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        let step = self.step as usize;
+        let mut copied = 0;
+        let mut run: Option<(u32, u32)> = None;
+        let copy = |first: u32, n: u32| {
+            // SAFETY: both ranges lie inside their heaps; the source is not
+            // shader-visible.
+            unsafe {
+                host.device.CopyDescriptorsSimple(
+                    n,
+                    D3D12_CPU_DESCRIPTOR_HANDLE { ptr: self.cpu + first as usize * step },
+                    D3D12_CPU_DESCRIPTOR_HANDLE { ptr: staging + first as usize * step },
+                    D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                );
+            }
+        };
+        for (word, bits) in self.staged.iter().enumerate() {
+            let mut bits = bits.swap(0, Ordering::AcqRel);
+            while bits != 0 {
+                let index = (word * 64) as u32 + bits.trailing_zeros();
+                bits &= bits - 1;
+                // Null views too (a slot the plan found unmapped or stale):
+                // left out, the slot kept showing a resource the plan had
+                // let go of, and the host GPU stopped at the world's first
+                // frames.
+                copied += 1;
+                run = match run {
+                    Some((first, n)) if first + n == index => Some((first, n + 1)),
+                    Some((first, n)) => {
+                        copy(first, n);
+                        Some((index, 1))
+                    }
+                    None => Some((index, 1)),
+                };
+            }
+        }
+        if let Some((first, n)) = run {
+            copy(first, n);
+        }
+        copied
     }
 
     /// Makes host slot `index` from the record the title has at `handle`
