@@ -106,7 +106,7 @@ pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
         }
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
-        let mut made = Lower::new(parts, &bad);
+        let made = Lower::new(parts, &bad);
         #[cfg(feature = "diagnostics")]
         let setup = started.elapsed();
         #[cfg(feature = "diagnostics")]
