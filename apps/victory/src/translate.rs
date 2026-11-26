@@ -576,7 +576,7 @@ fn translate(
                         }
                         Err(ShaderError::Unsupported { offset, what }) => t
                             .fail(format!("emit: {what}"), || {
-                                format!("{} at {offset:#x}", label())
+                                format!("{} at {offset:#x} {}", label(), instruction_at(&program, offset))
                             }),
                         Err(e) => t.fail(format!("emit: {e}"), label),
                     }
@@ -871,4 +871,17 @@ mod tests {
             "{err}"
         );
     }
+}
+
+/// The instruction at machine offset `offset`, as `name` and its raw fields:
+/// a refusal that points at an offset should also say which opcode it is.
+fn instruction_at(p: &victory_shader::ir::Program, offset: usize) -> String {
+    for b in &p.blocks {
+        for i in &b.insts {
+            if i.machine.offset == offset {
+                return format!("[{} {:?}]", i.name(), i.fields);
+            }
+        }
+    }
+    String::new()
 }
