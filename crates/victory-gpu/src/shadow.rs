@@ -923,6 +923,12 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_w
     let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::MarkedUs);
     marked.sort_unstable();
     marked.dedup();
+    // A bit identifies one copy and page in both bitmaps. A held mark
+    // wins for that bit, while other copies of the same address can write back.
+    // The single held bitmap was scanned in ascending bit order.
+    if !held.is_empty() {
+        marked.retain(|n| held.binary_search(n).is_err());
+    }
     let page_of = |m: &Marks, n: u32| {
         let (&base, copy) = m.owners.range(..=n).next_back()?;
         let copy = copy.upgrade()?;
@@ -1599,6 +1605,38 @@ pub(crate) mod tests {
         assert_eq!(unsafe { ((p + 16) as *const u8).read_volatile() }, 0x11, "title memory untouched");
         unregister(p + 1, p as u64);
         unregister(p, p as u64);
+    }
+
+    #[test]
+    fn held_mark_preserves_title_bytes_when_both_bitmaps_mark_one_copy_page() {
+        let Some(host) = crate::host::host() else { return };
+        let p = crate::watch::tests::pool(2);
+        let address = p as u64;
+        register(p, address, (2 * PAGE) as u64);
+        let copy = find(address, (2 * PAGE) as u64).unwrap();
+        let list = host.new_list().unwrap();
+        copy.refresh(&list, address, (2 * PAGE) as u64);
+        let writer = copy.clone();
+        list.defer(move || {
+            // Simulate writes through indexed views without a declared withheld range.
+            writer.write_host(address + 16, &[0xaa]);
+            writer.write_host(address + PAGE as u64 + 16, &[0xbb]);
+            let base = writer.marks.unwrap() as usize;
+            for (memory, n) in [(true, base), (false, base), (false, base + 1)] {
+                let b = bitmap(memory).unwrap();
+                // SAFETY: both page indices belong to this copy in the mapped bitmap.
+                unsafe { *(b.data as *mut u32).add(n / 32) |= 1 << (n % 32) };
+            }
+        });
+        list.defer_missed(|| true);
+        list.close();
+        host.execute(&[&list]);
+        // SAFETY: both bytes are inside the live, initially zeroed pool.
+        let bytes = unsafe { (((p + 16) as *const u8).read_volatile(), ((p + PAGE + 16) as *const u8).read_volatile()) };
+        unregister(p, address);
+        drop(copy);
+        crate::watch::tests::free(p);
+        assert_eq!(bytes, (0, 0xbb));
     }
 
     #[test]
