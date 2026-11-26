@@ -1,14 +1,14 @@
 //! Native GFX10 programs that the console compiler stores in a `DXIL` part.
 //!
 //! An `XDAT` index after the program header lists blobs stored around the
-//! bitcode; one or more of them hold native programs, zlib-packed (a vertex
-//! shader can carry two: compiled for use with and without a geometry
-//! shader). Layout as observed in shipped titles (index offsets are relative
-//! to the part data):
+//! bitcode. Native program blobs are either raw or zlib-packed. A vertex
+//! shader can carry two, compiled for use with and without a geometry shader.
+//! Index offsets are relative to the part data.
 //!
 //! ```text
 //! +0x18 "XDAT"  u32 entry count, u32 (0x24 seen), then per entry:
 //!               u32 kind, u32 offset, u32 size
+//! kind 0x0c     raw FSSM blob
 //! kind 0x0d     "XBCH" u32 version (3), u64 packed size, u64 unpacked size,
 //!               zlib stream
 //! unpacked      "FSSM" u32 version (0x101), u64 payload size, payload
@@ -73,6 +73,7 @@ use crate::dxbc::{u16_at, u32_at, u64_at};
 
 const XDAT_OFFSET: usize = 0x18;
 const MAX_XDAT_ENTRIES: usize = 64;
+const KIND_NATIVE_UNPACKED: u32 = 0x0c;
 const KIND_NATIVE: u32 = 0x0d;
 const XBCH_VERSION: u32 = 3;
 const XBCH_HEADER: usize = 0x18;
@@ -437,13 +438,18 @@ pub fn native_programs(part: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
     let mut out = Vec::new();
     for i in 0..count {
         let at = XDAT_OFFSET + 12 + 12 * i;
-        if u32_at(part, at)? != KIND_NATIVE {
+        let kind = u32_at(part, at)?;
+        if !matches!(kind, KIND_NATIVE_UNPACKED | KIND_NATIVE) {
             continue;
         }
         let offset = u32_at(part, at + 4)?.into();
         let size = u32_at(part, at + 8)?.into();
         let blob = bytes(part, offset, size).ok_or(Malformed("XDAT entry out of bounds"))?;
-        out.extend(programs(&unpack(blob)?)?);
+        if kind == KIND_NATIVE {
+            out.extend(programs(&unpack(blob)?)?);
+        } else {
+            out.extend(programs(blob)?);
+        }
     }
     Ok(out)
 }
@@ -928,6 +934,142 @@ pub(crate) mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn finds_unpacked_programs() {
+        let cs_code = [13, 14, 15, 16];
+        let mut blob = fssm(&[
+            (HwStage::Vs, &VS_CODE),
+            (HwStage::Ps, &PS_CODE),
+            (HwStage::Cs, &cs_code),
+        ]);
+        let cs = stage_data_at(&blob, HwStage::Cs);
+        for (i, value) in [0x9cu32, 8, 4, 1].into_iter().enumerate() {
+            let at = cs + CS_RSRC2 + 4 * i;
+            blob[at..at + 4].copy_from_slice(&value.to_le_bytes());
+        }
+
+        let data = part(&[(KIND_NATIVE_UNPACKED, &blob)]);
+        assert_eq!(
+            native_programs(&data).unwrap(),
+            [
+                NativeProgram {
+                    stage: HwStage::Vs,
+                    wave64: true,
+                    vgprs: 28,
+                    layout: vec![],
+                    used: vec![],
+                    io: StageIo::Vs {
+                        inputs: vec![],
+                        outputs: vec![],
+                    },
+                    code: VS_CODE.to_vec(),
+                },
+                NativeProgram {
+                    stage: HwStage::Ps,
+                    wave64: false,
+                    vgprs: 28,
+                    layout: vec![],
+                    used: vec![],
+                    io: StageIo::Ps {
+                        inputs: vec![],
+                        input_addr: 0,
+                        db_shader_control: 0,
+                        patches: vec![],
+                    },
+                    code: PS_CODE.to_vec(),
+                },
+                NativeProgram {
+                    stage: HwStage::Cs,
+                    wave64: true,
+                    vgprs: 28,
+                    layout: vec![],
+                    used: vec![],
+                    io: StageIo::Cs(ComputeIo {
+                        rsrc2: 0x9c,
+                        threads: [8, 4, 1],
+                    }),
+                    code: cs_code.to_vec(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn reads_mixed_xdat_entries_in_order() {
+        let ps = fssm(&[(HwStage::Ps, &PS_CODE)]);
+        let cs_code = [13, 14, 15, 16];
+        let cs = xbch(&fssm(&[(HwStage::Cs, &cs_code)]));
+        let vs = fssm(&[(HwStage::Vs, &VS_CODE)]);
+        let mut data = part(&[
+            (KIND_NATIVE_UNPACKED, &ps),
+            (0xff, b"ignored"),
+            (KIND_NATIVE, &cs),
+            (KIND_NATIVE_UNPACKED, &vs),
+        ]);
+        let unknown_offset = XDAT_OFFSET + 12 + 12 + 4;
+        data[unknown_offset..unknown_offset + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+
+        let found = native_programs(&data).unwrap();
+        let programs: Vec<_> = found.iter().map(|p| (p.stage, p.code.as_slice())).collect();
+        assert_eq!(
+            programs,
+            [
+                (HwStage::Ps, PS_CODE.as_slice()),
+                (HwStage::Cs, cs_code.as_slice()),
+                (HwStage::Vs, VS_CODE.as_slice()),
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_unpacked_headers() {
+        let good = fssm(&[(HwStage::Vs, &VS_CODE)]);
+        let parse = |blob: &[u8]| native_programs(&part(&[(KIND_NATIVE_UNPACKED, blob)]));
+        for len in 0..FSSM_HEADER {
+            assert!(
+                matches!(parse(&good[..len]), Err(Malformed(_))),
+                "header length {len}"
+            );
+        }
+
+        let mut bad = good.clone();
+        bad[..4].copy_from_slice(b"TEST");
+        assert!(matches!(parse(&bad), Err(Malformed(_))), "wrong magic");
+
+        bad = good.clone();
+        bad[4..8].copy_from_slice(&(FSSM_VERSION + 1).to_le_bytes());
+        assert!(matches!(parse(&bad), Err(Malformed(_))), "unknown version");
+
+        let payload_len = (good.len() - FSSM_HEADER) as u64;
+        bad = good;
+        for size in [payload_len - 1, payload_len + 1, u64::MAX] {
+            bad[8..FSSM_HEADER].copy_from_slice(&size.to_le_bytes());
+            assert!(
+                matches!(parse(&bad), Err(Malformed(_))),
+                "payload size {size}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_out_of_bounds_unpacked_entries() {
+        let blob = fssm(&[(HwStage::Vs, &VS_CODE)]);
+        let good = part(&[(KIND_NATIVE_UNPACKED, &blob)]);
+        let entry = XDAT_OFFSET + 12;
+        for (field, value) in [
+            (entry + 4, good.len() as u32 + 1),
+            (entry + 8, blob.len() as u32 + 1),
+            (entry + 8, u32::MAX),
+        ] {
+            let mut data = good.clone();
+            data[field..field + 4].copy_from_slice(&value.to_le_bytes());
+            assert!(matches!(
+                native_programs(&data),
+                Err(Malformed("XDAT entry out of bounds"))
+            ));
+        }
     }
 
     #[test]
