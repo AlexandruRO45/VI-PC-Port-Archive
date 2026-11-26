@@ -231,6 +231,9 @@ mod device_type {
                 Key, *const u16, *mut u32, *mut u32, *mut u8, *mut u32,
             ) -> u32)(key, name, reserved, kind, data, size);
         }
+        if !reserved.is_null() {
+            return INVALID_PARAMETER;
+        }
         if !is(name, VALUE) {
             return FILE_NOT_FOUND;
         }
@@ -337,6 +340,50 @@ mod device_type {
                 SUCCESS
             );
             assert_eq!(again, oem());
+        }
+
+        #[test]
+        fn oem_queries_require_null_reserved() {
+            let mut key = std::ptr::null_mut();
+            let path = w(KEY);
+            assert_eq!(RegOpenKeyW(LOCAL_MACHINE, path.as_ptr(), &mut key), SUCCESS);
+            assert_eq!(key, oem());
+
+            let mut dummy = 0;
+            let (mut kind, mut size, mut data) = (0xdead_beef, 8, [0xa5; 8]);
+            let sentinels = (kind, size, data);
+            for value in [VALUE, "Other"] {
+                let name = w(value);
+                assert_eq!(
+                    RegQueryValueExW(
+                        key,
+                        name.as_ptr(),
+                        &mut dummy,
+                        &mut kind,
+                        data.as_mut_ptr(),
+                        &mut size
+                    ),
+                    INVALID_PARAMETER,
+                    "value name: {value}"
+                );
+                assert_eq!((kind, size, data), sentinels, "value name: {value}");
+            }
+
+            let name = w(VALUE);
+            assert_eq!(
+                RegQueryValueExW(
+                    key,
+                    name.as_ptr(),
+                    std::ptr::null_mut(),
+                    &mut kind,
+                    data.as_mut_ptr(),
+                    &mut size
+                ),
+                SUCCESS
+            );
+            assert_eq!((kind, size), (DWORD, 4));
+            assert_eq!(data[..4], console_mode(console::current()).to_ne_bytes());
+            assert_eq!(RegCloseKey(key), SUCCESS);
         }
 
         #[test]
