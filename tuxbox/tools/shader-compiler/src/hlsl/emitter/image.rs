@@ -362,7 +362,9 @@ impl<'a> Emitter<'a> {
             0 => (1usize, 1usize, 1usize),
             1 => (2, 2, 2),
             2 => (3, 3, 3),
-            3 => (3, 3, 0),
+            // Cube derivatives are on the face, (ds, dt) per direction; the
+            // third coordinate is the face and has none.
+            3 => (3, 2, 0),
             4 => (2, 1, 1),
             5 => (3, 2, 2),
             _ => return Err(format!("image dim {dim} unsupported")),
@@ -424,8 +426,7 @@ impl<'a> Emitter<'a> {
             for _ in 0..nder {
                 dy.push(f(&take(self))?);
             }
-            let v = |c: &Vec<String>| if c.len() == 1 { c[0].clone() } else { format!("float{}({})", c.len(), c.join(", ")) };
-            Some((v(&dx), v(&dy)))
+            Some((dx, dy))
         } else {
             None
         };
@@ -477,6 +478,16 @@ impl<'a> Emitter<'a> {
         } else {
             format!("float{ncoord}({})", coords.join(", "))
         };
+        // HLSL takes a cube's derivatives as changes of the direction. That is
+        // affine in the face's (s, t), so a difference of directions gives them.
+        let grads = grads.map(|(dx, dy)| {
+            let spell = |c: &[String]| match c {
+                [ds, dt] if dim == 3 => format!("(tb_cube_dir(1.5 + {ds}, 1.5 + {dt}, {0}) - tb_cube_dir(1.5, 1.5, {0}))", coords[2]),
+                [only] => only.clone(),
+                _ => format!("float{}({})", c.len(), c.join(", ")),
+            };
+            (spell(&dx), spell(&dy))
+        });
         let smp = if let Some(Res::HeapSampler(key)) = rs.get(1).copied() {
             let name = format!("tb_sampler{idx}");
             let ty = if cmp { "SamplerComparisonState" } else { "SamplerState" };
@@ -494,17 +505,16 @@ impl<'a> Emitter<'a> {
             if cmp { format!("scmp{s}") } else { format!("samp{s}") }
         } else { return Err("missing sampler binding".into()); };
         let zero_off = if noff == 1 { "0".to_string() } else { format!("int{}({})", noff.max(1), vec!["0"; noff.max(1)].join(", ")) };
-        // Optional trailing ", offset[, clamp]" arguments.
+        // Optional trailing ", offset[, clamp]" arguments. Cube images have no
+        // texel offset, so every TextureCube sample that takes a clamp takes it
+        // directly: plain, bias, gradient and compare.
         let tail = |offset: &Option<String>, clamp: &Option<String>| -> Result<String, String> {
             Ok(match (offset, clamp) {
                 (None, None) => String::new(),
                 (Some(o), None) => format!(", {o}"),
-                (o, Some(c)) => {
-                    if noff == 0 {
-                        return Err("LOD clamp on a cube image unsupported".into());
-                    }
-                    format!(", {}, {c}", o.clone().unwrap_or_else(|| zero_off.clone()))
-                }
+                (None, Some(c)) if noff == 0 => format!(", {c}"),
+                (Some(_), Some(_)) if noff == 0 => return Err("texel offset on a cube image unsupported".into()),
+                (o, Some(c)) => format!(", {}, {c}", o.clone().unwrap_or_else(|| zero_off.clone())),
             })
         };
         let t = self.tmp;

@@ -896,6 +896,10 @@ if(BUILD_TESTING)
     add_test(NAME compile_helper COMMAND compile_helper_test)
   endif()
 
+  # D24/D16 fragment depth quantisation and bias SPIR-V patcher (runtime/src/depth24_fragment.h): pure stdlib.
+  add_executable(depth24_fragment_test test/depth24_fragment_test.cpp)
+  add_test(NAME depth24_fragment COMMAND depth24_fragment_test)
+
   add_executable(xdxr_build_output_test test/xdxr_build_output_test.cpp)
   add_test(NAME xdxr_build_output COMMAND xdxr_build_output_test)
 
@@ -4685,6 +4689,12 @@ if(TARGET Vulkan::Headers)
       target_compile_options(arena_blocks_test PRIVATE /W4 /permissive- /utf-8)
     endif()
     add_test(NAME arena_blocks COMMAND arena_blocks_test)
+    # The mem probe's breakdown line: the tally by consumer, the owner scopes and the text (src/memory_breakdown.h).
+    add_executable(memory_breakdown_test test/memory_breakdown_test.cpp)
+    if(WIN32 AND MSVC)
+      target_compile_options(memory_breakdown_test PRIVATE /W4 /permissive- /utf-8)
+    endif()
+    add_test(NAME memory_breakdown COMMAND memory_breakdown_test)
     # The address guard's page table (src/address_guard.h; docs/d3d12_vulkan.md, "Address guard").
     add_executable(address_guard_test test/address_guard_test.cpp)
     if(WIN32 AND MSVC)

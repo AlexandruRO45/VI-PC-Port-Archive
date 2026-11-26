@@ -355,8 +355,10 @@ ones marked *diagnostic* only add log lines or exist to compare a run with and w
 | `LEONIDA_PEEK_SECONDS` | `10` | *Diagnostic.* The period of the `LEONIDA_PEEK` thread (`src/main.cpp`), which prints 8-byte values of the title's image. |
 | `LEONIDA_INPUT_SCRIPT` | unset | Timed pad presses, `button@seconds` separated by commas (`a@70,a@85,start@120`), each held 300 ms or its own `button@seconds:hold`; the clock starts with the shim. Works with and without SDL3: with SDL3 it drives the keyboard pad (`LEONIDA_KEYBOARD_PAD=always`), without SDL3 one scripted pad that is the only device. Controllers and the keyboard pad still need SDL3. Format and buttons in [docs/gameinput.md](../docs/gameinput.md#environment-variables). |
 | `LEONIDA_INPUT_LOG` | on | The GameInput shim logs every press in `LEONIDA_INPUT_SCRIPT`'s form (`name@seconds`), so a session played by hand can be replayed. `0` turns the lines off. |
+| `LEONIDA_INPUT_TRACE` | unset | `1` (diagnostic, the GameInput shim built without SDL3) logs the title's reading calls on the scripted pad: the first 128, then each one with a button down and every 1000th. Details in [docs/gameinput.md](../docs/gameinput.md#scripted-input-without-sdl3). |
 | `LEONIDA_LOG_ALLOCINFO` | unset | *Diagnostic.* `1` logs every device slot 25 call (`GetResourceAllocationInfo`) with its thread, description and sizes (`shims/d3d12_xs_device.cpp`). |
 | `LEONIDA_LOG_EXE_PIPELINES` | unset | *Diagnostic.* When set, one line per distinct graphics pipeline that uses a program translated from the executable's inline containers. |
+| `LEONIDA_MEM_PROBE` | unset | *Diagnostic.* `<seconds>`: every that many seconds the memory probe (`src/mem_probe.h`) logs `[rt] mem-probe t=` (live pipelines, shader modules and `VkDeviceMemory` per memory type), `[rt] mem-probe breakdown t=` (the same allocated bytes by consumer: the arena with its reserved, bound and in-use MiB, geometry copies, title windows and shadows, upload heaps, staging, texture blocks, sampled textures, render targets and depth, and `other`, which add up to the allocated total; `src/memory_breakdown.h`) and `[rt] mem-probe smaps` (the process's resident memory by kind). |
 | `LEONIDA_MEM_PROBE_CACHE` | unset | *Diagnostic.* `1` adds the pipeline cache's size to the memory probe's report; the driver serializes the whole cache to answer. |
 | `LEONIDA_TEXTURE_PROBE` | unset | *Diagnostic.* Logs a `[rt] texture-probe` line for every shader resource view of a texture in the title's memory. |
 | `LEONIDA_LOCAL_DIAGNOSTICS` | unset | *Diagnostic.* `1` turns on the boot diagnostics that write to stderr from the draw, clear, present and descriptor paths (the lines tagged `present-probe`, `fsdraw`, `heap-probe`, `desc-probe` and `PresentX diag`; `src/local_diagnostics.h`). They follow a frame of the title from its draws to the window and cost a lock and a line per draw, so they are off by default. The full-screen draw targets that `LEONIDA_CAPTURE_SOURCE` reads back are only collected with it. |
@@ -582,9 +584,14 @@ The game's `atexit` handlers and static destructors go to a table of the run's o
 shared with gta6rt): `exit` and a return from `main` run them newest first before the run ends, `_cexit` runs them and
 returns, and `_exit`, `quick_exit`, `ExitProcess` and `abort` skip them, as natively. `run_tiny_atexit` runs a stand-in
 program natively and through `--run` for each of those paths (and for `_exit` from a second thread during `exit`) and
-holds both to the Windows sequence (under Wine, whose CRT differs, a native difference is only reported). Not covered
-yet: `at_quick_exit` handlers (`quick_exit` runs none) and the thread-local destructor callback
-(`_register_thread_local_exe_atexit_callback`); both still reach the host CRT.
+holds both to the Windows sequence (under Wine, whose CRT differs, a native difference is only reported). The
+executable's thread-local destructor callback (`_register_thread_local_exe_atexit_callback`) is kept by the run too:
+the host UCRT accepts one per process and fast-fails the second, and gta6rt's own startup registers the first. `exit`
+and `_cexit` call it once, as `(nullptr, DLL_PROCESS_DETACH, nullptr)`, before the atexit handlers, as the UCRT does,
+so the leaving thread's `thread_local` objects end before the static ones; `_exit`, `quick_exit`, `ExitProcess` and
+`abort` do not. Other threads' `thread_local` objects end through the loader's thread-detach notification, which calls
+the same function from the executable's TLS directory. `run_tiny_atexit` covers `exit` and `_cexit` with a
+`thread_local` object. `at_quick_exit` handlers are not covered (`quick_exit` runs none).
 `run_tiny_frame` does it with a stand-in that imports `d3d12_xs.dll!D3D12XboxCreateDevice` and, with
 `LEONIDA_D3D12=vulkan`, clears a render target and reads it back on the Vulkan device: the loader, the game thread,
 the Xbox-ABI proxies and the device in one process (`test/fixtures/tiny_frame.cpp`; `test/check_tiny_frame.py` checks
