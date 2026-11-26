@@ -466,13 +466,16 @@ fn work(scheduler: &'static Scheduler) {
         let started = std::time::Instant::now();
         let result = job.execute();
         lanes = scheduler.lock();
-        let sample = lanes.count(&job, started);
+        let waits = lanes.count(&job, started);
         lanes.finish(job, result);
         if std::mem::take(&mut lanes.starved) {
             scheduler.work.notify_all();
         }
         scheduler.finished.notify_all();
-        if let Some((limit, used, waits)) = sample {
+        if let Some(waits) = waits
+            && let Some(budget) = &lanes.host_budget
+        {
+            let (limit, used) = (budget.limit, budget.usage());
             drop(lanes);
             let (working_set, available) = super::xmem::host_ram_sample();
             tracing::info!(limit, ?used, waits, ?working_set, ?available, "host RAM budget (bytes)");
@@ -490,7 +493,7 @@ impl Job {
 
 impl Lanes {
     /// Counts a finished request; every 5 s a debug line sums them up.
-    fn count(&mut self, job: &Job, started: std::time::Instant) -> Option<(u64, host_ram::Usage, u64)> {
+    fn count(&mut self, job: &Job, started: std::time::Instant) -> Option<u64> {
         let (requests, bytes, busy) = &mut self.done;
         *requests += 1;
         *bytes += u64::from(job.request.destination_size);
@@ -524,8 +527,8 @@ impl Lanes {
             self.bcpack = Default::default();
             self.since = None;
             let waits = std::mem::take(&mut self.host_waits);
-            if tracing::enabled!(tracing::Level::INFO) && let Some(budget) = &self.host_budget {
-                return Some((budget.limit, budget.usage(), waits));
+            if tracing::enabled!(tracing::Level::INFO) && self.host_budget.is_some() {
+                return Some(waits);
             }
         }
         None
