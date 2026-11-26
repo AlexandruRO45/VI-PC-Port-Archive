@@ -508,6 +508,75 @@ fn world_frame_preparing() {
     unit_costs(&all);
 }
 
+/// One refresh batch asks for the first and last pages of an 8 MiB copy.
+/// The refresh and copy-back counters show whether each step spans the gap.
+#[test]
+#[ignore = "benchmark"]
+fn distant_refreshes_preparing() {
+    let Some(host) = host() else {
+        println!("no host device: nothing measured");
+        return;
+    };
+    const LEN: usize = 8 * MIB;
+    const CPU: u32 = 0x1234_5678;
+    const GPU: u32 = 0x8765_4321;
+    let b = Buffer::new(pool(LEN), LEN, 0).expect("an 8 MiB host copy");
+    b.copy.update(b.start, LEN);
+    let pages = [0, LEN / PAGE - 1];
+    for page in pages {
+        b.write(page, u64::from(CPU), false);
+    }
+    let ranges = pages.map(|page| (b.start + page * PAGE) as u64);
+    let list = host.new_list().expect("a list");
+    for at in ranges {
+        b.copy.refresh(&list, at, PAGE as u64);
+    }
+    for at in ranges {
+        b.copy.gpu_writes(&list, at, PAGE as u64, false);
+    }
+    let copy = b.copy.clone();
+    list.defer_host(move || {
+        for at in ranges {
+            assert_eq!(copy.read_host(at + 64, 1), [CPU], "the refresh reached the copy");
+            copy.write_host(at + 128, &GPU.to_le_bytes());
+        }
+    });
+    list.close();
+
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::take();
+    let merged = COPY_BACK[1].load(Relaxed);
+    host.execute(&[&list]);
+    let merged = COPY_BACK[1].load(Relaxed) - merged;
+    for at in ranges {
+        // SAFETY: the aligned dword is in a page of our pool.
+        let value = unsafe { ((at as usize + 128) as *const u32).read_volatile() };
+        assert_eq!(value, GPU, "the write reached title memory");
+    }
+    println!("two distant {PAGE}-byte ranges of an {LEN}-byte copy: {merged} bytes merged");
+    #[cfg(feature = "diagnostics")]
+    {
+        use crate::copystat::C;
+        let counters = crate::copystat::take();
+        let c = |counter: C| counters[counter as usize];
+        println!(
+            "  {} refreshes, {} bytes requested; {} change checks, {} bytes checked, {} bytes copied",
+            c(C::Refreshes),
+            c(C::RefreshBytes),
+            c(C::Watches),
+            c(C::Checked),
+            c(C::Checked) - c(C::Unchanged),
+        );
+        println!(
+            "  {} bytes snapshotted, {} bytes compared for copy-back",
+            c(C::SnapshotBytes),
+            c(C::CompareBytes),
+        );
+    }
+    list.reset();
+    crate::shadow::unregister(b.start, b.start as u64);
+}
+
 /// Milliseconds since `started`.
 fn ms(started: Instant) -> f64 {
     started.elapsed().as_secs_f64() * 1e3
