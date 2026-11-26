@@ -17,3 +17,8 @@ game_dir = 'D:\victory-data\game'
 # Other Xbox Series titles used to test platform-level code.
 # env: VICTORY_TEST_TITLES (separated by ';')
 test_titles = []
+
+[graphics]
+# Set false to disable ray tracing or true to enable the experimental passes.
+# The CLI switches --no-rt and --rt override VICTORY_RAY_TRACING (0 or 1), then this file.
+# ray_tracing = false

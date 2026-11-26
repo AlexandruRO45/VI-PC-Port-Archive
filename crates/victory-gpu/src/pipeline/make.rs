@@ -23,9 +23,9 @@
 //! Ported from the sibling fork `joshuu/victory-amd`'s 4436f8f1 (its
 //! loading waits only).
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
 use super::Shader;
@@ -37,6 +37,7 @@ pub(crate) struct Pending {
     pub(crate) graphics: Option<Box<GraphicsState>>,
     queue_state: AtomicU8,
     made: OnceLock<Option<HostPipeline>>,
+    finished: (Mutex<()>, Condvar),
     /// What identifies it across runs (shader containers and state), and
     /// whether a draw or dispatch has requested it yet.
     key: String,
@@ -49,51 +50,12 @@ pub(crate) struct Pending {
 
 /// Why a pipeline with these shaders is not made, if it is not.
 fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
-    if without_structures(shaders) {
-        Some("shades ray-tracing hits, left out")
-    } else if too_dear(shaders) {
-        Some("too dear to compile, left out")
+    let policy = super::ray_tracing::policy();
+    if policy.skips_passes() {
+        shaders.iter().find_map(|s| policy.omission(super::ray_tracing::work(s)))
     } else {
         None
     }
-}
-
-/// Whether some compute shader of `shaders` holds `name`.
-fn named(shaders: &[Arc<Shader>], name: &[u8]) -> bool {
-    shaders
-        .iter()
-        .any(|s| s.stage == "compute" && s.container.windows(name.len()).any(|w| w == name))
-}
-
-/// Whether a shader is left out for what it costs the host's driver:
-/// `CS_ScreenProbes_ActivateRays` of the title
-/// (39f0e9aeb156a61c, 66,501 instructions, 9,948 branches). As translated
-/// before the clean-up passes (`emit::shader_opt`), AMD's took a core and
-/// 0.8 GB more every 10 s for it and did not finish (RX 7800 XT: 47 GB after
-/// 8 minutes); cleaned up, it takes 85 s and 1.3 GB, once.
-/// `VICTORY_ACTIVATE_RAYS=0` leaves it out.
-fn too_dear(shaders: &[Arc<Shader>]) -> bool {
-    static OUT: OnceLock<bool> = OnceLock::new();
-    let out = *OUT.get_or_init(|| std::env::var_os("VICTORY_ACTIVATE_RAYS").is_some_and(|v| v == "0"));
-    out && named(shaders, b"CS_ScreenProbes_ActivateRays")
-}
-
-/// Whether a shader only shades what the console's ray-tracing structures
-/// were hit by: about 1,000 compute programs of the title
-/// (`CS_RaytracingResolve`, the `raytracingresolve_dispatch` pass of each
-/// material), all bound at the world's first frame, each 5 to 9 s of AMD's
-/// compiler. They stood in the queue before the passes that make the
-/// picture, and with the structure builder off there is no hit to shade.
-/// Made by default, the picture before loading time (with the builder on
-/// they shade what reflections and indirect light hit);
-/// `VICTORY_RT_RESOLVE=0` leaves them out while the builder is off.
-fn without_structures(shaders: &[Arc<Shader>]) -> bool {
-    static OUT: OnceLock<bool> = OnceLock::new();
-    let out = *OUT.get_or_init(|| {
-        let builder = std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1");
-        std::env::var_os("VICTORY_RT_RESOLVE").is_some_and(|v| v == "0") && !builder
-    });
-    out && named(shaders, b"CS_RaytracingResolve")
 }
 
 // SAFETY: D3D12 objects are free-threaded; the graphics state (whose input
@@ -118,9 +80,26 @@ impl Pending {
             begun: OnceLock::new(),
             queue_state: AtomicU8::new(NOT_QUEUED),
             made: OnceLock::new(),
+            finished: (Mutex::new(()), Condvar::new()),
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
         }
+    }
+
+    /// Identical title pipeline objects share one compilation and its native
+    /// result. The registry does not keep retired states or shaders alive.
+    pub(crate) fn shared(shaders: Vec<Arc<Shader>>, graphics: Option<Box<GraphicsState>>) -> Arc<Self> {
+        static PENDING: std::sync::LazyLock<Mutex<HashMap<String, Weak<Pending>>>> =
+            std::sync::LazyLock::new(Mutex::default);
+        let pending = Self::new(shaders, graphics);
+        let mut known = PENDING.lock().unwrap_or_else(|err| err.into_inner());
+        if let Some(existing) = known.get(&pending.key).and_then(Weak::upgrade) {
+            REUSED.fetch_add(1, Ordering::Relaxed);
+            return existing;
+        }
+        let pending = Arc::new(pending);
+        known.insert(pending.key.clone(), Arc::downgrade(&pending));
+        pending
     }
 
     /// Whether it is a compute pipeline.
@@ -138,7 +117,7 @@ impl Pending {
         let _ = self.begun.set(Instant::now());
         self.made
             .get_or_init(|| HostPipeline::new(&self.shaders, self.graphics.as_deref()));
-        let (lock, done) = &DONE;
+        let (lock, done) = &self.finished;
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
         done.notify_all();
     }
@@ -170,8 +149,7 @@ pub(crate) fn missing(p: &Pending) -> Option<String> {
     }
 }
 
-/// Signalled whenever a worker has made a pipeline.
-static DONE: (Mutex<()>, Condvar) = (Mutex::new(()), Condvar::new());
+static REUSED: AtomicU64 = AtomicU64::new(0);
 
 /// Waiting allowed per title frame, over all threads.
 fn wait_budget() -> Duration {
@@ -305,7 +283,6 @@ pub(crate) fn warm(shaders: Vec<Arc<Shader>>) -> Option<bool> {
 /// run drew with it (during loading, so the world's first frames find it).
 pub(crate) fn early(p: &Arc<Pending>) {
     if p.left_out.is_none() && !p.shaders.is_empty() && super::library::wanted_early(&p.key) {
-        super::library::EARLY.fetch_add(1, Ordering::Relaxed);
         start(p, EARLY);
     }
 }
@@ -438,7 +415,7 @@ fn wait(p: &Pending, frame: u64) {
     if left.is_zero() {
         return;
     }
-    let (lock, done) = &DONE;
+    let (lock, done) = &p.finished;
     let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
     while p.made.get().is_none() && !p.slow() {
         let rest = left.saturating_sub(started.elapsed());
@@ -529,6 +506,9 @@ fn start(p: &Arc<Pending>, priority: u8) {
     let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(new) = queue.push(p, priority) {
         if new {
+            if priority == EARLY {
+                super::library::EARLY.fetch_add(1, Ordering::Relaxed);
+            }
             PEAK.fetch_max(WAITING.fetch_add(1, Ordering::Relaxed) + 1, Ordering::Relaxed);
         }
         AVAILABLE.notify_one();
@@ -592,6 +572,7 @@ fn drained() {
             made = MADE.load(Ordering::Relaxed),
             loaded = LOADED.load(Ordering::Relaxed),
             started_early = EARLY.load(Ordering::Relaxed),
+            shared_requests = REUSED.load(Ordering::Relaxed),
             "host pipelines all made"
         );
     }

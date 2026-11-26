@@ -307,13 +307,14 @@ pub fn run(
 }
 
 /// `victory warm`: fills the caches a run reads (`Command::Warm`).
-pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result<()> {
+pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool, rays: crate::RayOptions) -> Result<()> {
     let paths = crate::default_paths(paths)?;
     let cfg = victory_core::Config::load()?;
+    rays.apply(&cfg);
     victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
     let threads = jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
     let seen = Mutex::new(HashSet::new());
-    let [done, refused, made, unmade] = [const { AtomicUsize::new(0) }; 4];
+    let [done, refused, made, unmade, omitted] = [const { AtomicUsize::new(0) }; 5];
     let started = std::time::Instant::now();
     for root in &paths {
         for entry in walkdir::WalkDir::new(root).into_iter().filter_map(Result::ok) {
@@ -349,7 +350,10 @@ pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result
                             });
                             let Some(stage) = stage else { continue };
                             let compute = pipelines && stage == "compute";
-                            let (translated, pipeline) = victory_hle::modules::d3d12x::warm(stage, bytes, compute);
+                            let Some((translated, pipeline)) = victory_hle::modules::d3d12x::warm_selected(stage, bytes, compute) else {
+                                omitted.fetch_add(1, Ordering::Relaxed);
+                                continue;
+                            };
                             let count = if translated { &done } else { &refused };
                             let n = count.fetch_add(1, Ordering::Relaxed) + 1;
                             match pipeline {
@@ -368,11 +372,12 @@ pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result
     }
     victory_hle::modules::d3d12x::save_pipeline_cache();
     println!(
-        "warm         {} translated, {} refused; {} compute pipelines, {} refused; {:.0} s",
+        "warm         {} translated, {} refused; {} compute pipelines, {} refused; {} omitted by ray-tracing mode; {:.0} s",
         done.into_inner(),
         refused.into_inner(),
         made.into_inner(),
         unmade.into_inner(),
+        omitted.into_inner(),
         started.elapsed().as_secs_f64()
     );
     Ok(())

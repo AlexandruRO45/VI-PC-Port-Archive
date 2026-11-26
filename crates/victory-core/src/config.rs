@@ -22,6 +22,10 @@ pub struct Config {
     pub data_dir: PathBuf,
     /// Other titles used to exercise platform-level code.
     pub test_titles: Vec<PathBuf>,
+    /// Folder containing an optional host FidelityFX upscaler DLL.
+    pub fidelityfx_dir: Option<PathBuf>,
+    /// Explicit ray-tracing preference from the environment or config file.
+    pub ray_tracing: Option<bool>,
     /// The config file that was read, if any.
     pub source: Option<PathBuf>,
 }
@@ -31,6 +35,14 @@ pub struct Config {
 struct FileConfig {
     #[serde(default)]
     paths: FilePaths,
+    #[serde(default)]
+    graphics: Graphics,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Graphics {
+    ray_tracing: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -39,6 +51,7 @@ struct FilePaths {
     game_dir: Option<PathBuf>,
     cache_dir: Option<PathBuf>,
     data_dir: Option<PathBuf>,
+    fidelityfx_dir: Option<PathBuf>,
     #[serde(default)]
     test_titles: Vec<PathBuf>,
 }
@@ -70,7 +83,13 @@ impl Config {
             }
             None => (None, FileConfig::default()),
         };
-        Self::resolve(parsed.paths, source, |k| std::env::var_os(k))
+        let mut cfg = Self::resolve(parsed.paths, source, |k| std::env::var_os(k))?;
+        cfg.ray_tracing = match std::env::var("VICTORY_RAY_TRACING").as_deref() {
+            Ok("0") => Some(false),
+            Ok("1") => Some(true),
+            _ => parsed.graphics.ray_tracing,
+        };
+        Ok(cfg)
     }
 
     fn resolve(
@@ -95,7 +114,9 @@ impl Config {
             game_dir: env_path("VICTORY_GAME_DIR").or(file.game_dir),
             cache_dir,
             data_dir,
+            ray_tracing: None,
             test_titles,
+            fidelityfx_dir: env_path("VICTORY_FIDELITYFX_DIR").or(file.fidelityfx_dir),
             source,
         })
     }
@@ -186,6 +207,14 @@ mod tests {
             cfg.test_titles,
             vec![PathBuf::from("first"), PathBuf::from("second")]
         );
+    }
+
+    #[test]
+    fn graphics_preferences_are_optional_and_accept_explicit_off() {
+        for (text, expected) in [("", None), ("[graphics]\nray_tracing = false", Some(false)),
+            ("[graphics]\nray_tracing = true", Some(true))] {
+            assert_eq!(toml::from_str::<FileConfig>(text).unwrap().graphics.ray_tracing, expected);
+        }
     }
 
     #[test]

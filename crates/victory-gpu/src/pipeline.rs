@@ -63,6 +63,8 @@ pub(crate) struct Shader {
     container: Vec<u8>,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
+    #[cfg(windows)]
+    ray_work: OnceLock<ray_tracing::Work>,
 }
 
 impl std::fmt::Debug for Shader {
@@ -113,6 +115,8 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 container: bytes.to_vec(),
                 #[cfg(windows)]
                 translated: OnceLock::new(),
+                #[cfg(windows)]
+                ray_work: OnceLock::new(),
             })
         })
         .clone()
@@ -124,6 +128,13 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
 /// (`None`: not asked for, or left out).
 #[cfg(windows)]
 pub fn warm(stage: &'static str, container: &[u8], compute: bool) -> (bool, Option<bool>) {
+    warm_selected(stage, container, compute).unwrap_or((false, None))
+}
+
+/// Prewarm a selected shader; an explicit RT-off mode omits RT work before
+/// translation. Callers reporting refusals can count omitted shaders separately.
+#[cfg(windows)]
+pub fn warm_selected(stage: &'static str, container: &[u8], compute: bool) -> Option<(bool, Option<bool>)> {
     let full = blake3::hash(container);
     // Not through the table, which lets nothing go.
     let shader = Arc::new(Shader {
@@ -131,10 +142,15 @@ pub fn warm(stage: &'static str, container: &[u8], compute: bool) -> (bool, Opti
         hash: full.to_hex()[..16].to_owned(),
         container: container.to_vec(),
         translated: OnceLock::new(),
+        ray_work: OnceLock::new(),
     });
+    let policy = ray_tracing::policy();
+    if policy.skips_passes() && policy.omission(ray_tracing::work(&shader)).is_some() {
+        return None;
+    }
     let translated = shader.translated().is_some();
     let made = (translated && compute).then(|| make::warm(vec![shader])).flatten();
-    (translated, made)
+    Some((translated, made))
 }
 
 /// A translated shader and the console resources its code reads.
@@ -260,17 +276,7 @@ static BUILDER: Mutex<Builder> = Mutex::new(Builder {
 /// Whether `shaders` are a pipeline of the structure builder.
 #[cfg(windows)]
 fn of_builder(shaders: &[Arc<Shader>]) -> bool {
-    use victory_shader::{Container, FourCC};
-    let [shader] = shaders else { return false };
-    if shader.stage != "compute" {
-        return false;
-    }
-    let Ok(c) = Container::parse(&shader.container) else {
-        return false;
-    };
-    c.part(FourCC::DXIL)
-        .and_then(|part| victory_shader::native_programs(part.data).ok())
-        .is_some_and(|programs| programs.iter().any(victory_shader::spill::is_spilled))
+    matches!(shaders, [s] if s.stage == "compute" && ray_tracing::work(s) == ray_tracing::Work::Builder)
 }
 
 /// `VICTORY_BVH_QUARANTINE=1`: what the structure builder's stages store
@@ -283,8 +289,7 @@ fn of_builder(shaders: &[Arc<Shader>]) -> bool {
 /// memory when the title writes them.
 #[cfg(windows)]
 pub(crate) fn builder_quarantined(this: This) -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    is_builder(this) && *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_QUARANTINE").is_some_and(|v| v == "1"))
+    is_builder(this) && ray_tracing::policy().quarantine
 }
 
 /// Whether the title's pipeline `this` is one of the structure builder's.
@@ -340,8 +345,7 @@ pub(crate) fn builder_runs() -> bool {
 
 #[cfg(windows)]
 fn builder_allowed() -> bool {
-    static ALLOWED: OnceLock<bool> = OnceLock::new();
-    *ALLOWED.get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1"))
+    ray_tracing::policy().builder
 }
 
 #[cfg(all(windows, feature = "diagnostics"))]
@@ -578,7 +582,7 @@ fn hand_out(
 ) -> HRESULT {
     tracing::trace!(?shaders, "pipeline state");
     #[cfg(windows)]
-    let host = Arc::new(make::Pending::new(shaders.clone(), graphics));
+    let host = make::Pending::shared(shaders.clone(), graphics);
     #[cfg(windows)]
     make::early(&host);
     #[cfg(windows)]
@@ -587,8 +591,10 @@ fn hand_out(
     if builder {
         // Another stage: the group is looked at again at its next dispatch.
         let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
-        b.pipelines.push(host.clone());
-        b.whole = false;
+        if !b.pipelines.iter().any(|pipeline| Arc::ptr_eq(pipeline, &host)) {
+            b.pipelines.push(host.clone());
+            b.whole = false;
+        }
     }
     let pipeline = Box::new(Pipeline {
         object: Object::new(&FUNCTIONS),
@@ -774,6 +780,8 @@ pub(crate) mod host;
 mod library;
 #[cfg(windows)]
 mod make;
+#[cfg(windows)]
+mod ray_tracing;
 
 /// Lets the pipeline library's mapped file go from memory when no pipeline
 /// has loaded for a while (`library::trim`); called by the host's sweep.

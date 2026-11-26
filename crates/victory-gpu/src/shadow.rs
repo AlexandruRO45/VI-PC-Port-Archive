@@ -1245,7 +1245,7 @@ fn find_pieces(scans: Vec<(usize, usize, usize, usize, usize)>) -> Vec<Vec<(usiz
         }
         let found = found.clone();
         jobs.push(Box::new(move || {
-            let mut mine: Found = Vec::with_capacity(group.len());
+            let mut mine: Found = Vec::new();
             for (data, before, start, from, to, which, place) in group {
                 let mut pieces = Vec::new();
                 let mut at = from;
@@ -1266,9 +1266,13 @@ fn find_pieces(scans: Vec<(usize, usize, usize, usize, usize)>) -> Vec<Vec<(usiz
                     }
                     at += n;
                 }
-                mine.push((which, place, pieces));
+                if !pieces.is_empty() {
+                    mine.push((which, place, pieces));
+                }
             }
-            found.lock().unwrap_or_else(|e| e.into_inner()).extend(mine);
+            if !mine.is_empty() {
+                found.lock().unwrap_or_else(|e| e.into_inner()).extend(mine);
+            }
         }));
     };
     let count = scans.len();
@@ -1412,6 +1416,9 @@ mod wide_tests {
                 wanted.push(pieces);
             }
         }
+        // A nonempty, entirely unchanged scan spanning multiple worker jobs.
+        scans.push((before, before, 0, 0, len));
+        wanted.push(Vec::new());
         // A scan of nothing (a range whose snapshot is gone).
         scans.push((0, 0, 0, 0, 0));
         wanted.push(Vec::new());
@@ -2022,7 +2029,7 @@ impl Shadow {
             for &(at, n) in &differing {
                 self.changed(at, at + n);
             }
-            let mut title = vec![0u8; PIECE];
+            let mut scratch = None;
             for (at, n) in differing {
                 // SAFETY: inside the mapping; only the submitting thread
                 // writes it.
@@ -2038,7 +2045,7 @@ impl Shadow {
                 let last = last_difference(host, old).unwrap_or(first);
                 let (at, n) = (at + first, last + 1 - first);
                 let (host, old) = (&mut host[first..=last], &old[first..=last]);
-                let title = &mut title[..n];
+                let title = &mut scratch.get_or_insert_with(|| vec![0u8; PIECE])[..n];
                 if !crate::host::read_into((start + at) as *const u8, title) {
                     continue;
                 }
@@ -2602,7 +2609,9 @@ impl Shadow {
                 // stays stale for the rest.
                 let (start, end) = (self.start as usize, (self.start + self.len) as usize);
                 if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
-                    *at = now;
+                    // Explicit title writes can be newer than the initial
+                    // submission-wide query. Remember the write we just copied.
+                    *at = now.max(write);
                 }
                 run.get_or_insert(page);
             } else if let Some(first) = run.take() {
@@ -3271,6 +3280,27 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     note(&shadow);
     map.insert((start, len), shadow.clone());
     Some(shadow)
+}
+
+#[cfg(test)]
+#[test]
+fn refresh_remembers_writes_newer_than_the_submission_query() {
+    let Some(host) = host() else { return };
+    let (buffer, data) = host.upload_buffer(PAGE as u64).unwrap();
+    let mut guest = vec![0x27u8; 2 * PAGE];
+    let base = guest.as_ptr() as usize;
+    let from = base.next_multiple_of(PAGE);
+    let shadow = Shadow::new(buffer, data, 0, from as u64, PAGE as u64);
+    let to = from + PAGE;
+    let page = from / PAGE;
+    assert_eq!(shadow.copy_stale(from, from + 1, 1, &[(page, 2)]), 1);
+    assert_eq!(shadow.copy_stale(from, to, 1, &[(page, 2)]), PAGE);
+    assert_eq!(shadow.copy_stale(from, to, 1, &[(page, 2)]), 0);
+    guest[from - base] = 0x9b;
+    assert_eq!(shadow.copy_stale(from, to, 1, &[(page, 3)]), PAGE);
+    // SAFETY: the upload remains mapped and the guest page was refreshed.
+    assert_eq!(unsafe { data.read() }, 0x9b);
+    assert_eq!(shadow.copy_stale(from, to, 1, &[(page, 3)]), 0);
 }
 
 #[cfg(test)]

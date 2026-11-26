@@ -69,6 +69,7 @@ fn build() -> &'static [u8; 32] {
             victory_shader::emit::host_max_wave(),
             // Which group barriers wait is part of the translation too.
             u32::from(victory_shader::emit::group_sync()),
+            u32::from(victory_shader::emit::ambient_fallback_enabled()),
             // And which clean-up passes ran over the translated code.
             victory_shader::emit::shader_opt(),
         ] {
@@ -102,10 +103,17 @@ fn build() -> &'static [u8; 32] {
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
     // Reuse every other shader's regular cache. The diagnostic translation
     // must never read or replace the cached uninstrumented shader.
-    if victory_shader::emit::ray_probe_enabled()
-        && &blake3::hash(container).to_hex()[..16] == victory_shader::emit::RAY_PROBE_HASH
-    {
-        return victory_shader::emit::translate_ray_probe(container).map_err(|e| e.to_string());
+    use victory_shader::emit;
+    let ray_probe = emit::ray_probe_enabled();
+    let raw_store_probe = emit::raw_store_probe_enabled();
+    if ray_probe || raw_store_probe {
+        let hash = blake3::hash(container).to_hex();
+        if ray_probe && &hash[..16] == emit::RAY_PROBE_HASH {
+            return emit::translate_ray_probe(container).map_err(|e| e.to_string());
+        }
+        if raw_store_probe && &hash[..16] == emit::RAW_STORE_PROBE_HASH {
+            return emit::translate_raw_store_probe(container).map_err(|e| e.to_string());
+        }
     }
     let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
     match CACHE.get() {

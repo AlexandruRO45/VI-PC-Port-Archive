@@ -127,8 +127,12 @@ pub(crate) enum C {
     WaitsForGroups,
     WaitsForBuffers,
     IndirectBounded,
+    IndirectWindowHits,
+    HeapViewResolveUs,
+    HeapBufferRefreshUs,
+    HeapTextureStageUs,
 }
-const COUNTERS: usize = 80;
+const COUNTERS: usize = C::HeapTextureStageUs as usize + 1;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -694,6 +698,10 @@ fn log_memory() {
     // budget and use the lines below print.
     if let Some(h) = crate::host::host() {
         h.log_video_memory("with the memory line");
+        let (textures, heaps) = h.small_textures.totals();
+        tracing::info!("small texture placements since startup: {textures} textures on {heaps} native 64 KiB heaps");
+        let (created, reused) = crate::texture::upload_pool_totals();
+        tracing::info!("texture staging pool since startup: {created} chunks made, {reused} allocations served by existing chunks");
     }
     // What else holds memory: the map, on a thread of its own, with every
     // sixth line; and what the shader table and the pipeline library keep.
@@ -1251,11 +1259,19 @@ pub(crate) fn log(frames: f64) {
     tracing::info!(
         "  waits for every earlier shader write, per frame: {:.0} for the title's barrier groups, {:.0} \
          for its barriers on buffers; {:.0} indirect commands bounded (a dispatch of ours between two \
-         such waits each); barrier experiment {}",
+         such waits each), {:.0} reused clamped commands; barrier experiment {}",
         c[C::WaitsForGroups as usize],
         c[C::WaitsForBuffers as usize],
         c[C::IndirectBounded as usize],
+        c[C::IndirectWindowHits as usize],
         barrier_test()
+    );
+    tracing::info!(
+        "  heap streaming per frame: {:.1} ms resolving buffer views, {:.1} ms preparing buffer refreshes, \
+         {:.1} ms staging textures",
+        c[C::HeapViewResolveUs as usize] / 1e3,
+        c[C::HeapBufferRefreshUs as usize] / 1e3,
+        c[C::HeapTextureStageUs as usize] / 1e3,
     );
     // What is compared after submissions, largest first, and how much of
     // it shaders had written.
