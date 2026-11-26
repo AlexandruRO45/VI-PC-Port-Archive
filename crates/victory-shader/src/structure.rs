@@ -1182,8 +1182,10 @@ impl<'a> Lanes<'a> {
                         && let Some(k) = self.key(|r| inst.read(r), code)
                     {
                         let phi = self.phis.contains_key(&k.0) || self.phis.contains_key(&k.1);
+                        let restored =
+                            self.restored.contains_key(&k.0) && self.restored.contains_key(&k.1);
                         takes_mask |= self.masks.contains_key(&k)
-                            || phi && !self.joins_loaded(k) && self.mask(k).1;
+                            || (phi && !self.joins_loaded(k) || restored) && self.mask(k).1;
                     }
                 }
                 let touches_exec =
@@ -1242,6 +1244,18 @@ impl<'a> Lanes<'a> {
                     && let Some(k) = self.key(|r| inst.read(r), code)
                 {
                     self.mask(k);
+                }
+                // A wave32 mask restored from a VGPR lane via `v_readlane_b32`
+                // keeps its mask identity without claiming EXEC at the restore.
+                if !self.p.wave64
+                    && name == "v_readlane_b32"
+                    && let Some(&(_, r)) = inst.writes.first()
+                    && self
+                        .restored
+                        .get(&r)
+                        .is_some_and(|&orig| self.masks.contains_key(&(orig, orig)))
+                {
+                    self.mask((r, r));
                 }
                 if name.starts_with("v_cmpx") {
                     if let Some(k) = self.key(|r| inst.write(r), EXEC) {
@@ -1730,6 +1744,30 @@ mod tests {
         assert_eq!(p.blocks[0].exit.successors(), [2, 4]);
         assert_eq!(p.blocks[1].preds, [2]);
         assert!(structure(&p).is_ok());
+    }
+
+    #[test]
+    fn restored_mask_feeds_sop_mask_op() {
+        let p = build(
+            &[
+                0x7D84_0080, // v_cmp_eq_u32_e32 vcc_lo, 0, v0
+                0xD761_0005,
+                0x0001_006A, // v_writelane_b32 v5, vcc_lo, 0
+                0xD760_0006,
+                0x0001_0105, // v_readlane_b32 s6, v5, 0
+                0x8701_7E06, // s_and_b32 s1, s6, exec_lo
+                S_ENDPGM,
+            ],
+            false,
+        );
+        let s = structure(&p).unwrap();
+        let read = p.blocks[0].insts[2].write(Reg::S(6)).unwrap();
+        let and = p.blocks[0].insts[3].write(Reg::S(1)).unwrap();
+        assert!(s.masks.contains_key(&read), "restored wave32 mask tracked");
+        assert!(
+            s.masks.contains_key(&and),
+            "SOP reading restored mask tracked"
+        );
     }
 
     /// [`Bools::vars`] as it was: lists of the nodes and variables seen.
