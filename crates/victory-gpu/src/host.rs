@@ -2364,18 +2364,25 @@ impl Deferred {
     /// [`Deferred::default`] gives, so nothing leaks across resets: the
     /// held uploads pass out of [`ALIVE`] as they would when dropped.
     fn clear(&mut self) {
-        ALIVE[6].fetch_sub(self.uploads.len() as u64, Ordering::Relaxed);
-        ALIVE[7].fetch_sub(self.upload_bytes, Ordering::Relaxed);
-        self.copies.clear();
-        self.uploads.clear();
-        self.upload_bytes = 0;
-        self.kept.clear();
-        self.refreshed.clear();
-        self.textures.clear();
-        self.writes.clear();
-        self.backs.clear();
-        self.budget_zeroed = false;
-        self.indirect_readable = 0;
+        // Every field belongs to one recording. Adding one must also decide how it resets.
+        let Self {
+            copies, uploads, upload_bytes, kept, refreshed, textures, writes, backs,
+            back_wanted, texture_backs, budget_zeroed, indirect_readable,
+        } = self;
+        ALIVE[6].fetch_sub(uploads.len() as u64, Ordering::Relaxed);
+        ALIVE[7].fetch_sub(*upload_bytes, Ordering::Relaxed);
+        copies.clear();
+        uploads.clear();
+        *upload_bytes = 0;
+        kept.clear();
+        refreshed.clear();
+        textures.clear();
+        writes.clear();
+        backs.clear();
+        back_wanted.clear();
+        texture_backs.clear();
+        *budget_zeroed = false;
+        *indirect_readable = 0;
     }
 }
 
@@ -7017,9 +7024,13 @@ impl HostList {
     /// through unordered access: if it is of a kind copied back
     /// ([`crate::texback`]), the list copies it when it closes.
     pub(crate) fn texture_written(&self, resource: crate::object::This) {
-        if !crate::texback::wanted(resource) {
-            return;
+        if crate::texback::wanted(resource) {
+            self.queue_texture_readback(resource);
         }
+    }
+
+    /// Request a copy of this texture when the recording closes.
+    pub(super) fn queue_texture_readback(&self, resource: crate::object::This) {
         let mut deferred = self.deferred();
         if !deferred.back_wanted.iter().any(|target| target.owner() == resource as usize)
             && let Some(target) = crate::texback::Target::new(resource)
