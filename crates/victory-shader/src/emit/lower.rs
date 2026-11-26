@@ -2233,18 +2233,10 @@ impl<'a> Lower<'a> {
         let da = self.s.m.bin(cur, Bin::Sub, p, ap);
         let db = self.s.m.bin(cur, Bin::Sub, c, bp);
         let t = self.s.m.bin(cur, Bin::Add, da, db);
-        let (pmin32, nmin32, pzero32) = (
-            self.s.m.f32(0x0080_0000),
-            self.s.m.f32(0x8080_0000),
-            self.s.m.f32(0),
-        );
+        let (pmin32, nmin32, pzero32) = (self.s.m.f32(0x0080_0000), self.s.m.f32(0x8080_0000), self.s.m.f32(0));
         let zero64 = self.s.m.cast(cur, Cast::FpExt, pzero32, f64t);
         let s_bits = self.s.m.cast(cur, Cast::Bitcast, s, i64t);
-        let (exp_mask, one64, zero64_i) = (
-            self.s.m.i64(0x7ff0_0000_0000_0000),
-            self.s.m.i64(1),
-            self.s.m.i64(0),
-        );
+        let (exp_mask, one64, zero64_i) = (self.s.m.i64(0x7ff0_0000_0000_0000), self.s.m.i64(1), self.s.m.i64(0));
         let s_exp = self.s.m.bin(cur, Bin::And, s_bits, exp_mask);
         let finite = self.s.m.cmp(cur, pred::NE, s_exp, exp_mask);
         let s_lsb = self.s.m.bin(cur, Bin::And, s_bits, one64);
@@ -2273,9 +2265,12 @@ impl<'a> Lower<'a> {
         let lt_zero = self.s.m.cmp(cur, pred::OLT, r64, zero64);
         let neg_tiny = self.s.m.bin(cur, Bin::And, gt_neg, lt_zero);
         let tiny = self.s.m.bin(cur, Bin::Or, pos_tiny, neg_tiny);
-        let (nzero_i32, pzero_i32) = (self.s.m.i32(0x8000_0000), self.s.m.i32(0));
-        let zero_bits = self.s.m.select(cur, lt_zero, nzero_i32, pzero_i32);
-        let signed_zero = self.as_float(zero_bits);
+        let nz = self.s.m.i32(0x8000_0000);
+        let k = self.s.m.i64(32);
+        let hi = self.s.m.bin(cur, Bin::LShr, r_bits, k);
+        let hi = self.s.m.cast(cur, Cast::Trunc, hi, self.s.t.i32);
+        let zb = self.s.m.bin(cur, Bin::And, hi, nz);
+        let signed_zero = self.as_float(zb);
         let trunc = self.s.m.cast(cur, Cast::FpTrunc, r64, self.s.t.f32);
         let r = self.s.m.select(cur, tiny, signed_zero, trunc);
         self.ftz(r)
