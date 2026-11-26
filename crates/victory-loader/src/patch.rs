@@ -20,7 +20,12 @@ pub(crate) struct Patch {
 
 /// A hex number, with an optional `0x` prefix, like the other knobs.
 fn hex(s: &str) -> Option<usize> {
-    usize::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok()
+    let s = s.trim().trim_start_matches("0x");
+    // `from_str_radix` would accept a leading `+`; hex digits only.
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    usize::from_str_radix(s, 16).ok()
 }
 
 /// An even-length run of hex digits, with an optional `0x` prefix.
@@ -72,11 +77,12 @@ fn planned<'a>(patches: &'a [Patch], module: &str, size: usize) -> Vec<&'a Patch
         .collect()
 }
 
-/// Writes `patch` into `image`, returning the replaced bytes. The caller has
-/// bounds-checked the range through [`planned`].
-fn write(image: &mut [u8], patch: &Patch) -> Vec<u8> {
-    let old = image[patch.rva..patch.rva + patch.bytes.len()].to_vec();
-    image[patch.rva..patch.rva + patch.bytes.len()].copy_from_slice(&patch.bytes);
+/// Writes `patch` at the start of `target` — the image bytes at
+/// `patch.rva` — returning the replaced bytes. The caller has bounds-checked
+/// the range through [`planned`].
+fn write(target: &mut [u8], patch: &Patch) -> Vec<u8> {
+    let old = target[..patch.bytes.len()].to_vec();
+    target[..patch.bytes.len()].copy_from_slice(&patch.bytes);
     old
 }
 
@@ -85,7 +91,19 @@ fn write(image: &mut [u8], patch: &Patch) -> Vec<u8> {
 pub(crate) fn apply(base: usize, size: usize, module: &str) {
     use std::ffi::c_void;
 
-    use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
+    use windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache;
+    use windows_sys::Win32::System::Memory::{PAGE_EXECUTE_READWRITE, VirtualProtect};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+    /// Restores a range's page protection on drop, including on unwind.
+    struct RestoreProtection(*const c_void, usize, u32);
+    impl Drop for RestoreProtection {
+        fn drop(&mut self) {
+            let mut ignored = 0;
+            // SAFETY: restoring the range's own protection.
+            unsafe { VirtualProtect(self.0, self.1, self.2, &mut ignored) };
+        }
+    }
 
     let patches = from_env();
     let planned = planned(&patches, module, size);
@@ -106,9 +124,12 @@ pub(crate) fn apply(base: usize, size: usize, module: &str) {
         let mut protection = 0;
         // SAFETY: `at..at + len` lies inside the mapped image, checked by
         // `planned`; the pages may be read-only (`.text`), so lift the
-        // protection for the write, then restore it.
-        if unsafe { VirtualProtect(at as *const c_void, len, PAGE_READWRITE, &mut protection) }
-            == 0
+        // protection for the write, then restore it. The target is code, so
+        // keep the pages executable while writable, like the TLS
+        // redirection.
+        if unsafe {
+            VirtualProtect(at as *const c_void, len, PAGE_EXECUTE_READWRITE, &mut protection)
+        } == 0
         {
             tracing::warn!(
                 module,
@@ -118,11 +139,15 @@ pub(crate) fn apply(base: usize, size: usize, module: &str) {
             );
             continue;
         }
-        // SAFETY: in-bounds of the mapped image, made writable above.
+        let restore = RestoreProtection(at as *const c_void, len, protection);
+        // SAFETY: in-bounds of the mapped image, made writable above; the
+        // slice starts at the patch's rva, which is where `write` puts the
+        // bytes.
         let old = write(unsafe { std::slice::from_raw_parts_mut(at as *mut u8, len) }, patch);
-        let mut ignored = 0;
-        // SAFETY: restoring the range's own protection.
-        unsafe { VirtualProtect(at as *const c_void, len, protection, &mut ignored) };
+        drop(restore);
+        // SAFETY: flushing the code this patch wrote, like the TLS
+        // redirection.
+        unsafe { FlushInstructionCache(GetCurrentProcess(), at as *const c_void, len) };
         tracing::info!(
             module,
             rva = format_args!("{:#x}", patch.rva),
@@ -159,9 +184,10 @@ mod tests {
 
     #[test]
     fn skips_malformed_entries() {
-        // Missing fields, a bad rva, odd-length and empty byte runs, a
-        // non-hex byte and an empty module name are all dropped.
-        let patches = parse("game.exe:10, game.exe:zz:90, game.exe:10:9, game.exe:10:0x, game.exe:10:9g, :10:90");
+        // Missing fields, a bad rva (including the `+` `from_str_radix`
+        // would accept), odd-length and empty byte runs, a non-hex byte and
+        // an empty module name are all dropped.
+        let patches = parse("game.exe:10, game.exe:zz:90, game.exe:+10:90, game.exe:0x+10:90, game.exe:10:9, game.exe:10:0x, game.exe:10:9g, :10:90");
         assert!(patches.is_empty(), "{patches:?}");
         // One good entry survives among them.
         let patches = parse("game.exe:zz:90,game.exe:10:9091");
@@ -195,7 +221,8 @@ mod tests {
         let patches = parse("game.exe:4:010203");
         let planned = planned(&patches, "game.exe", 16);
         let mut image = [0xccu8; 16];
-        let old = write(&mut image, planned[0]);
+        // `apply` passes the image bytes at the patch's rva.
+        let old = write(&mut image[4..7], planned[0]);
         assert_eq!(old, [0xcc, 0xcc, 0xcc]);
         assert_eq!(&image[4..7], &[1, 2, 3]);
         assert_eq!(image[7], 0xcc);
