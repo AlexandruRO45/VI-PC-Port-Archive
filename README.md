@@ -11,7 +11,7 @@ SeriesBridge is a proposed Windows application made of two separate components:
 
 The project is intended to investigate a practical Windows compatibility architecture, with GTA VI as a possible research target where the user already has lawful access to the required files. Compatibility must be demonstrated through testing; it must never be assumed from the fact that an executable can be loaded.
 
-![image](https://github.com/ozqari/VI-Claud/blob/main/Neon%20Purple%20GTA%20VI%20Game%20Launcher.png)
+![image](https://github.com/ozqari/SeriesBridge/blob/main/Neon%20Purple%20GTA%20VI%20Game%20Launcher.png)
 
 ## Project goals
 
