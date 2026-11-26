@@ -12,6 +12,7 @@
 //! interrupted pre-build keeps its work, and the next one finds those
 //! pipelines there.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -39,29 +40,15 @@ enum Job {
 pub fn run(paths: &[PathBuf], threads: usize) -> Result<()> {
     let started = Instant::now();
     pipeline::use_pipeline_cache(victory_core::Config::load()?.cache_subdir("pipelines")?);
-    // The files that hold shaders (or the pack itself).
-    let files: Vec<(PathBuf, Vec<u8>)> = paths
-        .iter()
-        .flat_map(|root| {
-            walkdir::WalkDir::new(root)
-                .into_iter()
-                .filter_map(Result::ok)
-        })
-        .filter(|e| e.file_type().is_file() && e.metadata().is_ok_and(|m| m.len() <= MAX_FILE))
-        .filter_map(|e| Some((e.path().to_owned(), std::fs::read(e.path()).ok()?)))
-        .filter(|(_, d)| d.starts_with(shaderpack::MAGIC) || !sources(d).is_empty())
-        .collect();
-    // It ships beside the shader databases.
-    let found = (files.iter())
-        .filter(|(_, d)| d.starts_with(shaderpack::MAGIC) || sgd5::is_sgd5(d))
-        .find_map(|(p, d)| Some((p, shaderpack::find(d)?)));
-    let Some((pack_path, pack)) = found else {
+    let inputs = collect_inputs(paths);
+    let Some((pack_path, pack)) = find_pack(&inputs) else {
         println!("pipelines    no shader pack among the files: nothing to pre-build");
         return Ok(());
     };
     let pack = shaderpack::Pack::parse(&pack).map_err(anyhow::Error::msg)?;
     let graphics: Vec<shaderpack::Graphics> = pack.graphics().collect();
     let compute: Vec<shaderpack::Compute> = pack.compute().collect();
+    let files = &inputs.shader_files;
 
     // Every container by the hash instructions its native program starts
     // with, which the pack's programs start with too.
@@ -241,7 +228,7 @@ pub fn run(paths: &[PathBuf], threads: usize) -> Result<()> {
             })
             .collect();
         let (n, what) = (todo.len(), "pipelines to make");
-        crate::translate::report(pack_path, n, what, &next, started, &workers, || {
+        crate::translate::report(&pack_path, n, what, &next, started, &workers, || {
             let (made, loaded) = counts();
             format!("; {made} made, {loaded} found in the library")
         });
@@ -291,6 +278,243 @@ fn program_ids(bytes: &[u8]) -> Vec<([u8; 24], HwStage)> {
         .unwrap_or_default()
 }
 
+struct Inputs {
+    /// First standalone shader-pack file (`PS\0\x09`) without shader containers.
+    direct_pack: Option<(PathBuf, Vec<u8>)>,
+    /// Files holding shader containers (`SGD5` or `DXBC`), kept for program/database lookup.
+    shader_files: Vec<(PathBuf, Vec<u8>)>,
+    /// Remaining files within `MAX_FILE`, checked for a compressed pack only if the fast path misses.
+    other_paths: Vec<PathBuf>,
+}
+
+fn collect_inputs(paths: &[PathBuf]) -> Inputs {
+    let mut inputs = Inputs {
+        direct_pack: None,
+        shader_files: Vec::new(),
+        other_paths: Vec::new(),
+    };
+    for entry in paths
+        .iter()
+        .flat_map(|root| {
+            walkdir::WalkDir::new(root)
+                .into_iter()
+                .filter_map(Result::ok)
+        })
+        .filter(|e| e.file_type().is_file() && e.metadata().is_ok_and(|m| m.len() <= MAX_FILE))
+    {
+        let path = entry.path();
+        let Ok(data) = std::fs::read(path) else {
+            continue;
+        };
+        if !sources(&data).is_empty() {
+            inputs.shader_files.push((path.to_owned(), data));
+        } else if data.starts_with(shaderpack::MAGIC) {
+            if inputs.direct_pack.is_none() {
+                inputs.direct_pack = Some((path.to_owned(), data));
+            }
+        } else {
+            inputs.other_paths.push(path.to_owned());
+        }
+    }
+    inputs
+}
+
+/// Locates the shader pack across the scanned inputs: first checking direct
+/// `PS\0\x09` and `SGD5` fast paths, then falling back to `shaderpack::find`
+/// on remaining shader files and other candidate paths.
+fn find_pack(inputs: &Inputs) -> Option<(PathBuf, Cow<'_, [u8]>)> {
+    if let Some((path, data)) = &inputs.direct_pack
+        && let Some(pack) = shaderpack::find(data)
+    {
+        return Some((path.clone(), pack));
+    }
+    let find_in = |fast: bool| {
+        inputs
+            .shader_files
+            .iter()
+            .filter(|(_, d)| (d.starts_with(shaderpack::MAGIC) || sgd5::is_sgd5(d)) == fast)
+            .find_map(|(p, d)| Some((p.clone(), shaderpack::find(d)?)))
+    };
+    find_in(true).or_else(|| find_in(false)).or_else(|| {
+        inputs.other_paths.iter().find_map(|path| {
+            let data = std::fs::read(path).ok()?;
+            let pack = shaderpack::find(&data)?.into_owned();
+            Some((path.clone(), Cow::Owned(pack)))
+        })
+    })
+}
+
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new() -> Self {
+            static NEXT: AtomicUsize = AtomicUsize::new(0);
+            let dir = std::env::temp_dir().join(format!(
+                "victory-prebuild-test-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+
+        fn write(&self, name: &str, bytes: &[u8]) -> PathBuf {
+            let path = self.0.join(name);
+            std::fs::write(&path, bytes).unwrap();
+            path
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn minimal_pack(fingerprint: u64) -> Vec<u8> {
+        let mut out = vec![0; 0x80];
+        out[..4].copy_from_slice(shaderpack::MAGIC);
+        out[0x48..0x50].copy_from_slice(&fingerprint.to_le_bytes());
+        out
+    }
+
+    fn minimal_dxbc() -> Vec<u8> {
+        let mut out = vec![0; 0x20];
+        out[..4].copy_from_slice(b"DXBC");
+        out[0x18..0x1C].copy_from_slice(&0x20_u32.to_le_bytes());
+        out
+    }
+
+    fn zlib_stored(data: &[u8]) -> Vec<u8> {
+        assert!(data.len() <= u16::MAX as usize);
+        let len = data.len() as u16;
+        let mut out = vec![0x78, 0x01, 0x01];
+        out.extend_from_slice(&len.to_le_bytes());
+        out.extend_from_slice(&(!len).to_le_bytes());
+        out.extend_from_slice(data);
+        let (mut s1, mut s2) = (1u32, 0u32);
+        for &b in data {
+            s1 = (s1 + u32::from(b)) % 65521;
+            s2 = (s2 + s1) % 65521;
+        }
+        out.extend_from_slice(&((s2 << 16) | s1).to_be_bytes());
+        out
+    }
+
+    fn archive_with_pack(prefix: &[u8], pack: &[u8]) -> Vec<u8> {
+        let mut out = prefix.to_vec();
+        if out.is_empty() {
+            out.extend_from_slice(b"ARCHIVE_HEADER_0");
+        }
+        out.resize(out.len().next_multiple_of(16), 0);
+        out.extend_from_slice(&zlib_stored(pack));
+        out.extend_from_slice(&[0; 16]);
+        out
+    }
+
+    #[test]
+    fn finds_compressed_pack_only_archive_without_polluting_shader_files() {
+        let dir = TempDir::new();
+        let junk = dir.write("junk.bin", b"plain non-shader non-pack data");
+        let dxbc_path = dir.write("shaders.dxbc", &minimal_dxbc());
+        let expected = minimal_pack(0x1122_3344_5566_7788);
+        let archive = archive_with_pack(b"RPF_NO_MAGIC_HDR", &expected);
+        assert!(!archive.starts_with(shaderpack::MAGIC));
+        assert!(!sgd5::is_sgd5(&archive));
+        assert!(sources(&archive).is_empty());
+        let pack_only = dir.write("pack-only.rpf", &archive);
+
+        let inputs = collect_inputs(&[junk, dxbc_path.clone(), pack_only.clone()]);
+        assert_eq!(inputs.shader_files.len(), 1);
+        assert_eq!(inputs.shader_files[0].0, dxbc_path);
+
+        let (found_path, found_pack) =
+            find_pack(&inputs).expect("compressed pack-only archive must be discovered");
+        assert_eq!(found_path, pack_only);
+        let parsed = shaderpack::Pack::parse(&found_pack).unwrap();
+        assert_eq!(parsed.fingerprint(), 0x1122_3344_5566_7788);
+    }
+
+    #[test]
+    fn finds_compressed_pack_in_dxbc_archive_without_sgd5_magic() {
+        let dir = TempDir::new();
+        let expected = minimal_pack(0xCAFE_BABE);
+        let mut mixed = minimal_dxbc();
+        mixed = archive_with_pack(&mixed, &expected);
+        assert!(!mixed.starts_with(shaderpack::MAGIC));
+        assert!(!sgd5::is_sgd5(&mixed));
+        assert!(!sources(&mixed).is_empty());
+        let mixed_path = dir.write("mixed.rpf", &mixed);
+
+        let inputs = collect_inputs(std::slice::from_ref(&mixed_path));
+        assert_eq!(inputs.shader_files.len(), 1);
+        assert!(inputs.other_paths.is_empty());
+
+        let (found_path, found_pack) =
+            find_pack(&inputs).expect("compressed pack in dxbc archive must be discovered");
+        assert_eq!(found_path, mixed_path);
+        assert_eq!(
+            shaderpack::Pack::parse(&found_pack).unwrap().fingerprint(),
+            0xCAFE_BABE
+        );
+    }
+
+    #[test]
+    fn prefers_direct_magic_and_sgd5_fast_paths_and_returns_none_when_absent() {
+        // Direct PS\0\x09 file wins and stays out of shader_files.
+        let dir = TempDir::new();
+        let direct = dir.write("direct.pack", &minimal_pack(0xAAAA));
+        let fallback = dir.write(
+            "fallback.rpf",
+            &archive_with_pack(b"RPF_FALLBACK", &minimal_pack(0xBBBB)),
+        );
+        let dxbc = dir.write("shaders.dxbc", &minimal_dxbc());
+        let inputs = collect_inputs(&[fallback, dxbc.clone(), direct.clone()]);
+        assert_eq!(inputs.shader_files.len(), 1);
+        assert_eq!(inputs.shader_files[0].0, dxbc);
+        let (found_path, found_pack) = find_pack(&inputs).unwrap();
+        assert_eq!(found_path, direct);
+        assert_eq!(
+            shaderpack::Pack::parse(&found_pack).unwrap().fingerprint(),
+            0xAAAA
+        );
+
+        // SGD5 archive wins over pack-only archive via the fast path.
+        let dir2 = TempDir::new();
+        let mut sgd5_blob = b"SGD5PADDING_0000".to_vec();
+        sgd5_blob.extend_from_slice(&minimal_dxbc());
+        let sgd5_archive = archive_with_pack(&sgd5_blob, &minimal_pack(0xCCCC));
+        let sgd5_path = dir2.write("shaders.sgd5", &sgd5_archive);
+        let fallback2 = dir2.write(
+            "pack-only.rpf",
+            &archive_with_pack(b"RPF_FALLBACK", &minimal_pack(0xDDDD)),
+        );
+        let inputs2 = collect_inputs(&[fallback2.clone(), sgd5_path.clone()]);
+        // Fast path must short-circuit without touching `other_paths`.
+        std::fs::remove_file(&fallback2).unwrap();
+        let (found_path2, found_pack2) = find_pack(&inputs2).unwrap();
+        assert_eq!(found_path2, sgd5_path);
+        assert_eq!(
+            shaderpack::Pack::parse(&found_pack2).unwrap().fingerprint(),
+            0xCCCC
+        );
+
+        // No pack anywhere -> None, and non-shader files still do not pollute shader_files.
+        let dir3 = TempDir::new();
+        let junk = dir3.write("notes.txt", b"not a shader or pack");
+        let only_dxbc = dir3.write("only.dxbc", &minimal_dxbc());
+        let inputs3 = collect_inputs(&[junk, only_dxbc.clone()]);
+        assert_eq!(inputs3.shader_files.len(), 1);
+        assert_eq!(inputs3.shader_files[0].0, only_dxbc);
+        assert!(find_pack(&inputs3).is_none());
+    }
 }
