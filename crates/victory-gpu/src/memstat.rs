@@ -185,7 +185,56 @@ pub fn report() -> String {
                 mib(commit),
                 mib(commit_total)
             );
+            warn_if_commit_low(commit, commit_total);
         }
     }
     line
+}
+
+/// Commit left below which the memory log warns: allocations start to fail
+/// there, Windows grows a system-managed paging file only slowly, and the
+/// host device losses seen on RDNA2 cards came with less than this left.
+const LOW_COMMIT: u64 = 4 << 30;
+
+/// Whether the commit left (limit minus in use) is below `LOW_COMMIT`.
+fn commit_is_low(in_use: u64, limit: u64) -> bool {
+    limit.saturating_sub(in_use) < LOW_COMMIT
+}
+
+/// Warns, at most once a minute, while the machine's commit is nearly
+/// spent.
+#[cfg(windows)]
+fn warn_if_commit_low(in_use: u64, limit: u64) {
+    static LAST: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+    if !commit_is_low(in_use, limit) {
+        return;
+    }
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    if last.is_none_or(|at| at.elapsed() >= std::time::Duration::from_secs(60)) {
+        *last = Some(std::time::Instant::now());
+        tracing::warn!(
+            left_mib = limit.saturating_sub(in_use) >> 20,
+            limit_mib = limit >> 20,
+            "the machine's commit limit is nearly reached: allocations may fail and the host GPU \
+             device may be lost; close other programs or set a larger paging file (System, \
+             Advanced system settings, Performance, Virtual memory)"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn commit_is_low_below_four_gib_left() {
+        let gib = 1u64 << 30;
+        assert!(!commit_is_low(40 * gib, 60 * gib));
+        assert!(!commit_is_low(56 * gib, 60 * gib));
+        assert!(commit_is_low(56 * gib + 1, 60 * gib));
+        assert!(commit_is_low(58 * gib, 59 * gib));
+        // In use above the limit (asked at two moments) is low, not an
+        // overflow.
+        assert!(commit_is_low(61 * gib, 60 * gib));
+    }
 }
