@@ -120,21 +120,16 @@ pub(crate) fn lower_with(
     match lower_for(parts, host_wave64) {
         Err(e) if !host_wave64 && approx && e.to_string().contains("without 64-lane waves") => {
             let _undeclared = super::shader::UndeclaredWave64::new();
-            let _capped = CappedLoops::new(APPROX_LOOP_LIMIT);
+            let _capped = CappedLoops::new(super::wave64_approx_loops());
             lower_for(parts, true)
         }
         r => r,
     }
 }
 
-/// Iterations after which a loop of a program lowered approximately
-/// ([`lower_with`]) is left. Such a program's loops can wait for what the
-/// other half of a console wave was to give, which in the host's narrower
-/// waves never comes: at [`LOOP_LIMIT`] per lane, Grand Theft Auto VI's
-/// first 3D scene kept the GPU busy for minutes.
-/// shortcut: a genuine loop of more iterations in such a program is cut
-/// short too.
-const APPROX_LOOP_LIMIT: u32 = 64;
+// Approximately lowered loops stop after `super::wave64_approx_loops`
+// iterations: they can wait for the console wave's other half, which never
+// comes (shortcut: genuine longer loops are cut too).
 
 thread_local! {
     /// A lower iteration limit for programs lowered on this thread now

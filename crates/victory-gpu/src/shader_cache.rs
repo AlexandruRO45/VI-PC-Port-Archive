@@ -99,7 +99,10 @@ pub fn host_shader(container: &[u8]) -> (Result<HostShader, String>, bool) {
             let key = if victory_shader::emit::host_wave64() {
                 *build()
             } else if victory_shader::emit::wave64_approx() {
-                *blake3::hash(&[&build()[..], b"wave32-approx"].concat()).as_bytes()
+                {
+                    let loops = victory_shader::emit::wave64_approx_loops().to_le_bytes();
+                    *blake3::hash(&[&build()[..], b"wave32-approx", &loops[..]].concat()).as_bytes()
+                }
             } else {
                 *blake3::hash(&[&build()[..], b"wave32"].concat()).as_bytes()
             };

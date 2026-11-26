@@ -272,6 +272,18 @@ pub fn set_wave64_approx(on: bool) {
     WAVE64_APPROX.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Iterations after which a loop of an approximately lowered wave64
+/// program is left: `VICTORY_WAVE64_LOOPS` (1 to 4096), 64 without it.
+pub fn wave64_approx_loops() -> u32 {
+    static LOOPS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *LOOPS.get_or_init(|| {
+        std::env::var("VICTORY_WAVE64_LOOPS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .map_or(64, |n| n.clamp(1, 4096))
+    })
+}
+
 /// What [`set_wave64_approx`] last set.
 pub fn wave64_approx() -> bool {
     WAVE64_APPROX.load(std::sync::atomic::Ordering::Relaxed)
