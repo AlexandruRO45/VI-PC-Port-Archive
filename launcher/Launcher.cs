@@ -1,5 +1,5 @@
-// Minimal game launcher: pick the game's .exe once, pick a runtime, press PLAY. Slideshow of the pictures in
-// backgrounds\ (drop more on the window), music from the game's own audio.
+// Minimal game launcher: pick the game's .exe once, pick a runtime, press PLAY. Side tabs: Launcher, Conversion
+// (the runtime), Settings. Slideshow of the pictures in backgrounds\ (drop more on the window), music from the game's own audio.
 // Runtimes: the archive top 3 (AnyXboxX left out, ztrx always 3rd) plus Hyphen (hyphenn, was victory-fork), VIctory and xcl.
 // Build: build.bat (uses the C# compiler that ships with Windows, C# 5).
 using System;
@@ -23,8 +23,8 @@ using System.Xml;
 [assembly: AssemblyTitle("GTA VI Launcher")]
 [assembly: AssemblyDescription("Runs your game dump through the PC port runtimes")]
 [assembly: AssemblyProduct("GTA VI Launcher")]
-[assembly: AssemblyVersion("1.4.0.0")]
-[assembly: AssemblyFileVersion("1.4.0.0")]
+[assembly: AssemblyVersion("1.5.0.0")]
+[assembly: AssemblyFileVersion("1.5.0.0")]
 
 // One runtime project, as the archive's site describes it.
 class Runtime
@@ -194,8 +194,10 @@ static class Launcher
         string[] saved = File.Exists(Settings) ? File.ReadAllLines(Settings) : new string[0];
         string exe = saved.Length > 0 ? saved[0].Trim() : "";
         try { if (Directory.Exists(exe)) exe = FindTitleExe(exe); } catch { } // settings from v1.0 held the folder
+        int song;
+        if (saved.Length < 4 || !int.TryParse(saved[3], out song) || song < 0 || song >= GameMusic.Songs.Length) song = 0;
         Application.Run(new LauncherForm(exe != null && File.Exists(exe) ? exe : null, saved.Length > 1 && saved[1].Trim().Length > 0 ? saved[1].Trim() : null,
-            saved.Length > 2 && saved[2].Trim() == "muted"));
+            saved.Length > 2 && saved[2].Trim() == "muted", song));
         return 0;
     }
 
@@ -255,7 +257,10 @@ class LauncherForm : Form
     [DllImport("msimg32.dll")] static extern bool AlphaBlend(IntPtr dst, int x, int y, int w, int h, IntPtr src, int sx, int sy, int sw, int sh, int blend);
 
     string exe, title, hover, state = "", runtimeKey; // state: "", "installing", "running"
-    bool muted, moving;
+    bool muted, moving, musicBusy;
+    int tab, song; // tab: 0 Launcher, 1 Conversion, 2 Settings; song: index into GameMusic.Songs
+    static readonly string[] Tabs = { "Launcher", "Conversion", "Settings" };
+    static readonly string[] TabGlyphs = { "", "", "" }; // Segoe MDL2: Home, Switch, Settings
     List<Runtime> runtimes;
     readonly List<string> art = new List<string>(); // slideshow image files; a null entry is the launcher's own sunset
     IntPtr shown, prevBmp, nextBmp; // slides as HBITMAPs at slideSize: on screen, fading out, composed ahead
@@ -265,9 +270,9 @@ class LauncherForm : Form
     double shownAt, fadeFrom = -9;
     const double SlideSeconds = 9, FadeSeconds = 1.2;
     readonly float s; // DPI scale
-    Rectangle closeR, maxR, minR, muteR, playR, changeR;
-    readonly List<Rectangle> pillR = new List<Rectangle>();
-    readonly Font titleF, tagF, pathF, linkF, playF, smallF, pillF, iconF;
+    Rectangle closeR, maxR, minR, muteR, playR;
+    readonly Dictionary<string, Rectangle> hits = new Dictionary<string, Rectangle>(); // clickable areas of the last full paint
+    readonly Font titleF, tagF, pathF, linkF, playF, smallF, pillF, iconF, tabF;
     readonly Icon smallIcon;
     readonly Stopwatch clock = Stopwatch.StartNew();
     readonly ToolTip tip = new ToolTip();
@@ -276,13 +281,15 @@ class LauncherForm : Form
     static readonly Color Accent = Color.FromArgb(255, 92, 141);
 
     int S(float v) { return (int)Math.Round(v * s); }
+    int Rail { get { return S(76); } } // the side tabs' width
     Runtime Current { get { return runtimes.FirstOrDefault(r => r.Key == runtimeKey) ?? runtimes[0]; } }
 
-    public LauncherForm(string exe, string runtimeKey, bool muted)
+    public LauncherForm(string exe, string runtimeKey, bool muted, int song)
     {
         using (var g = CreateGraphics()) s = g.DpiX / 96f;
         this.exe = exe;
         this.muted = muted;
+        this.song = song;
         Text = "GTA VI Launcher";
         FormBorderStyle = FormBorderStyle.None;
         StartPosition = FormStartPosition.CenterScreen;
@@ -301,6 +308,7 @@ class LauncherForm : Form
         smallF = Fnt("Bahnschrift SemiBold", 12, "Segoe UI Semibold");
         pillF = Fnt("Bahnschrift SemiBold", 14, "Segoe UI Semibold");
         iconF = Fnt("Segoe MDL2 Assets", 11, "Segoe UI Symbol");
+        tabF = Fnt("Segoe MDL2 Assets", 20, "Segoe UI Symbol");
 
         // Cached ranking now, the live one from the archive as soon as it arrives.
         runtimes = Launcher.LoadRuntimes(false);
@@ -374,7 +382,7 @@ class LauncherForm : Form
         }
         else if (prevBmp != IntPtr.Zero && t - fadeFrom > FadeSeconds + 0.5) { DeleteObject(prevBmp); prevBmp = IntPtr.Zero; }
         if (t < 0.7 || t - fadeFrom < FadeSeconds + 0.1) Invalidate();
-        else if (state == "" && ++ticks % 2 == 0) Invalidate(Glow); // the glow only, at 12 fps
+        else if (tab == 0 && state == "" && ++ticks % 2 == 0) Invalidate(Glow); // the glow only, at 12 fps
     }
 
     protected override void OnResize(EventArgs e)
@@ -414,9 +422,8 @@ class LauncherForm : Form
         if (maxR.Contains(p)) return "max";
         if (minR.Contains(p)) return "min";
         if (musicWav != null && muteR.Contains(p)) return "mute";
-        if (playR.Contains(p)) return "play";
-        if (exe != null && changeR.Contains(p)) return "change";
-        for (int i = 0; i < pillR.Count; i++) if (pillR[i].Contains(p)) return "pill" + i;
+        if (tab == 0 && playR.Contains(p)) return "play";
+        foreach (var kv in hits) if (kv.Value.Contains(p)) return kv.Key;
         return null;
     }
 
@@ -427,12 +434,9 @@ class LauncherForm : Form
         hover = h;
         Cursor = h == null ? Cursors.Default : Cursors.Hand;
         tip.Hide(this);
-        if (h != null && h.StartsWith("pill"))
-        {
-            int i = int.Parse(h.Substring(4));
-            if (i < runtimes.Count && runtimes[i].Note.Length > 0)
-                tip.Show(runtimes[i].Note, this, pillR[i].X, pillR[i].Y - S(30), 6000);
-        }
+        if (h == "runtime" && Current.Note.Length > 0) tip.Show(Current.Note, this, hits[h].X, hits[h].Y - S(30), 6000);
+        else if (h != null && h.StartsWith("row") && runtimes[int.Parse(h.Substring(3))].Note.Length > 0) // the row cuts long notes short
+            tip.Show(runtimes[int.Parse(h.Substring(3))].Note, this, hits[h].X + S(196), hits[h].Bottom + S(2), 8000);
         else if (h == "mute") tip.Show(muted ? "Play the game's music" : "Mute music", this, muteR.X - S(40), muteR.Bottom + S(4), 3000);
         Invalidate();
     }
@@ -450,16 +454,26 @@ class LauncherForm : Form
             else if (h == "mute") { muted = !muted; Save(); PlayMusic(); Invalidate(); }
             else if (h == "change") Pick();
             else if (h == "play") { if (state == "" && (exe != null || Pick())) Play(); }
-            else if (h != null && h.StartsWith("pill") && state == "")
+            else if (h == "runtime") { tab = 1; Invalidate(); }
+            else if (h == "song-" || h == "song+")
             {
-                int i = int.Parse(h.Substring(4));
+                song = (song + (h == "song+" ? 1 : GameMusic.Songs.Length - 1)) % GameMusic.Songs.Length;
+                Save();
+                LoadMusic(false);
+                Invalidate();
+            }
+            else if (h == "folder") { Directory.CreateDirectory(Backgrounds); Process.Start("explorer.exe", "\"" + Backgrounds + "\""); }
+            else if (h != null && h.StartsWith("tab")) { tab = int.Parse(h.Substring(3)); hover = null; Invalidate(); }
+            else if (h != null && h.StartsWith("row") && state == "")
+            {
+                int i = int.Parse(h.Substring(3));
                 if (i < runtimes.Count) { runtimeKey = runtimes[i].Key; Save(); Invalidate(); }
             }
         }
         catch (Exception ex) { Launcher.Error(ex.Message); }
     }
 
-    void Save() { File.WriteAllLines(Launcher.Settings, new[] { exe ?? "", runtimeKey, muted ? "muted" : "" }); }
+    void Save() { File.WriteAllLines(Launcher.Settings, new[] { exe ?? "", runtimeKey, muted ? "muted" : "", song.ToString() }); }
 
     bool Pick()
     {
@@ -587,15 +601,29 @@ class LauncherForm : Form
         catch { } // a broken manifest just means no splash
         ListArt();
         ShowSlide(0);
+        LoadMusic(changed);
+    }
 
-        if (changed && player != null) { player.Stop(); player.Dispose(); player = null; }
+    // The chosen song, decoded once in the background (a few seconds) and cached in victory-data.
+    void LoadMusic(bool fresh)
+    {
+        if (player != null) { player.Stop(); player.Dispose(); player = null; }
         musicWav = null;
+        musicBusy = exe != null;
         if (exe == null) return;
         string gameDir = Path.GetDirectoryName(exe);
+        int track = song;
         new Thread(() =>
         {
-            string wav = GameMusic.Prepare(gameDir, changed);
-            OnUi(() => { if (exe != null && Path.GetDirectoryName(exe) == gameDir) { musicWav = wav; PlayMusic(); Invalidate(); } });
+            string wav = GameMusic.Prepare(gameDir, track, fresh);
+            OnUi(() =>
+            {
+                if (exe == null || Path.GetDirectoryName(exe) != gameDir || track != song || (wav == null && musicWav != null)) return; // a later pick won
+                musicWav = wav;
+                musicBusy = false;
+                PlayMusic();
+                Invalidate();
+            });
         }) { IsBackground = true, Priority = ThreadPriority.BelowNormal }.Start();
     }
 
@@ -713,7 +741,7 @@ class LauncherForm : Form
                 // Title only over the launcher's own art: the game's art carries its logo.
                 Fade(g, new Rectangle(0, 0, (int)(w * 0.6), h), Color.FromArgb(150, 8, 6, 14), Color.FromArgb(0, 8, 6, 14), 0f);
                 g.TextRenderingHint = TextRenderingHint.AntiAliasGridFit;
-                int x = S(40);
+                int x = Rail + S(36);
                 using (var accent = new SolidBrush(Accent)) g.DrawString("PC PORT LAUNCHER", tagF, accent, x + S(2), h - S(214));
                 using (var white = new SolidBrush(Color.White)) g.DrawString(title.ToUpperInvariant(), titleF, white, x - S(3), h - S(196));
             }
@@ -807,9 +835,26 @@ class LauncherForm : Form
 
         if (!onlyPlay)
         {
+            hits.Clear();
+            // Side tabs; the other tabs dim the art so their text reads.
+            using (var b = new SolidBrush(Color.FromArgb(150, 8, 6, 14))) g.FillRectangle(b, 0, 0, Rail, h);
+            if (tab != 0) using (var b = new SolidBrush(Color.FromArgb(175, 8, 6, 14))) g.FillRectangle(b, Rail, 0, w - Rail, h);
+            g.DrawIcon(smallIcon, new Rectangle((Rail - S(16)) / 2, S(9), S(16), S(16)));
+            var center = TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine;
+            for (int i = 0; i < Tabs.Length; i++)
+            {
+                var r = new Rectangle(0, S(48) + i * S(74), Rail, S(70));
+                hits["tab" + i] = r;
+                bool on = tab == i;
+                if (on || hover == "tab" + i) using (var b = new SolidBrush(Color.FromArgb(on ? 40 : 22, 255, 255, 255))) g.FillRectangle(b, r);
+                if (on) using (var b = new SolidBrush(Accent)) g.FillRectangle(b, 0, r.Y + S(14), S(3), r.Height - S(28));
+                var c = on ? Color.White : muted2;
+                TextRenderer.DrawText(g, TabGlyphs[i], tabF, new Rectangle(0, r.Y + S(8), Rail, S(30)), c, center);
+                TextRenderer.DrawText(g, Tabs[i], smallF, new Rectangle(0, r.Y + S(42), Rail, S(18)), c, center);
+            }
+
             // Top bar: app name, music, minimize, full screen, close.
-            g.DrawIcon(smallIcon, new Rectangle(S(14), S(9), S(16), S(16)));
-            TextRenderer.DrawText(g, "LAUNCHER", smallF, new Point(S(36), S(9)), Color.FromArgb(220, 255, 255, 255));
+            TextRenderer.DrawText(g, "GTA VI LAUNCHER", smallF, new Point(Rail + S(14), S(9)), Color.FromArgb(220, 255, 255, 255));
             using (var hot = new SolidBrush(Color.FromArgb(40, 255, 255, 255)))
             {
                 if (hover == "min") g.FillRectangle(hot, minR);
@@ -835,41 +880,118 @@ class LauncherForm : Form
                 TextRenderer.DrawText(g, muted ? "" : "", iconF, muteR, muted ? muted2 : Color.White, // Mute / Volume glyphs
                     TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine);
 
-            // Game path and Change.
-            int x = S(40);
-            string line = exe ?? "Select your game's .exe to get started";
-            var flags = TextFormatFlags.PathEllipsis | TextFormatFlags.SingleLine | TextFormatFlags.NoPadding;
-            int maxW = playR.X - x - S(110);
-            int lw = Math.Min(TextRenderer.MeasureText(line, pathF, Size.Empty, TextFormatFlags.SingleLine | TextFormatFlags.NoPadding).Width, maxW);
-            var pathR = new Rectangle(x, h - S(112), lw, pathF.Height + S(4));
-            TextRenderer.DrawText(g, line, pathF, pathR, muted2, flags);
-            changeR = new Rectangle(pathR.Right + S(14), pathR.Y - S(4), TextRenderer.MeasureText("Change", pathF).Width, pathR.Height + S(8));
-            if (exe != null)
-                TextRenderer.DrawText(g, "Change", hover == "change" ? linkF : pathF,
-                    new Point(changeR.X, pathR.Y), hover == "change" ? Color.White : Accent, TextFormatFlags.NoPadding);
-
-            // Runtimes: one pill each; #n marks the archive's top 3.
-            pillR.Clear();
-            int px = x;
-            foreach (var rt in runtimes)
+            int x = Rail + S(36);
+            if (tab == 1) ConversionPage(g, x, w, cur, muted2);
+            else if (tab == 2) SettingsPage(g, x, w, muted2);
+            else
             {
-                string label = (rt.Rank > 0 ? "#" + rt.Rank + "  " : "") + rt.Name;
-                var r = new Rectangle(px, h - S(80), TextRenderer.MeasureText(label, pillF).Width + S(18), S(34));
-                pillR.Add(r);
-                bool on = rt == cur, hot = hover == "pill" + (pillR.Count - 1);
-                using (var path = Rounded(r, r.Height / 2))
+                // Game path and Change.
+                string line = exe ?? "Select your game's .exe to get started";
+                var flags = TextFormatFlags.PathEllipsis | TextFormatFlags.SingleLine | TextFormatFlags.NoPadding;
+                int maxW = playR.X - x - S(110);
+                int lw = Math.Min(TextRenderer.MeasureText(line, pathF, Size.Empty, TextFormatFlags.SingleLine | TextFormatFlags.NoPadding).Width, maxW);
+                var pathR = new Rectangle(x, h - S(112), lw, pathF.Height + S(4));
+                TextRenderer.DrawText(g, line, pathF, pathR, muted2, flags);
+                if (exe != null)
                 {
-                    using (var b = new SolidBrush(on ? Color.FromArgb(235, 255, 255, 255) : Color.FromArgb(hot ? 70 : 38, 255, 255, 255)))
-                        g.FillPath(b, path);
-                    if (!on) using (var pen = new Pen(Color.FromArgb(60, 255, 255, 255))) g.DrawPath(pen, path);
+                    var changeR = hits["change"] = new Rectangle(pathR.Right + S(14), pathR.Y - S(4), TextRenderer.MeasureText("Change", pathF).Width, pathR.Height + S(8));
+                    TextRenderer.DrawText(g, "Change", hover == "change" ? linkF : pathF,
+                        new Point(changeR.X, pathR.Y), hover == "change" ? Color.White : Accent, TextFormatFlags.NoPadding);
                 }
-                TextRenderer.DrawText(g, label, pillF, r, on ? Color.FromArgb(20, 16, 30) : Color.White,
-                    TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine);
-                px = r.Right + S(8);
+
+                // The chosen conversion tool; the Conversion tab picks another.
+                string label = (cur.Rank > 0 ? "#" + cur.Rank + "  " : "") + cur.Name;
+                var r = new Rectangle(x, h - S(80), TextRenderer.MeasureText(label, pillF).Width + S(18), S(34));
+                using (var path = Rounded(r, r.Height / 2))
+                using (var b = new SolidBrush(Color.FromArgb(235, 255, 255, 255)))
+                    g.FillPath(b, path);
+                TextRenderer.DrawText(g, label, pillF, r, Color.FromArgb(20, 16, 30), center);
+                string more = "Change conversion tool";
+                var mr = new Rectangle(r.Right + S(14), r.Y, TextRenderer.MeasureText(more, pathF).Width, r.Height);
+                TextRenderer.DrawText(g, more, hover == "runtime" ? linkF : pathF, mr, hover == "runtime" ? Color.White : Accent, TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine);
+                hits["runtime"] = Rectangle.Union(r, mr);
             }
         }
 
-        // PLAY, with a soft pulsing glow while it's ready.
+        // PLAY, with a soft pulsing glow while it's ready. Launcher tab only.
+        if (tab == 0) DrawPlay(g, t, cur);
+
+        // Fade in on start.
+        if (t < 0.6)
+            using (var b = new SolidBrush(Color.FromArgb((int)(255 * (1 - t / 0.6)), Color.Black)))
+                g.FillRectangle(b, ClientRectangle);
+    }
+
+    // Every runtime as a row: rank, name, how far it gets, installed or not. Click one to use it.
+    void ConversionPage(Graphics g, int x, int w, Runtime cur, Color muted2)
+    {
+        TextRenderer.DrawText(g, "CONVERSION TOOL", tagF, new Point(x, S(52)), Accent);
+        TextRenderer.DrawText(g, "The PC port runtime PLAY runs the game with. #1 to #3 are the archive's current top 3.", pathF, new Point(x, S(74)), muted2);
+        int y = S(108), rw = w - x - S(40);
+        var mid = TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine | TextFormatFlags.EndEllipsis;
+        // shortcut: no scrolling; 7 runtimes fit the smallest window, add a scroll offset if the list grows past ~8.
+        for (int i = 0; i < runtimes.Count; i++, y += S(56))
+        {
+            var rt = runtimes[i];
+            var r = new Rectangle(x, y, rw, S(50));
+            hits["row" + i] = r;
+            bool on = rt == cur, hot = hover == "row" + i;
+            using (var path = Rounded(r, S(8)))
+            using (var b = new SolidBrush(on ? Color.FromArgb(235, 255, 255, 255) : Color.FromArgb(hot ? 60 : 30, 255, 255, 255)))
+                g.FillPath(b, path);
+            Color fg = on ? Color.FromArgb(20, 16, 30) : Color.White, sub = on ? Color.FromArgb(90, 80, 110) : muted2;
+            if (rt.Rank > 0) TextRenderer.DrawText(g, "#" + rt.Rank, pillF, new Rectangle(r.X + S(16), r.Y, S(40), r.Height), Accent, mid);
+            TextRenderer.DrawText(g, rt.Name, pillF, new Rectangle(r.X + S(60), r.Y, S(130), r.Height), fg, mid);
+            TextRenderer.DrawText(g, rt.Note, pathF, new Rectangle(r.X + S(196), r.Y, rw - S(196) - S(130), r.Height), sub, mid);
+            TextRenderer.DrawText(g, on ? "Selected" : rt.Installed ? "Installed" : "Not installed", smallF,
+                new Rectangle(r.Right - S(126), r.Y, S(110), r.Height), on ? Accent : sub, mid | TextFormatFlags.Right);
+        }
+    }
+
+    void SettingsPage(Graphics g, int x, int w, Color muted2)
+    {
+        TextRenderer.DrawText(g, "SETTINGS", tagF, new Point(x, S(52)), Accent);
+        int vx = x + S(130), bx = w - S(40), y = S(96);
+        var mid = TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine | TextFormatFlags.NoPadding;
+        Action<string, string> row = (label, value) =>
+        {
+            TextRenderer.DrawText(g, label, pillF, new Rectangle(x, y, S(120), S(40)), Color.White, mid);
+            TextRenderer.DrawText(g, value, pathF, new Rectangle(vx, y, bx - vx - S(250), S(40)), muted2, mid | TextFormatFlags.PathEllipsis);
+        };
+
+        row("Game", exe ?? "Not selected yet");
+        Button(g, "change", new Rectangle(bx - S(110), y + S(3), S(110), S(34)), exe == null ? "Select" : "Change");
+
+        y += S(60);
+        string n = "Song " + (song + 1) + " of " + GameMusic.Songs.Length;
+        row("Music", exe == null ? "Select the game first" : musicBusy ? n + "  ·  loading..." : musicWav == null ? n + "  ·  not found in this game version" : muted ? n + "  ·  muted" : n);
+        Button(g, "mute", new Rectangle(bx - S(110), y + S(3), S(110), S(34)), muted ? "Unmute" : "Mute");
+        Button(g, "song+", new Rectangle(bx - S(160), y + S(3), S(42), S(34)), "›");
+        Button(g, "song-", new Rectangle(bx - S(208), y + S(3), S(42), S(34)), "‹");
+
+        y += S(60);
+        int pics = art.Count(a => a != null && a.StartsWith(Backgrounds, StringComparison.OrdinalIgnoreCase));
+        row("Pictures", pics + (pics == 1 ? " picture" : " pictures") + "  ·  drop more on the window");
+        Button(g, "folder", new Rectangle(bx - S(130), y + S(3), S(130), S(34)), "Open folder");
+
+        y += S(60);
+        row("Full screen", "F11, Alt+Enter or double-click the window; Esc to leave");
+        TextRenderer.DrawText(g, "v" + Assembly.GetExecutingAssembly().GetName().Version.ToString(3), smallF, new Point(x, ClientSize.Height - S(36)), muted2);
+    }
+
+    void Button(Graphics g, string key, Rectangle r, string text)
+    {
+        hits[key] = r;
+        using (var path = Rounded(r, S(6)))
+        {
+            using (var b = new SolidBrush(Color.FromArgb(hover == key ? 70 : 38, 255, 255, 255))) g.FillPath(b, path);
+            using (var pen = new Pen(Color.FromArgb(60, 255, 255, 255))) g.DrawPath(pen, path);
+        }
+        TextRenderer.DrawText(g, text, pillF, r, Color.White, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine);
+    }
+
+    void DrawPlay(Graphics g, double t, Runtime cur)
+    {
         bool ready = state == "";
         string label2 = state == "installing" ? "INSTALLING..." : state == "running" ? "RUNNING" : exe == null ? "SELECT GAME" : cur.Installed ? "PLAY" : "INSTALL & PLAY";
         if (ready)
@@ -886,11 +1008,6 @@ class LauncherForm : Form
             g.FillPath(b, path);
         TextRenderer.DrawText(g, label2, label2.Length > 10 ? pillF : playF, playR, Color.White,
             TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine);
-
-        // Fade in on start.
-        if (t < 0.6)
-            using (var b = new SolidBrush(Color.FromArgb((int)(255 * (1 - t / 0.6)), Color.Black)))
-                g.FillRectangle(b, ClientRectangle);
     }
 
     static GraphicsPath Rounded(Rectangle r, int rad)
@@ -911,28 +1028,34 @@ class LauncherForm : Form
 // Foundation transform). Bank layout follows rpf9-explorer's Tools/OpusPreview.cpp.
 static class GameMusic
 {
-    // shortcut: the bank is located by its offset in the v1.0.2.1 dump (a radio station, 2.8 h; channel 0 is the music),
-    // other dumps just get no music; scan audio.rpf for "ADAT" banks if another build turns up.
-    const long BankOffset = 0x15034A000, BankLength = 260816000;
+    // shortcut: songs are located by their bank's {offset, length} in the v1.0.2.1 dump (the streamed-music banks with the
+    // strongest beat; channel 0 is the music), other dumps just get no music; scan audio.rpf for "ADAT" banks if another build turns up.
+    public static readonly long[][] Songs =
+    {
+        new[] { 0x213135000L, 86258320L }, new[] { 0x12C3AC000L, 103261488L }, new[] { 0x136B58000L, 62957360L },
+        new[] { 0x132FBB000L, 55592144L }, new[] { 0x15034A000L, 260816000L }, // the last one was v1.4's song
+    };
     const int Seconds = 180, Rate = 24000;
-    public static string Wav { get { return Path.Combine(Launcher.Data, "music.wav"); } }
+    public static string Wav(int song) { return Path.Combine(Launcher.Data, "music-" + Songs[song][0].ToString("X") + ".wav"); }
 
-    // The decoded music, made on first use; null when this game has none we can read.
-    public static string Prepare(string gameDir, bool fresh)
+    // The decoded song, made on first use; null when this game has none we can read.
+    public static string Prepare(string gameDir, int song, bool fresh)
     {
         try
         {
-            if (fresh) File.Delete(Wav);
-            if (File.Exists(Wav)) return Wav;
+            string wav = Wav(song);
+            if (fresh) File.Delete(wav);
+            File.Delete(Path.Combine(Launcher.Data, "music.wav")); // v1.4's cache
+            if (File.Exists(wav)) return wav;
             string rpf = Path.Combine(gameDir, "audio.rpf");
-            if (!File.Exists(rpf) || new FileInfo(rpf).Length < BankOffset + BankLength) return null;
+            if (!File.Exists(rpf) || new FileInfo(rpf).Length < Songs[song][0] + Songs[song][1]) return null;
             Directory.CreateDirectory(Launcher.Data);
-            string part = Wav + ".part";
+            string part = wav + ".part";
             using (var f = new FileStream(rpf, FileMode.Open, FileAccess.Read, FileShare.ReadWrite, 1 << 16))
-                WriteWav(part, Decode(f, Inspect(f, BankOffset)[0], Seconds * 48000));
-            File.Delete(Wav);
-            File.Move(part, Wav);
-            return Wav;
+                WriteWav(part, Decode(f, Inspect(f, Songs[song][0])[0], Seconds * 48000));
+            File.Delete(wav);
+            File.Move(part, wav);
+            return wav;
         }
         catch { return null; } // music is a nicety; any failure just means silence
     }
