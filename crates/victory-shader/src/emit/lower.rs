@@ -240,6 +240,12 @@ struct Lower<'a> {
     /// Compute code that reads other lanes: thread ids follow the host
     /// lanes, so lane n is console lane n.
     console_lanes: bool,
+    /// Compute code whose samples take an implicit level (derivatives
+    /// across quads of lanes) in a group of more than one row: the console's
+    /// thread-group size. The host group is one row of as many threads, so
+    /// its lanes run in the console's order (x, then y, then z), and the
+    /// thread ids are taken back from the flat id.
+    rows: Option<[u32; 3]>,
     /// Pixel: an ordered section (POPS), whose UAVs the host makes
     /// rasterizer-ordered views.
     pops: bool,
@@ -540,6 +546,16 @@ fn code_table_start(p: &crate::ir::Program, addresses: &[&crate::resource::Addre
     if fixed_below { lowest } else { lowest.max(code_end & !3) }
 }
 
+/// An image instruction that takes its level from the coordinates'
+/// derivatives: a sample without an explicit level (`_l`, `_lz`) or
+/// gradients (`_d`, `_cd`), and `image_get_lod`.
+fn implicit_level(name: &str) -> bool {
+    name == "image_get_lod"
+        || name
+            .strip_prefix("image_sample")
+            .is_some_and(|rest| !rest.split('_').any(|t| matches!(t, "l" | "lz" | "d" | "cd")))
+}
+
 impl<'a> Lower<'a> {
     fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>) -> Self {
         let p = x.p;
@@ -560,6 +576,7 @@ impl<'a> Lower<'a> {
         let root_memory = x.res.scalar.iter().any(|s| matches!(s.1.param, MEMORY | USER_DATA))
             || insts().any(|i| i.name().starts_with("image_bvh"));
         let mut console_lanes = false;
+        let mut rows = None;
         if let StageIo::Cs(cs) = x.native.io {
             s.threads = Some(cs.threads);
             s.lds_dwords = cs.lds_bytes() / 4;
@@ -602,6 +619,19 @@ impl<'a> Lower<'a> {
             let one_wave = cs.threads.iter().product::<u32>() <= wave;
             if console_lanes || one_wave && s.lds_dwords > 0 {
                 s.wave_size = Some(wave);
+            }
+            // The console takes a sample's implicit level from quads of
+            // lanes, and its lanes hold threads in x-major order: in a group
+            // of more than one row, four threads of one row. Hosts place
+            // two-dimensional groups their own way (a run on an RX 6750 XT
+            // put 2x2 tiles of threads in a quad), so such a program runs
+            // as one row, where every host keeps the order.
+            if !console_lanes
+                && cs.threads[1] * cs.threads[2] > 1
+                && insts().any(|i| implicit_level(i.name()))
+            {
+                rows = Some(cs.threads);
+                s.threads = Some([cs.threads.iter().product(), 1, 1]);
             }
         }
         let mut no_barrier = HashSet::new();
@@ -691,6 +721,7 @@ impl<'a> Lower<'a> {
             heap: [false; 2],
             src0: None,
             console_lanes,
+            rows,
             pops: matches!(x.native.io, StageIo::Ps { db_shader_control, .. }
                 if db_shader_control & 1 << 16 != 0),
             root_memory,
@@ -2912,6 +2943,26 @@ impl<'a> Lower<'a> {
     /// plus the lane index. (A bijection while each host wave holds a
     /// wave-aligned run of flat ids, as the console's waves do.)
     fn thread_id(&mut self, c: u8) -> Val {
+        if let Some([x, y, _]) = self.rows {
+            let e = self.s.entry;
+            let f = self.s.op(
+                e,
+                "flattenedThreadIdInGroup.i32",
+                Attr::ReadNone,
+                self.s.t.i32,
+                96,
+                &[],
+            );
+            let (xk, yk, xy) = (self.s.m.i32(x), self.s.m.i32(y), self.s.m.i32(x * y));
+            return Val::I32(match c {
+                0 => self.s.m.bin(e, Bin::URem, f, xk),
+                1 => {
+                    let t = self.s.m.bin(e, Bin::UDiv, f, xk);
+                    self.s.m.bin(e, Bin::URem, t, yk)
+                }
+                _ => self.s.m.bin(e, Bin::UDiv, f, xy),
+            });
+        }
         if !self.console_lanes {
             return self.compute_id("threadIdInGroup.i32", 95, c);
         }
@@ -8843,7 +8894,7 @@ impl<'a> Lower<'a> {
                     if op == 61 {
                         // A bias scales the footprint by 2^bias.
                         let bias = addr_val(self, 0)?;
-                        let bias = self.as_float(bias);
+                        let bias = to_float(self, bias);
                         let scale = self.unary(21, bias);
                         for x in g.iter_mut().filter(|x| **x != fu) {
                             *x = self.s.m.bin(c, Bin::Mul, *x, scale);
