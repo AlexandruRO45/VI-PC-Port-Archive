@@ -185,13 +185,16 @@ fn depth_space(mut f: impl FnMut([u8; DEPTH])) {
     for enable in [0, 1] {
         for write in [0, 1] {
             for func in 1..=8 {
-                for tail in [[1, 1], [0, 0], [1, 0], [0, 1]] {
-                    let mut b = [0u8; DEPTH];
-                    b[..14].copy_from_slice(&[
-                        enable, write, func, 0, 0xFF, 0xFF, 1, 1, 1, 8, 1, 1, 1, 8,
-                    ]);
-                    b[22..].copy_from_slice(&tail);
-                    f(b);
+                for bounds in [0, 1] {
+                    for tail in [[1, 1], [0, 0], [1, 0], [0, 1]] {
+                        let mut b = [0u8; DEPTH];
+                        b[..14].copy_from_slice(&[
+                            enable, write, func, 0, 0xFF, 0xFF, 1, 1, 1, 8, 1, 1, 1, 8,
+                        ]);
+                        b[15] = bounds;
+                        b[22..].copy_from_slice(&tail);
+                        f(b);
+                    }
                 }
                 // Stencil on, the same ops on both faces.
                 for read in MASKS {
@@ -254,6 +257,7 @@ fn depth_from_registers(regs: &[u32; 14], mut f: impl FnMut([u8; DEPTH])) {
     let [control, stencil, mask, ..] = *regs;
     let stencil_on = (control & 1) as u8;
     let depth_on = control >> 1 & 1 != 0;
+    let depth_bounds = control >> 3 & 1 != 0;
     let off = [1, 1, 1, 8];
     let (front, back, masks) = if stencil_on != 0 {
         let front = [
@@ -281,6 +285,13 @@ fn depth_from_registers(regs: &[u32; 14], mut f: impl FnMut([u8; DEPTH])) {
     } else {
         (&[0, 1], &[0, 1], (1..=8).collect())
     };
+    let bounds: &[u8] = if depth_bounds {
+        &[1]
+    } else if depth_on {
+        &[0]
+    } else {
+        &[0, 1]
+    };
     let mut faces = vec![(front, back)];
     if stencil_on != 0 {
         // The second face when back-face stencil is off.
@@ -289,17 +300,27 @@ fn depth_from_registers(regs: &[u32; 14], mut f: impl FnMut([u8; DEPTH])) {
     for &e in enables {
         for &w in writes {
             for &fun in &funcs {
-                for &(front, back) in &faces {
-                    let mut b = [0u8; DEPTH];
-                    b[..6].copy_from_slice(&[e, w, fun, stencil_on, masks.0 as u8, masks.1 as u8]);
-                    b[6..10].copy_from_slice(&front);
-                    b[10..14].copy_from_slice(&back);
-                    b[22..].copy_from_slice(&[1, 1]);
-                    f(b);
-                    if stencil_on == 0 {
-                        b[4] = (mask >> 8) as u8;
-                        b[5] = (mask >> 16) as u8;
+                for &db in bounds {
+                    for &(front, back) in &faces {
+                        let mut b = [0u8; DEPTH];
+                        b[..6].copy_from_slice(&[
+                            e,
+                            w,
+                            fun,
+                            stencil_on,
+                            masks.0 as u8,
+                            masks.1 as u8,
+                        ]);
+                        b[6..10].copy_from_slice(&front);
+                        b[10..14].copy_from_slice(&back);
+                        b[15] = db;
+                        b[22..].copy_from_slice(&[1, 1]);
                         f(b);
+                        if stencil_on == 0 {
+                            b[4] = (mask >> 8) as u8;
+                            b[5] = (mask >> 16) as u8;
+                            f(b);
+                        }
                     }
                 }
             }
@@ -736,8 +757,134 @@ mod tests {
     #[test]
     fn the_depth_space_holds_the_d3d12_default() {
         let mut found = false;
-        depth_space(|b| found |= b[..6] == [1, 1, 2, 0, 0xFF, 0xFF] && b[22..] == [1, 1]);
+        let mut found_bounds = false;
+        depth_space(|b| {
+            found |= b[..6] == [1, 1, 2, 0, 0xFF, 0xFF] && b[15] == 0 && b[22..] == [1, 1];
+            found_bounds |= b[..6] == [1, 1, 2, 0, 0xFF, 0xFF] && b[15] == 1 && b[22..] == [0, 0];
+        });
         assert!(found);
+        assert!(found_bounds);
+    }
+
+    #[test]
+    fn registers_name_depth_bounds_states() {
+        // Depth on (bit 1), write on (bit 2), depth bounds on (bit 3), func LESS (1 << 4).
+        let mut regs = [0u32; 14];
+        regs[0] = 0x1E;
+        let mut want = [0u8; DEPTH];
+        want[..14].copy_from_slice(&[1, 1, 2, 0, 0xFF, 0xFF, 1, 1, 1, 8, 1, 1, 1, 8]);
+        want[15] = 1;
+        want[22..].copy_from_slice(&[1, 1]);
+        let mut found = false;
+        depth_from_registers(&regs, |b| found |= b == want);
+        assert!(found, "depth on + depth bounds bit 3");
+
+        // Same with stencil enabled and separate back-face ops.
+        regs[0] = 0x1F | (1 << 7) | (2 << 8) | (3 << 20);
+        regs[1] = 3 | (4 << 4) | (5 << 8) | (6 << 12) | (7 << 16) | (8 << 20);
+        regs[2] = (0xA5 << 8) | (0x5A << 16);
+        let mut want_stencil = [0u8; DEPTH];
+        want_stencil[..6].copy_from_slice(&[1, 1, 2, 1, 0xA5, 0x5A]);
+        want_stencil[6..10].copy_from_slice(&[3, 4, 3, 3]);
+        want_stencil[10..14].copy_from_slice(&[5, 7, 6, 4]);
+        want_stencil[15] = 1;
+        want_stencil[22..].copy_from_slice(&[1, 1]);
+        let mut found_stencil = false;
+        depth_from_registers(&regs, |b| found_stencil |= b == want_stencil);
+        assert!(found_stencil, "stencil + depth bounds bit 3");
+
+        // Depth test off, depth bounds on (bit 3 only).
+        let mut regs_only_bounds = [0u32; 14];
+        regs_only_bounds[0] = 1 << 3;
+        let mut want_only_bounds = want;
+        want_only_bounds[0] = 0;
+        want_only_bounds[1] = 0;
+        let mut found_only_bounds = false;
+        depth_from_registers(&regs_only_bounds, |b| {
+            found_only_bounds |= b == want_only_bounds
+        });
+        assert!(found_only_bounds, "depth off + depth bounds bit 3");
+
+        // Depth test off and bit 3 cleared (e.g. driver cleared DB_DEPTH_CONTROL without a DSV).
+        let regs_zero = [0u32; 14];
+        let mut saw_zero = false;
+        let mut saw_one = false;
+        depth_from_registers(&regs_zero, |b| {
+            if b[..14] == want_only_bounds[..14] && b[22..] == [1, 1] {
+                saw_zero |= b[15] == 0;
+                saw_one |= b[15] == 1;
+            }
+        });
+        assert!(saw_zero && saw_one, "depth off tries both bounds states");
+
+        // Depth test on with bit 3 clear does not emit depth bounds enabled.
+        let mut regs_no_bounds = [0u32; 14];
+        regs_no_bounds[0] = 0x16;
+        let mut saw_bounds_when_off = false;
+        depth_from_registers(&regs_no_bounds, |b| saw_bounds_when_off |= b[15] != 0);
+        assert!(!saw_bounds_when_off);
+    }
+
+    #[test]
+    fn named_find_recovers_depth_bounds_pipeline_from_registers() {
+        let mut depth = [0u8; DEPTH];
+        depth[..14].copy_from_slice(&[1, 1, 2, 0, 0xFF, 0xFF, 1, 1, 1, 8, 1, 1, 1, 8]);
+        depth[15] = 1;
+        depth[22..].copy_from_slice(&[1, 1]);
+        let raster = [3, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0];
+        let mut blend = [0u8; BLEND];
+        for i in 0..8 {
+            blend[4 + 8 * i..12 + 8 * i].copy_from_slice(&DEFAULT_TARGET);
+        }
+        let (dh, rh, bh) = (city64(&depth), city64(&raster), city64(&blend));
+
+        // Minimal vertex-shader register image: dword 1 = 4, DB_DEPTH_CONTROL at 0x74 + 0x44.
+        let mut packet = vec![0u8; 0x74 + 0x44 + 14 * 4];
+        packet[4..8].copy_from_slice(&4u32.to_le_bytes());
+        packet[0x74 + 0x44..0x74 + 0x48].copy_from_slice(&0x1Eu32.to_le_bytes());
+        packet[0x74 + 0x44 + 5 * 4..0x74 + 0x44 + 6 * 4].copy_from_slice(&0xFu32.to_le_bytes());
+
+        let meta = metadata();
+        let blobs = [packet, meta];
+        let mut file = b"PS\0\x09".to_vec();
+        file.resize(0x50, 0);
+        let blob_bytes: u32 = blobs.iter().map(|b| b.len() as u32).sum();
+        for w in [1u32, 0, blobs.len() as u32, 0, blob_bytes, 0] {
+            file.extend_from_slice(&w.to_le_bytes());
+        }
+        file.resize(0x80, 0);
+        // One graphics record (0x70 bytes): key, packet 0, metadata 1, 5 hashes, 7 stage pairs.
+        file.extend_from_slice(&0u64.to_le_bytes());
+        file.extend_from_slice(&0u32.to_le_bytes());
+        file.extend_from_slice(&1u32.to_le_bytes());
+        for h in [0u64, 0, dh, rh, bh] {
+            file.extend_from_slice(&h.to_le_bytes());
+        }
+        for _ in 0..14 {
+            file.extend_from_slice(&u32::MAX.to_le_bytes());
+        }
+        let mut at = 0u32;
+        for b in &blobs {
+            file.extend_from_slice(&at.to_le_bytes());
+            file.extend_from_slice(&(b.len() as u32).to_le_bytes());
+            at += b.len() as u32;
+        }
+        for b in &blobs {
+            file.extend_from_slice(b);
+        }
+
+        let pack = Pack::parse(&file).unwrap();
+        let named = Named::find(&pack, &[]);
+        assert_eq!(named.depth.get(&dh), Some(&depth));
+        assert_eq!(named.source.get(&dh), Some(&"registers"));
+
+        let g = pack.graphics().next().unwrap();
+        let vs = [1u8; 12];
+        let s = stream(&g, &named, &vs, false, None).unwrap();
+        let b = s.bytes();
+        let w = |o: usize| u32::from_le_bytes(b[o..o + 4].try_into().unwrap());
+        assert_eq!(w(0x210), 21);
+        assert_eq!(w(0x214 + 0x34), 1, "DepthBoundsTestEnable in stream");
     }
 
     /// A record's metadata: targets 28 and 10, depth format 40, topology
