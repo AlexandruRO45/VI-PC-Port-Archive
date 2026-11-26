@@ -1,7 +1,7 @@
 // Minimal game launcher: pick the game's .exe once, pick a runtime, press PLAY. Side tabs: Launcher, Conversion
 // (the runtime), Settings. Slideshow of the pictures in backgrounds\ (drop more on the window), music from the game's own audio.
-// Runtimes: the archive top 3 (AnyXboxX left out, ztrx always 3rd) plus Hyphen (hyphenn, was victory-fork), cool_fox, VIctory and xcl,
-// each installed in runtimes\<key> and built into its target\release.
+// Runtimes: the archive top 3 (AnyXboxX left out, ztrx always 3rd) plus Hyphen (hyphenn, was victory-fork), cool_fox, CGBJ, VIctory
+// and xcl, each installed in runtimes\<key>\target\release: built there from source, or a ready-made build (CGBJ) unpacked there.
 // Build: build.bat (uses the C# compiler that ships with Windows, C# 5).
 using System;
 using System.Collections.Generic;
@@ -24,22 +24,66 @@ using System.Xml;
 [assembly: AssemblyTitle("GTA VI Launcher")]
 [assembly: AssemblyDescription("Runs your game dump through the PC port runtimes")]
 [assembly: AssemblyProduct("GTA VI Launcher")]
-[assembly: AssemblyVersion("1.6.1.0")]
-[assembly: AssemblyFileVersion("1.6.1.0")]
+[assembly: AssemblyVersion("1.7.0.0")]
+[assembly: AssemblyFileVersion("1.7.0.0")]
 
 // One runtime project, as the archive's site describes it.
 class Runtime
 {
-    public string Key, Name, Branch, Note;
+    public string Key, Name, Branch, Note, Release; // Release: a ready-made build's ZIP, for archive entries without source to build
     public int Reached, Top, Rank; // Top: the archive's pinned place (0 = none); Rank: 1-3 in the launcher's top 3, else 0
     public bool Gone; // removed from GitHub; the archive keeps its last copy
 
-    // Every runtime installs next to the launcher, in runtimes\<key>, and builds into its target\release.
+    // Ready-made builds the launcher may install: the runner exe and its SHA-256 as the archive's release notes list it.
+    // A download whose exe doesn't match is deleted, not run. Release entries not listed here can't be installed.
+    static readonly Dictionary<string, string[]> Builds = new Dictionary<string, string[]>
+    {
+        { "cgbj", new[] { "victory-3d-rtx-pareto-residency.exe", "DF748C624082173ABD3E36540D7E89AB6673FDAB34D781341692960A45C2ED5E" } },
+    };
+
+    // Every runtime installs next to the launcher, in runtimes\<key>, into its target\release (built there, or a build unpacked there).
     public string Dir { get { return Path.Combine(Launcher.Here, "runtimes", Key); } }
 
     // shortcut: a runtime without a recipe here is assumed to build like VIctory (cargo -p victory); add one when the archive's top 3 gains one that doesn't.
-    public string Exe { get { return Path.Combine(Dir, @"target\release\" + (Key == "xcl" ? "xcl.exe" : "victory.exe")); } }
+    public string Exe
+    {
+        get
+        {
+            string[] b;
+            string name = Builds.TryGetValue(Key, out b) ? b[0] : Key == "xcl" ? "xcl.exe" : "victory.exe";
+            return Path.Combine(Dir, @"target\release\" + name);
+        }
+    }
     public bool Installed { get { return File.Exists(Exe); } }
+    public bool Ready { get { return Release != null; } } // installs by download, no git or Rust
+
+    // The console command that installs it; null when the launcher can't.
+    public string Install
+    {
+        get
+        {
+            if (Release == null)
+            {
+                string clone = Directory.Exists(Dir) ? "" :
+                    "git clone --depth 1 --single-branch --branch " + Branch + "/main " + Launcher.Archive + " \"" + Dir + "\" && ";
+                return clone + "cd /d \"" + Dir + "\" && " + Build;
+            }
+            string[] b;
+            if (!Builds.TryGetValue(Key, out b)) return null;
+            // Download, unpack into target\release (the files may sit in a subfolder of the ZIP), then check the exe's hash.
+            // shortcut: paths go in single quotes, so a launcher folder with an apostrophe in its name breaks this; quote properly if that turns up.
+            string to = Path.Combine(Dir, @"target\release");
+            return "powershell -NoProfile -ExecutionPolicy Bypass -Command \"$ErrorActionPreference='Stop'; $ProgressPreference='SilentlyContinue'; " +
+                "[Net.ServicePointManager]::SecurityProtocol='Tls12'; $d='" + to + "'; New-Item -ItemType Directory -Force $d | Out-Null; " +
+                "$z=Join-Path $d 'download.zip'; Write-Host 'Downloading " + Name + "...'; Invoke-WebRequest -UseBasicParsing '" + Release + "' -OutFile $z; " +
+                "Expand-Archive $z $d -Force; Remove-Item $z; " +
+                "$x=Get-ChildItem $d -Recurse -Filter '" + b[0] + "' | Select-Object -First 1; " +
+                "if ($x -and $x.DirectoryName -ne $d) { Get-ChildItem $x.DirectoryName | Move-Item -Destination $d -Force }; " +
+                "$f=Join-Path $d '" + b[0] + "'; if (-not (Test-Path $f) -or (Get-FileHash $f -Algorithm SHA256).Hash -ne '" + b[1] + "') " +
+                "{ Remove-Item -Recurse -Force '" + Dir + "'; throw 'The download is not the archived build (missing, quarantined by antivirus, or a different checksum). Nothing was kept.' }; " +
+                "Write-Host 'Installed.'\"";
+        }
+    }
 
     public string Build
     {
@@ -65,6 +109,8 @@ class Runtime
             return "powershell -NoProfile -ExecutionPolicy Bypass -Command \"& '" + Path.Combine(Dir, @"scripts\play.ps1") + "' -Exe '" + game + "' -Build release; exit $LASTEXITCODE\"";
         // Its launcher sets the RTX-tested Series S settings and runs target\release\victory.exe on VICTORY_GAME_DIR's game_scarlett_master.exe.
         if (Key == "cool-fox") return "\"" + Path.Combine(Dir, "Play-VIctory.cmd") + "\" pareto-residency";
+        // The ready-made cool_fox build ships the same launcher next to its exe.
+        if (Key == "cgbj") return "\"" + Path.Combine(Path.GetDirectoryName(Exe), "Play-VIctory.cmd") + "\" pareto-residency";
         return exe + "run \"" + game + "\" --execute";
     }
 }
@@ -76,13 +122,12 @@ static class Launcher
     public static readonly string Settings = Path.Combine(Here, "launcher.txt");
     public const string Archive = "https://github.com/Guernica4u/GTA6-PC-Port-Archive.git";
     const string ArchiveSite = "https://raw.githubusercontent.com/Guernica4u/GTA6-PC-Port-Archive/main/docs/index.html";
-    static readonly string[] Wanted = { "ztrx", "hyphenn", "victory-fork", "victory", "xcl", "cool-fox" }; // the user's picks: Zettrox, Hyphen (renamed), VIctory, xcl, cool_fox; kept even once gone
+    static readonly string[] Wanted = { "ztrx", "hyphenn", "victory-fork", "victory", "xcl", "cool-fox", "cgbj" }; // the user's picks: Zettrox, Hyphen (renamed), VIctory, xcl, cool_fox, CGBJ; kept even once gone or unpinned
     static readonly string[] Excluded = { "anyxboxx" }; // the user doesn't want it, even when it ranks
     static readonly Dictionary<string, string> Names = new Dictionary<string, string>
     {
         { "hyphenn", "Hyphen" }, { "victory-fork", "Hyphen" }, { "dexnom", "DexNom" }, { "belobug", "Belobug" }, { "victory-7900xtx", "7900XTX" },
-        { "cool-fox", "cool_fox" },
-    };
+    }; // cool_fox :CGBJ and NEWEST CGBJ private keep the site's names, as the user asked
     const string Third = "ztrx"; // the user's pick for 3rd place, wherever the archive ranks it
 
     public static XmlDocument Manifest(string dir)
@@ -110,7 +155,8 @@ static class Launcher
     // The archive site's PROJECTS table: key, name, branch, reached, top, note, gone.
     public static List<Runtime> ParseArchive(string html)
     {
-        var starts = Regex.Matches(html, "^\\s*\"?([\\w-]+)\"?: \\{ repo: \"", RegexOptions.Multiline);
+        // An entry opens with its repo, or (a ready-made build kept as a release, no repo) with its saved date.
+        var starts = Regex.Matches(html, "^\\s*\"?([\\w-]+)\"?: \\{ (?:repo|saved): \"", RegexOptions.Multiline);
         var list = new List<Runtime>();
         for (int i = 0; i < starts.Count; i++)
         {
@@ -123,6 +169,7 @@ static class Launcher
             list.Add(new Runtime
             {
                 Key = key, Name = str("name") ?? key, Branch = str("branch") ?? key, Note = str("note") ?? "",
+                Release = Regex.IsMatch(chunk, "\\brepo: \"") ? null : str("release"),
                 Reached = reached.Success ? int.Parse(reached.Groups[1].Value) : 0,
                 Top = top.Success ? int.Parse(top.Groups[1].Value) : 0,
                 Gone = Regex.IsMatch(chunk, "\\bgone: *(true|\")"),
@@ -146,14 +193,15 @@ static class Launcher
         return pick;
     }
 
-    // Offline fallback: the archive on 26 Nov 2026, after cool_fox left GitHub the day it took first place.
+    // Offline fallback: the archive on 26 Nov 2026: NEWEST CGBJ private (codec_d's ready-made build) first, cool_fox :CGBJ second.
     const string Builtin =
-        "  \"cool-fox\": { repo: \"codec-d/cool_fox\", gone: \"26 Nov 2026\", name: \"cool_fox\", branch: \"cool-fox\", reached: 5, note: \"VIctory-7900XTX with settings tested on RTX cards. Prologue and first mission at 13-22 fps.\" },\n" +
-        "  \"victory-7900xtx\": { repo: \"avatarmanz/VIctory-7900XTX\", name: \"VIctory-7900XTX\", top: 1, branch: \"victory-7900xtx\", reached: 5, note: \"Prologue and first mission at 13-22 fps. Needs about 64 GB of RAM.\" },\n" +
+        "  cgbj: { saved: \"26 Nov 2026\", name: \"NEWEST CGBJ private\", top: 1, branch: \"cool-fox\", reached: 5, release: \"https://github.com/Guernica4u/GTA6-PC-Port-Archive/releases/download/cgbj-pareto-residency/cool_fox-pareto-residency-windows-x64.zip\", note: \"cool_fox's ready-made build with the Series S profile and RTX-tested settings. Unsigned; Windows Defender flags the ZIP.\" },\n" +
+        "  \"cool-fox\": { repo: \"codec-d/cool_fox\", removed: \"26 Nov 2026\", name: \"cool_fox :CGBJ\", top: 2, branch: \"cool-fox\", reached: 5, note: \"VIctory-7900XTX with settings tested on RTX cards. Prologue and first mission at 13-22 fps.\" },\n" +
+        "  \"victory-7900xtx\": { repo: \"avatarmanz/VIctory-7900XTX\", name: \"VIctory-7900XTX\", top: 3, branch: \"victory-7900xtx\", reached: 5, note: \"Prologue and first mission at 13-22 fps. Needs about 64 GB of RAM.\" },\n" +
         "  ztrx: { repo: \"Zettrox/ztrx\", gone: \"25 Nov 2026\", name: \"ztrx\", branch: \"ztrx\", reached: 5, note: \"The prologue is playable. NVIDIA only.\" },\n" +
-        "  hyphenn: { repo: \"fxceless/victory-fork\", name: \"hyphenn\", top: 4, branch: \"hyphenn\", reached: 4, note: \"First gameplay scene at 2-4 fps.\" },\n" +
-        "  dexnom: { repo: \"DexNom/VIctory\", name: \"DexNom Runtime\", top: 2, branch: \"dexnom\", reached: 4, note: \"VIctory fork tuned on Radeon, experimental ray tracing.\" },\n" +
-        "  belobug: { repo: \"Belobug/VIctory-Belobug-AMD\", name: \"VIctory-Belobug-AMD\", top: 3, branch: \"belobug\", reached: 4, note: \"The world renders lit at 5-7 fps on an RX 9070 XT.\" },\n" +
+        "  hyphenn: { repo: \"fxceless/victory-fork\", name: \"hyphenn\", top: 6, branch: \"hyphenn\", reached: 4, note: \"First gameplay scene at 2-4 fps.\" },\n" +
+        "  dexnom: { repo: \"DexNom/VIctory\", name: \"DexNom Runtime\", top: 4, branch: \"dexnom\", reached: 4, note: \"VIctory fork tuned on Radeon, experimental ray tracing.\" },\n" +
+        "  belobug: { repo: \"Belobug/VIctory-Belobug-AMD\", name: \"VIctory-Belobug-AMD\", top: 5, branch: \"belobug\", reached: 4, note: \"The world renders lit at 5-7 fps on an RX 9070 XT.\" },\n" +
         "  victory: { repo: \"Marvisak/VIctory\", name: \"VIctory\", branch: \"victory\", reached: 3, note: \"Menus and the world intro.\" },\n" +
         "  xcl: { repo: \"ivall/xcl\", name: \"xcl\", branch: \"xcl\", reached: 2, note: \"Its own code, not VIctory. Menus at 30 fps; gameplay not reached yet.\" },\n";
 
@@ -227,7 +275,12 @@ static class Launcher
             "  tuxbox: { repo: \"brcly/TuxBox\", name: \"TuxBox\", branch: \"tuxbox\", reached: 2 },\n" +
             "  \"leonida-old\": { repo: \"x/L\", gone: \"23 Nov 2026\", name: \"Leonida\", reached: 9 },\n";
         var keys = string.Join(",", Choose(ParseArchive(site)).Select(r => r.Key + r.Rank).ToArray());
-        if (keys != "victory-7900xtx1,dexnom2,ztrx3,belobug0,hyphenn0,cool-fox0,victory0,xcl0") return 5;
+        if (keys != "cgbj1,cool-fox2,ztrx3,victory-7900xtx0,hyphenn0,victory0,xcl0") return 5;
+        // A release-only entry installs by download with its pinned checksum; source entries build.
+        var all = ParseArchive(Builtin);
+        var cgbj = all.First(r => r.Key == "cgbj");
+        if (cgbj.Release == null || !cgbj.Install.Contains("DF748C62") || all.First(r => r.Key == "cool-fox").Release != null ||
+            !all.First(r => r.Key == "xcl").Install.Contains("cargo build")) return 10;
         foreach (var r in Choose(ParseArchive(Builtin))) // every runtime builds into runtimes\<key>\target\release
             if (!r.Exe.StartsWith(Path.Combine(Here, "runtimes", r.Key, @"target\release\"))) return 9;
         if (Choose(ParseArchive(Builtin)).First(r => r.Key == "hyphenn").Name != "Hyphen") return 6;
@@ -433,7 +486,7 @@ class LauncherForm : Form
         tip.Hide(this);
         if (h == "runtime" && Current.Note.Length > 0) tip.Show(Current.Note, this, hits[h].X, hits[h].Y - S(30), 6000);
         else if (h != null && h.StartsWith("row") && runtimes[int.Parse(h.Substring(3))].Note.Length > 0) // the row cuts long notes short
-            tip.Show(runtimes[int.Parse(h.Substring(3))].Note, this, hits[h].X + S(196), hits[h].Bottom + S(2), 8000);
+            tip.Show(runtimes[int.Parse(h.Substring(3))].Note, this, hits[h].X + S(60), hits[h].Bottom + S(2), 8000);
         else if (h == "mute") tip.Show(muted ? "Play the game's music" : "Mute music", this, muteR.X - S(40), muteR.Bottom + S(4), 3000);
         Invalidate();
     }
@@ -497,20 +550,21 @@ class LauncherForm : Form
         var rt = Current;
         if (rt.Installed) { Start(rt); return; }
 
-        if (MessageBox.Show(this, rt.Name + " isn't installed yet. Download it from the archive and build it now?\n\n" +
-                "Needs git and Rust. Takes a few minutes; a console window shows the progress.", "GTA VI Launcher",
-                MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
-        var steps = new List<string>();
-        if (!Directory.Exists(rt.Dir))
-            steps.Add("git clone --depth 1 --single-branch --branch " + rt.Branch + "/main " + Launcher.Archive + " \"" + rt.Dir + "\"");
-        steps.Add("cd /d \"" + rt.Dir + "\" && " + rt.Build);
-        var p = RunConsole(string.Join(" && ", steps.ToArray()), Launcher.Here);
+        string install = rt.Install;
+        if (install == null) { Launcher.Error("The launcher can't install " + rt.Name + " yet."); return; }
+        string ask = rt.Ready
+            ? rt.Name + " isn't installed yet. Download its ready-made build from the archive now?\n\n" +
+              "Its exe isn't signed, and antivirus may flag or remove it. The launcher checks the download against the archive's checksum and runs nothing that doesn't match."
+            : rt.Name + " isn't installed yet. Download it from the archive and build it now?\n\n" +
+              "Needs git and Rust. Takes a few minutes; a console window shows the progress.";
+        if (MessageBox.Show(this, ask, "GTA VI Launcher", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
+        var p = RunConsole(install, Launcher.Here);
         SetState("installing");
         p.Exited += (o, e) => OnUi(() =>
         {
             SetState("");
             if (rt.Installed) Start(rt);
-            else Launcher.Error("Installing " + rt.Name + " failed. The console window showed why (is git and Rust installed?).");
+            else Launcher.Error("Installing " + rt.Name + " failed. The console window showed why" + (rt.Ready ? "." : " (is git and Rust installed?)."));
         });
     }
 
@@ -928,6 +982,8 @@ class LauncherForm : Form
         var mid = TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine | TextFormatFlags.EndEllipsis;
         // Rows shrink to fit the window. shortcut: no scrolling; past ~10 runtimes rows get too thin, add a scroll offset then.
         int step = Math.Min(S(56), (ClientSize.Height - y - S(12)) / Math.Max(1, runtimes.Count));
+        // The name column fits the longest name (the site's own names, e.g. "NEWEST CGBJ private"), within reason.
+        int nameW = Math.Min(S(230), runtimes.Max(rt => TextRenderer.MeasureText(rt.Name, pillF).Width));
         for (int i = 0; i < runtimes.Count; i++, y += step)
         {
             var rt = runtimes[i];
@@ -939,8 +995,8 @@ class LauncherForm : Form
                 g.FillPath(b, path);
             Color fg = on ? Color.FromArgb(20, 16, 30) : Color.White, sub = on ? Color.FromArgb(90, 80, 110) : muted2;
             if (rt.Rank > 0) TextRenderer.DrawText(g, "#" + rt.Rank, pillF, new Rectangle(r.X + S(16), r.Y, S(40), r.Height), Accent, mid);
-            TextRenderer.DrawText(g, rt.Name, pillF, new Rectangle(r.X + S(60), r.Y, S(130), r.Height), fg, mid);
-            TextRenderer.DrawText(g, rt.Note, pathF, new Rectangle(r.X + S(196), r.Y, rw - S(196) - S(130), r.Height), sub, mid);
+            TextRenderer.DrawText(g, rt.Name, pillF, new Rectangle(r.X + S(60), r.Y, nameW, r.Height), fg, mid);
+            TextRenderer.DrawText(g, rt.Note, pathF, new Rectangle(r.X + S(72) + nameW, r.Y, rw - S(72) - nameW - S(130), r.Height), sub, mid);
             TextRenderer.DrawText(g, on ? "Selected" : rt.Installed ? "Installed" : "Not installed", smallF,
                 new Rectangle(r.Right - S(126), r.Y, S(110), r.Height), on ? Accent : sub, mid | TextFormatFlags.Right);
         }
