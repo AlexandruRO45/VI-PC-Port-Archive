@@ -8884,6 +8884,24 @@ impl<'a> Lower<'a> {
             // there need conditions the validator does not grant these
             // programs, so the gradients are read from the quad and the
             // sample takes them explicitly.
+            // A sample's texel offset word: DXIL takes immediate offsets in
+            // -8..=7; the console's are 6-bit and may be computed.
+            if offset_word && matches!(op, 60 | 61) {
+                let w = addr_val(self, 0)?;
+                let w = self
+                    .s
+                    .m
+                    .int_value(w)
+                    .ok_or("a sample offset that is not constant")? as u32;
+                for (k, o) in os.iter_mut().enumerate().take(offsets) {
+                    let x = (w >> (8 * k) & 0x3F) as i32;
+                    let x = if x >= 32 { x - 64 } else { x };
+                    if !(-8..=7).contains(&x) {
+                        return Err("a sample offset past -8..7");
+                    }
+                    *o = self.s.m.i32(x as u32);
+                }
+            }
             let quad_grads = matches!(op, 60 | 61)
                 && self.s.threads.is_some()
                 && self.s.mesh.is_none()
@@ -8892,16 +8910,14 @@ impl<'a> Lower<'a> {
                 60 | 61 if quad_grads => {
                     let mut g = self.quad_gradients(&cs[..spatial]);
                     if op == 61 {
-                        // A bias scales the footprint by 2^bias.
-                        let bias = addr_val(self, 0)?;
+                        // A bias scales the footprint by 2^bias; it follows
+                        // the offset word.
+                        let bias = addr_val(self, usize::from(offset_word))?;
                         let bias = to_float(self, bias);
                         let scale = self.unary(21, bias);
                         for x in g.iter_mut().filter(|x| **x != fu) {
                             *x = self.s.m.bin(c, Bin::Mul, *x, scale);
                         }
-                    }
-                    if offset_word {
-                        return Err("a sample offset outside a pixel shader");
                     }
                     args.extend(&os);
                     args.extend(g);
@@ -8916,32 +8932,13 @@ impl<'a> Lower<'a> {
                     )
                 }
                 60 => {
-                    if offset_word {
-                        // DXIL takes immediate offsets in -8..=7; the
-                        // console's are 6-bit and may be computed.
-                        let w = addr_val(self, 0)?;
-                        let w = self
-                            .s
-                            .m
-                            .int_value(w)
-                            .ok_or("a sample offset that is not constant")?
-                            as u32;
-                        for (k, o) in os.iter_mut().enumerate().take(offsets) {
-                            let x = (w >> (8 * k) & 0x3F) as i32;
-                            let x = if x >= 32 { x - 64 } else { x };
-                            if !(-8..=7).contains(&x) {
-                                return Err("a sample offset past -8..7");
-                            }
-                            *o = self.s.m.i32(x as u32);
-                        }
-                    }
                     args.extend(&os);
                     args.push(fu);
                     self.s
                         .op(c, "sample.f32", Attr::ReadOnly, self.s.t.res_ret, 60, &args)
                 }
                 61 => {
-                    let bias = addr_val(self, 0)?;
+                    let bias = addr_val(self, usize::from(offset_word))?;
                     let bias = to_float(self, bias);
                     args.extend(&os);
                     args.extend([bias, fu]);

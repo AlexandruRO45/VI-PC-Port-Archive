@@ -1028,11 +1028,21 @@ fn pops_wait_loop_exits_immediately_for_inactive_lanes() {
     assert_eq!(pixels, vec![[0.0; 4], [0.0; 4], [1.0; 4], [1.0; 4]]);
 }
 
+/// How [`quad_program_as`] samples: plain, or with a texel offset of (1, 0)
+/// (`image_sample_o`). An offset moves the footprint, not its derivatives,
+/// so both pick the same level.
+#[derive(Clone, Copy, Debug)]
+enum Sample {
+    Plain,
+    Offset,
+}
+
 /// Per lane of a [8, 8, 1] group (v0 = x, v1 = y): (u, v) from entry 1 of
-/// the table at s0 at the flat index x + 8y, `image_sample` of red with an
-/// implicit level (the culling shaders' sampler), stored at flat × 4.
-fn quad_program() -> Vec<u32> {
-    vec![
+/// the table at s0 at the flat index x + 8y, a sample of red with an
+/// implicit level (the culling shaders' sampler) as `form` says, stored at
+/// flat × 4.
+fn quad_program_as(form: Sample) -> Vec<u32> {
+    let mut w = vec![
         0xBE84_0300, // s_mov_b32 s4, s0
         0xBE85_0380, // s_mov_b32 s5, 0
         0xF40C_0302,
@@ -1053,15 +1063,23 @@ fn quad_program() -> Vec<u32> {
         0x3428_0482, // v_lshlrev_b32 v20, 2, v2
         0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
         0xE034_1000,
-        0x8005_0C10, // buffer_load_dwordx2 v[12:13], v16, s[20:23], 0 offen
+        0x8005_0D10, // buffer_load_dwordx2 v[13:14], v16, s[20:23], 0 offen
+        0x7E18_0281, // v_mov_b32 v12, 1 (offset x 1, y 0)
         0xBF8C_3F70, // s_waitcnt vmcnt(0)
-        0xF080_0108,
-        0x0043_040C, // image_sample v4, v[12:13], s[12:19], s[8:11] dmask:0x1 dim:2D
+    ];
+    w.extend(match form {
+        // image_sample v4, v[13:14], s[12:19], s[8:11] dmask:0x1 dim:2D
+        Sample::Plain => [0xF080_0108, 0x0043_040D],
+        // image_sample_o v4, v[12:14]: offset, u, v
+        Sample::Offset => [0xF0C0_0108, 0x0043_040C],
+    });
+    w.extend([
         0xBF8C_3F70, // s_waitcnt vmcnt(0)
         0xE070_1000,
         0x800A_0414, // buffer_store_dword v4, v20, s[40:43], 0 offen
         0xBF81_0000, // s_endpgm
-    ]
+    ]);
+    w
 }
 
 /// An implicit-level `image_sample` in a [8, 8, 1] compute group takes its
@@ -1097,10 +1115,15 @@ fn compute_samples_take_derivatives_from_lane_quads() {
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let mut ran = 0;
-    for wave64 in [false, true] {
-        let shader = match build_group(&quad_program(), wave64, [8, 8, 1], 1 << 1 | 1 << 11) {
+    for (wave64, form) in [
+        (false, Sample::Plain),
+        (true, Sample::Plain),
+        (false, Sample::Offset),
+        (true, Sample::Offset),
+    ] {
+        let shader = match build_group(&quad_program_as(form), wave64, [8, 8, 1], 1 << 1 | 1 << 11) {
             Ok(s) => s,
-            Err(e) => panic!("wave{}: lower: {e:?}", if wave64 { 64 } else { 32 }),
+            Err(e) => panic!("wave{} {form:?}: lower: {e:?}", if wave64 { 64 } else { 32 }),
         };
         if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref())
             && let Err(e) = v.validate(&mut shader.dxil.clone())
@@ -1109,9 +1132,10 @@ fn compute_samples_take_derivatives_from_lane_quads() {
         }
         let views = [
             View::Mipped(size, size, levels, &texels),
+            // Read with buffer_load_dwordx2 ... offen: a raw view.
             View::Buffer {
                 data: &input,
-                stride: Stride::Structured(8),
+                stride: Stride::Raw,
             },
             View::RawUav(64 * 4),
         ];
@@ -1140,7 +1164,7 @@ fn compute_samples_take_derivatives_from_lane_quads() {
                 .unwrap_or_else(|e| panic!("wave{w} {label}: dispatch failed: {e}"));
             ran += 1;
             let got: Vec<f32> = out[0][..64].iter().map(|&x| f32::from_bits(x)).collect();
-            eprintln!("wave{w} {label}: levels {got:?}");
+            eprintln!("wave{w} {form:?} {label}: levels {got:?}");
             for (f, &g) in got.iter().enumerate() {
                 assert!(
                     (g - 1.0).abs() < 0.02,
