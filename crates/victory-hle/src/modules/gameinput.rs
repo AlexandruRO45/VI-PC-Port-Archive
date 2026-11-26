@@ -1143,12 +1143,18 @@ pub(crate) fn module() -> HleModule {
 /// and when a key is released, everything shifts down to fill in the gap."
 #[cfg(any(windows, test))]
 fn press_order(previous: &[u8], down: &[u8]) -> Vec<u8> {
-    previous
+    let mut held: Vec<u8> = previous
         .iter()
-        .filter(|vk| down.contains(vk))
-        .chain(down.iter().filter(|vk| !previous.contains(vk)))
         .copied()
-        .collect()
+        .filter(|vk| down.contains(vk))
+        .collect();
+    // Each key once, even if a reading lists it twice.
+    for &vk in down {
+        if !held.contains(&vk) {
+            held.push(vk);
+        }
+    }
+    held
 }
 
 /// Host input: XInput pads, the keyboard while our process has focus.
@@ -1913,10 +1919,16 @@ mod tests {
         let with_b = press_order(&held, b"ABZ");
         assert_eq!(with_b, b"ZAB");
 
+        // Releasing a key in the middle shifts the later ones down.
+        assert_eq!(press_order(&with_b, b"BZ"), b"ZB");
+
         // Releasing Z shifts remaining keys down; re-pressing Z puts it at the end.
-        let held = press_order(&held, b"A");
-        assert_eq!(held, b"A");
-        let held = press_order(&held, b"AZ");
-        assert_eq!(held, b"AZ");
+        let held = press_order(&with_b, b"AB");
+        assert_eq!(held, b"AB");
+        let held = press_order(&held, b"ABZ");
+        assert_eq!(held, b"ABZ");
+
+        // A key listed twice in one reading is held once.
+        assert_eq!(press_order(&[], b"AA"), b"A");
     }
 }
