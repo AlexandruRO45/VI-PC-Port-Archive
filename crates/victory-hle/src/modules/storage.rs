@@ -264,19 +264,89 @@ mod tests {
         std::fs::write(sub.join("b.dat"), [0u8; 5]).unwrap();
         let outside = tempfile::tempdir().unwrap();
         std::fs::write(outside.path().join("c.dat"), [0u8; 100]).unwrap();
-        let junction = |name: &str, target: &Path| {
-            let ok = std::process::Command::new("cmd")
-                .args(["/c", "mklink", "/J"])
-                .arg(dir.path().join(name))
-                .arg(target)
-                .status()
-                .unwrap();
-            assert!(ok.success(), "mklink /J {name}");
-        };
+        let junction = |name: &str, target: &Path| make_junction(&dir.path().join(name), target);
         junction("cycle", dir.path());
         junction("escape", outside.path());
 
         // Only the two real files count; neither junction is walked.
         assert_eq!(used_bytes(dir.path()), 15);
+    }
+
+    /// Makes `link` a junction (mount-point reparse point) to `target`
+    /// through the reparse-point API directly — what `cmd /c mklink /J`
+    /// does, without shelling out to `cmd`.
+    #[cfg(windows)]
+    fn make_junction(link: &Path, target: &Path) {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Foundation::{CloseHandle, GENERIC_WRITE, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::Storage::FileSystem::{
+            CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, OPEN_EXISTING,
+        };
+        use windows_sys::Win32::System::IO::DeviceIoControl;
+        use windows_sys::Win32::System::Ioctl::FSCTL_SET_REPARSE_POINT;
+        use windows_sys::Win32::System::SystemServices::IO_REPARSE_TAG_MOUNT_POINT;
+
+        std::fs::create_dir(link).unwrap();
+        let wide: Vec<u16> = link.as_os_str().encode_wide().chain(Some(0)).collect();
+        // SAFETY: `wide` is a valid NUL-terminated UTF-16 string that
+        // outlives the call; the returned handle is checked below.
+        let handle = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                GENERIC_WRITE,
+                0,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_ne!(handle, INVALID_HANDLE_VALUE, "opening {link:?}");
+
+        // A mount point names its target as an NT path ("\??\C:\...").
+        let target = target.canonicalize().unwrap();
+        let target = target.to_str().unwrap();
+        let target = target.strip_prefix(r"\\?\").unwrap_or(target);
+        let substitute: Vec<u16> = format!(r"\??\{target}").encode_utf16().collect();
+        let print: Vec<u16> = target.encode_utf16().collect();
+        let substitute_bytes = (substitute.len() * 2) as u16;
+        let print_bytes = (print.len() * 2) as u16;
+
+        // REPARSE_DATA_BUFFER for a mount point: tag, length, reserved,
+        // then the substitute/print name header followed by both names,
+        // each NUL-terminated.
+        let data_len = 8 + substitute_bytes + 2 + print_bytes + 2;
+        let mut buffer = vec![0u8; 8 + data_len as usize];
+        buffer[0..4].copy_from_slice(&IO_REPARSE_TAG_MOUNT_POINT.to_le_bytes());
+        buffer[4..6].copy_from_slice(&data_len.to_le_bytes());
+        buffer[10..12].copy_from_slice(&substitute_bytes.to_le_bytes());
+        buffer[12..14].copy_from_slice(&(substitute_bytes + 2).to_le_bytes());
+        buffer[14..16].copy_from_slice(&print_bytes.to_le_bytes());
+        let mut at = 16;
+        for unit in substitute.iter().copied().chain([0]).chain(print.iter().copied().chain([0]))
+        {
+            buffer[at..at + 2].copy_from_slice(&unit.to_le_bytes());
+            at += 2;
+        }
+
+        let mut returned = 0;
+        // SAFETY: `handle` is the live directory handle from above;
+        // `buffer` points to `buffer.len()` readable bytes holding a
+        // well-formed mount-point REPARSE_DATA_BUFFER.
+        let ok = unsafe {
+            DeviceIoControl(
+                handle,
+                FSCTL_SET_REPARSE_POINT,
+                buffer.as_ptr().cast(),
+                buffer.len() as u32,
+                std::ptr::null_mut(),
+                0,
+                &mut returned,
+                std::ptr::null_mut(),
+            )
+        };
+        // SAFETY: `handle` is still open and is closed exactly once.
+        unsafe { CloseHandle(handle) };
+        assert_ne!(ok, 0, "junction {link:?} -> {target:?}");
     }
 }
