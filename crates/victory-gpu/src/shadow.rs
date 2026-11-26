@@ -149,6 +149,23 @@ impl Shadow {
         (self.start + self.len).saturating_sub(address)
     }
 
+    /// `n` dwords of the copy at title address `address`, or as many as lie
+    /// in it (`VICTORY_DUMP_ARGUMENTS`: what an indirect command will read).
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn dwords_at(&self, address: u64, n: usize) -> Vec<u32> {
+        let at = address.saturating_sub(self.start);
+        if at >= self.len {
+            return Vec::new();
+        }
+        let n = n.min(((self.len - at) / 4) as usize);
+        if n == 0 {
+            return Vec::new();
+        }
+        // SAFETY: inside the mapping (`at` and `n` cut to `len`); read on the
+        // submitting thread before the submission runs.
+        unsafe { std::slice::from_raw_parts(self.data.add(at as usize).cast::<u32>(), n).to_vec() }
+    }
+
     /// `n` dwords of the copy at title address `address` (tests).
     #[cfg(test)]
     pub(crate) fn read_host(&self, address: u64, n: usize) -> Vec<u32> {

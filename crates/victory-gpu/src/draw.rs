@@ -1763,6 +1763,29 @@ impl State {
         if let Some((s, at)) = &counter {
             s.refresh(list, *at, 4);
         }
+        // `VICTORY_DUMP_ARGUMENTS`: the record the GPU will read, logged
+        // once the refresh has filled the copy (a command that hangs the
+        // GPU is the one whose counts no read-back can report afterwards).
+        #[cfg(feature = "diagnostics")]
+        if crate::switch::on("VICTORY_DUMP_ARGUMENTS") {
+            let copy = args.clone();
+            let (at, words) = (arguments, (len / 4).min(16) as usize);
+            let (name, count) = (
+                crate::pipeline::shaders_of(self.pipeline as This),
+                counter.as_ref().map(|(s, at)| {
+                    s.dwords_at(*at, 1).first().copied().unwrap_or(u32::MAX)
+                }),
+            );
+            list.defer(move || {
+                tracing::info!(
+                    kind,
+                    max,
+                    count = count.unwrap_or(u32::MAX),
+                    dwords = ?copy.dwords_at(at, words),
+                    "indirect arguments {name}"
+                );
+            });
+        }
         // Bounded first: the clamp binds a compute pipeline of its own.
         let Some(clamped) = crate::indirect::bound(list, args.gpu(arguments), (kind, stride, max)) else {
             why("not bounded (no clamp, or arguments not 4-byte aligned)");
