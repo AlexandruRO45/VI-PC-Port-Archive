@@ -82,10 +82,17 @@ fn enable_debug_layer() {
         }
         let mut layer: Option<ID3D12Debug> = None;
         // SAFETY: a plain call with a valid out pointer.
-        unsafe {
-            if D3D12GetDebugInterface(&mut layer).is_ok() {
-                layer.iter().for_each(|l| l.EnableDebugLayer());
-            }
+        if unsafe { D3D12GetDebugInterface(&mut layer) }.is_ok()
+            && let Some(layer) = layer
+        {
+            // SAFETY: this runs before creating this module's first device.
+            unsafe { layer.EnableDebugLayer() };
+        } else {
+            eprintln!(
+                "warning: VICTORY_D3D12_DEBUG requested the D3D12 debug layer, but it is unavailable. \
+                 Install Graphics Tools in Windows Optional Features and rerun. \
+                 Continuing without debug-layer messages."
+            );
         }
     });
 }
