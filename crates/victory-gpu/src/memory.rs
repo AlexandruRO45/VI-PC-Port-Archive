@@ -47,7 +47,7 @@ const BLOCK: usize = 4096;
 const LEVEL1: usize = 4096;
 /// Level-2 blocks a table has room for besides the null one: copies in 512
 /// distinct 256 MiB regions (the world's ~4,100 copies use a few dozen).
-const CAPACITY: usize = 2048;
+const CAPACITY: usize = 512;
 /// Sentinel in [`Layout::owner`] for a page with no host copy.
 const NO_OWNER: u32 = u32::MAX;
 /// Total dwords in a page table buffer (level-1 + `CAPACITY + 1` blocks of
