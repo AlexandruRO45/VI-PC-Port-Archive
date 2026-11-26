@@ -30,7 +30,9 @@ use crate::{HleExport, HleModule, hle_export};
 
 const SOCKET_ERROR: i32 = -1;
 const INVALID_SOCKET: Socket = !0;
+const WSAEFAULT: i32 = 10014;
 const WSAEINVAL: i32 = 10022;
+const WSAEAFNOSUPPORT: i32 = 10047;
 const WSAEADDRNOTAVAIL: i32 = 10049;
 const WSAENETUNREACH: i32 = 10051;
 const WSASERVICE_NOT_FOUND: i32 = 10108;
@@ -202,19 +204,43 @@ fn reverse_resolvable(ip: Option<IpAddr>) -> bool {
     }
 }
 
+/// Parses a `sockaddr` for `getnameinfo` / `GetNameInfoW`, returning the
+/// Winsock error (`WSAEFAULT` or `WSAEAFNOSUPPORT`) on invalid input.
+fn name_info_addr(addr: *const u8, len: i32) -> Result<IpAddr, i32> {
+    let Ok(len) = usize::try_from(len) else {
+        return Err(WSAEFAULT);
+    };
+    if addr.is_null() || len < 2 {
+        return Err(WSAEFAULT);
+    }
+    // SAFETY: the title passes `len` readable bytes.
+    let b = unsafe { std::slice::from_raw_parts(addr, len) };
+    match u16::from_le_bytes([b[0], b[1]]) {
+        AF_INET if len < 16 => Err(WSAEFAULT),
+        AF_INET => Ok(<[u8; 4]>::try_from(&b[4..8]).expect("len >= 16").into()),
+        AF_INET6 if len < 28 => Err(WSAEFAULT),
+        AF_INET6 => Ok(<[u8; 16]>::try_from(&b[8..24]).expect("len >= 28").into()),
+        _ => Err(WSAEAFNOSUPPORT),
+    }
+}
+
 /// `getnameinfo` flags that keep a host name lookup on the machine: the
-/// numeric form, as without a network, or `None` if a name is required.
-fn name_info_flags(sa: *const u8, len: i32, host_wanted: bool, flags: i32) -> Option<i32> {
-    if !host_wanted
-        || flags & NI_NUMERICHOST != 0
-        || reverse_resolvable(socket_addr(sa, len).map(|a| a.ip()))
-    {
-        Some(flags)
+/// numeric form, as without a network, or a Winsock error code.
+fn name_info_flags(sa: *const u8, len: i32, host_wanted: bool, flags: i32) -> Result<i32, i32> {
+    let ip = match name_info_addr(sa, len) {
+        Ok(ip) => ip,
+        Err(err) => {
+            wsa_error(err);
+            return Err(err);
+        }
+    };
+    if !host_wanted || flags & NI_NUMERICHOST != 0 || reverse_resolvable(Some(ip)) {
+        Ok(flags)
     } else if flags & NI_NAMEREQD != 0 {
         wsa_error(WSAHOST_NOT_FOUND);
-        None
+        Err(WSAHOST_NOT_FOUND)
     } else {
-        Some(flags | NI_NUMERICHOST)
+        Ok(flags | NI_NUMERICHOST)
     }
 }
 
@@ -697,8 +723,9 @@ pub extern "system" fn getnameinfo(
     serv_len: u32,
     flags: i32,
 ) -> i32 {
-    let Some(flags) = name_info_flags(sa, sa_len, !host.is_null(), flags) else {
-        return WSAHOST_NOT_FOUND;
+    let flags = match name_info_flags(sa, sa_len, !host.is_null(), flags) {
+        Ok(flags) => flags,
+        Err(err) => return err,
     };
     host!("ws2_32.dll", "getnameinfo": extern "system" fn(*const u8, i32, *mut c_char, u32, *mut c_char, u32, i32) -> i32)(
         sa, sa_len, host, host_len, serv, serv_len, flags,
@@ -714,8 +741,9 @@ pub extern "system" fn GetNameInfoW(
     serv_len: u32,
     flags: i32,
 ) -> i32 {
-    let Some(flags) = name_info_flags(sa, sa_len, !host.is_null(), flags) else {
-        return WSAHOST_NOT_FOUND;
+    let flags = match name_info_flags(sa, sa_len, !host.is_null(), flags) {
+        Ok(flags) => flags,
+        Err(err) => return err,
     };
     host!("ws2_32.dll", "GetNameInfoW": extern "system" fn(*const u8, i32, *mut u16, u32, *mut u16, u32, i32) -> i32)(
         sa, sa_len, host, host_len, serv, serv_len, flags,
@@ -1118,5 +1146,118 @@ mod tests {
             }
             assert!(present, "{dll} lacks {}", e.name);
         }
+    }
+
+    #[test]
+    fn getnameinfo_reports_winsock_address_errors_instead_of_host_not_found() {
+        // Ensure Winsock is initialized even when this test runs alone.
+        let _listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let last_error = host!("ws2_32.dll", "WSAGetLastError": extern "system" fn() -> i32);
+        let set_error = host!("ws2_32.dll", "WSASetLastError": extern "system" fn(i32));
+
+        let mut host_a = [0 as c_char; 64];
+        let mut host_w = [0u16; 64];
+        let v4_trunc = v4(AWAY, 80);
+        let mut v6_trunc = [0u8; 28];
+        v6_trunc[..2].copy_from_slice(&AF_INET6.to_le_bytes());
+        let mut af_unknown = [0u8; 16];
+        af_unknown[..2].copy_from_slice(&99u16.to_le_bytes());
+
+        for (label, ptr, len, flags, expected) in [
+            ("null sockaddr (NI_NAMEREQD)", std::ptr::null(), 16, NI_NAMEREQD, WSAEFAULT),
+            ("null sockaddr (numeric)", std::ptr::null(), 16, NI_NUMERICHOST, WSAEFAULT),
+            ("negative sockaddr len", v4_trunc.as_ptr(), -1, NI_NAMEREQD, WSAEFAULT),
+            ("short header len", v4_trunc.as_ptr(), 1, NI_NAMEREQD, WSAEFAULT),
+            ("truncated AF_INET", v4_trunc.as_ptr(), 4, NI_NAMEREQD, WSAEFAULT),
+            ("truncated AF_INET6", v6_trunc.as_ptr(), 16, NI_NAMEREQD, WSAEFAULT),
+            ("unsupported AF", af_unknown.as_ptr(), 16, NI_NAMEREQD, WSAEAFNOSUPPORT),
+        ] {
+            set_error(0);
+            let hr_a = getnameinfo(
+                ptr,
+                len,
+                host_a.as_mut_ptr(),
+                host_a.len() as u32,
+                std::ptr::null_mut(),
+                0,
+                flags,
+            );
+            assert_eq!(hr_a, expected, "getnameinfo {label}");
+            assert_eq!(last_error(), expected, "getnameinfo WSAGetLastError {label}");
+
+            set_error(0);
+            let hr_w = GetNameInfoW(
+                ptr,
+                len,
+                host_w.as_mut_ptr(),
+                host_w.len() as u32,
+                std::ptr::null_mut(),
+                0,
+                flags,
+            );
+            assert_eq!(hr_w, expected, "GetNameInfoW {label}");
+            assert_eq!(last_error(), expected, "GetNameInfoW WSAGetLastError {label}");
+        }
+
+        // Valid non-loopback address still obeys the offline lookup policy.
+        let public = v4([203, 0, 113, 1], 443);
+        set_error(0);
+        assert_eq!(
+            getnameinfo(
+                public.as_ptr(),
+                16,
+                host_a.as_mut_ptr(),
+                host_a.len() as u32,
+                std::ptr::null_mut(),
+                0,
+                NI_NAMEREQD,
+            ),
+            WSAHOST_NOT_FOUND
+        );
+        assert_eq!(last_error(), WSAHOST_NOT_FOUND);
+        set_error(0);
+        assert_eq!(
+            GetNameInfoW(
+                public.as_ptr(),
+                16,
+                host_w.as_mut_ptr(),
+                host_w.len() as u32,
+                std::ptr::null_mut(),
+                0,
+                NI_NAMEREQD,
+            ),
+            WSAHOST_NOT_FOUND
+        );
+        assert_eq!(last_error(), WSAHOST_NOT_FOUND);
+
+        assert_eq!(
+            getnameinfo(
+                public.as_ptr(),
+                16,
+                host_a.as_mut_ptr(),
+                host_a.len() as u32,
+                std::ptr::null_mut(),
+                0,
+                0,
+            ),
+            0
+        );
+        // SAFETY: NUL-terminated by `getnameinfo`.
+        let numeric = unsafe { CStr::from_ptr(host_a.as_ptr()) };
+        assert_eq!(numeric.to_str(), Ok("203.0.113.1"));
+        assert_eq!(
+            GetNameInfoW(
+                public.as_ptr(),
+                16,
+                host_w.as_mut_ptr(),
+                host_w.len() as u32,
+                std::ptr::null_mut(),
+                0,
+                0,
+            ),
+            0
+        );
+        let len_w = host_w.iter().position(|&c| c == 0).unwrap();
+        assert_eq!(String::from_utf16_lossy(&host_w[..len_w]), "203.0.113.1");
     }
 }
