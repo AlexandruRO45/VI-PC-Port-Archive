@@ -755,6 +755,29 @@ fn section_run(given: &[usize]) -> usize {
         .count()
 }
 
+/// How many bytes from `base` to the end of the placeholder it lies in: the
+/// most one call can map as one view there. 0 when the host does not report
+/// a reserved placeholder at `base` (an address already shown, or the title's
+/// own memory), so the caller maps page by page as before.
+fn placeholder_room(base: usize) -> usize {
+    let mut info = MEMORY_BASIC_INFORMATION::default();
+    // SAFETY: `VirtualQueryEx` fills `info` for the region holding `base`.
+    let got = unsafe {
+        VirtualQueryEx(
+            GetCurrentProcess(),
+            base as *const c_void,
+            &mut info,
+            std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+        )
+    };
+    if got == 0 || info.State != MEM_RESERVE {
+        return 0;
+    }
+    (info.BaseAddress as usize)
+        .saturating_add(info.RegionSize)
+        .saturating_sub(base)
+}
+
 /// One page at each address; null `pages`, or a page number 0, unmaps
 /// (Grand Theft Auto VI passes 0 for addresses to clear).
 pub extern "system" fn XMemMapPhysicalPagesScatter(
@@ -798,8 +821,11 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
         }
         // One call maps consecutive slices of one section only, and those live
         // in one placeholder: batch no further, so a batched call never spans
-        // two reservations (which fails, and would have unmapped both).
+        // two reservations (which fails, and would have unmapped both). Ask
+        // the host where the placeholder ends rather than trusting the pages
+        // to say it: consecutive slices can still cross one.
         if !zero && !pages.is_null() && run > 1 {
+            run = run.min(placeholder_room(address) / PAGE).max(1);
             // SAFETY: `i < n` and the title passes `n` pages.
             let given = unsafe { std::slice::from_raw_parts(pages.add(i), run) };
             run = section_run(given);
