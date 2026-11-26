@@ -201,6 +201,7 @@ impl Shadow {
     // shortcut: a page the copy holds only in part (at its ends) has no
     // "copied" mark and is compared without the title-write check.
     pub(crate) fn copy_back_page(&self, page: usize) -> usize {
+        drain_lazy(page, PAGE);
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (page.max(start), (page + PAGE).min(end));
         if from >= to {
@@ -406,6 +407,7 @@ impl Shadow {
     }
 
     fn copy_back_or_not(&self, address: usize, len: usize, back: bool) -> usize {
+        drain_lazy(address, len);
         let mut snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let (segments, compared) = &mut *snapshot;
         let mut written = 0;
@@ -548,6 +550,9 @@ impl Shadow {
     /// since it was last copied (all of it if the memory is not
     /// write-watched). Returns the bytes copied.
     pub(crate) fn update(&self, address: usize, len: usize) -> usize {
+        // A page held back in the range goes back before the refresh
+        // copies title memory over what the shaders wrote into it.
+        drain_lazy(address, len);
         if self.clean() {
             return 0;
         }
@@ -898,6 +903,68 @@ pub(crate) fn forget_read(slot: u32) {
 // another both wrote through views goes back unless the withheld list
 // declared it.
 pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_withheld: bool) {
+    copy_back_marks_with(withheld, memory_withheld, lazy_on());
+}
+
+/// `VICTORY_LAZY_COPY_BACK`: marked pages leave the submission sealed
+/// no-access and go back at their first access — a per-frame copy-back is
+/// 95 % wait (FIND-33: the fetch of a fetched snapshot's pages and the
+/// waits around them), and a page the title never reads needs none of it.
+fn lazy_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_LAZY_COPY_BACK"))
+}
+
+/// The pages of `[address, address + len)` a submission left sealed (
+/// [`crate::watch::take_lazy`]) go back before anything reads or refreshes
+/// around them: nothing here looks at what they wait behind.
+fn drain_lazy(address: usize, len: usize) {
+    if !crate::watch::lazy_armed() {
+        return;
+    }
+    let (first, last) = (address / PAGE, address.saturating_add(len).div_ceil(PAGE));
+    service_lazy(crate::watch::take_lazy(first, last));
+}
+
+/// Pages that waited for their reader ([`crate::watch::take_lazy`])
+/// go back now, one page at a time, as [`copy_back_marks_with`] would
+/// have copied them, and the seal returns to the read-only guard the wait
+/// arming made of it ([`crate::watch::repaged`]).
+pub(crate) fn service_lazy(pages: Vec<(Arc<Shadow>, usize)>) {
+    for (copy, page) in pages {
+        copy_back_one(&copy, page, true);
+    }
+}
+
+/// One marked page's copy-back with its counters; `lazy`, that it waited
+/// sealed behind a no-access block whose read of the page's own bytes
+/// needs the guard made again first ([`crate::watch::repaged`]).
+fn copy_back_one(copy: &Arc<Shadow>, page: usize, lazy: bool) {
+    if lazy {
+        crate::watch::repaged(page);
+    }
+    let written = copy.copy_back_marked(page);
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(crate::copystat::C::MarkedPages, 1);
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(crate::copystat::C::MarkedBytes, written as u64);
+    #[cfg(not(feature = "diagnostics"))]
+    let _ = written;
+}
+
+/// [`copy_back_marks`], with the lazy mode of [`lazy_on`] told instead:
+/// tests follow the pages of a sealed submission directly.
+fn copy_back_marks_with(
+    withheld: &[(Arc<Shadow>, usize, usize)],
+    memory_withheld: bool,
+    lazy: bool,
+) {
+    // What an earlier submission left sealed goes back first: a submission
+    // that follows may refresh the copies holding those pages, copying
+    // title memory over what the shaders wrote before it is in there.
+    if lazy && crate::watch::lazy_armed() {
+        service_lazy(crate::watch::take_all_lazy());
+    }
     let (mut marked, mut held) = (Vec::new(), Vec::new());
     for memory in [false, true] {
         let Some(b) = bitmap(memory) else {
@@ -946,6 +1013,7 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_w
         let m = marks();
         marked.iter().filter_map(|&n| page_of(&m, n)).collect()
     };
+    let mut armed = Vec::new();
     for (copy, page) in pages {
         if withheld
             .iter()
@@ -953,14 +1021,21 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_w
         {
             continue;
         }
-        let written = copy.copy_back_marked(page);
-        #[cfg(feature = "diagnostics")]
-        {
-            crate::copystat::add(crate::copystat::C::MarkedPages, 1);
-            crate::copystat::add(crate::copystat::C::MarkedBytes, written as u64);
+        let (start, len) = copy.range();
+        let held_whole = page >= start as usize && page + PAGE <= (start + len) as usize;
+        if lazy && held_whole {
+            armed.push((copy, page));
+        } else {
+            copy_back_one(&copy, page, false);
         }
-        #[cfg(not(feature = "diagnostics"))]
-        let _ = written;
+    }
+    if lazy {
+        // VICTORY_LAZY_COPY_BACK: the armed pages seal no-access, their
+        // copies' bytes waiting for a reader; the ones a view of the same
+        // pages shows elsewhere cannot wait and go back now.
+        for (copy, page) in crate::watch::arm_lazy(&armed) {
+            copy_back_one(&copy, page, false);
+        }
     }
 }
 
@@ -1523,6 +1598,83 @@ pub(crate) mod tests {
         let left: u32 = (base / 32..=(base + 1) / 32).map(|w| unsafe { *bits.add(w) }).fold(0, |a, w| a | w);
         assert_eq!(left, 0, "bits cleared");
         assert_eq!(copy.copy_back(p, len), 0, "nothing kept to compare");
+        unregister(p, p as u64);
+    }
+
+    /// With the lazy copy-back (`VICTORY_LAZY_COPY_BACK`), marked pages leave
+    /// the submission sealed; the first read faults its page back, the
+    /// first write goes back and then lands as the title's own over it, and
+    /// a page nothing touched goes back at the next copy-back.
+    #[test]
+    fn marked_pages_leave_the_submission_and_go_back_at_their_first_access() {
+        let p = crate::watch::tests::pool(3);
+        let len = 3 * PAGE;
+        register(p, p as u64, len as u64);
+        let (Some(copy), Some(b)) = (find(p as u64, len as u64), bitmap(false)) else {
+            unregister(p, p as u64);
+            return; // no host GPU here
+        };
+        let base = copy.marks.expect("tracked memory gets mark bits") as usize;
+        copy.update(p, len);
+        copy.writing(p, len, true);
+        // The shaders write a byte of every page; pages 0, 1 and 2 marked.
+        copy.write_host((p + 10) as u64, &[0xaa]);
+        copy.write_host((p + PAGE + 20) as u64, &[0xbb]);
+        copy.write_host((p + 2 * PAGE + 30) as u64, &[0xcc]);
+        let bits = b.data as *mut u32;
+        for n in [base, base + 1, base + 2] {
+            // SAFETY: a dword of the mapped bitmap.
+            unsafe { *bits.add(n / 32) |= 1 << (n % 32) };
+        }
+        let protection = |page: usize| {
+            use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
+            // SAFETY: plain data filled in by the query.
+            let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+            // SAFETY: a valid out pointer of the right size.
+            let n = unsafe {
+                VirtualQuery((p + page * PAGE) as *const _, &mut info, size_of_val(&info))
+            };
+            assert!(n != 0);
+            info.Protect
+        };
+        copy_back_marks_with(&[], false, true);
+        // SAFETY: bytes of our pool.
+        unsafe {
+            let read = |at: usize| ((p + at) as *const u8).read_volatile();
+            assert_eq!(
+                protection(0),
+                windows_sys::Win32::System::Memory::PAGE_NOACCESS,
+                "sealed"
+            );
+            assert_eq!(
+                protection(2),
+                windows_sys::Win32::System::Memory::PAGE_NOACCESS,
+                "sealed"
+            );
+            // A read faults the page back.
+            assert_eq!(read(10), 0xaa);
+            assert_eq!(
+                protection(0),
+                windows_sys::Win32::System::Memory::PAGE_READONLY,
+                "guarded again"
+            );
+            // A write faults the page back and then lands as the title's.
+            ((p + PAGE + 50) as *mut u8).write_volatile(0xdd);
+            assert_eq!(read(PAGE + 20), 0xbb, "went back underneath the write");
+            assert_eq!(read(PAGE + 50), 0xdd, "the title's own byte");
+        }
+        // Page 2, which nothing touched, still waits behind its seal.
+        assert_eq!(
+            protection(2),
+            windows_sys::Win32::System::Memory::PAGE_NOACCESS,
+            "page 2 still waits"
+        );
+        // A copy-back of an empty submission writes what nothing touched.
+        copy_back_marks_with(&[], false, true);
+        // SAFETY: bytes of our pool.
+        let left = unsafe { ((p + 2 * PAGE + 30) as *const u8).read_volatile() };
+        assert_eq!(left, 0xcc, "the untouched page went back");
+        assert!(!crate::watch::lazy_armed(), "nothing waits any longer");
         unregister(p, p as u64);
     }
 

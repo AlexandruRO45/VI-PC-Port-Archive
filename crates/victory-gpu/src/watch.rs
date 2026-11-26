@@ -197,6 +197,12 @@ struct Guards {
     /// with no question to the runtime (whose lock its page mappings hold
     /// for long).
     alias_of: BTreeMap<usize, Vec<usize>>,
+    /// Pages whose marked write ([`crate::shadow::copy_back_marks`]) goes
+    /// back only at their first access (`VICTORY_LAZY_COPY_BACK`): sealed
+    /// no-access, their copy holds the bytes until something faults them
+    /// back ([`crate::shadow::service_lazy`]). Only armed where this guard
+    /// itself made the page read-only and no view shows it elsewhere.
+    lazy: BTreeMap<usize, std::sync::Arc<crate::shadow::Shadow>>,
     /// Tracked pages written this frame and the frame before (diagnostics).
     #[cfg(feature = "diagnostics")]
     written: BTreeSet<usize>,
@@ -209,6 +215,7 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     holders: BTreeMap::new(),
     busy: Vec::new(),
     alias_of: BTreeMap::new(),
+    lazy: BTreeMap::new(),
     #[cfg(feature = "diagnostics")]
     written: BTreeSet::new(),
     #[cfg(feature = "diagnostics")]
@@ -802,10 +809,132 @@ impl Drop for Writing {
 pub fn writing(at: usize, len: usize) -> Writing {
     // The length is the title's (`fread`'s size times count, saturated).
     let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
+    // A page held back in the range goes back before this write marks it
+    // changed afterwards: the write is what the holder sees next.
+    if lazy_armed() {
+        crate::shadow::service_lazy(take_lazy(first, last));
+    }
     let mut g = guards();
     g.busy.push((first, last));
     changed(&mut g, first, last, true);
     Writing { first, last }
+}
+
+/// Whether a marked write can wait for the page's first access
+/// ([`arm_lazy`]): only a page this guard made read-only whose bytes no
+/// view of the same pages shows elsewhere — a write seen through one
+/// would fault the page back reading stale bytes, and a write beside it
+/// ([`crate::shadow::service_lazy`], `#3069`) needs its own answer.
+fn lazy_can_take(g: &Guards, page: usize) -> bool {
+    !g.lazy.contains_key(&page) && g.protected.contains(&page) && !g.alias_of.contains_key(&page)
+}
+
+/// Seals each marked page no-access and holds its copy's bytes back until
+/// the page's first access ([`crate::shadow::copy_back_marks`],
+/// `VICTORY_LAZY_COPY_BACK`). The pages that cannot wait come back, to go
+/// back the eager way instead.
+pub(crate) fn arm_lazy(
+    pages: &[(std::sync::Arc<crate::shadow::Shadow>, usize)],
+) -> Vec<(std::sync::Arc<crate::shadow::Shadow>, usize)> {
+    use windows_sys::Win32::System::Memory::{PAGE_NOACCESS, VirtualProtect};
+    let mut eager = Vec::new();
+    let mut g = guards();
+    for (copy, page) in pages {
+        if !lazy_can_take(&g, *page) {
+            eager.push((copy.clone(), *page));
+            continue;
+        }
+        let mut old = 0;
+        // SAFETY: a block we made read-only (failing harmlessly if gone).
+        if unsafe { VirtualProtect((page * PAGE) as *const _, PAGE, PAGE_NOACCESS, &mut old) } == 0
+        {
+            eager.push((copy.clone(), *page));
+        } else {
+            g.lazy.insert(*page, copy.clone());
+        }
+    }
+    eager
+}
+
+/// Whether any page is armed — nothing to drain otherwise ([`take_lazy`]).
+pub(crate) fn lazy_armed() -> bool {
+    guards().lazy.iter().next().is_some()
+}
+
+/// The armed pages of `[from, to)` (page numbers), removed from the wait.
+pub(crate) fn take_lazy(
+    from: usize,
+    to: usize,
+) -> Vec<(std::sync::Arc<crate::shadow::Shadow>, usize)> {
+    let mut g = guards();
+    let pages: Vec<usize> = g.lazy.range(from..to).map(|(&p, _)| p).collect();
+    pages
+        .into_iter()
+        .map(|p| {
+            let copy = g
+                .lazy
+                .remove(&p)
+                .expect("it was taken from the same ledger");
+            (copy, p)
+        })
+        .collect()
+}
+
+/// Every armed page, removed from the wait.
+pub(crate) fn take_all_lazy() -> Vec<(std::sync::Arc<crate::shadow::Shadow>, usize)> {
+    let mut g = guards();
+    std::mem::take(&mut g.lazy)
+        .into_iter()
+        .map(|(p, c)| (c, p))
+        .collect()
+}
+
+/// The copy an armed page waits behind, removed and returned; it goes
+/// back now ([`crate::shadow::service_lazy`]) and its fault re-runs.
+pub(crate) fn lazy_page(page: usize) -> Option<std::sync::Arc<crate::shadow::Shadow>> {
+    guards().lazy.remove(&page)
+}
+
+/// Drops the wait of the armed pages of `[first, last)` — flushes the
+/// protection back to the read-only guard they waited behind, as what
+/// they hold is no longer wanted: the memory shows something new
+/// ([`title_memory_remapped`]) or is taken again ([`retake`]).
+fn forget_lazy(g: &mut Guards, first: usize, last: usize) {
+    use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
+    if g.lazy.is_empty() || g.lazy.range(first..last).next().is_none() {
+        return;
+    }
+    for page in g
+        .lazy
+        .range(first..last)
+        .map(|(&p, _)| p)
+        .collect::<Vec<_>>()
+    {
+        g.lazy.remove(&page);
+        let mut old = 0;
+        // SAFETY: an armed block of ours (failing harmlessly if gone).
+        unsafe { VirtualProtect((page * PAGE) as *const _, PAGE, PAGE_READONLY, &mut old) };
+    }
+}
+
+/// A page armed no-access that went back keeps its guard: the seal turns
+/// back into the read-only block it was, never leaving a fault that loops
+/// ([`crate::shadow::service_lazy`]).
+pub(crate) fn repaged(page: usize) {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_NOACCESS, PAGE_READONLY, VirtualProtect,
+        VirtualQuery,
+    };
+    // SAFETY: plain data filled in by the query.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out pointer of the right size.
+    let n = unsafe { VirtualQuery((page * PAGE) as *const _, &mut info, size_of_val(&info)) };
+    if n == 0 || info.State != MEM_COMMIT || info.Protect & 0xff != PAGE_NOACCESS {
+        return;
+    }
+    let mut old = 0;
+    // SAFETY: an armed block of ours.
+    unsafe { VirtualProtect((page * PAGE) as *const _, PAGE, PAGE_READONLY, &mut old) };
 }
 
 /// The runtime mapped or unmapped title memory `[at, at + len)`: what it
@@ -813,6 +942,7 @@ pub fn writing(at: usize, len: usize) -> Writing {
 pub fn title_memory_remapped(at: usize, len: usize) {
     let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
     let mut g = guards();
+    forget_lazy(&mut g, first, last);
     // What it showed is gone already: nothing to keep.
     changed(&mut g, first, last, false);
     // What it showed is not what it shows now: its links go, both ways.
@@ -839,7 +969,8 @@ pub fn title_memory_remapped(at: usize, len: usize) {
 /// were uploaded again for nothing: 19 % of the uploads, run evict3).
 pub(crate) fn retake(at: usize, len: usize) {
     let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
-    let g = guards();
+    let mut g = guards();
+    forget_lazy(&mut g, first, last);
     let others: Vec<usize> = g.alias_of.range(first..last).flat_map(|(_, o)| o.iter().copied()).collect();
     mark(&g, first, last);
     for page in others {
@@ -866,6 +997,12 @@ fn mark(g: &Guards, first: usize, last: usize) {
 pub fn title_memory_aliased(at: usize, others: &[usize]) {
     let mut g = guards();
     let page = at / PAGE;
+    // A view of the same pages a sealed page waits behind reads what the
+    // seal hides without a fault: the wait ends, read-only as it was.
+    forget_lazy(&mut g, page, page + 1);
+    for &other in others {
+        forget_lazy(&mut g, other / PAGE, other / PAGE + 1);
+    }
     for &other in others {
         for (x, y) in [(other / PAGE, page), (page, other / PAGE)] {
             let links = g.alias_of.entry(x).or_default();
@@ -895,14 +1032,25 @@ fn install() {
     unsafe extern "system" fn on_write(info: *mut EXCEPTION_POINTERS) -> i32 {
         // SAFETY: the system passes the exception being dispatched.
         let r = unsafe { &*(*info).ExceptionRecord };
+        const READ: usize = 0;
         const WRITE: usize = 1;
         if r.ExceptionCode != EXCEPTION_ACCESS_VIOLATION as NTSTATUS
             || r.NumberParameters < 2
-            || r.ExceptionInformation[0] != WRITE
+            || (r.ExceptionInformation[0] != WRITE && r.ExceptionInformation[0] != READ)
         {
             return EXCEPTION_CONTINUE_SEARCH;
         }
         let at = r.ExceptionInformation[1];
+        // A sealed block holds a marked write back for whoever faults it
+        // (`VICTORY_LAZY_COPY_BACK`): the reader gets it first; a writer
+        // re-faults as into the read-only guard it goes back behind.
+        if let Some(copy) = lazy_page(at / PAGE) {
+            crate::shadow::service_lazy(vec![(copy, at / PAGE)]);
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+        if r.ExceptionInformation[0] == READ {
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
         #[cfg(feature = "diagnostics")]
         let _timed = Timed(std::time::Instant::now(), crate::copystat::C::HandlerUs);
         // Held across both checks: another thread may have opened the block
