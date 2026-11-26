@@ -906,11 +906,6 @@ static ARM_SEALED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsi
 static ARM_REFUSED_GUARD: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 static ARM_REFUSED_HOST: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-/// Whether any page is armed — nothing to drain otherwise ([`take_lazy`]).
-pub(crate) fn lazy_armed() -> bool {
-    guards().lazy.iter().next().is_some()
-}
-
 /// The armed pages of `[from, to)` (page numbers), claimed: removed from
 /// the wait and in flight ([`Guards::servicing`]) until [`done_lazy`]
 /// ends each of their services.
