@@ -160,6 +160,23 @@ victory config
 `translate --jobs N` requires a positive worker count. Omit it to use the
 default worker count.
 
+For a memory-constrained host, set `VICTORY_HOST_RAM_BUDGET_MIB` or
+`host_ram_budget_mib` in `victory.toml` before running a title. Unset or zero
+uses the usual scheduling. A positive limit covers loose GPU shadow buffers
+and DirectStorage's buffered input, combined zlib/BCPack intermediate,
+BCPack records/history and worst-case scattered output. Reads wait for other
+reads to finish. A read that cannot fit alongside retained shadows completes
+with `E_OUTOFMEMORY`. A loose shadow that cannot fit logs a warning and the
+requesting draw or view can fail. Descriptors and lists keep their windows.
+The default heap allocator retires unused windows wholly inside a freed block.
+With a title allocator hook, a new shadow under pressure can reclaim unused
+windows whose entire virtual address range is free.
+Budgeted runs release idle snapshot buffers and use one runtime pipeline worker.
+
+The limit counts buffer capacities. Guest backing, registered GPU resources,
+active snapshots, compiler/driver internals and allocator overhead can still
+raise process memory above it. Keep the host's external memory guard in place.
+
 Logging: `VICTORY_LOG=victory_loader=trace,info` (a release build logs
 info and above).
 
