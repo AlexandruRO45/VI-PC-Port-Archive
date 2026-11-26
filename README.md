@@ -1,4 +1,4 @@
-# VIctory
+# Grand RTX 5090
 
 Runs an Xbox Series X|S title natively on Windows, from files
 the user supplies.
