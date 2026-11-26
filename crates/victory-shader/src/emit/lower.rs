@@ -6198,11 +6198,14 @@ impl<'a> Lower<'a> {
                 };
                 let a = select_at(self, dreg, dst_off)?;
                 let b = select_at(self, sreg, src_off)?;
-                for r in dreg.min(sreg)..=255u8 {
-                    if inst.write(Reg::V(r)).is_none() {
-                        break;
-                    }
-                    let old = match inst.read(Reg::V(r)) {
+                // `range.rs` can bound M0 so [dreg, dreg+end) and [sreg, sreg+end)
+                // are disjoint when the bases are far apart; walk `inst.writes`
+                // instead of breaking at the first gap.
+                for &(reg, _) in &inst.writes {
+                    let Reg::V(r) = reg else {
+                        continue;
+                    };
+                    let old = match inst.read(reg) {
                         Some(o) => self.i32_of(o)?,
                         None => self.s.m.i32(0),
                     };
@@ -6217,7 +6220,7 @@ impl<'a> Lower<'a> {
                         let is_d = self.s.m.cmp(c, pred::EQ, dst_off, kk);
                         x = self.s.m.select(c, is_d, b, x);
                     }
-                    self.write_placed(inst, Reg::V(r), x, guard);
+                    self.write_placed(inst, reg, x, guard);
                 }
                 Ok(())
             }

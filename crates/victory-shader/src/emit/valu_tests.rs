@@ -2324,3 +2324,34 @@ fn v_swaprel_b32_swaps_indexed_vgprs_and_respects_exec() {
         );
     });
 }
+
+#[test]
+fn v_swaprel_b32_constant_m0_swaps_distant_ranges() {
+    // Constant M0 = 2 bounds [v1, v4) and [v10, v13) separately via range.rs, leaving
+    // a gap between them; v_swaprel_b32 v1, v10 swaps v[1 + 0] (v1) and v[10 + 2] (v12).
+    let shader = build_valu_cs(&[
+        vop1(0x001, 11, vgpr(3)),          // v11 = s2
+        vop1(0x001, 12, vgpr(4)),          // v12 = s3
+        0xBEFC_0382,                       // s_mov_b32 m0, 2 (src_off=2, dst_off=0)
+        vop1(0x068, 1, vgpr(10)),          // v_swaprel_b32 v1, v10
+        0x3404_0488,                       // v_lshlrev_b32 v2, 8, v2
+        0x3416_1690,                       // v_lshlrev_b32 v11, 16, v11
+        0x3418_1898,                       // v_lshlrev_b32 v12, 24, v12
+        0x3800_0501,                       // v_or_b32 v0, v1, v2
+        0x3800_1700,                       // v_or_b32 v0, v0, v11
+        0x3800_1900,                       // v_or_b32 v0, v0, v12
+    ]);
+
+    let cases: &[([u32; 4], u32)] = &[
+        ([0x11, 0x22, 0xAA, 0xBB], 0x11_AA_22_BB),
+        ([0x42, 0x10, 0x20, 0x99], 0x42_20_10_99),
+    ];
+    let inputs: Vec<[u32; 4]> = cases.iter().map(|c| c.0).collect();
+    run_cases(&shader, &inputs, |backend, i, _, got| {
+        let want = cases[i].1;
+        assert_eq!(
+            got, want,
+            "{backend}: v_swaprel_b32 constant m0=2 = {got:#010x}, want {want:#010x}",
+        );
+    });
+}
