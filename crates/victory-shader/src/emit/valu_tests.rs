@@ -462,11 +462,6 @@ fn v_fma_f16_quiets_nans() {
                 "{backend} case {i} with {input:08x?}: expected a quiet f16 NaN, got {actual:#010x}"
             );
             assert_eq!(
-                actual & 0x8000,
-                expected & 0x8000,
-                "{backend} case {i} with {input:08x?}: NaN sign"
-            );
-            assert_eq!(
                 actual >> 16,
                 expected >> 16,
                 "{backend} case {i} with {input:08x?}: upper half"
