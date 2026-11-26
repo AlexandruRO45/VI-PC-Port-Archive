@@ -5,6 +5,7 @@ set "VICTORY_GAME_DIR=C:\Users\Vyto\Downloads\GTA6"
 rem 10 GB TEST 2 (one change against cool_fox's own settings; test 1's CARD_WINDOWS_MB=1792 dropped: worse, this fork reads no windows).
 rem Card copies of the title's buffers: this fork caps them at 512 MB on cards of 12 GB or less; v11 ran well with 1024.
 set VICTORY_CARD_BUFFERS_MB=1024
+rem RESULT: WORSE, 2 fps and textures not loading (buffer card copies got 254 MB instead of 655+; GPU 330 ms). Do not use.
 rem 10 GB TEST 3 (one change against test 2, the failsafe: run-coolfox-10gb-2.cmd, 19.6 fps): the room kept for render targets 3072 -> 1024 MB,
 rem so about 19,000 waiting textures get onto the card (Series S targets are small; the 90 % budget line still holds).
 set VICTORY_CARD_ROOM_FOR_TARGETS_MB=1024
