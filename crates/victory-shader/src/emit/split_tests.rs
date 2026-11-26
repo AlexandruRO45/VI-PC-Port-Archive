@@ -284,10 +284,10 @@ fn exchanges_inside_a_branch_one_half_skips() {
     });
 }
 
-/// Groups of several console waves need the halves to meet without a
-/// group barrier: not yet.
+/// Groups of several console waves (e.g. 128 threads = 2 console waves)
+/// allocate per-wave exchange slots in LDS and synchronize with a group barrier.
 #[test]
-fn console_flow_is_for_one_console_wave_per_group() {
+fn console_flow_supports_multiple_console_waves_per_group() {
     let body = [
         0xD760_0009,
         0x0001_5100, // v_readlane_b32 s9, v0, 40
@@ -298,7 +298,7 @@ fn console_flow_is_for_one_console_wave_per_group() {
         lanes_max: 32,
     };
     assert!(emit_for(&program(&body, 64), nvidia).is_ok());
-    assert!(emit_for(&program(&body, 128), nvidia).is_err());
+    assert!(emit_for(&program(&body, 128), nvidia).is_ok());
 }
 
 /// A loop lane t runs t times, with a lane read of the other half in
@@ -393,4 +393,58 @@ fn loops_with_an_exit_mask_grown_from_zero() {
         0x4A04_040C, // v_add_nc_u32 v2, s12, v2
     ];
     console_flow_case("exit-mask loop reading lane 40", &body, 64, |_| 40 + 64);
+}
+
+/// Multiple console waves in a single threadgroup (128 threads = 2 console
+/// Wave64s) each read lane 40 of their own console wave without colliding in
+/// the shared-memory exchange array.
+#[test]
+fn multi_wave_console_flow_isolates_per_wave_exchange() {
+    let body = [
+        0xD760_0009,
+        0x0001_5100, // v_readlane_b32 s9, v0, 40
+        0x7E04_0209, // v_mov_b32 v2, s9
+    ];
+    console_flow_case("128-thread multi-wave readlane 40", &body, 128, |t| {
+        (t & !63) + 40
+    });
+}
+
+/// A Wave64 compute shader using both cross-half lane exchange and LDS
+/// (`ds_write_b32` / `ds_read_b32`) runs in the console flow on 32-lane hosts
+/// without corrupting user LDS or `xchg` slots.
+#[test]
+fn console_flow_with_lds_preserves_shared_memory() {
+    let lds_body: [u32; 13] = [
+        0x3406_0082, // v_lshlrev_b32 v3, 2, v0          (byte addr = t * 4)
+        0x4A08_00FF,
+        0x0000_0064, // v_add_nc_u32 v4, 100, v0         (val = t + 100)
+        0xD834_0000,
+        0x0000_0403, // ds_write_b32 v3, v4
+        0xD760_0009,
+        0x0001_5100, // v_readlane_b32 s9, v0, 40        (s9 = 40)
+        0x3A06_06FF,
+        0x0000_0080, // v_xor_b32 v3, 128, v3            (partner addr = (t ^ 32) * 4)
+        0xD8D8_0000,
+        0x0500_0003, // ds_read_b32 v5, v3
+        0xBF8C_007F, // s_waitcnt vmcnt(0) lgkmcnt(0)
+        0x4A04_0A09, // v_add_nc_u32 v2, s9, v5          (40 + ((t ^ 32) + 100))
+    ];
+    let mut native = program(&lds_body, 64);
+    if let StageIo::Cs(ref mut cs) = native.io {
+        cs.rsrc2 |= 1 << 15; // 1 LDS block (128 dwords = 512 bytes)
+    }
+    let Ok(names) = adapters() else {
+        eprintln!("no DXGI; skipped");
+        return;
+    };
+    for name in names {
+        let Ok(host) = Host::on(&name) else {
+            continue;
+        };
+        let out = run(&host, &native, 1)
+            .unwrap_or_else(|e| panic!("{name}: console flow with LDS: {e}"));
+        let expect: Vec<u32> = (0..64u32).map(|t| 40 + ((t ^ 32) + 100)).collect();
+        assert_eq!(out, expect, "{name}: console flow with LDS");
+    }
 }

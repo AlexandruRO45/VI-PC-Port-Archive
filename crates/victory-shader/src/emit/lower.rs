@@ -1193,15 +1193,21 @@ impl<'a> Lower<'a> {
             // The rest of such programs need the halves to exchange values
             // (masks read whole, lanes of the other half): the console flow,
             // for a group of one console wave without LDS.
-            wants_console_flow = console_lanes
+            let lds_wave64 = !console_lanes
+                && x.native.wave64
+                && !x.target.runs(64)
+                && x.target.runs(32)
+                && s.lds_dwords > 0
+                && !insts().any(|i| i.name().contains("permute"))
+                && (0..p.blocks.len()).all(|b| super::wave::sections(p, b).is_empty());
+            wants_console_flow = (console_lanes
                 && !split
                 && x.native.wave64
                 && !x.target.runs(64)
                 && x.target.runs(32)
-                && s.lds_dwords == 0
-                && cs.threads.iter().product::<u32>() <= 64
                 && !insts().any(|i| i.name().contains("permute"))
-                && (0..p.blocks.len()).all(|b| super::wave::sections(p, b).is_empty());
+                && (0..p.blocks.len()).all(|b| super::wave::sections(p, b).is_empty()))
+                || lds_wave64;
             // On a host that runs the console's wave size: lane reads and
             // writes in a program whose lanes branch differently (see
             // [`CONSOLE_FLOW`]).
@@ -4729,6 +4735,11 @@ impl<'a> Lower<'a> {
             return self.ds_sub_dword(inst, sub, a, offset, dst_reg, data, guard);
         }
         if let Some(rest) = name.strip_prefix("ds_read") {
+            if self.x.console_cf && self.x.native.wave64 && !self.x.target.runs(64) {
+                let mode = self.s.m.i32(1 | 8);
+                let void = self.s.t.void;
+                self.s.op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+            }
             let reg = dst_reg.ok_or("an LDS read result")?;
             let elements = if rest.starts_with('2') {
                 pair(name)
@@ -4769,6 +4780,11 @@ impl<'a> Lower<'a> {
                 self.lds_store_dword(address, x);
             }
             self.end_guarded(at, &[]);
+            if self.x.console_cf && self.x.native.wave64 && !self.x.target.runs(64) {
+                let mode = self.s.m.i32(1 | 8);
+                let void = self.s.t.void;
+                self.s.op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+            }
             return Ok(());
         }
         // Atomics: the old value returns with `_rtn`.
@@ -12667,25 +12683,32 @@ impl<'a> Lower<'a> {
             return (x, z);
         }
         let (_, half) = self.console_lane();
+        let waves = threads.div_ceil(64);
         let slots = match self.xchg {
             Some(g) => g,
             None => {
-                let arr = self.s.m.array(2, self.s.t.i32);
+                let arr = self.s.m.array(waves * 2, self.s.t.i32);
                 let g = self.s.m.global("xchg", arr, 3);
                 self.xchg = Some(g);
                 g
             }
         };
+        let f = self.console_flat();
+        let k6 = self.s.m.i32(6);
+        let k1 = self.s.m.i32(1);
+        let wave_idx = self.s.m.bin(at, Bin::LShr, f, k6);
+        let base = self.s.m.bin(at, Bin::Shl, wave_idx, k1);
+        let mine_idx = self.s.m.bin(at, Bin::Add, base, half);
+        let hi_idx = self.s.m.bin(at, Bin::Add, base, k1);
         let void = self.s.t.void;
         // Thread-group sync with a group-shared memory fence.
         let mode = self.s.m.i32(1 | 8);
-        let mine = self.s.m.element(at, slots, half);
+        let mine = self.s.m.element(at, slots, mine_idx);
         self.s.m.store(at, mine, x);
         self.s
             .op(at, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
-        let one = self.s.m.i32(1);
-        let p0 = self.s.m.element(at, slots, z);
-        let p1 = self.s.m.element(at, slots, one);
+        let p0 = self.s.m.element(at, slots, base);
+        let p1 = self.s.m.element(at, slots, hi_idx);
         let lo = self.s.m.load(at, p0);
         let hi = self.s.m.load(at, p1);
         // Both read before the next exchange writes.

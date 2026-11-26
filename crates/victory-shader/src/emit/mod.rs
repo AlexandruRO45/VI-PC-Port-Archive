@@ -1189,14 +1189,10 @@ mod tests {
                 emit_for(&compute(&words, true), target).unwrap_or_else(|e| panic!("{name}: {e}"));
             host.compute_pipeline(&one)
                 .unwrap_or_else(|e| panic!("{name}: {e}"));
-            match emit_for(&compute_of(&words, true, 128), target) {
-                Ok(cs) => {
-                    assert!(target.runs(64), "{name}");
-                    host.compute_pipeline(&cs)
-                        .unwrap_or_else(|e| panic!("{name}: {e}"));
-                }
-                Err(_) => assert!(!target.runs(64), "{name}"),
-            }
+            let two = emit_for(&compute_of(&words, true, 128), target)
+                .unwrap_or_else(|e| panic!("{name} (128 threads): {e}"));
+            host.compute_pipeline(&two)
+                .unwrap_or_else(|e| panic!("{name} (128 threads pipeline): {e}"));
         }
     }
 
