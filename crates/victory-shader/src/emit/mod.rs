@@ -182,7 +182,8 @@ pub fn group_sync() -> u8 {
 ///   waves without the round that asks which half has a lane (where every lane
 ///   has one), 64 the dwords of one console load read by one call for every
 ///   four (not on unless asked), 128 pure loop-invariant code motion, 256
-///   adjacent redundant barrier elimination (`511` is every pass with it).
+///   adjacent and read-after-read redundant barrier elimination (`511` is
+///   every pass with it).
 ///
 /// Part of the translation: the shader cache keys on it (`victory-gpu`'s
 /// does).
