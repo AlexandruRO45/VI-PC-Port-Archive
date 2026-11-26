@@ -961,6 +961,20 @@ pub(crate) fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn reset_forgets_bound_pipelines_root_uploads_and_texture_aliases() {
+        let mut deferred = super::Deferred::default();
+        deferred.bound.insert(1);
+        deferred.filled.insert((2, 256), 3);
+        deferred.texture_aliases.insert(4, 5);
+
+        deferred.clear();
+
+        assert!(deferred.bound.is_empty());
+        assert!(deferred.filled.is_empty());
+        assert!(deferred.texture_aliases.is_empty());
+    }
+
+    #[test]
     fn sparse_copies_preserve_islands_and_observe_remaps() {
         use windows_sys::Win32::System::Memory::*;
         const N: usize = 5 << 16;
@@ -2400,8 +2414,8 @@ impl Deferred {
     fn clear(&mut self) {
         // Every field belongs to one recording. Adding one must also decide how it resets.
         let Self {
-            copies, uploads, upload_bytes, kept, refreshed, textures, writes, backs,
-            back_wanted, texture_backs, budget_zeroed, indirect_readable,
+            copies, uploads, upload_bytes, kept, refreshed, bound, filled, textures, texture_aliases,
+            writes, backs, back_wanted, texture_backs, budget_zeroed, indirect_readable,
         } = self;
         ALIVE[6].fetch_sub(uploads.len() as u64, Ordering::Relaxed);
         ALIVE[7].fetch_sub(*upload_bytes, Ordering::Relaxed);
@@ -2410,7 +2424,10 @@ impl Deferred {
         *upload_bytes = 0;
         kept.clear();
         refreshed.clear();
+        bound.clear();
+        filled.clear();
         textures.clear();
+        texture_aliases.clear();
         writes.clear();
         backs.clear();
         back_wanted.clear();
