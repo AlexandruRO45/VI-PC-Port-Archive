@@ -10988,7 +10988,6 @@ mod tests {
 
     const S_ENDPGM: u32 = 0xBF81_0000;
 
-
     /// A program's constant table starts after its instructions, unless a
     /// load at a fixed offset reads below that.
     #[test]

@@ -28,17 +28,14 @@ pub(super) struct Plan {
 /// lanes run in step; the host's two waves do not, so a lane reading what a
 /// lane of the other half wrote, or writing where it read, must wait at a
 /// barrier between the two. The program's accesses must come in phases of
-/// reads only or writes only (writes are ordered too, where a point lets
-/// them), and between two phases there must be a point
+/// reads only, writes only (each write ordered after the last) or atomics
+/// only, and between two of them there must be a point
 /// every thread reaches exactly once (on every path to every exit, outside
 /// loops, where no instruction is half done): a barrier anywhere else could
 /// hang the group. The first such point after the last access of a phase
 /// takes the barrier. `inside(b, i)` tells an instruction the lowering
 /// handles as part of an earlier one (no barrier before it).
 //
-// shortcut: two writes with no such point between them (in one branch or
-// loop) keep no order between the halves: lanes writing the same dword from
-// both lose the console's order; the title's tiles write disjoint slots.
 pub(super) fn barriers(
     p: &Program,
     exits: &[LaneExit],
@@ -161,11 +158,7 @@ pub(super) fn barriers(
         if a == b && a != WRITE {
             continue;
         }
-        let writes = a == WRITE && b == WRITE;
         if from == to {
-            if writes {
-                continue;
-            }
             return Err(NO_POINT);
         }
         // The first place past `from` and no later than `to`.
@@ -174,9 +167,6 @@ pub(super) fn barriers(
             i => *q > (from.0, i),
         };
         let Some(point) = points.iter().find(|q| past(q) && **q <= to) else {
-            if writes {
-                continue;
-            }
             return Err(NO_POINT);
         };
         barriers.push((spine[point.0 - 1], point.1));
