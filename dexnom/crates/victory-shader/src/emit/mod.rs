@@ -165,6 +165,48 @@ pub fn translate_ray_probe(container: &[u8]) -> Result<HostShader, ShaderError> 
     }
 }
 
+/// Diagnostic storage for InitHeaders, after the page faults and ray probe.
+pub const RAW_STORE_PROBE_HASH: &str = "3cea4534bbc15632";
+pub const RAW_STORE_PROBE_BASE: u32 = MEMORY_FAULTS + RAY_PROBE_DWORDS;
+pub const RAW_STORE_PROBE_CAPACITY: u32 = 4096;
+pub const RAW_STORE_PROBE_EVENT_DWORDS: u32 = 5;
+/// Attempted event count, overflow flag, then five dwords per store.
+/// Each store records the full low/high address, byte width, directory copy
+/// slot and byte offset into that copy's host view.
+pub const RAW_STORE_PROBE_DWORDS: u32 = 2 + RAW_STORE_PROBE_CAPACITY * RAW_STORE_PROBE_EVENT_DWORDS;
+
+pub fn raw_store_probe_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    cfg!(feature = "diagnostics")
+        && *ENABLED.get_or_init(|| {
+            std::env::var("VICTORY_CAPTURE_RAW_STORES").as_deref() == Ok(RAW_STORE_PROBE_HASH)
+        })
+}
+
+thread_local! {
+    static RAW_STORE_PROBE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn with_raw_store_probe<T>(work: impl FnOnce() -> T) -> T {
+    struct Reset(bool);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            RAW_STORE_PROBE.set(self.0);
+        }
+    }
+    let _restore = Reset(RAW_STORE_PROBE.replace(true));
+    work()
+}
+
+/// Call for the matching diagnostic hash outside the ordinary shader cache.
+pub fn translate_raw_store_probe(container: &[u8]) -> Result<HostShader, ShaderError> {
+    if raw_store_probe_enabled() {
+        with_raw_store_probe(|| translate(container))
+    } else {
+        translate(container)
+    }
+}
+
 /// The iteration count after which a translated loop is left, per lane and
 /// per entry into the loop: [`DEFAULT_LOOP_LIMIT`].
 ///
@@ -343,6 +385,27 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
     let io = io::raise(&p, &native)?;
     let st = st?;
     emit(&c, &native, &p, &st, &io, &res)
+}
+
+/// The RT-off renderer can use a diffuse light floor in the tiled material pass.
+pub fn ambient_fallback_enabled() -> bool {
+    std::env::var_os("VICTORY_RAY_TRACING").is_some_and(|v| v == "0")
+        && std::env::var_os("VICTORY_AMBIENT_FALLBACK").is_none_or(|v| v != "0")
+}
+
+fn tiled_ambient(c: &Container, native: &NativeProgram) -> bool {
+    native.stage == HwStage::Ps
+        && ambient_fallback_enabled()
+        && c.part(FourCC::PSV0).is_some_and(|psv| {
+            psv.data.split(|&b| b == 0).any(|entry| {
+                entry.starts_with(b"TL_PS_PBR_MATERIAL_")
+                    || entry.starts_with(b"TL_PS_NoDir_PBR_MATERIAL_")
+            })
+        })
+        && native.used.iter().any(|u| {
+            u.root == RootType::Table && u.kind == crate::ResourceType::Srv
+                && u.slot == 0 && u.table_offset_dwords == lower::ALBEDO_DWORD && u.dwords == 8
+        })
 }
 
 /// Emits a program whose earlier stages already ran.
@@ -714,7 +777,7 @@ fn emit_program(
         0xba30_5538_e28d_414c_af39_a51a_4bc2_f308
             | 0xd635_3bf6_df15_ff8e_c4aa_aec1_0dbf_3974
     ) && matches!(native.io, crate::native::StageIo::Cs(cs) if cs.threads == [64, 1, 1]);
-    let l = lower::lower_program(&parts, box_rehydration, tiled_lighting_uint_srvs(c.digest))?;
+    let l = lower::lower_program(&parts, box_rehydration, tiled_lighting_uint_srvs(c.digest), tiled_ambient(c, native))?;
     let wave_size = l.wave_size;
     let shader = HostShader {
         stage: native.stage,

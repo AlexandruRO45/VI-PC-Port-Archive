@@ -53,6 +53,7 @@ The game also imports Windows core API sets for services such as files, timing a
 | `thread-dimensions` | Slot 80 `USE_THREAD_DIMENSIONS` (`0x20`) converts thread counts using the bound PSO's `[numthreads]` and fails closed without one |
 | `descriptor-reclaim` | Shader-visible descriptor heap reclamation across completed batches, overlapping in-flight `Reset()`, `ClearState`, evicted-slot rebinding, and unsubmitted pin exhaustion |
 | `xbox-shader` | A console shader's pipeline and dispatch ([shader cache](#shader-cache)) |
+| `wave64-shader` | A console shader that sums across 64-lane waves, translated while the game runs; not part of `all` |
 
 ```sh
 python tuxbox.py verify --only lanes-selftest --output build/lanes-selftest.json
@@ -100,7 +101,14 @@ python tuxbox.py verify --only lanes-shader-cache --output build/lanes-cache.jso
 | Compiled | An uncached shader is translated by the host worker while the game runs |
 | Reused | The next launch uses that translation without compiling it again |
 
-These checks run on the Proton backend. They remove only this shader's cache entries from the prefix.
+Lanes also carries a console program that sums across 64-lane waves. The `wave64-shader` scenario runs it and compares every thread's word, twice: once with the provider told the host has 32-lane waves ([host profile](../../docs/USAGE.md#host-profile)), so any card takes the [32-lane translation](../../docs/SHADERS.md#64-lane-programs-on-32-lane-hosts), and once with the card as it is.
+
+| Check | What it proves |
+| --- | --- |
+| Wave, narrow | The provider asks for the 32-lane translation while the game runs, loads it, and the results are the console's |
+| Wave, host | The results are the console's with whatever translation this card needs |
+
+These checks run on the Proton backend. They remove only these shaders' cache entries from the prefix.
 
 ## Deterministic replay
 

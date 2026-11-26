@@ -52,14 +52,15 @@ struct Journal {
     kept: bool,
 }
 
-static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
+const EMPTY_JOURNAL: Journal = Journal {
     asked: 0,
     written: BTreeMap::new(),
     found: Vec::new(),
     ahead: Vec::new(),
     ahead_asked: 0,
     kept: false,
-});
+};
+static JOURNAL: Mutex<Journal> = Mutex::new(EMPTY_JOURNAL);
 
 /// Ranges of one submission closer than this are asked about together:
 /// walking the pages between them costs less than another kernel call (a
@@ -75,23 +76,30 @@ const AHEAD_MAX: usize = (1 << 30) / PAGE;
 /// submissions refresh thousands of host copies (6,664 askings a frame,
 /// 456 ms, in run 14). Ranges that are not write-watched, or lie alone, are
 /// left to `writes`.
-pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
-    let mut pieces: Vec<(usize, usize)> = ranges
-        .iter()
-        .filter(|r| r.0 < r.1)
-        .map(|&(start, end)| (start / PAGE, end.div_ceil(PAGE)))
-        .collect();
-    if pieces.len() < 2 {
-        return;
-    }
-    pieces.sort_unstable();
+pub(crate) fn ask_ahead(ranges: impl Iterator<Item = (usize, usize)>) {
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
-    let j = &mut *j;
     // The submission's one asking stands ([`ask_once`]): what it does not
-    // hold is left to `writes`.
+    // hold is left to `writes`. Avoid collecting and sorting the ranges
+    // every time the submission flushes a batch.
     if j.kept {
         return;
     }
+    let pieces = watched_pieces(ranges);
+    if pieces.len() >= 2 {
+        ask_groups(&mut j, &pieces);
+    }
+}
+
+fn watched_pieces(ranges: impl Iterator<Item = (usize, usize)>) -> Vec<(usize, usize)> {
+    let mut pieces: Vec<_> = ranges
+        .filter(|&(start, end)| start < end)
+        .map(|(start, end)| (start / PAGE, end.div_ceil(PAGE)))
+        .collect();
+    pieces.sort_unstable();
+    pieces
+}
+
+fn ask_groups(j: &mut Journal, pieces: &[(usize, usize)]) {
     j.asked += 1;
     j.ahead_asked = j.asked;
     j.ahead.clear();
@@ -176,25 +184,19 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
     if !once() {
         return;
     }
-    ask_once_end();
-    ask_ahead(ranges);
+    let mut pieces = watched_pieces(ranges.iter().copied());
+    // Distinct host copies can ask for the same guest pages. In particular,
+    // don't retry a failed GetWriteWatch for every copy with that span.
+    pieces.dedup();
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     let j = &mut *j;
-    if j.ahead.is_empty() {
-        // `ask_ahead` asked nothing (fewer than two ranges).
-        j.asked += 1;
-        j.ahead_asked = j.asked;
-    }
-    // `ask_ahead` leaves a range that lies alone to `writes`, which asks
+    ask_groups(j, &pieces);
+    // `ask_groups` leaves a range that lies alone to `writes`, which asks
     // once per flush: with one asking for the submission that was every
     // such range asked again at each of its 70 flushes (run 76: 2,300
     // askings a frame with the switch on, as without it). They are asked
     // here, once; what is not write-watched stays with `writes`.
-    for &(start, end) in ranges {
-        if start >= end {
-            continue;
-        }
-        let (first, last) = (start / PAGE, end.div_ceil(PAGE));
+    for (first, last) in pieces {
         if !j.ahead.iter().any(|&(a, b)| a <= first && last <= b) && ask_kernel(j, first, last) {
             j.ahead.push((first, last));
         }
@@ -277,12 +279,19 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
         add(C::WatchUs, started.elapsed().as_micros() as u64);
         slow(started.elapsed().as_micros() as u64);
     }
-    let now = j.ahead_asked;
-    for k in 0..count {
-        let page = j.found[k] / PAGE;
-        j.written.insert(page, now);
-    }
+    note_kernel_writes(j, count, j.ahead_asked);
     true
+}
+
+fn note_kernel_writes(j: &mut Journal, count: usize, now: u64) {
+    let mut previous = None;
+    for &address in &j.found[..count] {
+        let page = address / PAGE;
+        if previous != Some(page) {
+            j.written.insert(page, now);
+            previous = Some(page);
+        }
+    }
 }
 
 /// What [`writes`] would say of `[start, end)` from the journal alone, if
@@ -359,8 +368,8 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     }
     j.asked += 1;
     let now = j.asked;
-    let pages = j.found[..count].iter().map(|&at| at / PAGE).chain(guarded);
-    for page in pages.collect::<Vec<_>>() {
+    note_kernel_writes(j, count, now);
+    for page in guarded {
         j.written.insert(page, now);
     }
     Some((
@@ -988,6 +997,17 @@ mod tests {
         MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
     };
     const MEM_WRITE_WATCH: u32 = 0x20_0000;
+
+    #[test]
+    fn kernel_pages_fold_into_guest_pages_without_losing_writes() {
+        let mut journal = EMPTY_JOURNAL;
+        journal.found.extend([0, KERNEL_PAGE, PAGE, PAGE + KERNEL_PAGE, 3 * PAGE]);
+        note_kernel_writes(&mut journal, 4, 12);
+        assert_eq!(journal.written, BTreeMap::from([(0, 12), (1, 12)]));
+        journal.found[..3].copy_from_slice(&[PAGE, 3 * PAGE, PAGE + KERNEL_PAGE]);
+        note_kernel_writes(&mut journal, 3, 15);
+        assert_eq!(journal.written, BTreeMap::from([(0, 12), (1, 15), (3, 15)]));
+    }
 
     #[test]
     fn clean_runs_match_individual_pages_after_overlaps_and_invalidations() {

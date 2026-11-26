@@ -1152,7 +1152,13 @@ mod tests {
         let live = host::placed_texture(&srv).unwrap();
         let View::Shader(texture, _) = live.view else { panic!("no sampled texture") };
         let gpu = crate::resource::host_resource(texture as This).unwrap();
-        assert_eq!(host.shows(1, gpu), Some(true));
+        let shown = host.shows(1, gpu);
+        if let Some((_, ready)) = crate::resource::sparse_sample(texture as This) {
+            assert_eq!(ready, None);
+            assert_eq!(shown, None);
+        } else {
+            assert_eq!(shown, Some(true));
+        }
 
         // Replacing the selection and writing the original bytes back still creates a new generation.
         clear(1);
@@ -1162,7 +1168,7 @@ mod tests {
         put(2, addr, 1);
         clear(2);
         // A copied/renderable texture starting earlier can overlap the view.
-        let _writer = crate::resource::texture_at(base, &writer).unwrap();
+        let _writer = crate::resource::texture_at(base, &writer, 0).unwrap();
         assert!(host.demand_material_texture(heap, 1, new_stamp, frame).is_none(), "GPU-writable owner");
         assert_eq!(release(object), 0);
     }

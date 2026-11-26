@@ -27,6 +27,8 @@ pub mod device;
 #[cfg(windows)]
 mod draw;
 pub mod dxgi;
+#[cfg(windows)]
+pub mod external;
 pub mod fence;
 pub mod frame;
 #[cfg(windows)]
@@ -57,6 +59,8 @@ mod shadow;
 pub mod signature;
 #[cfg(windows)]
 mod texture;
+#[cfg(windows)]
+mod tiles;
 #[cfg(windows)]
 mod watch;
 #[cfg(windows)]

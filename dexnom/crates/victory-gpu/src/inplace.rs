@@ -311,7 +311,11 @@ impl ReadbackMapping {
     /// A remap cannot come between the identity check and the CPU write.
     pub(crate) fn for_write(&self) -> Option<crate::watch::Reading> {
         let guard = crate::watch::title_memory_reading();
-        self.0.load(Ordering::Acquire).then_some(guard)
+        self.live().then_some(guard)
+    }
+
+    pub(crate) fn live(&self) -> bool {
+        self.0.load(Ordering::Acquire)
     }
 }
 

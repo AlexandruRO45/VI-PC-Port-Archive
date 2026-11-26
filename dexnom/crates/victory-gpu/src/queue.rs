@@ -779,6 +779,22 @@ extern "system" fn present(
     #[cfg(windows)]
     release_held(forces());
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
+    #[cfg(all(windows, feature = "diagnostics"))]
+    if frame.is_power_of_two()
+        && std::env::var_os("VICTORY_TRACE_PRESENT_PLANES").is_some()
+        && planes > 0
+        && let Some(first) = unsafe { plane_parameters.as_ref() }
+    {
+        let mut bytes = [0; 128];
+        let amount = if planes > 1 { bytes.len() } else { 24 };
+        let words = if crate::host::read_into(plane_parameters.cast(), &mut bytes[..amount]) {
+            bytes[..amount].chunks_exact(8)
+                .map(|word| format!("{:#x}", u64::from_le_bytes(word.try_into().unwrap())))
+                .collect::<Vec<_>>()
+        } else { Vec::new() };
+        tracing::info!(frame, planes, first_count = first.count, first_resources = ?first.resources,
+            ?words, "PresentX plane header trace");
+    }
     if frame.is_power_of_two() {
         let (draws, dispatches) = crate::list::take_counts();
         #[cfg(windows)]

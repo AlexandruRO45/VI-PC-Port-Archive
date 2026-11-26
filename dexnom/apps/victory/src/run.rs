@@ -5,12 +5,20 @@ use anyhow::{Context, Result};
 use crate::{Console, Unimplemented};
 
 #[cfg(windows)]
+#[path = "native_1440p.rs"]
+mod native_1440p;
+#[cfg(windows)]
+#[path = "fsr_preset.rs"]
+mod fsr_preset;
+
+#[cfg(windows)]
 pub fn run(
     exe: &Path,
     unimplemented: Unimplemented,
     strict: bool,
     execute: bool,
     console: Console,
+    rays: crate::RayOptions,
 ) -> Result<()> {
     use std::sync::Arc;
     use victory_hle::{HleResolver, HostPolicy};
@@ -19,8 +27,16 @@ pub fn run(
     // A title that relaunched itself: the old process must be gone first.
     victory_hle::modules::lifecycle::wait_for_previous();
     let cfg = victory_core::Config::load()?;
+    rays.apply(&cfg);
+    use fsr_preset::FsrPreset;
+    let fsr = match std::env::var("VICTORY_FSR_4K").as_deref() {
+        Ok("0") => None,
+        Ok(name) => Some(FsrPreset::from_name(name).context("Unknown FSR preset")?),
+        Err(_) => (std::env::var("VICTORY_FSR_1440P_TO_4K").as_deref() == Ok("1"))
+            .then_some(FsrPreset::Quality),
+    };
     let original = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
-    let prepared = victory_loader::prepare(&original)?;
+    let mut prepared = victory_loader::prepare(&original)?;
     let hash = prepared.original_hash.to_hex();
     match victory_game::identify(&hash) {
         Some(build) => println!("build          {} ({hash})", build.label),
@@ -29,7 +45,42 @@ pub fn run(
 
     let images = cfg.cache_subdir("images")?;
     victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
-    let image = victory_loader::load(&prepared, &images)?;
+    let render_1080p = std::env::var("VICTORY_RENDER_1080P").as_deref() == Ok("1");
+    let image = if let Some(preset) = fsr {
+        anyhow::ensure!(matches!(console, Console::SeriesX), "FSR at 4K requires Series X mode");
+        native_1440p::prepare_fsr_4k(&mut prepared, preset)?;
+        // SAFETY: Windows supports setting the environment across threads.
+        // Display settings precede host provider initialization and title queries.
+        unsafe {
+            std::env::set_var("VICTORY_DISPLAY_MODE", "3840x2160");
+            std::env::set_var("VICTORY_NATIVE_1440P", "0");
+            std::env::set_var("VICTORY_RENDER_1080P", "0");
+        }
+        victory_hle::modules::fidelityfx::use_host_dir(cfg.fidelityfx_dir.as_deref());
+        anyhow::ensure!(
+            victory_hle::modules::fidelityfx::serving(),
+            "FSR at 4K requires the PC FidelityFX provider. Set VICTORY_FIDELITYFX_DIR to its folder."
+        );
+        let cache = format!("images/fsr-{}-4k-sdr", preset.name());
+        victory_loader::load(&prepared, &cfg.cache_subdir(&cache)?)?
+    } else if render_1080p || std::env::var("VICTORY_NATIVE_1440P").as_deref() == Ok("1") {
+        anyhow::ensure!(matches!(console, Console::SeriesX), "1440p output requires Series X mode");
+        native_1440p::prepare(&mut prepared, render_1080p)?;
+        // SAFETY: Windows supports setting the environment across threads.
+        // The title and DXGI emulation have not started querying display modes.
+        unsafe {
+            std::env::set_var("VICTORY_DISPLAY_MODE", "2560x1440");
+            std::env::set_var("VICTORY_NATIVE_1440P", "1");
+        }
+        let image_cache = if render_1080p {
+            "images/1080p-to-1440p-sdr"
+        } else {
+            "images/native-1440p-sdr"
+        };
+        victory_loader::load(&prepared, &cfg.cache_subdir(image_cache)?)?
+    } else {
+        victory_loader::load(&prepared, &images)?
+    };
     // The program is mapped from the copy `load` wrote: the file's bytes
     // and their patched copy are not read again, and were held for the
     // whole run (two blocks of 114.7 MB each for the title, in
@@ -339,6 +390,6 @@ mod tests {
 }
 
 #[cfg(not(windows))]
-pub fn run(_: &Path, _: Unimplemented, _: bool, _: bool, _: Console) -> Result<()> {
+pub fn run(_: &Path, _: Unimplemented, _: bool, _: bool, _: Console, _: crate::RayOptions) -> Result<()> {
     anyhow::bail!("running titles requires Windows")
 }

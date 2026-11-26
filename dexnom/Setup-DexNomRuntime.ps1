@@ -7,7 +7,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 if ($env:OS -ne 'Windows_NT' -or ![Environment]::Is64BitOperatingSystem) {
-    throw 'DexNom Runtime requires 64-bit Windows.'
+    throw 'DexNom RayTime requires 64-bit Windows.'
 }
 if (!(Get-Command rustup -ErrorAction SilentlyContinue) -or !(Get-Command cargo -ErrorAction SilentlyContinue)) {
     throw 'Install Rust for Windows from https://rustup.rs, then reopen Setup.cmd.'
@@ -61,7 +61,7 @@ $state = [IO.Directory]::CreateDirectory((Join-Path $InstallDir 'state'))
 try {
     $lock = [IO.File]::Open((Join-Path $state.FullName 'launcher.lock'), 'OpenOrCreate', 'Write', 'None')
 } catch [IO.IOException] {
-    throw "Could not lock the install directory. Close DexNom Runtime and shader preload before updating. $($_.Exception.Message)"
+    throw "Could not lock the install directory. Close DexNom RayTime and shader preload before updating. $($_.Exception.Message)"
 }
 try {
     foreach ($name in 'victory.exe','victory-play.exe','victory-warm.exe') {
@@ -80,12 +80,13 @@ try {
 } finally { $lock.Dispose() }
 
 $launcher = Join-Path $InstallDir 'victory-play.exe'
-Write-Host "Installed DexNom Runtime in $InstallDir"
+Write-Host "Installed DexNom RayTime in $InstallDir"
 [IO.Directory]::CreateDirectory($ShortcutDirectory) | Out-Null
 $shell = New-Object -ComObject WScript.Shell
 foreach ($entry in @(
-    @{ Name = 'DexNom Runtime'; Arguments = '' }
-    @{ Name = 'DexNom Runtime (Experimental RT)'; Arguments = '--rt' }
+    @{ Name = 'DexNom RayTime'; Arguments = '' }
+    @{ Name = 'DexNom RayTime (Experimental RT)'; Arguments = '--rt' }
+    @{ Name = 'DexNom RayTime (FSR Quality 4K)'; Arguments = '--rt --console series-x --local-gpu-memory --fsr-quality --sparse-textures --no-upload-ahead --capture-readbacks --rt-write-stats' }
 )) {
     $shortcut = $shell.CreateShortcut((Join-Path $ShortcutDirectory ($entry.Name + '.lnk')))
     $shortcut.TargetPath = $launcher
@@ -93,4 +94,4 @@ foreach ($entry in @(
     $shortcut.WorkingDirectory = $InstallDir
     $shortcut.Save()
 }
-Write-Host "Open DexNom Runtime from $ShortcutDirectory to play, or select DexNom Runtime (Experimental RT) to try ray tracing."
+Write-Host "Open DexNom RayTime from $ShortcutDirectory. The FSR Quality 4K shortcut uses the tested ray-tracing profile."

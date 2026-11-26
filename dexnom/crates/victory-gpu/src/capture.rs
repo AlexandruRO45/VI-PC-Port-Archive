@@ -516,6 +516,20 @@ fn defer_texture_png(
             }
             let pitch = f.RowPitch as usize;
             let rows = std::slice::from_raw_parts(data.cast::<u8>(), pitch * f.Height as usize);
+            // These small float textures include exposure state. PNG normalization
+            // discards its absolute values and alpha channel.
+            if f.Format == DXGI_FORMAT_R32G32B32A32_FLOAT && f.Height == 1 && f.Width <= 8 {
+                let texels: Vec<[f32; 4]> = rows[..f.Width as usize * 16]
+                    .chunks_exact(16)
+                    .map(|texel| {
+                        std::array::from_fn(|channel| {
+                            let offset = channel * 4;
+                            f32::from_le_bytes(texel[offset..offset + 4].try_into().unwrap())
+                        })
+                    })
+                    .collect();
+                tracing::info!(name, ?texels, "float texture samples");
+            }
             match to_rgba(f.Format.0 as u32, f.Width as usize, f.Height as usize, pitch, rows) {
                 Some(rgba) => save_as(&name, f.Width, f.Height, f.Width as usize * 4, false, &rgba),
                 None => tracing::info!(format = f.Format.0, name, "texture not dumped: format"),

@@ -717,7 +717,8 @@ void main() {
         const PIECES: u32 = 3;
         let size = PIECE * PIECES as usize;
         let (_now, now_ptr, now_gpu) = warp.shared_buffer(size as u64);
-        let (_hashes, _, hashes_gpu) = warp.shared_buffer(crate::shadow::card_hash_bytes(size as u64));
+        let hash_bytes = crate::shadow::card_hash_bytes(size as u64) as usize;
+        let (_hashes, hashes_ptr, hashes_gpu) = warp.shared_buffer(hash_bytes as u64);
         let (_differs, differs_ptr, differs_gpu) = warp.shared_buffer(64);
         let content: Vec<u8> = (0..size).map(|i| (i * 31 + i / 251) as u8).collect();
         // SAFETY: the mapping holds `size` bytes.
@@ -744,6 +745,26 @@ void main() {
             [0, 1, 2].map(|piece| unsafe { differs_ptr.cast::<u32>().add(piece).read_volatile() })
         };
         let run = |warp: &mut WarpHarness, mode| run_span(warp, mode, 0, 0, PIECES, 0);
+        // Per-upload and coalesced dispatches must produce identical hashes,
+        // including unchanged sentinel bytes in gaps and beyond the last piece.
+        let span = |first, pieces| crate::shadow::CardSpan { first, pieces, skew: 4096, from: 0, to: size as u32 };
+        let hashes_after = |warp: &mut WarpHarness, runs: &[crate::shadow::CardSpan]| {
+            // The harness fences each dispatch before returning the CPU mappings.
+            unsafe { std::ptr::write_bytes(hashes_ptr, 0xa5, hash_bytes) };
+            for r in runs {
+                run_span(warp, 0, r.first, r.skew, r.pieces, 0);
+            }
+            unsafe { std::slice::from_raw_parts(hashes_ptr, hash_bytes) }.to_vec()
+        };
+        for (ranges, expected_runs) in [
+            (vec![span(0, 1), span(1, 1), span(1, 2)], 1),
+            (vec![span(2, 1), span(0, 1), span(2, 1)], 2),
+        ] {
+            let baseline = hashes_after(&mut warp, &ranges);
+            let joined = crate::shadow::joined_piece_runs(ranges);
+            assert_eq!(joined.len(), expected_runs);
+            assert_eq!(hashes_after(&mut warp, &joined), baseline);
+        }
         let at = PIECE + 1234;
         // SAFETY (each): inside the mapping.
         let set = |value: u8| unsafe { now_ptr.add(at).write_volatile(value) };

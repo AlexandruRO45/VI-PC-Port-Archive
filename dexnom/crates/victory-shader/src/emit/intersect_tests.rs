@@ -1022,6 +1022,114 @@ fn raw_guest_writes_include_stores_and_both_atomic_implementations() {
 }
 
 #[test]
+fn archived_init_headers_builds_with_the_raw_store_probe() {
+    let Some(path) = std::env::var_os("VICTORY_INIT_HEADERS_PROBE_CONTAINER") else {
+        return;
+    };
+    let container = std::fs::read(path).expect("local InitHeaders shader container");
+    let plain = super::translate(&container).unwrap();
+    let instrumented = super::with_raw_store_probe(|| super::translate(&container)).unwrap();
+    assert_ne!(plain.dxil, instrumented.dxil);
+    assert!(instrumented.writes_guest_memory);
+    assert_eq!(plain.root_uavs, instrumented.root_uavs);
+    if let Ok(mut validator) = super::validator::Validator::load(super::validator::Validator::default_path().as_deref()) {
+        validator.validate(&mut instrumented.dxil.clone()).unwrap();
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let host = Host::new(true).expect("WARP device for the archived InitHeaders probe");
+    host.compute_pipeline(&instrumented).unwrap();
+}
+
+#[test]
+fn warp_raw_store_probe_reports_mapped_stores_and_bounds_overflow() {
+    use super::{RAW_STORE_PROBE_BASE, RAW_STORE_PROBE_CAPACITY, RAW_STORE_PROBE_DWORDS, RAW_STORE_PROBE_EVENT_DWORDS};
+
+    let words = [
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xF408_0202, 0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0x0
+        0x3428_0086, // v_lshlrev_b32 v20, 6, v0
+        0xE038_1000, 0x8002_0114, // buffer_load_dwordx4 v[1:4], v20, s[8:11], 0 offen
+        0xE030_1030, 0x8002_1114, // buffer_load_dword v17, v20, s[8:11], 0 offen offset:48
+        0xBE94_037E, // s_mov_b32 s20, exec_lo
+        0x7DAA_2280, // v_cmpx_ne_u32 exec_lo, 0, v17
+        (0x37 << 26) | (0x1f << 18) | (2 << 14) | 4, // global_store_dwordx3 offset:4
+        (125 << 16) | (1 << 8) | 1, // v[1:2], v[1:3], null
+        (0x37 << 26) | (0x1e << 18) | (2 << 14) | 16, // global_store_dwordx4 offset:16
+        (125 << 16) | (1 << 8) | 1, // v[1:2], v[1:4], null
+        0xBEFE_0314, // s_mov_b32 exec_lo, s20
+        0xBF81_0000, // s_endpgm
+    ];
+    let (normal, _) = build_words(&words).unwrap();
+    let (instrumented, _) = super::with_raw_store_probe(|| build_words(&words)).unwrap();
+    assert_ne!(normal.dxil, instrumented.dxil);
+    assert_eq!(normal.dxil, build_words(&words).unwrap().0.dxil);
+    assert_eq!(normal.root_uavs, instrumented.root_uavs);
+
+    let mut constants = vec![0; instrumented.user_data_dwords() as usize];
+    for dword in 0..2 {
+        let word = instrumented.user_data.iter().find(|u|
+            u.root == RootType::Other(super::USER_MEMORY_BASE) && u.dword == dword
+        ).unwrap();
+        constants[word.index as usize] = 1;
+    }
+    let mut input = vec![0; (THREADS * RECORD / 4) as usize];
+    for (lane, (lo, hi, active)) in [
+        (0xffff_fffc, 0xabcd_ef00, 1), // offset carries into the full high word
+        (32, 0xabcd_ef01, 0),          // mapped address, inactive lane
+        (0x1_0000, 0xabcd_ef01, 1),    // active lane, missing page
+    ].into_iter().enumerate() {
+        let start = lane * (RECORD / 4) as usize;
+        input[start..start + 4].copy_from_slice(&[lo, hi, 3, 4]);
+        input[start + 12] = active;
+    }
+    let page = 0x1_0000;
+    let mut directory = vec![0; (page + 2) * 2];
+    directory[page * 2..page * 2 + 2].copy_from_slice(&[1, 16]);
+
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let host = Host::new(true).expect("WARP is required to validate the probe");
+    let (root, pso) = host.compute_pipeline(&instrumented).unwrap();
+    let base = RAW_STORE_PROBE_BASE as usize;
+    let stride = RAW_STORE_PROBE_EVENT_DWORDS as usize;
+    let dispatch = |first_index| {
+        let mut probe = vec![0; base + RAW_STORE_PROBE_DWORDS as usize + 1];
+        probe[base] = first_index;
+        *probe.last_mut().unwrap() = 0xfeed_beef;
+        let outputs = host.dispatch(&root, &pso, &Dispatch {
+            roots: vec![
+                (0, Root::Constants(constants.clone())),
+                (1, Root::Uav(2)),
+                (2, Root::View { srv: true, data: directory.clone() }),
+            ],
+            views: &[
+                View::Buffer { data: &input, stride: Stride::Raw },
+                View::RawUav(16),
+                View::RawUav(32),
+                View::RawUavData(&probe),
+            ],
+            samplers: &[],
+            groups: [1, 1, 1],
+        }).unwrap();
+        assert_eq!(&outputs[1][4..11], &[
+            0xffff_fffc, 0xabcd_ef00, 3, 0xffff_fffc, 0xabcd_ef00, 3, 4,
+        ]);
+        assert_eq!(outputs[2][1 + (page + 1) % (super::MEMORY_FAULTS as usize - 1)], (page + 1) as u32);
+        assert_eq!(outputs[2].last(), Some(&0xfeed_beef));
+        outputs.into_iter().nth(2).unwrap()
+    };
+    let events = dispatch(0);
+    assert_eq!(&events[base..base + 2], &[2, 0]);
+    let records = base + 2;
+    assert_eq!(&events[records..records + stride], &[0, 0xabcd_ef01, 12, 1, 16]);
+    assert_eq!(&events[records + stride..records + stride * 2], &[12, 0xabcd_ef01, 16, 1, 28]);
+
+    let overflow = dispatch(RAW_STORE_PROBE_CAPACITY - 1);
+    assert_eq!(&overflow[base..base + 2], &[RAW_STORE_PROBE_CAPACITY + 1, 1]);
+    let last = records + (RAW_STORE_PROBE_CAPACITY - 1) as usize * stride;
+    assert_eq!(&overflow[last..last + stride], &[0, 0xabcd_ef01, 12, 1, 16]);
+}
+
+#[test]
 fn a_structure_that_returns_triangle_ids_is_refused_by_name() {
     // Triangle return mode 0 (bit 24 of dword 3 clear): the last two
     // result dwords would be a triangle id and a hit status.

@@ -88,6 +88,8 @@ enum Command {
     /// Translate the shaders of a title's archives into the cache and make
     /// their compute pipelines, so that a run finds them there.
     Warm {
+        #[command(flatten)]
+        rays: RayOptions,
         paths: Vec<PathBuf>,
         /// Worker threads (default: every logical core).
         #[arg(long)]
@@ -98,6 +100,8 @@ enum Command {
     },
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
+        #[command(flatten)]
+        rays: RayOptions,
         exe: PathBuf,
         /// What unimplemented imports do when called.
         #[arg(long, value_enum, default_value_t = Unimplemented::Trap)]
@@ -118,6 +122,63 @@ enum Command {
     },
     /// Show the resolved configuration and check it.
     Config,
+}
+
+#[derive(clap::Args)]
+struct RayOptions {
+    /// Enable experimental ray tracing.
+    #[arg(long)]
+    rt: bool,
+    /// Disable the ray structure builder, traversal, activation and hit resolve.
+    #[arg(long)]
+    no_rt: bool,
+    /// Trace against the prebuilt world BVH without rebuilding dynamic geometry.
+    #[arg(long, conflicts_with_all = ["rt", "no_rt"])]
+    rt_static_bvh: bool,
+}
+
+impl RayOptions {
+    fn selected(&self, preference: Option<bool>) -> Option<bool> {
+        if self.no_rt { Some(false) } else if self.rt { Some(true) } else { preference }
+    }
+
+    #[cfg(windows)]
+    fn apply(&self, cfg: &victory_core::Config) {
+        if self.rt_static_bvh {
+            // SAFETY: Windows supports setting the process environment across threads.
+            unsafe { std::env::set_var("VICTORY_RAY_TRACING", "static-bvh") };
+            return;
+        }
+        if !self.rt && !self.no_rt && std::env::var("VICTORY_RAY_TRACING").as_deref() == Ok("static-bvh") {
+            return;
+        }
+        if let Some(on) = self.selected(cfg.ray_tracing) {
+            // SAFETY: Windows supports updating the process environment even
+            // when logging threads exist. Title-requested relaunches inherit it.
+            unsafe { std::env::set_var("VICTORY_RAY_TRACING", if on { "1" } else { "0" }) };
+        }
+    }
+}
+
+#[cfg(test)]
+mod ray_cli_tests {
+    use super::*;
+
+    #[test]
+    fn normal_run_and_warm_keep_cli_precedence() {
+        for (mode, expected) in [
+            (vec![], Some(true)), (vec!["--rt"], Some(true)), (vec!["--no-rt"], Some(false)),
+            (vec!["--rt", "--no-rt"], Some(false)), (vec!["--no-rt", "--rt"], Some(false)),
+        ] {
+            for verb in ["run", "warm"] {
+                let args = ["victory", verb, "file"].into_iter().chain(mode.iter().copied());
+                let cli = Cli::try_parse_from(args).unwrap();
+                let rays = match cli.command { Command::Run { rays, .. } | Command::Warm { rays, .. } => rays, _ => unreachable!() };
+                assert_eq!(rays.selected(Some(true)), expected);
+            }
+        }
+        assert_eq!(RayOptions { rt: false, no_rt: false, rt_static_bvh: false }.selected(None), None);
+    }
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -174,8 +235,11 @@ fn main() -> Result<()> {
             }
             translate::run(paths, validate, pipelines, list, jobs)
         }
-        Command::Warm { paths, jobs, no_pipelines } => translate::warm(paths, jobs, !no_pipelines),
+        Command::Warm { rays, paths, jobs, no_pipelines } => {
+            translate::warm(paths, jobs, !no_pipelines, rays)
+        }
         Command::Run {
+            rays,
             exe,
             unimplemented,
             strict,
@@ -183,7 +247,7 @@ fn main() -> Result<()> {
             console,
             title_args: _,
         } => {
-            let result = run::run(&exe, unimplemented, strict, execute, console);
+            let result = run::run(&exe, unimplemented, strict, execute, console, rays);
             // The process's own end, as `main`'s Result maps it: Ok is 0,
             // Err is 1. A title that ends the process itself logs its own
             // line and never returns here.
@@ -209,6 +273,7 @@ fn show_config() -> Result<()> {
             .map_or("(none)".into(), |p| p.display().to_string())
     );
     println!("game_dir    : {}", status(&cfg.game_dir));
+    println!("ray_tracing : {}", match cfg.ray_tracing { Some(true) => "on", Some(false) => "off", None => "individual stage settings" });
     println!("cache_dir   : {}", cfg.cache_dir.display());
     println!("data_dir    : {}", cfg.data_dir.display());
     for t in &cfg.test_titles {

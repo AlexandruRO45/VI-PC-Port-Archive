@@ -58,6 +58,8 @@ use crate::shadow::Shadow;
 
 #[cfg(feature = "diagnostics")]
 pub(crate) mod ray_probe;
+#[cfg(feature = "diagnostics")]
+pub(crate) mod raw_store_probe;
 
 /// A window of memory outside buffers (`shadow.rs`).
 const CELL: u64 = 4 << 20;
@@ -183,6 +185,11 @@ pub(crate) struct Ready {
     /// Last numbered copy this draw prepared. Other recording threads can
     /// subsequently add mappings to the same directory.
     pub(crate) count: u32,
+    /// New broad declarations after the list's coverage deduplication.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) new_raw_write_ranges: u64,
+    #[cfg(feature = "diagnostics")]
+    pub(crate) new_raw_write_bytes: u64,
 }
 
 impl Memory {
@@ -190,7 +197,10 @@ impl Memory {
         CHANGES.get_or_init(Default::default);
         tracing::info!("title memory by address: a shader reads or writes through raw addresses");
         let mut fault_dwords = MEMORY_FAULTS;
-        if victory_shader::emit::ray_probe_enabled() {
+        if victory_shader::emit::raw_store_probe_enabled() {
+            fault_dwords = victory_shader::emit::RAW_STORE_PROBE_BASE
+                + victory_shader::emit::RAW_STORE_PROBE_DWORDS;
+        } else if victory_shader::emit::ray_probe_enabled() {
             fault_dwords += victory_shader::emit::RAY_PROBE_DWORDS;
         }
         Some(Memory {
@@ -566,9 +576,18 @@ pub(crate) fn ready(
             m.copies[i].refresh(list, start, len);
         }
     }
+    #[cfg(feature = "diagnostics")]
+    let measure_broad = writes == Writes::All && crate::draw::rt_raw_write_probe();
+    #[cfg(feature = "diagnostics")]
+    let mut new_broad = [0, 0];
     for i in written {
         for &(start, len) in &m.ranges[i] {
             m.copies[i].gpu_writes(list, start, len);
+            #[cfg(feature = "diagnostics")]
+            if measure_broad {
+                new_broad[0] += 1;
+                new_broad[1] += len;
+            }
         }
     }
     writes.owned(&m.pages, |owner, at, len| {
@@ -593,12 +612,20 @@ pub(crate) fn ready(
         faults: m.faults.2,
         base,
         count,
+        #[cfg(feature = "diagnostics")]
+        new_raw_write_ranges: new_broad[0],
+        #[cfg(feature = "diagnostics")]
+        new_raw_write_bytes: new_broad[1],
     })
 }
 
 #[cfg(test)]
 #[path = "memory/producer_tests.rs"]
 mod producer_tests;
+
+#[cfg(test)]
+#[path = "memory/deferred_readback_tests.rs"]
+mod deferred_readback_tests;
 
 #[cfg(test)]
 mod tests {
