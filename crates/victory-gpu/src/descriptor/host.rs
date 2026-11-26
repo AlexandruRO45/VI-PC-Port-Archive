@@ -722,10 +722,10 @@ impl HostHeap {
     pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<View> {
         if index >= self.count {
             // Diagnostic (NVIDIA heap cap): log once per 64 Ki-slot band past
-            // the host heap so sequential heap initialization does not flood stderr.
-            static HIGHEST_BAND: std::sync::atomic::AtomicU32 =
-                std::sync::atomic::AtomicU32::new(0);
-            if note_capped_slot(&HIGHEST_BAND, index) {
+            // the host heap so sequential heap initialization does not flood
+            // stderr, while keeping the exact high-water mark for
+            // `log_capped_high_water`.
+            if CAPPED_SLOTS.note(index, self.count) {
                 tracing::warn!(
                     index,
                     count = self.count,
@@ -1822,12 +1822,68 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     };
 }
 
-/// Returns whether `index` enters a new 64 Ki-slot band past the host heap,
-/// recording that band so sequential heap writes warn once per band instead
-/// of once per slot.
-fn note_capped_slot(highest_band: &std::sync::atomic::AtomicU32, index: u32) -> bool {
-    let band = (index >> 16) + 1;
-    highest_band.fetch_max(band, std::sync::atomic::Ordering::Relaxed) < band
+/// Tracks title slots past a capped host view heap: warns immediately on each
+/// new 64 Ki-slot band so sequential heap writes do not flood logs, while
+/// preserving the exact maximum index so it can be reported once it settles
+/// (on the periodic summary and at shutdown).
+struct CappedSlots {
+    highest_band: std::sync::atomic::AtomicU32,
+    highest: std::sync::atomic::AtomicU64,
+    reported: std::sync::atomic::AtomicU64,
+    count: std::sync::atomic::AtomicU32,
+}
+
+impl CappedSlots {
+    const fn new() -> Self {
+        Self {
+            highest_band: std::sync::atomic::AtomicU32::new(0),
+            highest: std::sync::atomic::AtomicU64::new(0),
+            reported: std::sync::atomic::AtomicU64::new(0),
+            count: std::sync::atomic::AtomicU32::new(0),
+        }
+    }
+
+    /// Records a capped slot access at `index` (with heap limit `count`) and
+    /// returns whether `index` entered a new 64 Ki-slot band.
+    fn note(&self, index: u32, count: u32) -> bool {
+        let seen = u64::from(index) + 1;
+        if self.highest.fetch_max(seen, std::sync::atomic::Ordering::Relaxed) < seen {
+            self.count.store(count, std::sync::atomic::Ordering::Relaxed);
+        }
+        let band = (index >> 16) + 1;
+        let warn = self.highest_band.fetch_max(band, std::sync::atomic::Ordering::Relaxed) < band;
+        if warn {
+            self.reported.fetch_max(seen, std::sync::atomic::Ordering::Relaxed);
+        }
+        warn
+    }
+
+    /// Returns `(index, count)` if the true high-water mark advanced beyond
+    /// the last reported index, marking it reported.
+    fn take_unreported_high_water(&self) -> Option<(u32, u32)> {
+        let highest = self.highest.load(std::sync::atomic::Ordering::Relaxed);
+        if highest == 0 {
+            return None;
+        }
+        if self.reported.fetch_max(highest, std::sync::atomic::Ordering::Relaxed) < highest {
+            Some((
+                (highest - 1) as u32,
+                self.count.load(std::sync::atomic::Ordering::Relaxed),
+            ))
+        } else {
+            None
+        }
+    }
+}
+
+static CAPPED_SLOTS: CappedSlots = CappedSlots::new();
+
+/// Logs the exact highest title slot seen past a capped host view heap if it
+/// grew past the last logged index.
+pub fn log_capped_high_water() {
+    if let Some((index, count)) = CAPPED_SLOTS.take_unreported_high_water() {
+        tracing::warn!(index, count, "highest title slot past the host heap");
+    }
 }
 
 #[cfg(test)]
@@ -2473,25 +2529,41 @@ mod tests {
     }
 
     #[test]
-    fn capped_slot_warning_fires_once_per_64k_band() {
-        let highest = std::sync::atomic::AtomicU32::new(0);
-        // Sequential heap initialization across 113,664 slots past a 1M-capped
-        // heap (bands 14 -> 15) warns only when entering each new 64 Ki-slot band.
+    fn capped_slot_warning_fires_once_per_64k_band_and_keeps_exact_high_water() {
+        let capped = CappedSlots::new();
+        assert_eq!(capped.take_unreported_high_water(), None);
+
+        // Sequential heap initialization across a 1,245,184-slot title heap
+        // capped at 934,461 mirrored slots warns once per 64 Ki-slot band.
         let mut logged = Vec::new();
-        for index in 934_912..1_048_576 {
-            if note_capped_slot(&highest, index) {
+        for index in 934_461..1_245_184 {
+            if capped.note(index, 934_461) {
                 logged.push(index);
             }
         }
-        assert_eq!(logged, [934_912, 983_040]);
-        // Revisiting earlier slots or bands stays quiet.
-        assert!(!note_capped_slot(&highest, 0));
-        assert!(!note_capped_slot(&highest, 983_040));
-        assert!(!note_capped_slot(&highest, 1_048_575));
-        // Entering the next band and u32::MAX (no overflow) each fire once.
-        assert!(note_capped_slot(&highest, 1_048_576));
-        assert!(!note_capped_slot(&highest, 1_048_577));
-        assert!(note_capped_slot(&highest, u32::MAX));
-        assert!(!note_capped_slot(&highest, u32::MAX));
+        assert_eq!(logged, [934_461, 983_040, 1_048_576, 1_114_112, 1_179_648]);
+        // The exact high-water mark inside the last band is preserved and
+        // reported once.
+        assert_eq!(capped.take_unreported_high_water(), Some((1_245_183, 934_461)));
+        assert_eq!(capped.take_unreported_high_water(), None);
+
+        // Revisiting earlier slots or bands stays quiet and does not re-report.
+        assert!(!capped.note(0, 934_461));
+        assert!(!capped.note(983_040, 934_461));
+        assert!(!capped.note(1_245_183, 934_461));
+        assert_eq!(capped.take_unreported_high_water(), None);
+
+        // Entering the next band logs immediately without a duplicate summary;
+        // growing further within that band reports the exact new maximum once.
+        assert!(capped.note(1_245_184, 934_461));
+        assert_eq!(capped.take_unreported_high_water(), None);
+        assert!(!capped.note(1_245_200, 934_461));
+        assert_eq!(capped.take_unreported_high_water(), Some((1_245_200, 934_461)));
+        assert_eq!(capped.take_unreported_high_water(), None);
+
+        // u32::MAX (no overflow) warns once and needs no extra summary.
+        assert!(capped.note(u32::MAX, 934_461));
+        assert!(!capped.note(u32::MAX, 934_461));
+        assert_eq!(capped.take_unreported_high_water(), None);
     }
 }
