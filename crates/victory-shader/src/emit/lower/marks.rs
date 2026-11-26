@@ -23,8 +23,12 @@ impl Lower<'_> {
             let lane = self
                 .s
                 .op(c, "waveGetLaneIndex", Attr::ReadNone, i32t, 111, &[]);
-            let none = self.s.m.i32(u32::MAX);
-            let key = self.s.m.select(c, helper, none, lane);
+            // A helper's key is its lane with a high bit: the minimum is the
+            // first non-helper, or (all helpers) a helper no lane matches,
+            // still a lane to read at (writes there are dropped anyway).
+            let flag = self.s.m.i32(1 << 30);
+            let flagged = self.s.m.bin(c, Bin::Or, lane, flag);
+            let key = self.s.m.select(c, helper, flagged, lane);
             // Operation 2, unsigned: the minimum.
             let (min, unsigned) = (self.s.m.i8(2), self.s.m.i8(1));
             let lead = self.s.op(
@@ -35,14 +39,11 @@ impl Lower<'_> {
                 119,
                 &[key, min, unsigned],
             );
-            let f = self.s.op(
-                c,
-                "waveReadLaneAt.i32",
-                Attr::NoUnwind,
-                i32t,
-                117,
-                &[n, lead],
-            );
+            let low = self.s.m.i32((1 << 30) - 1);
+            let at = self.s.m.bin(c, Bin::And, lead, low);
+            let f = self
+                .s
+                .op(c, "waveReadLaneAt.i32", Attr::NoUnwind, i32t, 117, &[n, at]);
             (f, self.s.m.cmp(c, pred::EQ, lane, lead))
         } else {
             let f = self
