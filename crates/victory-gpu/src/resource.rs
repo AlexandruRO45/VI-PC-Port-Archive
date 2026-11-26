@@ -3007,12 +3007,13 @@ mod tests {
         }
         type Copy =
             extern "system" fn(This, *const Location, u32, u32, u32, *const Location, *const u8);
+        const DEPTH_WRITE: u32 = 0x10;
         let mut failures = Vec::new();
         for (storage, view) in [(45, 45), (44, 45), (20, 20), (19, 20)] {
             let mut desc = texture(8, 4, storage, 2);
             desc.depth_or_array_size = 2;
             desc.flags = 2; // ALLOW_DEPTH_STENCIL
-            let image = create(&desc, 0x10); // DEPTH_WRITE
+            let image = create(&desc, DEPTH_WRITE);
             let target = create(&buffer(4096), 0);
             let (out, _) = buffer_bytes(target).unwrap();
             // SAFETY: the guest target buffer holds 4096 bytes.
@@ -3038,7 +3039,10 @@ mod tests {
                     ..Default::default()
                 }),
             );
-            let native = &crate::list::host_list(list).unwrap().list;
+            let host_list = crate::list::host_list(list).unwrap();
+            // Track the fixture's native clears before readback sets COPY_SOURCE.
+            crate::list::ensure_state(host_list, image, DEPTH_WRITE);
+            let native = &host_list.list;
             let flags = D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL;
             let left = RECT {
                 left: 0,
@@ -3049,14 +3053,17 @@ mod tests {
             // SAFETY: a live DSV into the selected mip and array slice.
             unsafe {
                 native.ClearDepthStencilView(dsv, flags, 0.75, 0x91, None);
-                native.ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_STENCIL, 0.0, 0x37, Some(&[left]));
+                native.ClearDepthStencilView(dsv, flags, 0.25, 0x37, Some(&[left]));
             }
-            let depth_bits = if view == 45 {
-                0x00bf_ffff
+            let (left, right) = if view == 45 {
+                (0x0040_0000u32, 0x00bf_ffffu32)
             } else {
-                0.75_f32.to_bits()
+                (0.25_f32.to_bits(), 0.75_f32.to_bits())
             };
-            let depth_row = depth_bits.to_le_bytes().repeat(4);
+            let depth_row: Vec<_> = [left, left, right, right]
+                .into_iter()
+                .flat_map(u32::to_le_bytes)
+                .collect();
             let stencil_row = [0x37, 0x37, 0x91, 0x91];
             let mut expected = vec![0xeeu8; 4096];
             let copy = slot::<Copy>(list, 0x80);
