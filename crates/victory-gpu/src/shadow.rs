@@ -932,14 +932,7 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_w
             (copy, page)
         })
     };
-    // Held back: dropped from the copies (`crate::memory::drop_withheld`).
-    if !held.is_empty() {
-        let m = marks();
-        for (_, page) in held.into_iter().filter_map(|n| page_of(&m, n)) {
-            crate::memory::drop_withheld(page, PAGE);
-        }
-    }
-    if marked.is_empty() {
+    if marked.is_empty() && held.is_empty() {
         return;
     }
     let pages: Vec<(Arc<Shadow>, usize)> = {
@@ -961,6 +954,14 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_w
         }
         #[cfg(not(feature = "diagnostics"))]
         let _ = written;
+    }
+    // A missed submission retakes the page immediately across all its copies.
+    // Let ordinary marked writes in other copies reach title memory first.
+    if !held.is_empty() {
+        let m = marks();
+        for (_, page) in held.into_iter().filter_map(|n| page_of(&m, n)) {
+            crate::memory::drop_withheld(page, PAGE);
+        }
     }
 }
 
@@ -1598,6 +1599,51 @@ pub(crate) mod tests {
         assert_eq!(unsafe { ((p + 16) as *const u8).read_volatile() }, 0x11, "title memory untouched");
         unregister(p + 1, p as u64);
         unregister(p, p as u64);
+    }
+
+    #[test]
+    fn held_mark_preserves_an_ordinary_write_in_a_shared_page() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let p = crate::watch::tests::pool(2);
+        let address = p as u64;
+        // SAFETY: two bytes in the newly allocated, unguarded pool.
+        unsafe {
+            ((p + 16) as *mut u8).write_volatile(0x11);
+            ((p + 32) as *mut u8).write_volatile(0x22);
+        }
+        register(p, address, (2 * PAGE) as u64);
+        register(p + 1, address, PAGE as u64);
+        let outer = find(address, (2 * PAGE) as u64).unwrap();
+        let inner = find(address, PAGE as u64).unwrap();
+        assert!(!Arc::ptr_eq(&outer, &inner));
+        let list = host.new_list().unwrap();
+        for (copy, memory, len) in [(&outer, true, 2 * PAGE), (&inner, false, PAGE)] {
+            let _writer = list.writer_uses_memory(memory);
+            copy.refresh(&list, address, len as u64);
+            copy.gpu_writes(&list, address, len as u64, true);
+        }
+        let copies = (outer.clone(), inner.clone());
+        list.defer(move || {
+            for (copy, memory, offset, byte) in [(&copies.0, true, 16, 0xaa), (&copies.1, false, 32, 0xbb)] {
+                copy.write_host(address + offset, &[byte]);
+                let (bit, _) = copy.mark_entry(address).unwrap();
+                let b = bitmap(memory).unwrap();
+                // SAFETY: mark_entry returned a valid bit in the mapped bitmap.
+                unsafe { *(b.data as *mut u32).add((bit / 32) as usize) |= 1 << (bit % 32) };
+            }
+        });
+        list.defer_missed(|| true);
+        list.close();
+        host.execute(&[&list]);
+        // SAFETY: both reads are inside the live pool.
+        let bytes = unsafe { (((p + 16) as *const u8).read_volatile(), ((p + 32) as *const u8).read_volatile()) };
+        unregister(p + 1, address);
+        unregister(p, address);
+        drop((inner, outer));
+        crate::watch::tests::free(p);
+        assert_eq!(bytes, (0x11, 0xbb));
     }
 
     /// A partial refresh of an armed page updates its saved bytes too (both
