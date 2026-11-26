@@ -236,7 +236,11 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                         row: i.row,
                         channel,
                     };
-                    loaded.push((Reg::V(i.vgpr + channel), input));
+                    let reg = i
+                        .vgpr
+                        .checked_add(channel)
+                        .ok_or(ShaderError::Malformed("vertex input VGPR out of bounds"))?;
+                    loaded.push((Reg::V(reg), input));
                 }
             }
             (loaded, &[][..], &outputs[..])
@@ -315,7 +319,7 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                 let user = native
                     .layout
                     .iter()
-                    .map(|r| u32::from(r.user_data) + r.sgprs)
+                    .map(|r| u32::from(r.user_data).saturating_add(r.sgprs))
                     .max();
                 Some(user.unwrap_or(0).clamp(8, 104) as u8 + 2)
             }
@@ -792,5 +796,42 @@ mod tests {
                 (3, Input::Position(1)),
             ]
         );
+    }
+
+    #[test]
+    fn raise_handles_extreme_vs_vgpr_and_ps_root_sgprs_without_overflow() {
+        let p = program(&[S_ENDPGM]);
+        // Vertex input with vgpr = 255 and mask = 0x3 (channel 1 overflows u8).
+        let vs = NativeProgram {
+            stage: HwStage::Vs,
+            wave64: false,
+            vgprs: 256,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Vs {
+                inputs: vec![crate::native::VsInput {
+                    usage: Usage::Generic,
+                    row: 0,
+                    mask: 0x3,
+                    vgpr: 255,
+                }],
+                outputs: vec![],
+            },
+            code: vec![],
+        };
+        assert!(matches!(raise(&p, &vs), Err(ShaderError::Malformed(_))));
+
+        // Pixel root layout with user_data = 1 and sgprs = u32::MAX (overflows u32).
+        let mut ps = pixel(vec![], 0);
+        ps.layout.push(crate::native::RootParam {
+            root: crate::native::RootType::Constants,
+            table_offset_dwords: 0,
+            sgprs: u32::MAX,
+            base_register: 0,
+            user_data: 1,
+            slot: 0,
+        });
+        let io = raise(&p, &ps).unwrap();
+        assert_eq!(io.initialized_sgprs, Some(106));
     }
 }
