@@ -472,7 +472,7 @@ impl LoadedImage {
 mod tests {
     use super::*;
 
-    fn never(_: &str) -> bool {
+    fn accept_all(_: &str) -> bool {
         true
     }
 
@@ -504,9 +504,12 @@ mod tests {
             r"sub/evil.dll",
             r"C:\Windows\System32\version.dll",
         ] {
-            assert!(map_dll(name, dirs, &never, seen, loaded).is_ok());
+            assert!(map_dll(name, dirs, &accept_all, seen, loaded).is_ok());
         }
-        assert!(seen.is_empty(), "a rejected name must not enter the dedup set");
+        assert!(
+            seen.is_empty(),
+            "a rejected name must not enter the dedup set"
+        );
         assert!(loaded.is_empty());
     }
 
@@ -518,8 +521,8 @@ mod tests {
         // Both lower-case to the same key; the second is a dedup no-op. The
         // files do not exist, so both are missing-file no-ops, and only the
         // first registers in `seen`.
-        assert!(map_dll("kernel32.dll", dirs, &never, seen, loaded).is_ok());
-        assert!(map_dll("KERNEL32.DLL", dirs, &never, seen, loaded).is_ok());
+        assert!(map_dll("kernel32.dll", dirs, &accept_all, seen, loaded).is_ok());
+        assert!(map_dll("KERNEL32.DLL", dirs, &accept_all, seen, loaded).is_ok());
         assert_eq!(seen.len(), 1);
         assert_eq!(seen.iter().next().map(String::as_str), Some("kernel32.dll"));
         assert!(loaded.is_empty());
@@ -552,6 +555,7 @@ mod tests {
         let outside = dir.path().join("outside");
         std::fs::create_dir(&title).unwrap();
         std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("a.dll"), b"x").unwrap();
         let escaped = title.join("escaped.dll");
         if std::os::windows::fs::symlink_dir(&outside, &escaped).is_err() {
             return;
