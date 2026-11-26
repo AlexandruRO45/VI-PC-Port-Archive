@@ -21,6 +21,7 @@ use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source, USER
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 mod bvh;
+mod denorm;
 
 type Why = &'static str;
 
@@ -284,6 +285,8 @@ struct Lower<'a> {
     /// the one in force at the instruction being lowered (see [`round16`]).
     round16: Vec<Option<u8>>,
     mode16: Option<u8>,
+    /// Normalized conversions that read a flushed half input, when known.
+    flush_half_input: Option<HashSet<usize>>,
 }
 
 /// The 16/64-bit round mode (MODE bits 3:2: 0 nearest even, 3 toward zero)
@@ -315,17 +318,25 @@ fn round16_after(inst: &Inst, mode: Option<u8>) -> Option<u8> {
 /// The 16/64-bit round mode each block starts with: nearest even at the
 /// program's start, then as the MODE writes on the way set it; `None` where
 /// paths that set it differently join (or a write is not a constant).
-fn round16(p: &crate::ir::Program) -> Vec<Option<u8>> {
+fn round16(p: &Program) -> Vec<Option<u8>> {
+    mode_at_blocks(p, Some(0), round16_after)
+}
+
+fn mode_at_blocks<T: Copy + Eq>(
+    p: &Program,
+    initial: Option<T>,
+    after: fn(&Inst, Option<T>) -> Option<T>,
+) -> Vec<Option<T>> {
     // None: not reached yet; Some(m): the mode (m None: not known).
-    let mut entry: Vec<Option<Option<u8>>> = vec![None; p.blocks.len()];
-    entry[0] = Some(Some(0));
+    let mut entry = vec![None; p.blocks.len()];
+    entry[0] = Some(initial);
     let order = crate::ir::reverse_postorder(&p.blocks);
     loop {
         let mut changed = false;
         for &b in &order {
             let Some(mut m) = entry[b] else { continue };
             for inst in &p.blocks[b].insts {
-                m = round16_after(inst, m);
+                m = after(inst, m);
             }
             for s in p.blocks[b].exit.successors() {
                 let new = match entry[s] {
@@ -725,6 +736,7 @@ impl<'a> Lower<'a> {
             abort: None,
             round16: round16(p),
             mode16: Some(0),
+            flush_half_input: None,
         }
     }
 
@@ -7197,6 +7209,17 @@ impl<'a> Lower<'a> {
         let (k0, k1, k10) = (k(self, 0), k(self, 1), k(self, 10));
         let mag_mask = k(self, 0x7FFF);
         let mag = self.s.m.bin(c, Bin::And, h, mag_mask);
+        let mag = if self
+            .flush_half_input
+            .get_or_insert_with(|| denorm::flush_half_input_sites(self.x.p))
+            .contains(&inst.machine.offset)
+        {
+            let min_normal = k(self, 0x0400);
+            let tiny = self.s.m.cmp(c, pred::IULT, mag, min_normal);
+            self.s.m.select(c, tiny, k0, mag)
+        } else {
+            mag
+        };
         let k15 = k(self, 15);
         let neg = self.s.m.bin(c, Bin::LShr, h, k15);
         let neg = self.s.m.cmp(c, pred::NE, neg, k0);
