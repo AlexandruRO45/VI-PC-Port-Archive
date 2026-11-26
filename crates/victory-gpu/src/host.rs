@@ -1323,12 +1323,23 @@ impl Host {
         }
         // SAFETY: a plain query.
         if unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
+            // The debug layer keeps what was wrong until it is read: the
+            // removal itself names only a code (`DXGI_ERROR_INVALID_CALL`),
+            // and the stored messages name the call and its arguments.
+            #[cfg(feature = "diagnostics")]
+            let layer = self
+                .log_messages()
+                .map(|e| format!("; debug layer: {e}"))
+                .unwrap_or_default();
+            #[cfg(not(feature = "diagnostics"))]
+            let layer = String::new();
             fail(format_args!(
-                "host GPU device removed after a submission of {} lists{}{}{}",
+                "host GPU device removed after a submission of {} lists{}{}{}{}",
                 runs.len(),
                 self.removal_data(runs),
                 last_notes(runs),
-                removed_during(runs, removed_in)
+                removed_during(runs, removed_in),
+                layer
             ));
         }
         // What shaders wrote goes back before the bottom-of-pipe writes,
