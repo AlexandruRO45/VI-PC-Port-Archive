@@ -99,6 +99,28 @@ const DYNAMIC: u32 = 1 << 18;
 /// (a capped heap, NVIDIA): the title's slots keep their room first.
 const MIN_DYNAMIC: u32 = 1 << 16;
 
+/// Slots past the dynamic ones of a capped heap for the page table's view
+/// pairs ([`HostHeap::pair`]), as an uncapped heap has below `HEAP_VIEWS`.
+/// Without them every pair took two dynamic slots, which ran out.
+const CAPPED_PAIRS: u32 = 1 << 16;
+
+/// The dynamic slots of a heap capped at [`PORTABLE_VIEWS`] that the title's
+/// views overfill: [`MIN_DYNAMIC`], or `VICTORY_DYNAMIC_SLOTS` (at most half
+/// the heap less [`CAPPED_PAIRS`]), taken from the title's slots kept in place. On NVIDIA the
+/// title's 1,245,184 views leave too few: thousands of tables a frame were
+/// refused, each a dropped draw; 524288 left 0-33 a frame (VIctory-NVIDIA).
+fn capped_dynamic() -> u32 {
+    static SLOTS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *SLOTS.get_or_init(|| {
+        let asked = std::env::var("VICTORY_DYNAMIC_SLOTS").ok().and_then(|v| v.trim().parse::<u32>().ok());
+        let slots = asked.unwrap_or(MIN_DYNAMIC).clamp(MIN_DYNAMIC, PORTABLE_VIEWS / 2 - CAPPED_PAIRS);
+        if slots != MIN_DYNAMIC {
+            tracing::warn!(slots, "dynamic descriptor slots on a capped view heap");
+        }
+        slots
+    })
+}
+
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
         let host = host()?;
@@ -155,13 +177,14 @@ impl HostHeap {
         } else {
             // shortcut: a host that caps its heaps below `HEAP_VIEWS` (NVIDIA)
             // faults on an index past them, as before the clamp.
-            match make(count + MIN_DYNAMIC) {
+            match make(count + MIN_DYNAMIC + CAPPED_PAIRS) {
                 Ok(heap) => (heap, count, MIN_DYNAMIC),
-                Err(e) if count + MIN_DYNAMIC > PORTABLE_VIEWS => {
+                Err(e) if count + MIN_DYNAMIC + CAPPED_PAIRS > PORTABLE_VIEWS => {
                     // shortcut: descriptors past the host's limit are left
                     // out; a title that reaches them needs remapping.
                     tracing::warn!(error = %e, count, "host view heap capped at {PORTABLE_VIEWS}");
-                    (make(PORTABLE_VIEWS).ok()?, PORTABLE_VIEWS - MIN_DYNAMIC, MIN_DYNAMIC)
+                    let dynamic = capped_dynamic();
+                    (make(PORTABLE_VIEWS).ok()?, PORTABLE_VIEWS - dynamic - CAPPED_PAIRS, dynamic)
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
@@ -593,7 +616,7 @@ impl HostHeap {
 
     /// The slots the view addresses have an entry for: the title's and the
     /// dynamic ones.
-    fn address_slots(&self) -> u32 {
+    pub(crate) fn address_slots(&self) -> u32 {
         self.count + self.dynamic
     }
 
@@ -2220,10 +2243,17 @@ mod tests {
             return; // no host GPU
         };
         // Every index a translated shader can reach exists (clamped below
-        // `HEAP_VIEWS`, `HEAP_SAMPLERS`).
+        // `HEAP_VIEWS`, `HEAP_SAMPLERS`), except on a host that caps its
+        // view heaps (NVIDIA): there the smaller dynamic range, all of it.
         // SAFETY: plain queries of live heaps.
         unsafe {
-            assert!(heap.heap.GetDesc().NumDescriptors >= victory_shader::emit::HEAP_VIEWS);
+            let views = heap.heap.GetDesc().NumDescriptors;
+            if heap.dynamic == DYNAMIC {
+                assert!(views >= victory_shader::emit::HEAP_VIEWS);
+            } else {
+                assert_eq!(heap.dynamic, MIN_DYNAMIC, "a capped heap's dynamic range");
+                assert!(views >= heap.count + heap.dynamic + CAPPED_PAIRS, "room for view pairs");
+            }
             let samplers = HostHeap::new(true, 128).unwrap();
             assert!(samplers.heap.GetDesc().NumDescriptors >= victory_shader::emit::HEAP_SAMPLERS);
         }
