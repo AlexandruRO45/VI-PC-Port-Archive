@@ -3310,7 +3310,9 @@ impl<'a> Lower<'a> {
             MaskData::None => name == "s_bcnt1_i32_b64",
         };
         let effect = matches!(inst.fields, Fields::Exp { .. })
-            || matches!(inst.fields, Fields::Flat { .. }) && !name.starts_with("global_load_")
+            || matches!(inst.fields, Fields::Flat { .. })
+                && (!name.starts_with("global_load_")
+                    || matches!(inst.fields, Fields::Flat { lds: true, .. }))
             || name.contains("store")
             || name.contains("atomic")
             || name == "s_barrier"
