@@ -2377,14 +2377,12 @@ mod tests {
         };
         use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_D32_FLOAT, DXGI_FORMAT_R8G8B8A8_UNORM};
 
-        const TEST: &str = "resource::tests::clear_only_targets_are_captured_without_a_pipeline_name";
-        const CHILD: &str = "VICTORY_TEST_CLEAR_ONLY_CAPTURE";
-        const UNAVAILABLE: &str = "WARP unavailable for clear-only capture";
-        if std::env::var_os(CHILD).is_some() {
-            let Some(host) = crate::host::host() else {
-                println!("{UNAVAILABLE}");
-                return;
-            };
+        let Some(host) = crate::host::host() else {
+            eprintln!("no host GPU for clear-only capture; skipped");
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        crate::capture::with_test_capture(dir.path(), || {
             let null = std::ptr::null();
             let make = |format, flags| {
                 let desc = ResourceDesc { flags, ..texture(4, 4, format, 1) };
@@ -2432,30 +2430,11 @@ mod tests {
             list.close();
             next.close();
             host.execute(&[list, next]);
-            crate::capture::dump_targets(1);
+            crate::capture::dump_targets(crate::queue::presented() + 1);
             for o in [guest, next_guest, allocator, color, depth, named] {
                 assert_eq!(slot::<Release>(o, 0x10)(o), 0);
             }
-            return;
-        }
-
-        let dir = tempfile::tempdir().unwrap();
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", TEST, "--nocapture"])
-            .env(CHILD, "1")
-            .env("VICTORY_D3D12_WARP", "1")
-            .env("VICTORY_D3D12_DEBUG", "0")
-            .env("VICTORY_CAPTURE", dir.path())
-            .env("VICTORY_CAPTURE_FRAMES", "1")
-            .env("VICTORY_DUMP_TARGETS", "1")
-            .output()
-            .unwrap();
-        let message = String::from_utf8_lossy(&output.stdout);
-        assert!(output.status.success(), "{message}\n{}", String::from_utf8_lossy(&output.stderr));
-        if message.contains(UNAVAILABLE) {
-            eprintln!("{UNAVAILABLE}; skipped");
-            return;
-        }
+        });
 
         let mut actual = Vec::new();
         for entry in std::fs::read_dir(dir.path()).unwrap() {
@@ -2470,7 +2449,7 @@ mod tests {
             assert_eq!([word(16), word(20)], [2, 2]);
             let rgb = miniz_oxide::inflate::decompress_to_vec_zlib(&png[41..41 + word(33) as usize]).unwrap();
             assert_eq!(rgb.len(), 14);
-            actual.push((name.starts_with("frame-1-s"), name.contains("-by-namedpipeline"), rgb));
+            actual.push((name.split('-').nth(2).unwrap().starts_with('s'), name.contains("-by-namedpipeline"), rgb));
         }
         let red = [0, 255, 0, 0, 255, 0, 0].repeat(2);
         let two_depths = [0, 0, 0, 0, 255, 255, 255].repeat(2);
