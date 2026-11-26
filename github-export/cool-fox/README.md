@@ -1,4 +1,4 @@
-# cool_fox GitHub export
+# cool_fox :CGBJ GitHub export
 
 Issues, pull requests and comments from `codec-d/cool_fox`, exported from the GitHub REST API on 2026-11-26.
 
