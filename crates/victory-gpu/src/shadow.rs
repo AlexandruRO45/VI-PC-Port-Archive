@@ -353,7 +353,7 @@ impl Shadow {
                 if let Some((dirty_start, dirty_end)) = dirty_span {
                     let dirty_len = dirty_end - dirty_start;
                     if mode != 1 {
-                        crate::watch::writing(title_addr + dirty_start, dirty_len);
+                        crate::watch::written_back(title_addr + dirty_start, dirty_len);
                     }
                     crate::host::write_mapped(
                         (title_addr + dirty_start) as *mut u8,
@@ -608,7 +608,7 @@ impl Shadow {
                         {
                             let dirty_len = dirty_end - dirty_start;
                             if mode != 1 {
-                                crate::watch::writing(start + at + dirty_start, dirty_len);
+                                crate::watch::written_back(start + at + dirty_start, dirty_len);
                             }
                             crate::host::write_mapped(
                                 (start + at + dirty_start) as *mut u8,
@@ -2161,7 +2161,7 @@ impl Shadow {
                 }
                 if let Some((dirty_start, dirty_end)) = merge_gpu_writes_mut(&mut buf[..n], host, old) {
                     let dirty_len = dirty_end - dirty_start;
-                    crate::watch::writing(at + dirty_start, dirty_len);
+                    crate::watch::written_back(at + dirty_start, dirty_len);
                     crate::host::write_mapped(
                         (at + dirty_start) as *mut u8,
                         buf[dirty_start..].as_ptr(),

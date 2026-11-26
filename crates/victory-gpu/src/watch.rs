@@ -805,46 +805,58 @@ fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
 /// Before our own write into title memory `[at, at + len)` through the
 /// kernel (which does not fault into our handler): opens its guarded blocks.
 /// The runtime calls it (as `kernel_will_write`) before the title's kernel
-/// reads into its own memory.
+/// reads into its own memory. Also before title memory is opened in place
+/// for the GPU, where nothing is written: it does not tell the textures
+/// ([`written_back`] does).
 pub fn writing(at: usize, len: usize) {
+    let _ = open_for_write(at, len);
+}
+
+/// [`writing`], before we write the GPU's results or the title's copies
+/// into title memory `[at, at + len)`: the textures placed there, at any
+/// view of its pages, are also uploaded again at their next use. What the
+/// GPU wrote into a texture's memory through another view of it (a buffer)
+/// and we copy back reached the texture only when its turn to be looked at
+/// again came, if ever (tattoos and skin of noise on people: right with
+/// every texture looked at at every use, VICTORY_TEXTURES=always). Not for
+/// memory only opened in place: textures a host copy made would then be
+/// uploaded over from the stale title memory (seen in review of #139).
+pub(crate) fn written_back(at: usize, len: usize) {
+    for (from, to) in open_for_write(at, len) {
+        crate::resource::textures_rewritten(from as u64, to as u64);
+    }
+}
+
+/// Opens `[at, at + len)` for our write, and its pages' other views; the
+/// ranges opened (the range, then the views').
+fn open_for_write(at: usize, len: usize) -> Vec<(usize, usize)> {
     if len == 0 {
-        return;
+        return Vec::new();
     }
     let (first, last) = (at / BLOCK, (at + len).div_ceil(BLOCK));
-    // Textures placed where the write lands, at any view of its pages.
-    let mut stale = vec![(at, at + len)];
-    {
-        let mut g = guards();
-        let until = std::time::Instant::now() + PIN;
-        g.pins.push((first, last, until));
-        open(&mut g, at, at + len);
-        if view_guard() {
-            // The same pages at their other views: the write lands in them
-            // too, so their copies must take them again, now and when it
-            // has landed.
-            for block in first..last {
-                let shown = aliases(block * BLOCK);
-                if shown.len() < 2 || shown.len() > MANY_VIEWS {
-                    continue;
-                }
-                for alias in shown {
-                    if alias / BLOCK != block {
-                        g.pins.push((alias / BLOCK, alias / BLOCK + 1, until));
-                        open_here(&mut g, alias, alias + BLOCK);
-                        stale.push((alias, alias + BLOCK));
-                    }
+    let mut opened = vec![(at, at + len)];
+    let mut g = guards();
+    let until = std::time::Instant::now() + PIN;
+    g.pins.push((first, last, until));
+    open(&mut g, at, at + len);
+    if view_guard() {
+        // The same pages at their other views: the write lands in them too,
+        // so their copies must take them again, now and when it has landed.
+        for block in first..last {
+            let shown = aliases(block * BLOCK);
+            if shown.len() < 2 || shown.len() > MANY_VIEWS {
+                continue;
+            }
+            for alias in shown {
+                if alias / BLOCK != block {
+                    g.pins.push((alias / BLOCK, alias / BLOCK + 1, until));
+                    open_here(&mut g, alias, alias + BLOCK);
+                    opened.push((alias, alias + BLOCK));
                 }
             }
         }
     }
-    // Uploaded again at their next use: what the GPU wrote into a texture's
-    // memory through another view of it (a buffer) and we copy back reached
-    // the texture only when its turn to be looked at again came, if ever
-    // (tattoos and skin of noise on people: right with every texture looked
-    // at at every use, VICTORY_TEXTURES=always).
-    for (from, to) in stale {
-        crate::resource::textures_rewritten(from as u64, to as u64);
-    }
+    opened
 }
 
 /// The runtime mapped or unmapped title memory `[at, at + len)`: what it
