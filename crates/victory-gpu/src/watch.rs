@@ -262,6 +262,61 @@ fn ask_run(j: &mut Journal, pieces: &[(usize, usize)]) {
     ask_run(j, b);
 }
 
+#[cfg(test)]
+std::thread_local! {
+    static E013_COUNTS: std::cell::Cell<Option<(u64, u64)>> = const {
+        std::cell::Cell::new(None)
+    };
+}
+
+#[cfg(test)]
+fn e013_note_kernel(bytes: usize) {
+    E013_COUNTS.with(|c| {
+        if let Some((calls, total)) = c.get() {
+            c.set(Some((calls + 1, total + bytes as u64)));
+        }
+    });
+}
+
+#[cfg(all(test, feature = "diagnostics"))]
+std::thread_local! {
+    static E025_STATS: std::cell::Cell<Option<(u64, u64, u64, u64)>> = const {
+        std::cell::Cell::new(None)
+    };
+}
+
+#[cfg(all(test, feature = "diagnostics"))]
+pub(crate) fn e025_begin() {
+    E025_STATS.with(|s| s.set(Some((0, 0, 0, 0))));
+}
+
+#[cfg(all(test, feature = "diagnostics"))]
+pub(crate) fn e025_end() -> (u64, u64, u64, u64) {
+    E025_STATS.with(|s| s.replace(None).expect("E02.5 counters active"))
+}
+
+#[cfg(all(test, feature = "diagnostics"))]
+fn e025_start() -> Option<std::time::Instant> {
+    E025_STATS.with(|s| s.get().map(|_| std::time::Instant::now()))
+}
+
+#[cfg(all(test, feature = "diagnostics"))]
+fn e025_finish(started: Option<std::time::Instant>, bytes: usize, failed: bool) {
+    if let Some(started) = started {
+        let ns = started.elapsed().as_nanos() as u64;
+        E025_STATS.with(|s| {
+            if let Some((calls, total, time, failures)) = s.get() {
+                s.set(Some((
+                    calls + 1,
+                    total + bytes as u64,
+                    time + ns,
+                    failures + u64::from(failed),
+                )));
+            }
+        });
+    }
+}
+
 /// Asks the kernel for the written pages of pages `[first, last)` and notes
 /// them in the journal under the ahead asking; false (and nothing changed)
 /// if the range is not write-watched memory of one reservation.
@@ -273,6 +328,10 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
     let mut granularity = 0;
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
+    #[cfg(test)]
+    e013_note_kernel((last - first) * PAGE);
+    #[cfg(all(test, feature = "diagnostics"))]
+    let e025_started = e025_start();
     // SAFETY: the answer buffer holds `count` entries.
     let failed = unsafe {
         GetWriteWatch(
@@ -284,6 +343,8 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
             &mut granularity,
         )
     } != 0;
+    #[cfg(all(test, feature = "diagnostics"))]
+    e025_finish(e025_started, (last - first) * PAGE, failed);
     if failed {
         return false;
     }
@@ -349,6 +410,10 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     let mut granularity = 0;
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
+    #[cfg(test)]
+    e013_note_kernel((last - first) * PAGE);
+    #[cfg(all(test, feature = "diagnostics"))]
+    let e025_started = e025_start();
     // SAFETY: the answer buffer holds `count` entries.
     let failed = unsafe {
         GetWriteWatch(
@@ -360,6 +425,8 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
             &mut granularity,
         )
     } != 0;
+    #[cfg(all(test, feature = "diagnostics"))]
+    e025_finish(e025_started, (last - first) * PAGE, failed);
     let guarded = if failed {
         count = 0;
         if !guarded {
@@ -1265,6 +1332,152 @@ mod tests {
             "E02.6 release/reuse/next epoch ok; policy_gap_kib={}",
             ahead_gap() * PAGE / 1024
         );
+    }
+
+    /// Compare complete query epochs on one synthetic private reservation.
+    /// Run alone, with VICTORY_ASK_ONCE=1. No GPU or external assets needed.
+    #[test]
+    #[ignore = "synthetic interval grouping benchmark"]
+    fn measures_write_query_grouping() {
+        use std::time::{Duration, Instant};
+
+        struct Allocation {
+            base: usize,
+            bytes: usize,
+        }
+        impl Drop for Allocation {
+            fn drop(&mut self) {
+                ask_once_end();
+                ask_ahead_done();
+                let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+                j.written
+                    .retain(|&p, _| p < self.base / PAGE || p >= (self.base + self.bytes) / PAGE);
+                drop(j);
+                // SAFETY: this is our private allocation, no outstanding reads.
+                unsafe { VirtualFree(self.base as *mut _, 0, MEM_RELEASE) };
+            }
+        }
+
+        assert!(once(), "run with VICTORY_ASK_ONCE=1");
+        ask_once_end();
+        ask_ahead_done();
+        println!("E02 policy_gap_kib={}", ahead_gap() * PAGE / 1024);
+        const ROUNDS: usize = 20;
+        for n in [2usize, 8, 32] {
+            for region in [1usize, 8, 32] {
+                for gap in [0usize, 1, 4, 8, 12, 16, 24, 32, 64, 128] {
+                    let span = (n * region + (n - 1) * gap) * PAGE;
+                    let requested = n * region * PAGE;
+                    // SAFETY: private committed memory, owned by Allocation.
+                    let base = unsafe {
+                        VirtualAlloc(
+                            std::ptr::null(),
+                            span,
+                            MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                            PAGE_READWRITE,
+                        )
+                    } as usize;
+                    assert_ne!(base, 0);
+                    let _allocation = Allocation { base, bytes: span };
+                    assert_eq!(base % PAGE, 0);
+                    let ranges: Vec<_> = (0..n)
+                        .map(|i| {
+                            let start = base + i * (region + gap) * PAGE;
+                            (start, start + region * PAGE)
+                        })
+                        .collect();
+
+                    // Seed only requested pages. Every strategy starts with
+                    // the same journal density and no outstanding writes.
+                    for &(a, b) in &ranges {
+                        for at in (a..b).step_by(PAGE) {
+                            // SAFETY: each byte is in our allocation.
+                            unsafe { (at as *mut u8).write_volatile(1) };
+                        }
+                    }
+                    let (_, initial) = writes(base, base + span, false).expect("native");
+                    assert_eq!(initial.len(), n * region);
+
+                    for mode in ["clean", "sparse"] {
+                        for path in ["individual", "current", "whole"] {
+                            let mut samples = Vec::new();
+                            let mut calls = 0u64;
+                            let mut bytes = 0u64;
+                            for sample in 0..5 {
+                                let (mut watermark, _) = writes(base, base + span, false).unwrap();
+                                let mut elapsed = Duration::ZERO;
+                                // Reuse output storage, outside timed operations.
+                                let mut answers = Vec::with_capacity(n);
+                                for cycle in 0..=ROUNDS {
+                                    let block = (sample * ROUNDS + cycle) % region;
+                                    if mode == "sparse" {
+                                        for &(a, _) in &ranges {
+                                            // SAFETY: within the requested interval.
+                                            unsafe {
+                                                ((a + block * PAGE) as *mut u8)
+                                                    .write_volatile((cycle + 2) as u8)
+                                            };
+                                        }
+                                    }
+                                    E013_COUNTS.with(|c| c.set(Some((0, 0))));
+                                    let start = Instant::now();
+                                    match path {
+                                        "current" => ask_once(&ranges),
+                                        "whole" => ask_once(&[(base, base + span)]),
+                                        "individual" => (),
+                                        _ => unreachable!(),
+                                    }
+                                    for &(a, b) in &ranges {
+                                        answers.push(writes(a, b, false).expect("native interval"));
+                                    }
+                                    if path != "individual" {
+                                        ask_once_end();
+                                    }
+                                    let took = start.elapsed();
+                                    let (c, b) = E013_COUNTS.with(|v| v.replace(None).unwrap());
+
+                                    // Validate all changes against the known
+                                    // writes, using a common epoch watermark.
+                                    for (&(a, _), (now, pages)) in
+                                        ranges.iter().zip(answers.drain(..))
+                                    {
+                                        assert!(now > watermark);
+                                        assert_eq!(pages.len(), region);
+                                        let mut changed = pages
+                                            .iter()
+                                            .filter(|&&(_, stamp)| stamp > watermark)
+                                            .map(|&(page, _)| page);
+                                        let expected =
+                                            (mode == "sparse").then_some(a / PAGE + block);
+                                        assert_eq!(changed.next(), expected);
+                                        assert_eq!(changed.next(), None);
+                                    }
+                                    watermark =
+                                        JOURNAL.lock().unwrap_or_else(|e| e.into_inner()).asked;
+                                    if cycle != 0 {
+                                        elapsed += took;
+                                        calls += c;
+                                        bytes += b;
+                                    }
+                                }
+                                samples.push(elapsed.as_secs_f64() * 1e6 / ROUNDS as f64);
+                            }
+                            samples.sort_by(f64::total_cmp);
+                            let epochs = (5 * ROUNDS) as f64;
+                            println!(
+                                "E01.3 n={n} region_kib={} gap_kib={} mode={mode} path={path} median_us={:.3} calls_per_epoch={:.2} queried_kib={:.2} amplification={:.3} samples={samples:?}",
+                                region * PAGE / 1024,
+                                gap * PAGE / 1024,
+                                samples[2],
+                                calls as f64 / epochs,
+                                bytes as f64 / epochs / 1024.0,
+                                bytes as f64 / epochs / requested as f64
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]
