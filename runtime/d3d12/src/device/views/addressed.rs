@@ -169,7 +169,7 @@ pub(super) fn buffer_stride(view: &D3D12_SHADER_RESOURCE_VIEW_DESC) -> Option<u3
     element_stride(view.Format.0, buffer.StructureByteStride)
 }
 
-pub(super) fn element_stride(format: i32, structure_stride: u32) -> Option<u32> {
+pub(crate) fn element_stride(format: i32, structure_stride: u32) -> Option<u32> {
     if structure_stride != 0 {
         return (structure_stride <= 2048).then_some(structure_stride);
     }

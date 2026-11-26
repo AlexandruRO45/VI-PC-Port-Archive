@@ -7,6 +7,11 @@ pub(in super::super) unsafe extern "system" fn srv(
     desc: *const D3D12_SHADER_RESOURCE_VIEW_DESC,
     mut handle: D3D12_CPU_DESCRIPTOR_HANDLE,
 ) {
+    // The console index a shader names for this descriptor is the slot in the
+    // game's own heap, computed before the host rewrites the handle. The shim
+    // records that stride for the compute stride table (space 32767).
+    let descriptor_slot = handle.ptr;
+    let tracked_stride = unsafe { super::super::strides::srv_stride(desc) };
     let _write = super::super::descriptor_paging::Write::new(&device.state.descriptor_arenas, &mut handle);
     let resource = unsafe { view_resource(device, object, desc, handle) };
     let proxy = unsafe { super::super::resource_proxy(object, identity(device).as_raw()) };
@@ -55,6 +60,9 @@ pub(in super::super) unsafe extern "system" fn srv(
     } else {
         unsafe { device.native.CreateShaderResourceView(alias.as_ref().map(|(native, _)| native).or(resource), Some(desc), handle) };
     }
+    if tracked_stride != 0 {
+        device.state.descriptor_strides.set(descriptor_slot, tracked_stride);
+    }
     device.state.imported_views.store(handle.ptr, alias.map(|(native, original)| DescriptorBacking::BufferAlias { native, original }));
 }
 
@@ -65,6 +73,11 @@ pub(in super::super) unsafe extern "system" fn uav(
     desc: *const D3D12_UNORDERED_ACCESS_VIEW_DESC,
     mut handle: D3D12_CPU_DESCRIPTOR_HANDLE,
 ) {
+    // The console index a shader names for this descriptor is the slot in the
+    // game's own heap, computed before the host rewrites the handle. The shim
+    // records that stride for the compute stride table (space 32767).
+    let descriptor_slot = handle.ptr;
+    let tracked_stride = unsafe { super::super::strides::uav_stride(desc) };
     let _write = super::super::descriptor_paging::Write::new(&device.state.descriptor_arenas, &mut handle);
     crate::diagnostics::display::texture_view(handle.ptr, None, None);
     let owner = identity(device).as_raw();
@@ -212,6 +225,9 @@ pub(in super::super) unsafe extern "system" fn uav(
             .unwrap_or_else(|e| fail_call(format_args!("placed UAV offset={offset} stride={stride}: {:?}", e.code())));
     } else {
         unsafe { device.native.CreateUnorderedAccessView(buffer, counter, Some(final_desc), handle) };
+    }
+    if tracked_stride != 0 {
+        device.state.descriptor_strides.set(descriptor_slot, tracked_stride);
     }
 }
 

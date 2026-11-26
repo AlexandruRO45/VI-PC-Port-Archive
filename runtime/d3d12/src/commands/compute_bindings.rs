@@ -284,6 +284,17 @@ impl Bindings {
             });
         }
         let heap = heap.ok_or(E_INVALIDARG)?;
+        let stride_table = if COMPUTE && table.stride_table.is_some() {
+            let owner = guest.parent.as_ref().ok_or(E_INVALIDARG)?;
+            let address = unsafe {
+                crate::device::stride_table::populate(owner, arena.map(Arc::as_ref), &self.heaps, resources)?
+            };
+            static SITE: std::sync::Once = std::sync::Once::new();
+            crate::diagnostics::log_once(&SITE, || "bound compute heap stride table".to_string());
+            Some((table.stride_table.unwrap(), address))
+        } else {
+            None
+        };
         let index_map = if let Some(binding) = table.index_map {
             // Global indices originate in shader data. Any resident SRV can
             // sample placed textures and needs the usual pre-submit upload.
@@ -305,6 +316,9 @@ impl Bindings {
                 // Changing root signatures invalidates the native arguments. Replay
                 // constants and descriptors, then substitute each reflected table.
                 self.apply_compute_args(list, bases);
+                if let Some((slot, address)) = stride_table {
+                    list.SetComputeRootShaderResourceView(slot, address);
+                }
                 dispatch();
                 list.SetComputeRootSignature(self.compute.as_ref());
                 self.apply_compute_args(list, &[]);

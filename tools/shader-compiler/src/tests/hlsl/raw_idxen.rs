@@ -119,3 +119,57 @@ fn stride_inference_still_rejects_a_clobbered_index_or_address() {
     let load = insns.iter().find(|i| i.aux.mask & 2 != 0).expect("IDXEN load");
     assert_eq!(em.sibling_stride(load), None);
 }
+
+// The console descriptor stride is not provable at compile time for heap raw
+// views. With the stride-table decoration the emitter reads the stride from the
+// host-provided per-slot table instead of refusing.
+#[test]
+fn runtime_stride_table_is_used_when_the_static_stride_is_unprovable() {
+    // A load whose index is never shifted in the shader and no byte-descriptor
+    // proof exists: the sibling heuristic cannot prove a stride.
+    let words = [
+        0x7e00_0000u32,                  // v_nop
+        0xe030_2000u32, 0x8002_0401u32,  // buffer_load_dword v4, v1, s[8:11], 0 idxen
+        0xbf81_0000u32,                  // s_endpgm
+    ];
+    let ex = compute_extract(&words);
+    let insns = disassemble(&ex.isa);
+    let load = insns.iter().position(|i| i.aux.mask & 2 != 0).expect("IDXEN load");
+    let mut em = Emitter::new(&ex, insns.clone());
+    em.heap_stride_table = true;
+    em.res.insert(load, vec![super::Res::HeapRaw(20)]);
+    em.cur_idx = load;
+    let address = em.raw_address(&insns[load]).expect("table stride must resolve");
+    assert!(em.body.contains("tb_heap_stride(s20)"), "{:?}", em.body);
+    assert!(em.body.contains(&format!("uint {address}")), "{:?}", em.body);
+    // The index must be multiplied by the runtime stride read, not a constant.
+    assert!(em.body.contains("v1 * t0"), "{:?}", em.body);
+}
+
+#[test]
+fn runtime_stride_table_is_not_used_for_a_proven_static_stride() {
+    // The compile-time proof (a shift pattern) stays the fast path.
+    let words = stride_fixture_words();
+    let ex = compute_extract(&words);
+    let insns = disassemble(&ex.isa);
+    let load = insns.iter().position(|i| i.aux.mask & 2 != 0).expect("IDXEN load");
+    let mut em = Emitter::new(&ex, insns.clone());
+    em.heap_stride_table = true;
+    em.res.insert(load, vec![super::Res::HeapRaw(20)]);
+    em.cur_idx = load;
+    em.raw_address(&insns[load]).expect("static stride must resolve");
+    assert!(em.body.contains("v1 * 16u"), "{:?}", em.body);
+    assert!(!em.body.contains("tb_heap_stride"), "{:?}", em.body);
+}
+
+#[test]
+fn stride_table_declaration_is_emitted_when_decorated() {
+    let words = [0xbf81_0000u32];
+    let ex = compute_extract(&words);
+    let insns = disassemble(&ex.isa);
+    let mut em = Emitter::new(&ex, insns.clone());
+    em.heap_stride_table = true;
+    let res = em.resource_decls().expect("declarations must build");
+    assert!(res.contains("ByteAddressBuffer tb_heap_strides : register(t0, space32767);"), "{res}");
+    assert!(res.contains("uint tb_heap_stride(uint slot)"), "{res}");
+}

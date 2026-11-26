@@ -399,6 +399,8 @@ impl Arena {
         self.base_address
     }
 
+    pub(crate) fn count(&self) -> usize { self.count as usize }
+
     pub(crate) fn contains(&self, address: u64) -> bool {
         address
             .checked_sub(self.base() as u64)

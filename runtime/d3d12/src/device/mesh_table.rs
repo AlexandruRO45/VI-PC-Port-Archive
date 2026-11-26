@@ -274,6 +274,7 @@ pub(super) fn reflected(
             lengths,
             accessed_views,
             index_map: None,
+            stride_table: None,
             mirrors,
             pixel_root,
         })))

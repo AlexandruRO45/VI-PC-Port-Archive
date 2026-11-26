@@ -266,6 +266,8 @@ struct Emitter<'a> {
     heap_load_ty: HashMap<usize, [bool; 3]>,
     /// The root carries TuxBox's guest-to-host heap index map (root SRV t0, space32766).
     heap_map: bool,
+    /// The root carries TuxBox's per-slot heap descriptor stride table (root SRV t0, space32767).
+    heap_stride_table: bool,
     /// Compute sampler heap base SGPR (FSSM user-data class 6).
     sampler_heap_base: Option<u8>,
     /// Sampler slots read from that heap: bound from SamplerDescriptorHeap in main.

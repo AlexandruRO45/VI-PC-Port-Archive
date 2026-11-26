@@ -208,6 +208,14 @@ uint tb_fmac_half(uint a, uint b, uint c) {
             // Without TuxBox's index map the guest heap index is the host heap index.
             h.push_str("struct TBHeapConstants { uint4 data[4096]; };\nuint tb_heap_index(uint i) { return i; }\n");
         }
+        // The root carries the guest-to-host heap index map (space 32766).
+        // The guest heap slot -> console descriptor stride table lives in the
+        // sibling root SRV at space 32767: entry 0 is a valid flag, entry
+        // 1 + slot is the stride in bytes. An unpopulated table reports 0, a
+        // read of an unmapped slot is not a valid descriptor either way.
+        if self.heap_stride_table {
+            h.push_str("ByteAddressBuffer tb_heap_strides : register(t0, space32767);\nuint tb_heap_stride(uint slot) { return tb_heap_strides.Load(0) == 0u ? 0u : tb_heap_strides.Load(4u+slot*4u); }\n");
+        }
         for (slot, dwords) in &self.cb_size {
             let space = self.space_suffix(2, *slot);
             let _ = writeln!(h, "cbuffer CB{slot} : register(b{}{space}) {{ uint4 cb{slot}[{}]; }};", self.register_of(2, *slot), dwords.div_ceil(4).max(1));

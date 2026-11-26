@@ -51,15 +51,37 @@ impl<'a> Emitter<'a> {
     pub(in crate::hlsl) fn raw_address(&mut self, ins: &Insn) -> Result<String, String> {
         let (indexed, offset) = (ins.aux.mask & 2 != 0, ins.aux.mask & 1 != 0);
         let vector = if indexed {
-            let stride = matches!(self.res.get(&self.cur_idx).and_then(|v| v.first()), Some(Res::HeapRaw(_)))
+            let is_heap_raw = matches!(self.res.get(&self.cur_idx).and_then(|v| v.first()), Some(Res::HeapRaw(_)));
+            let stride = is_heap_raw
                 .then(|| self.sibling_stride(ins)).flatten();
-            if (stride.is_none() && !self.raw_byte_index.contains(&ins.offset))
-                || !ins.mnemonic.starts_with("buffer_load_dword")
-            {
+            // The console descriptor stride is not provable at compile time for heap raw
+            // views: it comes from the host-provided per-slot stride table (root SRV
+            // space32767, a sibling of the heap index map). When the decoration is present,
+            // the table is read instead of refusing. Without it the refusal stands.
+            let table_stride = stride.is_none()
+                && !self.raw_byte_index.contains(&ins.offset)
+                && is_heap_raw
+                && self.heap_stride_table
+                && ins.mnemonic.starts_with("buffer_load_dword");
+            if stride.is_none() && !self.raw_byte_index.contains(&ins.offset) && !table_stride {
+                return Err("raw buffer IDXEN needs the console descriptor stride".into());
+            }
+            if !ins.mnemonic.starts_with("buffer_load_dword") {
                 return Err("raw buffer IDXEN needs the console descriptor stride".into());
             }
             let mut index = r(&ins.src[0])?;
-            if let Some(stride) = stride { index = format!("({index} * {stride}u)"); }
+            if let Some(stride) = stride {
+                index = format!("({index} * {stride}u)");
+            } else if table_stride {
+                let Some(Res::HeapRaw(slot_sgpr)) = self.res.get(&self.cur_idx).and_then(|v| v.first()).copied() else {
+                    return Err("unsupported descriptor for stride table".into());
+                };
+                let t = self.tmp;
+                self.tmp += 1;
+                let slot = format!("s{slot_sgpr}");
+                self.line(&format!("uint t{t} = tb_heap_stride({slot});"));
+                index = format!("({index} * t{t})");
+            }
             if offset {
                 let Opnd::Vgpr(v) = ins.src[0] else { return Err("invalid indexed raw address".into()) };
                 let byte_offset = Opnd::Vgpr(v.checked_add(1).ok_or("raw address register overflow")?);

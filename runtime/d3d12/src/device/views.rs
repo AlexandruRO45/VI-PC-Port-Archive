@@ -5,6 +5,7 @@ mod creation;
 pub(super) use mirrors::cbv;
 pub(crate) use mirrors::snapshot_cbv_mirrors;
 use mirrors::srv_mirror;
+pub(crate) use addressed::element_stride;
 pub(super) use addressed::AddressSrv;
 use addressed::buffer_at;
 #[cfg(test)]

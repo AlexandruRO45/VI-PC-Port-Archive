@@ -13,6 +13,8 @@ pub(crate) struct ComputeTable {
     pub(crate) lengths: Vec<u32>,
     pub(crate) accessed_views: Vec<(usize, std::ops::Range<u32>)>,
     pub(crate) index_map: Option<IndexMapBinding>,
+    /// The slot of the appended stride-table root SRV (space 32767).
+    pub(crate) stride_table: Option<u32>,
     /// LOCAL: appended host parameters that bind the same guest table
     /// (host index, guest slot), e.g. a pixel-only copy of a mesh-rewritten table.
     pub(crate) mirrors: Vec<(u32, u32)>,
@@ -208,6 +210,16 @@ pub(super) fn reflected(
         !matches!(signature.params[2].kind, RootParamKind::Constants { register, space, .. }
             if (register, space) == (c.register, c.space))
     });
+    let stride_table = matches!(program, Program::Compute(_))
+        .then(|| signature.params.len() as u32)
+        .filter(|_| {
+            // The stride table only rides in on a root signature that is
+            // already being rewritten for other reasons: the guest keeps its
+            // own table for a program that translates unchanged.
+            rewrite.contains(&true) || !srv_registers.is_empty()
+                || scalar_index.is_some() || rewrite_constants.is_some()
+                || !recovered_samplers.is_empty()
+        });
     if !rewrite.contains(&true) && srv_registers.is_empty() && scalar_index.is_none()
         && rewrite_constants.is_none() && recovered_samplers.is_empty() {
         return Ok(TableLayout::Original);
@@ -276,7 +288,7 @@ pub(super) fn reflected(
             };
         }
         let index_map = scalar_index.map(|(scalar_word, scalar_mask)| IndexMapBinding {
-            slot: source.NumParameters, scalar_word, scalar_mask,
+            slot: parameters.len() as u32, scalar_word, scalar_mask,
         });
         if index_map.is_some() {
             // Read through a root SRV so the map itself never occupies a
@@ -294,6 +306,25 @@ pub(super) fn reflected(
                 },
             });
             desc.Anonymous.Desc_1_1.NumParameters = parameters.len() as u32;
+        }
+        // A compute shader gets the per-slot heap descriptor stride table as a
+        // root SRV at space 32767 (sibling of the pixel-only index map at
+        // space 32766). The shader names the table t0, so nothing else may
+        // occupy that register space here.
+        if let Some(slot) = stride_table {
+            parameters.push(D3D12_ROOT_PARAMETER1 {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_SRV,
+                ShaderVisibility: D3D12_SHADER_VISIBILITY(1),
+                Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                    Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                        ShaderRegister: 0,
+                        RegisterSpace: 32767,
+                        Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE,
+                    },
+                },
+            });
+            desc.Anonymous.Desc_1_1.NumParameters = parameters.len() as u32;
+            debug_assert_eq!(slot, parameters.len() as u32 - 1);
         }
         let samplers: Vec<_> = recovered_samplers.into_iter().map(|s| D3D12_STATIC_SAMPLER_DESC {
             Filter: D3D12_FILTER(s[0] as i32),
@@ -333,6 +364,7 @@ pub(super) fn reflected(
             lengths,
             accessed_views,
             index_map,
+            stride_table,
             mirrors: Vec::new(),
             pixel_root: None,
         })))
@@ -435,6 +467,7 @@ fn append_corroborated_ranges(
             lengths,
             accessed_views,
             index_map: None,
+            stride_table: None,
             mirrors: Vec::new(),
             pixel_root: None,
         })))
