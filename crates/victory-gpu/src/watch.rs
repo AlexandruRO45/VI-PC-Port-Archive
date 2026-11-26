@@ -1112,7 +1112,33 @@ fn placeholder(block: usize) -> bool {
             std::ptr::null_mut(),
         )
     };
-    status >= 0 && region.region_type & PLACEHOLDER_RESERVATION != 0
+    if status >= 0 {
+        return region.region_type & PLACEHOLDER_RESERVATION != 0;
+    }
+    // Wine answers no class 7: no hole was ever known there, and each was
+    // asked about at every asking (9,000 to 19,000 questions a frame in the
+    // opening scene). What the plain query does tell there: a placeholder is
+    // private memory reserved without access (the only way
+    // `MEM_RESERVE_PLACEHOLDER` makes one, and as `XMemVirtualAlloc` makes the
+    // title's), and the block lies whole in it.
+    // shortcut: an ordinary reservation without access looks the same, and an
+    // ordinary commit into one tells nobody; the title's go through the
+    // runtime, which tells ([`title_memory_allocated`]), and
+    // [`look_at_holes`] looks. (After avatarmanz/VIctory-7900XTX#59:
+    // Kayotic1337's finding and fallback, zocram4cc's narrower test.)
+    use windows_sys::Win32::System::Memory::{
+        MEM_PRIVATE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_NOACCESS, VirtualQuery,
+    };
+    let at = block * BLOCK;
+    // SAFETY: plain data filled in by the query.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out pointer of the right size.
+    let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+    n != 0
+        && info.State == MEM_RESERVE
+        && info.Type == MEM_PRIVATE
+        && info.AllocationProtect == PAGE_NOACCESS
+        && (info.BaseAddress as usize).saturating_add(info.RegionSize) >= at.saturating_add(BLOCK)
 }
 
 /// The runtime gave the title memory at `[at, at + len)`, allocated or
