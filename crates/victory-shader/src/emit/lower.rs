@@ -60,6 +60,9 @@ pub(crate) struct Lowered {
     /// Heap handles written.
     #[cfg(test)]
     pub heap_handles: u32,
+    /// Instructions written to the DXIL function body.
+    #[cfg(test)]
+    pub instructions: usize,
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
@@ -1404,6 +1407,8 @@ impl<'a> Lower<'a> {
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
             heap_handles: self.s.m.written_calls("dx.op.createHandleFromHeap") as u32,
+            #[cfg(test)]
+            instructions: self.s.m.written_instructions(),
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
             #[cfg(test)]
@@ -7642,30 +7647,28 @@ impl<'a> Lower<'a> {
             "v_min3_i32" | "v_max3_i32" | "v_min3_u32" | "v_max3_u32" | "v_med3_i32"
             | "v_med3_u32" => {
                 let (a, b, d) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);
-                let signed = name.ends_with("i32");
-                let (lt, gt) = if signed {
-                    (pred::SLT, pred::SGT)
+                let (min, max) = if name.ends_with("i32") {
+                    (38, 37) // IMin / IMax
                 } else {
-                    (pred::IULT, pred::IUGT)
+                    (40, 39) // UMin / UMax
                 };
-                let pick = |l: &mut Self, p, x, y| {
-                    let t = l.s.m.cmp(c, p, x, y);
-                    l.s.m.select(c, t, x, y)
+                let pick = |l: &mut Self, opcode, x, y| {
+                    l.s.op(c, "binary.i32", Attr::ReadNone, l.s.t.i32, opcode, &[x, y])
                 };
                 match &name[2..6] {
                     "min3" => {
-                        let t = pick(self, lt, a, b);
-                        pick(self, lt, t, d)
+                        let t = pick(self, min, a, b);
+                        pick(self, min, t, d)
                     }
                     "max3" => {
-                        let t = pick(self, gt, a, b);
-                        pick(self, gt, t, d)
+                        let t = pick(self, max, a, b);
+                        pick(self, max, t, d)
                     }
                     _ => {
-                        let lo = pick(self, lt, a, b);
-                        let hi = pick(self, gt, a, b);
-                        let t = pick(self, lt, hi, d);
-                        pick(self, gt, lo, t)
+                        let lo = pick(self, min, a, b);
+                        let hi = pick(self, max, a, b);
+                        let t = pick(self, min, hi, d);
+                        pick(self, max, lo, t)
                     }
                 }
             }
@@ -11089,6 +11092,26 @@ mod tests {
 
     fn lowers_valu(body: &[u32]) -> Result<(), crate::ShaderError> {
         lower_valu(body).map(|_| ())
+    }
+
+    #[test]
+    fn min3_max3_med3_instruction_counts() {
+        // Baseline counts from main (63bcca4), including setup and terminators.
+        for (name, opcode, before, after) in [
+            ("v_min3_i32", 0x152, 22, 20),
+            ("v_min3_u32", 0x153, 22, 20),
+            ("v_max3_i32", 0x155, 22, 20),
+            ("v_max3_u32", 0x156, 22, 20),
+            ("v_med3_i32", 0x158, 26, 22),
+            ("v_med3_u32", 0x159, 26, 22),
+        ] {
+            let lowered = lower_valu(&[
+                0xD400_0000 | opcode << 16, // VOP3 v0, v1, v2, v3
+                0x040E_0501,
+            ])
+            .unwrap();
+            assert_eq!(lowered.instructions, after, "{name} (main: {before})");
+        }
     }
 
     #[test]
