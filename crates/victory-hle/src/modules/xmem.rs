@@ -1086,44 +1086,6 @@ mod tests {
     }
 
     #[test]
-    fn file_backed_pages_alias_across_a_placeholder_and_storage_view() {
-        let dir = tempfile::tempdir().unwrap();
-        let section = match Section::new(2 * PAGE, Some(dir.path())) {
-            Ok(section) => section,
-            Err(e) if matches!(e.raw_os_error(), Some(1 | 50)) => {
-                eprintln!("temporary volume does not support sparse files: {e}");
-                return;
-            }
-            Err(e) => panic!("creating a file-backed section: {e}"),
-        };
-        let slice = Slice { section: Arc::new(section), index: 1 };
-        let mut storage = View::map(&slice, 1).unwrap();
-        assert_eq!(storage.bytes()[0], 0);
-        let base = XMemVirtualAlloc(
-            std::ptr::null_mut(),
-            PAGE,
-            MEM_RESERVE | PAGES_64K,
-            0,
-            PAGE_READWRITE,
-        );
-        assert!(!base.is_null());
-        let mut physical = Physical::default();
-        assert!(map(&mut physical, base as usize, PAGE, slice));
-        storage.bytes()[0] = 37;
-        // SAFETY: a writable page at the placeholder, aliasing the storage view.
-        unsafe {
-            assert_eq!(base.cast::<u8>().read(), 37);
-            base.cast::<u8>().write(91);
-        }
-        unmap(&mut physical, base as usize, PAGE);
-        assert_eq!(storage.bytes()[0], 91, "the last open view keeps its file alive");
-        drop(storage);
-        assert_eq!(dir.path().read_dir().unwrap().count(), 0, "no backing files left");
-        // SAFETY: our single placeholder, no longer mapped.
-        assert_ne!(unsafe { VirtualFree(base, 0, MEM_RELEASE) }, 0);
-    }
-
-    #[test]
     fn physical_pages_map_alias_and_unmap() {
         let mut pages = [0usize; 3];
         let mut n = 3;
@@ -1214,6 +1176,44 @@ mod tests {
     fn page_bytes(page: usize) -> Vec<u8> {
         let slice = physical().pages.get(&page).cloned().expect("known page");
         View::map(&slice, 1).expect("mapped").bytes().to_vec()
+    }
+
+    #[test]
+    fn file_backed_pages_alias_across_a_placeholder_and_storage_view() {
+        let dir = tempfile::tempdir().unwrap();
+        let section = match Section::new(2 * PAGE, Some(dir.path())) {
+            Ok(section) => section,
+            Err(e) if matches!(e.raw_os_error(), Some(1 | 50)) => {
+                eprintln!("temporary volume does not support sparse files: {e}");
+                return;
+            }
+            Err(e) => panic!("creating a file-backed section: {e}"),
+        };
+        let slice = Slice { section: Arc::new(section), index: 1 };
+        let mut storage = View::map(&slice, 1).unwrap();
+        assert_eq!(storage.bytes()[0], 0);
+        let base = XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            PAGE,
+            MEM_RESERVE | PAGES_64K,
+            0,
+            PAGE_READWRITE,
+        );
+        assert!(!base.is_null());
+        let mut physical = Physical::default();
+        assert!(map(&mut physical, base as usize, PAGE, slice));
+        storage.bytes()[0] = 37;
+        // SAFETY: a writable page at the placeholder, aliasing the storage view.
+        unsafe {
+            assert_eq!(base.cast::<u8>().read(), 37);
+            base.cast::<u8>().write(91);
+        }
+        unmap(&mut physical, base as usize, PAGE);
+        assert_eq!(storage.bytes()[0], 91, "the last open view keeps its file alive");
+        drop(storage);
+        assert_eq!(dir.path().read_dir().unwrap().count(), 0, "no backing files left");
+        // SAFETY: our single placeholder, no longer mapped.
+        assert_ne!(unsafe { VirtualFree(base, 0, MEM_RELEASE) }, 0);
     }
 
     #[test]
