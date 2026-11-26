@@ -225,9 +225,11 @@ impl Bindings {
         root.as_ref()?.paged_tables.as_deref()
     }
 
-    pub(super) fn supports_paged_draw<const COMPUTE: bool>(&self) -> bool {
+    /// Why the bound pipeline's root cannot be served from the paged arena,
+    /// or `None` when it can.
+    pub(super) fn paged_layout_gap<const COMPUTE: bool>(&self) -> Option<&'static str> {
         let root = if COMPUTE { &self.layout } else { &self.graphics_layout };
-        root.as_ref().is_some_and(|r| !r.direct_resources && r.paged_tables.is_some())
+        paged_layout_gap(root.as_ref())
     }
 
     pub(super) fn graphics_constants(&mut self, slot:u32, first:u32, words:&[u32]) {
@@ -601,3 +603,18 @@ impl Bindings {
         }
     }
 }
+
+/// The three ways a root falls outside descriptor paging. They need
+/// different fixes, so the skip log names which one it was.
+pub(super) fn paged_layout_gap(root: Option<&RootSource>) -> Option<&'static str> {
+    match root {
+        None => Some("no root signature was recorded for the pipeline"),
+        Some(root) if root.direct_resources => Some("its root indexes the resource heap directly"),
+        Some(root) if root.paged_tables.is_none() => Some("its root signature could not be parsed"),
+        Some(_) => None,
+    }
+}
+
+#[cfg(test)]
+#[path = "../tests/commands/compute_bindings.rs"]
+mod tests;

@@ -476,11 +476,10 @@ impl Recording {
             }
             return;
         }
-        if self.descriptor_arena.is_some() && !self.bindings.supports_paged_draw::<true>() {
-            Self::skip(
-                "compute dispatch: pipeline has no paged descriptor layout",
-                E_NOTIMPL,
-            );
+        if self.descriptor_arena.is_some()
+            && let Some(gap) = self.bindings.paged_layout_gap::<true>()
+        {
+            Self::skip(&format!("compute dispatch: pipeline has no paged descriptor layout: {gap}"), E_NOTIMPL);
             return;
         }
         if let Err(error) = self
@@ -650,8 +649,10 @@ impl Recording {
             }
             return;
         }
-        if self.descriptor_arena.is_some() && !self.bindings.supports_paged_draw::<false>() {
-            Self::skip("draw: pipeline has no paged descriptor layout", E_NOTIMPL);
+        if self.descriptor_arena.is_some()
+            && let Some(gap) = self.bindings.paged_layout_gap::<false>()
+        {
+            Self::skip(&format!("draw: pipeline has no paged descriptor layout: {gap}"), E_NOTIMPL);
             return;
         }
         if let Err(error) = self
