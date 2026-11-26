@@ -506,7 +506,7 @@ fn translate(
         Ok(p) => p,
         Err(e) => return t.fail(e.to_string(), example),
     };
-    for p in programs {
+    for (program_index, p) in programs.into_iter().enumerate() {
         t.programs += 1;
         match victory_shader::range::build(&p.patched_code(), p.wave64, p.vgprs) {
             Ok((program, structured)) => {
@@ -572,7 +572,7 @@ fn translate(
                     match emit::emit_with(&container, &p, &program, &s, &i, &r, marks) {
                         Ok(shader) => {
                             *counter(t, p.stage, 1) += 1;
-                            check(shader, t, checks, label);
+                            check(shader, t, checks, label, program_index);
                         }
                         Err(ShaderError::Unsupported { offset, what }) => t
                             .fail(format!("emit: {what}"), || {
@@ -594,21 +594,20 @@ fn translate(
 }
 
 /// Keep the source offset and stage readable within a 100-byte filename stem.
-fn dump_filename(label: &str, dxil: &[u8]) -> String {
+fn dump_filename(label: &str, program_index: usize) -> String {
     const HASH_CHARS: usize = 32;
-    const SUFFIX_CHARS: usize = 100 - HASH_CHARS - 1;
-    // Shortened labels can coincide, and one source label can emit different shaders.
+    const READABLE_CHARS: usize = 100 - HASH_CHARS - 1;
+    // One container can hold several native programs at the same stage.
     let mut key = blake3::Hasher::new();
-    key.update(&(label.len() as u64).to_le_bytes());
     key.update(label.as_bytes());
-    key.update(dxil);
+    key.update(&(program_index as u64).to_le_bytes());
     let digest = key.finalize().to_hex();
     let name: String = label
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
         .collect();
-    let suffix = &name[name.len().saturating_sub(SUFFIX_CHARS)..];
-    format!("{}_{suffix}.dxil", &digest[..HASH_CHARS])
+    let readable = &name[name.len().saturating_sub(READABLE_CHARS)..];
+    format!("{readable}_{}.dxil", &digest[..HASH_CHARS])
 }
 
 /// Validates an emitted shader if asked to.
@@ -617,6 +616,7 @@ fn check(
     t: &mut Tally,
     checks: &mut Checks,
     label: impl Fn() -> String,
+    program_index: usize,
 ) {
     if let Some(keep) = &checks.keep {
         lock(keep).push((label(), shader.clone()));
@@ -625,7 +625,7 @@ fn check(
     if t.list
         && let Ok(dir) = std::env::var("VICTORY_EMIT_DUMP")
     {
-        let path = Path::new(&dir).join(dump_filename(&label(), &shader.dxil));
+        let path = Path::new(&dir).join(dump_filename(&label(), program_index));
         let _ = std::fs::write(path, &shader.dxil);
     }
     if let Some((h, stub_ps)) = &checks.host {
@@ -867,19 +867,19 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn dump_names_preserve_distinct_labels_and_shaders() {
+    fn dump_names_distinguish_full_source_labels_and_native_programs() {
         use super::dump_filename;
 
         let label = "pass-a.bin@0x0 Vs";
-        let name = dump_filename(label, b"A");
-        assert_ne!(name, dump_filename("pass_a.bin@0x0 Vs", b"A"));
-        assert_ne!(name, dump_filename(label, b"B"));
-        assert_eq!(name, dump_filename(label, b"A"));
-        assert!(name.ends_with("_pass_a_bin_0x0_Vs.dxil"));
+        let name = dump_filename(label, 0);
+        assert_ne!(name, dump_filename("pass_a.bin@0x0 Vs", 0));
+        assert_ne!(name, dump_filename(label, 1));
+        assert!(name.starts_with("pass_a_bin_0x0_Vs_"));
+        assert!(name.ends_with(".dxil"));
 
         let tail = "x".repeat(100);
-        let a = dump_filename(&format!("one/{tail}.bin@0x0 Vs"), b"A");
-        let b = dump_filename(&format!("two/{tail}.bin@0x0 Vs"), b"A");
+        let a = dump_filename(&format!("one/{tail}.bin@0x0 Vs"), 0);
+        let b = dump_filename(&format!("two/{tail}.bin@0x0 Vs"), 0);
         assert_ne!(a, b);
         assert_eq!(a.len(), 100 + ".dxil".len());
     }
