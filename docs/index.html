@@ -187,6 +187,7 @@ const REPO = "https://github.com/Guernica4u/GTA6-PC-Port-Archive";
 const STEPS = ["Starts", "Menus", "Loads the world", "World on screen", "Playable"];
 // reached = how many STEPS work, from each project's README (24 Nov 2026); branch = its branch prefix in this repo;
 // gone = date it was removed from GitHub (listed in the graveyard); born and commits come from its archived history
+// private = its repo went private but work goes on there: listed in the graveyard (public copy gone) and in the archive
 // top = pinned to the top of the archive in this order (picked by hand), the rest sort by reached
 // release = a build kept as a release of this repo (no GitHub project of its own); its code is on the `branch` it names
 // gta = made only for GTA VI (the others run Xbox Series games in general); the "Only GTA VI projects" button keeps these
@@ -227,12 +228,12 @@ const PROJECTS = {
   "victory-7900xtx": { repo: "avatarmanz/VIctory-7900XTX", saved: "25 Nov 2026", name: "VIctory-7900XTX", gta: true, top: 3, lic: "GPL-3.0", branch: "victory-7900xtx", up: "https://github.com/avatarmanz/VIctory-7900XTX",
     desc: "A VIctory fork tuned for speed on an AMD RX 7900 XTX.", reached: 5,
     note: "Plays the prologue and the first mission at 13-22 fps, and 6-10 fps in busy street chases. Ran 41 minutes without a crash. Needs about 64 GB of RAM.", src: "https://github.com/avatarmanz/VIctory-7900XTX#where-it-stands-2026-11-25" },
-  "cool-fox": { repo: "codec-d/cool_fox", saved: "26 Nov 2026", removed: "26 Nov 2026", commits: 627, name: "cool_fox :CGBJ", gta: true, top: 2, lic: "GPL-3.0", branch: "cool-fox", up: null, frozen: "Final copy, 26 Nov 2026",
-    desc: "VIctory-7900XTX with a ready-made Windows build and a one-command launcher tuned on NVIDIA RTX. Removed from GitHub a few hours after it was published.", reached: 5,
+  "cool-fox": { repo: "codec-d/cool_fox", saved: "26 Nov 2026", gone: "26 Nov 2026", born: "26 Nov 2026", private: true, commits: 627, name: "cool_fox :CGBJ", gta: true, top: 2, lic: "GPL-3.0", branch: "cool-fox", up: null, frozen: "Last public copy, 26 Nov 2026",
+    desc: "VIctory-7900XTX with a ready-made Windows build and a one-command launcher tuned on NVIDIA RTX. Its repo went private a few hours after it was published; work goes on there.", reached: 5,
     note: "Builds on VIctory-7900XTX: the prologue and first mission play at 13-22 fps on an RX 7900 XTX. Adds a Windows ZIP and Series S settings tested on RTX cards.", src: `${REPO}/tree/main/cool-fox#run-the-codec_d-windows-build` },
   cgbj: { saved: "26 Nov 2026", name: "NEWEST CGBJ private", gta: true, top: 1, lic: "GPL-3.0", branch: "cool-fox", reached: 5,
     release: "https://github.com/Guernica4u/GTA6-PC-Port-Archive/releases/download/cgbj-pareto-residency/cool_fox-pareto-residency-windows-x64.zip", notes: "https://github.com/Guernica4u/GTA6-PC-Port-Archive/releases/tag/cgbj-pareto-residency",
-    desc: "The Windows build codec_d released privately from cool_fox :CGBJ, kept here after the repo was removed. Ready to run with your own dump.",
+    desc: "The Windows build codec_d released privately from cool_fox :CGBJ, kept here after the repo went private. Ready to run with your own dump.",
     note: "cool_fox's build with the Series S profile and RTX-tested settings. Unsigned exe; Windows Defender flags the ZIP (Trojan:Script/Wacatac.H!ml, a machine-learning detection). Read the release notes first.",
     src: "https://github.com/Guernica4u/GTA6-PC-Port-Archive/releases/tag/cgbj-pareto-residency" },
 };
@@ -241,7 +242,7 @@ const esc = s => String(s).replace(/[&<>"']/g, c => ({ "&":"&amp;", "<":"&lt;", 
 const label = P => P.tag ? `${P.name} <small>(${P.tag})</small>` : P.name;
 const plain = P => P.name + (P.tag ? ` (${P.tag})` : "");
 const KEYS = Object.keys(PROJECTS);
-const ALIVE = KEYS.filter(k => !PROJECTS[k].gone).sort((a, b) => (PROJECTS[a].top || 99) - (PROJECTS[b].top || 99) || PROJECTS[b].reached - PROJECTS[a].reached || plain(PROJECTS[a]).localeCompare(plain(PROJECTS[b]))), DEAD = KEYS.filter(k => PROJECTS[k].gone);
+const ALIVE = KEYS.filter(k => !PROJECTS[k].gone || PROJECTS[k].private).sort((a, b) => (PROJECTS[a].top || 99) - (PROJECTS[b].top || 99) || PROJECTS[b].reached - PROJECTS[a].reached || plain(PROJECTS[a]).localeCompare(plain(PROJECTS[b]))), DEAD = KEYS.filter(k => PROJECTS[k].gone);
 const fmt = n => n == null ? "—" : n.toLocaleString("en-US");
 const ago = t => { const h = Math.round((Date.now() / 1000 - t) / 3600); return h < 1 ? "under an hour ago" : h < 48 ? `${h} hour${h === 1 ? "" : "s"} ago` : `${Math.round(h / 24)} days ago`; };
 const pulse = `<svg width="34" height="14" viewBox="0 0 34 14" aria-hidden="true"><path d="M0 7h9l3-6 4 12 3-9 2 3h13" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" stroke-linecap="round"/></svg>`;
@@ -255,14 +256,14 @@ function projects(st) {
   $("alive").innerHTML = ALIVE.map(k => {
     const P = PROJECTS[k], s = st[k] || {};
     return `<article class="life p-${k}" data-gta="${+!!P.gta}" aria-labelledby="h-${k}">
-      <div class="hd"><h3 id="h-${k}">${label(P)}</h3><span class="beat">${P.release ? "Build" : P.removed ? "Final copy" : pulse + "Alive"}</span></div>
+      <div class="hd"><h3 id="h-${k}">${label(P)}</h3><span class="beat">${P.release ? "Build" : pulse + (P.private ? "Alive · private" : "Alive")}</span></div>
       <p>${esc(P.desc)}</p>
       ${P.release ? `<div class="facts">Windows x64 build · unsigned<br>${esc(P.note)}<br>Saved ${P.saved} · ${P.lic} · Status: ${esc(reach(P))}</div>
       <div class="actions">
         <a class="btn solid sm" href="${P.release}">Download build</a>
         <a class="btn sm" href="${zip(P, "main")}">Source code</a>
         <a class="btn sm" href="${P.notes}" target="_blank" rel="noopener">Release notes ↗</a>
-      </div>` : `<div class="facts">${s.updated ? `Last code change ${ago(s.updated)}<br>` : ""}${fmt(s.prs)} PRs · ${fmt(s.issues)} issues · ${fmt(s.comments)} comments<br>Saved since ${P.saved} · ${P.lic}${P.removed ? `<br>Removed from GitHub ${P.removed}; this copy no longer changes` : ""}<br>Status: ${esc(reach(P))} (<a href="${P.src}" target="_blank" rel="noopener">source</a>)</div>
+      </div>` : `<div class="facts">${s.updated ? `Last code change ${ago(s.updated)}<br>` : ""}${fmt(s.prs)} PRs · ${fmt(s.issues)} issues · ${fmt(s.comments)} comments<br>Saved since ${P.saved} · ${P.lic}${P.private ? `<br>Repo went private ${P.gone}; work goes on there. This is the last public copy` : ""}<br>Status: ${esc(reach(P))} (<a href="${P.src}" target="_blank" rel="noopener">source</a>)</div>
       <div class="actions">
         <a class="btn solid sm" href="${zip(P, "main")}">Download</a>
         <a class="btn sm" href="browse.html#${k}">Issues</a>
@@ -272,10 +273,10 @@ function projects(st) {
   }).join("");
   $("yard").innerHTML = DEAD.map(k => {
     const P = PROJECTS[k], s = st[k] || {};
-    return `<article class="grave" data-gta="${+!!P.gta}" aria-labelledby="h-${k}">
-      <div><h3 id="h-${k}">${label(P)}</h3>
-        <span class="gone">Removed from GitHub · ${P.gone}</span>
-        <div class="was">Was at github.com/${P.repo}<br>Active ${P.born || "?"} – ${P.gone}</div>
+    return `<article class="grave" data-gta="${+!!P.gta}" aria-labelledby="gh-${k}">
+      <div><h3 id="gh-${k}">${label(P)}</h3>
+        <span class="gone">${P.private ? "Went private" : "Removed from GitHub"} · ${P.gone}</span>
+        <div class="was">Was at github.com/${P.repo}<br>${P.private ? "Public" : "Active"} ${P.born || "?"} – ${P.gone}</div>
         <p class="d">${esc(P.desc)}</p></div>
       <dl>${P.commits ? `<div><dt>Commits</dt><dd>${fmt(P.commits)}</dd></div>` : ""}<div><dt>Pull requests</dt><dd>${fmt(s.prs)}</dd></div><div><dt>Issues</dt><dd>${fmt(s.issues)}</dd></div><div><dt>Comments</dt><dd>${fmt(s.comments)}</dd></div></dl>
       <div class="actions"><a class="btn solid sm" href="${zip(P, "main")}">Download code</a><a class="btn sm" href="${zip(P, "github-export")}">Download issues and comments</a><a class="btn sm" href="browse.html#${k}">Browse issues</a></div>
