@@ -199,9 +199,13 @@
 //!   console never exports them).
 
 mod bitcode;
+#[cfg(test)]
+mod census_tests;
 #[cfg(all(test, windows))]
 mod bvh_tests;
 mod container;
+#[cfg(all(test, windows))]
+mod crosslane_tests;
 #[cfg(all(test, windows))]
 mod diff_tests;
 #[cfg(all(test, windows))]
@@ -638,7 +642,6 @@ fn signature(part: &[u8]) -> Result<Vec<container::SigElement>, ShaderError> {
 
 #[cfg(test)]
 mod tests {
-    use super::bitcode::Attr;
     use super::lower::LOOP_LIMIT;
     use super::parse_loop_limit;
 
@@ -653,7 +656,6 @@ mod tests {
         }
     }
     use super::container::SigElement;
-    use super::shader::Shader;
     use super::*;
     use crate::native::{ComputeIo, StageIo};
 
@@ -1023,6 +1025,9 @@ mod tests {
     /// A pixel shader writing a constant colour.
     #[cfg(windows)]
     fn constant_color() -> Vec<u8> {
+        use super::bitcode::Attr;
+        use super::shader::Shader;
+
         let mut s = Shader::new(true);
         s.outputs.push(SigElement {
             name: "SV_Target".into(),
@@ -1223,6 +1228,7 @@ mod tests {
             TRIANGLE | EDGE_FLAGS | CULL,
         ] {
             let ms = triangle_mesh(prim).unwrap_or_else(|e| panic!("{prim:#x}: {e}"));
+            Container::parse(&ms.dxil).expect("mesh shader container");
             #[cfg(windows)]
             if let Some(v) = validator.as_mut() {
                 v.validate(&mut ms.dxil.clone())
