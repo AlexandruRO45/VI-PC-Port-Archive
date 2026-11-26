@@ -146,11 +146,15 @@ fn near(base: usize, size: usize) -> Result<*mut u8> {
     if size >= 1 << 30 {
         bail!("image too large for TLS thunks within rel32 reach");
     }
-    let above = (base + size).next_multiple_of(GRANULE);
+    let above = base
+        .checked_add(size)
+        .and_then(|end| end.checked_next_multiple_of(GRANULE));
     for k in 0..(1usize << 14) {
         for hint in [
-            base.checked_sub((k + 1) * GRANULE),
-            Some(above + k * GRANULE),
+            // Passing `NULL` (`0`) lets Windows pick any 64-bit address,
+            // outside `rel32` reach of the image.
+            base.checked_sub((k + 1) * GRANULE).filter(|&h| h != 0),
+            above.and_then(|a| a.checked_add(k * GRANULE)),
         ] {
             let Some(hint) = hint else { continue };
             // SAFETY: a fresh allocation at a free address, or null.
@@ -215,5 +219,21 @@ mod tests {
             // SAFETY: our page again.
             unsafe { VirtualProtect(page as _, 4096, PAGE_READWRITE, &mut old) };
         }
+    }
+
+    #[test]
+    fn near_never_uses_null_hint_outside_rel32_reach() {
+        use windows_sys::Win32::System::Memory::{MEM_RELEASE, VirtualFree};
+
+        let base = 0x1_0000usize;
+        let p = near(base, 4096).unwrap();
+        let addr = p as usize;
+        // SAFETY: `p` was freshly allocated by `VirtualAlloc(..., MEM_COMMIT | MEM_RESERVE, ...)`.
+        unsafe { VirtualFree(p.cast(), 0, MEM_RELEASE) };
+        let delta = (addr as i128 - base as i128).abs();
+        assert!(
+            delta < (1i128 << 31),
+            "allocated at {addr:#x}, outside rel32 reach of {base:#x}"
+        );
     }
 }
