@@ -3184,7 +3184,9 @@ fn lds_out_of_bounds_reads_zero_and_drops_writes() {
 
 /// RDNA2 `v_fmac_f16` in VOP3 encoding (`0x136`) honors `neg[2]` (`-acc`) and
 /// `abs[2]` (`|acc|`) on the accumulator VGPR's low half while preserving its
-/// high half (mode `0xc0`: IEEE=0, DX10_CLAMP=1, f16 denormals kept).
+/// high half. The rows are of the oracle's mode `0xc0` table (IEEE=0,
+/// DX10_CLAMP=1, f16 denormals kept), the console mode this file models (see
+/// the module header); a probe does not set a mode itself.
 /// Ten exact non-overflow, non-rounding rows (0, 1, 2, 3, 5, 6, 9, 10, 14, 15)
 /// measured on gfx1031 in `boykopovar/AnyPS5`
 /// `core/libs/prx/libSceAgcDriver/tests/execution/VFmacF16Modifiers.cpp` (`d204d17e7c`).
