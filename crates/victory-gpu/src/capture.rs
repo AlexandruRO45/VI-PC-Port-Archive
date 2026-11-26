@@ -69,6 +69,19 @@ enum PngPixel {
 }
 
 impl PngPixel {
+    fn for_present_format(format: DXGI_FORMAT) -> Option<Self> {
+        Some(match format {
+            DXGI_FORMAT_R8G8B8A8_UNORM | DXGI_FORMAT_R8G8B8A8_UNORM_SRGB => Self::Rgba8,
+            DXGI_FORMAT_B8G8R8A8_UNORM | DXGI_FORMAT_B8G8R8A8_UNORM_SRGB => Self::Bgra8,
+            // PNGs show the displayed colors. The presentation copy uses an
+            // UNORM swap chain for these packed bits, including UINT sources.
+            DXGI_FORMAT_R10G10B10A2_TYPELESS
+            | DXGI_FORMAT_R10G10B10A2_UNORM
+            | DXGI_FORMAT_R10G10B10A2_UINT => Self::Rgb10A2,
+            _ => return None,
+        })
+    }
+
     fn rgb(self, pixel: [u8; 4]) -> [u8; 3] {
         match self {
             Self::Rgba8 => [pixel[0], pixel[1], pixel[2]],
@@ -87,6 +100,15 @@ impl PngPixel {
 /// Saves four-byte color pixels to an 8-bit RGB PNG at half size.
 fn save_as(name: &str, width: u32, height: u32, pitch: usize, format: PngPixel, rows: &[u8]) {
     let Some(folder) = folder() else { return };
+    let png = encode_rgb_png(width, height, pitch, format, rows);
+    let path = folder.join(format!("{name}.png"));
+    match std::fs::create_dir_all(folder).and_then(|()| std::fs::write(&path, png)) {
+        Ok(()) => tracing::info!(path = %path.display(), "frame saved"),
+        Err(e) => tracing::warn!(error = %e, path = %path.display(), "frame not saved"),
+    }
+}
+
+fn encode_rgb_png(width: u32, height: u32, pitch: usize, format: PngPixel, rows: &[u8]) -> Vec<u8> {
     let (w, h) = ((width / 2).max(1), (height / 2).max(1));
     // Filter byte 0 per row, then RGB of every other pixel of every other row.
     let mut raw = Vec::with_capacity((w as usize * 3 + 1) * h as usize);
@@ -110,11 +132,7 @@ fn save_as(name: &str, width: u32, height: u32, pitch: usize, format: PngPixel, 
         &miniz_oxide::deflate::compress_to_vec_zlib(&raw, 3),
     );
     chunk(&mut png, b"IEND", &[]);
-    let path = folder.join(format!("{name}.png"));
-    match std::fs::create_dir_all(folder).and_then(|()| std::fs::write(&path, png)) {
-        Ok(()) => tracing::info!(path = %path.display(), "frame saved"),
-        Err(e) => tracing::warn!(error = %e, path = %path.display(), "frame not saved"),
-    }
+    png
 }
 
 fn chunk(png: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
@@ -217,20 +235,12 @@ pub(crate) fn save_read_back(
     footprint: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
 ) {
     let f = footprint.Footprint;
-    let format = match f.Format {
-        DXGI_FORMAT_R8G8B8A8_UNORM | DXGI_FORMAT_R8G8B8A8_UNORM_SRGB => PngPixel::Rgba8,
-        DXGI_FORMAT_B8G8R8A8_UNORM | DXGI_FORMAT_B8G8R8A8_UNORM_SRGB => PngPixel::Bgra8,
-        // The display copy interprets every member of this family as UNORM.
-        DXGI_FORMAT_R10G10B10A2_TYPELESS
-        | DXGI_FORMAT_R10G10B10A2_UNORM
-        | DXGI_FORMAT_R10G10B10A2_UINT => PngPixel::Rgb10A2,
-        other => {
-            tracing::warn!(
-                format = other.0,
-                "frame not saved: unsupported color format"
-            );
-            return;
-        }
+    let Some(format) = PngPixel::for_present_format(f.Format) else {
+        tracing::warn!(
+            format = f.Format.0,
+            "frame not saved: unsupported color format"
+        );
+        return;
     };
     let mut data = std::ptr::null_mut();
     // SAFETY: the copy finished (every submission is waited for); the
@@ -627,6 +637,7 @@ fn half(h: u16) -> f32 {
     let (sign, exp, man) = ((h >> 15) as u32, ((h >> 10) & 0x1f) as i32, (h & 0x3ff) as f32);
     let v = match exp {
         0 => man * 2f32.powi(-24),
+        31 if man != 0.0 => f32::NAN,
         31 => f32::INFINITY,
         e => (1.0 + man / 1024.0) * 2f32.powi(e - 15),
     };
@@ -639,6 +650,7 @@ fn small_float(bits: u32, man: u32) -> f32 {
     let (exp, m) = ((bits >> man) & 0x1f, (bits & ((1 << man) - 1)) as f32);
     match exp {
         0 => m / (1 << man) as f32 * 2f32.powi(-14),
+        31 if m != 0.0 => f32::NAN,
         31 => f32::INFINITY,
         e => (1.0 + m / (1 << man) as f32) * 2f32.powi(e as i32 - 15),
     }
@@ -649,10 +661,16 @@ fn small_float(bits: u32, man: u32) -> f32 {
 /// channels: lowest black, highest white, as grey). `None` for formats not
 /// handled.
 fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option<Vec<u8>> {
-    let mut out = Vec::with_capacity(w * h * 4);
     let px = |x: usize, y: usize, n: usize| &rows[y * pitch + x * n..][..n];
     let u16_at = |b: &[u8], i: usize| u16::from_le_bytes([b[2 * i], b[2 * i + 1]]);
     let u32_at = |b: &[u8], i: usize| u32::from_le_bytes(b[4 * i..4 * i + 4].try_into().unwrap_or([0; 4]));
+    if matches!(format, 42 | 43) {
+        let words = (0..h)
+            .flat_map(|y| (0..w).map(move |x| (x, y)))
+            .map(|(x, y)| u32_at(px(x, y, 4), 0));
+        return Some(r32_integer_to_rgba(format, words));
+    }
+    let mut out = Vec::with_capacity(w * h * 4);
     // Channel values as floats, then scaled.
     type Decode = Box<dyn Fn(&[u8]) -> [f32; 3]>;
     let (n, decode): (usize, Decode) = match format {
@@ -701,7 +719,7 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
         35..=38 => (4, Box::new(move |b| [f32::from(u16_at(b, 0)), f32::from(u16_at(b, 1)), 0.0])),
         48..=52 => (2, Box::new(move |b| [f32::from(b[0]), f32::from(b[1]), 0.0])),
         // Single channels (and depth planes): shown as grey.
-        39..=43 => (4, Box::new(move |b| [f32::from_bits(u32_at(b, 0)); 3])),
+        39..=41 => (4, Box::new(move |b| [f32::from_bits(u32_at(b, 0)); 3])),
         19..=22 => (8, Box::new(move |b| [f32::from_bits(u32_at(b, 0)); 3])),
         44..=47 => (4, Box::new(move |b| [(u32_at(b, 0) & 0xff_ffff) as f32; 3])),
         53..=54 => (2, Box::new(move |b| [half(u16_at(b, 0)); 3])),
@@ -713,7 +731,7 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
         .flat_map(|y| (0..w).map(move |x| (x, y)))
         .map(|(x, y)| decode(px(x, y, n)))
         .collect();
-    let grey = matches!(format, 19..=22 | 39..=47 | 53..=65);
+    let grey = matches!(format, 19..=22 | 39..=41 | 44..=47 | 53..=65);
     let finite = values.iter().flatten().copied().filter(|v| v.is_finite());
     let (low, max) = if grey {
         finite.fold((f32::MAX, f32::MIN), |(l, h), v| (l.min(v), h.max(v)))
@@ -747,6 +765,46 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
         out.extend([c[0], c[1], c[2], 255]);
     }
     Some(out)
+}
+
+fn r32_integer_to_rgba(format: u32, words: impl Iterator<Item = u32>) -> Vec<u8> {
+    let signed = format == 43;
+    let mut values: Vec<i64> = words
+        .map(|word| if signed { i64::from(word as i32) } else { i64::from(word) })
+        .collect();
+    let first = values.first().copied().unwrap_or(0);
+    let (low, high) = values.iter().copied().fold((first, first), |(low, high), value| {
+        (low.min(value), high.max(value))
+    });
+    // The full 32-bit span scaled by 255 fits in i64, without float rounding.
+    let range = (high - low).max(1);
+    let flat_nonzero = high == low && low != 0;
+    let mut out = Vec::with_capacity(values.len() * 4);
+    for &value in &values {
+        let grey = if flat_nonzero {
+            255
+        } else {
+            ((value - low) * 255 / range) as u8
+        };
+        out.extend([grey, grey, grey, 255]);
+    }
+
+    let total = values.len();
+    values.retain(|&value| value != 0);
+    let nonzero = values.len() as f64 / total.max(1) as f64;
+    for value in &mut values {
+        *value = value.abs();
+    }
+    let mut at = |q: f64| -> i64 {
+        if values.is_empty() {
+            return 0;
+        }
+        let k = ((values.len() - 1) as f64 * q).round() as usize;
+        *values.select_nth_unstable(k).1
+    };
+    let (p50, p99) = (at(0.5), at(0.99));
+    tracing::info!(format, low, high, p50, p99, nonzero, not_finite = 0, "target values");
+    out
 }
 
 /// Pixels per side of the grid [`probe`] reads.
@@ -887,6 +945,56 @@ pub(crate) fn recent_levels() -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn half_classifies_special_and_finite_values() {
+        use super::half;
+
+        assert!(half(0x7c01).is_nan());
+        assert!(half(0xfe00).is_nan());
+        assert_eq!(half(0x7c00), f32::INFINITY);
+        assert_eq!(half(0xfc00), f32::NEG_INFINITY);
+        assert_eq!(half(0x0000).to_bits(), 0.0f32.to_bits());
+        assert_eq!(half(0x8000).to_bits(), (-0.0f32).to_bits());
+        assert_eq!(half(0x0001), 2f32.powi(-24));
+        assert_eq!(half(0xbe00), -1.5);
+    }
+
+    #[test]
+    fn packed_float_classifies_special_and_finite_values() {
+        use super::small_float;
+
+        for mantissa_bits in [5, 6] {
+            let special = 31 << mantissa_bits;
+            assert!(small_float(special | 1, mantissa_bits).is_nan());
+            assert!(small_float(special | (1 << (mantissa_bits - 1)), mantissa_bits).is_nan());
+            assert_eq!(small_float(special, mantissa_bits), f32::INFINITY);
+            assert_eq!(small_float(0, mantissa_bits).to_bits(), 0.0f32.to_bits());
+            assert_eq!(small_float(1, mantissa_bits), 2f32.powi(-14 - mantissa_bits as i32));
+            assert_eq!(small_float(15 << mantissa_bits, mantissa_bits), 1.0);
+        }
+    }
+
+    #[test]
+    fn hdr_targets_render_nan_and_infinity_as_distinct_channel_values() {
+        // R16G16B16A16_FLOAT: [NaN, +Inf, NaN], [1, 0.5, 0].
+        let half = [0x7c01u16, 0x7c00, 0xfe00, 0, 0x3c00, 0x3800, 0, 0];
+        let half: Vec<_> = half.into_iter().flat_map(u16::to_le_bytes).collect();
+        // R11G11B10_FLOAT: the same values with 6-bit and 5-bit mantissas.
+        let packed = [
+            0x7c1u32 | (0x7c0 << 11) | (0x3e1 << 22),
+            0x3c0 | (0x380 << 11),
+        ];
+        let packed: Vec<_> = packed.into_iter().flat_map(u32::to_le_bytes).collect();
+        let expected = [0, 255, 0, 255, 255, 127, 0, 255];
+        for (format, row) in [(10, half), (26, packed)] {
+            assert_eq!(
+                super::to_rgba(format, 2, 1, row.len(), &row).as_deref(),
+                Some(&expected[..]),
+                "format {format}"
+            );
+        }
+    }
+
+    #[test]
     fn crc_matches_the_png_check_value() {
         assert_eq!(super::crc32(b"IEND"), 0xae42_6082);
     }
@@ -894,116 +1002,51 @@ mod tests {
     #[test]
     fn packed_10_bit_frames_are_saved_as_rgb_pngs() {
         use super::*;
-        use windows::Win32::Foundation::RECT;
 
-        const TEST: &str = "capture::tests::packed_10_bit_frames_are_saved_as_rgb_pngs";
-        const CHILD: &str = "VICTORY_TEST_PACKED_FRAME";
-        const UNAVAILABLE: &str = "WARP unavailable for packed frame capture";
-        if std::env::var_os(CHILD).is_some() {
-            let Some(host) = crate::host::host() else {
-                println!("{UNAVAILABLE}");
-                return;
-            };
-            for (frame, format) in [
-                (1, DXGI_FORMAT_R8G8B8A8_UNORM),
-                (2, DXGI_FORMAT_R10G10B10A2_UNORM),
-                (3, DXGI_FORMAT_R10G10B10A2_TYPELESS),
-            ] {
-                let mut texture = None;
-                let desc = D3D12_RESOURCE_DESC {
-                    Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
-                    Width: 4,
-                    Height: 2,
-                    DepthOrArraySize: 1,
-                    MipLevels: 1,
-                    Format: format,
-                    SampleDesc: DXGI_SAMPLE_DESC {
-                        Count: 1,
-                        Quality: 0,
-                    },
-                    Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
-                    ..Default::default()
-                };
-                let heap = D3D12_HEAP_PROPERTIES {
-                    Type: D3D12_HEAP_TYPE_DEFAULT,
-                    ..Default::default()
-                };
-                let list = host.new_list().unwrap();
-                // SAFETY: valid descriptions, and the texture and list remain live through execution.
-                let (buffer, footprint) = unsafe {
-                    host.device
-                        .CreateCommittedResource(
-                            &heap,
-                            D3D12_HEAP_FLAG_NONE,
-                            &desc,
-                            D3D12_RESOURCE_STATE_RENDER_TARGET,
-                            None,
-                            &mut texture,
-                        )
-                        .unwrap();
-                    let texture = texture.as_ref().unwrap();
-                    let view = D3D12_RENDER_TARGET_VIEW_DESC {
-                        Format: if format == DXGI_FORMAT_R10G10B10A2_TYPELESS {
-                            DXGI_FORMAT_R10G10B10A2_UNORM
-                        } else {
-                            format
-                        },
-                        ViewDimension: D3D12_RTV_DIMENSION_TEXTURE2D,
-                        ..Default::default()
-                    };
-                    let handle = host.rtv(texture, Some(&view));
-                    let left = RECT {
-                        left: 0,
-                        top: 0,
-                        right: 2,
-                        bottom: 2,
-                    };
-                    list.list
-                        .ClearRenderTargetView(handle, &[0.0, 0.25, 1.0, 0.0], None);
-                    list.list
-                        .ClearRenderTargetView(handle, &[1.0, 0.5, 0.0, 1.0], Some(&[left]));
-                    list.list.ResourceBarrier(&[crate::host::transition(
-                        texture,
-                        D3D12_RESOURCE_STATE_RENDER_TARGET,
-                        D3D12_RESOURCE_STATE_COPY_SOURCE,
-                    )]);
-                    read_back(&host.device, &list.list, texture).unwrap()
-                };
-                list.close();
-                host.execute(&[&list]);
-                save_read_back(frame, &buffer, &footprint);
+        let rgba8 = [
+            [255, 128, 0, 0],
+            [0, 64, 255, 255],
+            [7, 8, 16, 42],
+            [128, 128, 128, 127],
+        ];
+        let bgra8 = rgba8.map(|[r, g, b, a]| [b, g, r, a]);
+        let rgb10 = [
+            1023 | 512 << 10,
+            256 << 10 | 1023 << 20 | 3 << 30,
+            30 | 31 << 10 | 64 << 20 | 1 << 30,
+            512 | 512 << 10 | 512 << 20 | 2 << 30,
+        ]
+        .map(u32::to_le_bytes);
+
+        const PITCH: usize = 20;
+        for (format, pixels) in [
+            (DXGI_FORMAT_R8G8B8A8_UNORM, rgba8),
+            (DXGI_FORMAT_B8G8R8A8_UNORM, bgra8),
+            (DXGI_FORMAT_R10G10B10A2_UNORM, rgb10),
+            (DXGI_FORMAT_R10G10B10A2_TYPELESS, rgb10),
+            (DXGI_FORMAT_R10G10B10A2_UINT, rgb10),
+        ] {
+            // Only the sampled pixels have meaningful colors. Intervening
+            // rows, columns, and pitch padding must not affect the PNG.
+            let mut rows = [0xcc; 4 * PITCH];
+            for (offset, color) in [0, 8, 2 * PITCH, 2 * PITCH + 8].into_iter().zip(pixels) {
+                rows[offset..offset + 4].copy_from_slice(&color);
             }
-            return;
-        }
-
-        let dir = tempfile::tempdir().unwrap();
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", TEST, "--nocapture"])
-            .env(CHILD, "1")
-            .env("VICTORY_CAPTURE", dir.path())
-            .env("VICTORY_D3D12_WARP", "1")
-            .env("VICTORY_D3D12_DEBUG", "0")
-            .output()
-            .unwrap();
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(
-            output.status.success(),
-            "{stdout}\n{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        if stdout.contains(UNAVAILABLE) {
-            eprintln!("{UNAVAILABLE}; skipped");
-            return;
-        }
-        for frame in 1..=3 {
-            let png = std::fs::read(dir.path().join(format!("frame-{frame}.png")))
-                .unwrap_or_else(|e| panic!("frame {frame} did not produce a PNG: {e}"));
+            let pixel = PngPixel::for_present_format(format).unwrap();
+            let png = encode_rgb_png(4, 4, PITCH, pixel, &rows);
             let word = |at| u32::from_be_bytes(png[at..at + 4].try_into().unwrap());
-            assert_eq!([word(16), word(20)], [2, 1]);
-            let pixels =
+            assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
+            assert_eq!([word(16), word(20)], [2, 2]);
+            assert_eq!(&png[24..26], &[8, 2]);
+            assert_eq!(&png[37..41], b"IDAT");
+            let data =
                 miniz_oxide::inflate::decompress_to_vec_zlib(&png[41..41 + word(33) as usize])
                     .unwrap();
-            assert_eq!(pixels, [0, 255, 128, 0, 0, 64, 255], "frame {frame}");
+            assert_eq!(
+                data,
+                [0, 255, 128, 0, 0, 64, 255, 0, 7, 8, 16, 128, 128, 128],
+                "{format:?}"
+            );
         }
     }
 
@@ -1019,5 +1062,55 @@ mod tests {
         assert_eq!(super::to_rgba(89, 1, 1, 4, &xr), Some(vec![255, 127, 0, 255]));
         // B8G8R8A8 still swaps to RGBA.
         assert_eq!(super::to_rgba(87, 1, 1, 4, &[1, 2, 3, 4]), Some(vec![3, 2, 1, 255]));
+    }
+}
+
+#[cfg(test)]
+mod r32_tests {
+    #[test]
+    fn r32_integer_captures_scale_numeric_values() {
+        let unsigned = [1u32, 2, 3].map(u32::to_le_bytes).concat();
+        let signed = [-2i32, -1, 0].map(i32::to_le_bytes).concat();
+        let expected = Some(vec![0, 0, 0, 255, 127, 127, 127, 255, 255, 255, 255, 255]);
+
+        assert_eq!(super::to_rgba(42, 3, 1, 12, &unsigned), expected);
+        assert_eq!(super::to_rgba(43, 3, 1, 12, &signed), expected);
+    }
+
+    #[test]
+    fn r32_integer_captures_keep_adjacent_contrast() {
+        let unsigned = [16_777_216u32, 16_777_217].map(u32::to_le_bytes).concat();
+        let signed = [-16_777_217i32, -16_777_216].map(i32::to_le_bytes).concat();
+        let expected = Some(vec![0, 0, 0, 255, 255, 255, 255, 255]);
+
+        assert_eq!(super::to_rgba(42, 2, 1, 8, &unsigned), expected);
+        assert_eq!(super::to_rgba(43, 2, 1, 8, &signed), expected);
+    }
+
+    #[test]
+    fn r32_integer_captures_handle_full_range_and_row_pitch() {
+        let signed = [i32::MIN, -1, i32::MIN, 0, i32::MAX].map(i32::to_le_bytes).concat();
+        let expected = Some(vec![0, 0, 0, 255, 127, 127, 127, 255, 127, 127, 127, 255, 255, 255, 255, 255]);
+
+        assert_eq!(super::to_rgba(43, 2, 2, 12, &signed), expected);
+    }
+
+    #[test]
+    fn r32_integer_captures_constant_uint_is_white() {
+        let rows = [7u32; 2].map(u32::to_le_bytes).concat();
+        assert_eq!(super::to_rgba(42, 2, 1, 8, &rows), Some(vec![255; 8]));
+    }
+
+    #[test]
+    fn r32_integer_captures_constant_sint_is_white() {
+        let rows = [-7i32; 2].map(i32::to_le_bytes).concat();
+        assert_eq!(super::to_rgba(43, 2, 1, 8, &rows), Some(vec![255; 8]));
+    }
+
+    #[test]
+    fn r32_integer_captures_constant_zero_is_black() {
+        let expected = Some([0, 0, 0, 255].repeat(2));
+        assert_eq!(super::to_rgba(42, 2, 1, 8, &[0; 8]), expected);
+        assert_eq!(super::to_rgba(43, 2, 1, 8, &[0; 8]), expected);
     }
 }
