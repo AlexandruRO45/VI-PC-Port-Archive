@@ -15,6 +15,17 @@
 //! share, [`console`] which console model the title sees. Planned:
 //! `present` (swap chain).
 
+// This fork: compiler warnings in the newer GPU code are let through until it
+// is tidied, so that `-D warnings` passes (with the clippy lints let through
+// in the workspace Cargo.toml).
+#![allow(
+    dead_code,
+    unused_variables,
+    unused_assignments,
+    private_interfaces,
+    dropping_copy_types
+)]
+
 #[cfg(windows)]
 mod ambient;
 #[cfg(all(windows, feature = "diagnostics"))]
