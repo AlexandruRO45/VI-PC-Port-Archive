@@ -1253,7 +1253,13 @@ impl State {
         #[cfg(feature = "diagnostics")]
         if std::env::var_os("VICTORY_MESH_TRACE").is_some() {
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-            if crate::queue::presented() >= trace_after()
+            let bake = crate::pipeline::host_pipeline(self.pipeline as This).is_some_and(|p| {
+                p.stages
+                    .iter()
+                    .any(|s| s.shader.name().contains("Bake") || s.shader.name().contains("LUT"))
+            });
+            if !bake
+                && crate::queue::presented() >= trace_after()
                 && N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 2000
             {
                 tracing::info!("{}", self.op_text(format!("mesh {x}"), false, true));
