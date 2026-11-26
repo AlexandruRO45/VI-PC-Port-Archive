@@ -538,7 +538,19 @@ pub(crate) fn save(now: bool) {
     let tmp = PathBuf::from(tmp);
     let (bytes, prebuilt) = {
         let mut l = library.state.lock().unwrap_or_else(|e| e.into_inner());
-        if l.added == 0 && !l.prebuilt_changed && !USED_CHANGED.swap(false, Ordering::Relaxed) {
+        let used_changed = USED_CHANGED.swap(false, Ordering::Relaxed);
+        if l.added == 0 && !l.prebuilt_changed {
+            // Only the early list changed (a run that made no pipeline):
+            // that list alone, not the whole library again.
+            if used_changed {
+                drop(l);
+                let used = used().as_ref().map(Used::list).unwrap_or_default();
+                if let Err(e) = std::fs::create_dir_all(dir)
+                    .and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()))
+                {
+                    tracing::warn!(error = %e, "early pipeline list not saved");
+                }
+            }
             return;
         }
         // Serialised straight into the mapped file: no copy of the whole
