@@ -94,6 +94,11 @@ numbers are estimates until a run carries them.**
   frame-rate change (those passes cost under 1 ms of card time a frame on the test machine).
   Whether shadowed areas come out lit by the sky instead of black is not known until it runs.
   Also pull request #1141 (`VICTORY_WAVE_WIDE=last`, opt-in).
+- **`VICTORY_FILL_HOT=1`** (from Steenax6/VIctory-NVID `2e21055`; compiled here, not run): when a
+  flight changes bytes a fill of upload memory had read ahead of it, only reads of that 64 KiB of
+  title memory wait for flights from then on, where the first such fill made every fill wait for
+  the rest of the run. In that tree's opening scene one fill of 2,048 bytes did that, and two fills
+  a frame then waited 54 ms for flights whose bytes were the same afterwards 1,229 times of 1,229.
 - `diagnostics/timing-run-295s-2026-11-25.txt`: a 295 s timing run with breadcrumbs.
 
 ### Before that (2026-11-25, night UTC)
