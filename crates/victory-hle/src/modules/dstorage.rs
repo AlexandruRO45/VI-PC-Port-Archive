@@ -1265,12 +1265,22 @@ mod tests {
 
     /// A file another writer holds open (sharing reads and writes, not
     /// deletes) still opens: the title's own tools keep its files open.
+    /// And the sharing is mutual: beside the title's own handle a
+    /// delete-access open succeeds, because it shares deletes.
     #[test]
     fn open_file_shares_writes_and_deletes() {
         use std::os::windows::fs::OpenOptionsExt;
+        const DELETE: u32 = 0x0001_0000;
+        const ERROR_SHARING_VIOLATION: i32 = 32;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("data.bin");
         std::fs::write(&path, b"data").unwrap();
+        let delete = || {
+            std::fs::OpenOptions::new()
+                .access_mode(DELETE)
+                .share_mode(0x7)
+                .open(&path)
+        };
         // FILE_SHARE_READ | FILE_SHARE_WRITE, no FILE_SHARE_DELETE.
         let held = std::fs::OpenOptions::new()
             .read(true)
@@ -1279,9 +1289,18 @@ mod tests {
             .open(&path)
             .unwrap();
         let file = open(&path);
+        // Beside `held`, which shares no deletes, the delete open fails:
+        // the check has teeth.
+        assert_eq!(
+            delete().unwrap_err().raw_os_error(),
+            Some(ERROR_SHARING_VIOLATION)
+        );
+        drop(held);
+        // Beside the title's handle alone it succeeds: the title shared
+        // deletes.
+        delete().expect("the title's handle shares deletes");
         let release: extern "system" fn(*mut c_void) -> u32 = call(file, 0x10);
         assert_eq!(release(file), 0);
-        drop(held);
     }
 
     /// A missing path fails with the host's own error code, captured before
