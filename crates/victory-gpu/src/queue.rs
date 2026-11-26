@@ -713,6 +713,10 @@ extern "system" fn present(
         use windows::core::Interface;
 
         const COPY_SOURCE: u32 = 0x800;
+        // The states below are read and moved here, on this thread, while
+        // the thread of `behind` may still run lists that use the same
+        // textures: let what it was given run before the first move.
+        before_sync();
         // SAFETY: the title passes the plane descriptions.
         let slice = unsafe { std::slice::from_raw_parts(plane_parameters, planes.min(8) as usize) };
         let mut resources: Vec<(This, ID3D12Resource, u32, bool)> =
