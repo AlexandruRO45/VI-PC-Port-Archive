@@ -67,6 +67,20 @@ static JOURNAL: Mutex<Journal> = Mutex::new(EMPTY_JOURNAL);
 /// call that resets written pages costs 30-70 microseconds whatever the
 /// range).
 const AHEAD_GAP: usize = (8 << 20) / PAGE;
+
+/// Experimental merge distance, in 64 KiB tracking blocks.
+/// Missing or invalid settings retain the original 8 MiB distance.
+fn parse_ahead_gap(value: Option<&str>) -> usize {
+    value
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&v| v <= 8192 && v.is_multiple_of(PAGE / 1024))
+        .map_or(AHEAD_GAP, |v| v / (PAGE / 1024))
+}
+
+fn ahead_gap() -> usize {
+    static GAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *GAP.get_or_init(|| parse_ahead_gap(std::env::var("VICTORY_AHEAD_GAP_KIB").ok().as_deref()))
+}
 /// The most one asking covers (its answer needs 8 bytes per 4 KiB page).
 const AHEAD_MAX: usize = (1 << 30) / PAGE;
 
@@ -100,6 +114,7 @@ fn watched_pieces(ranges: impl Iterator<Item = (usize, usize)>) -> Vec<(usize, u
 }
 
 fn ask_groups(j: &mut Journal, pieces: &[(usize, usize)]) {
+    let gap = ahead_gap();
     j.asked += 1;
     j.ahead_asked = j.asked;
     j.ahead.clear();
@@ -109,7 +124,7 @@ fn ask_groups(j: &mut Journal, pieces: &[(usize, usize)]) {
         let mut last = pieces[i].1;
         let mut k = i + 1;
         while k < pieces.len()
-            && pieces[k].0 <= last + AHEAD_GAP
+            && pieces[k].0 <= last + gap
             && last.max(pieces[k].1) - first <= AHEAD_MAX
         {
             last = last.max(pieces[k].1);
@@ -997,6 +1012,23 @@ mod tests {
         MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
     };
     const MEM_WRITE_WATCH: u32 = 0x20_0000;
+
+    #[test]
+    fn ahead_gap_accepts_aligned_distances_and_preserves_default() {
+        for kib in (0..=8192).step_by(64) {
+            assert_eq!(parse_ahead_gap(Some(&kib.to_string())), kib / 64);
+        }
+        for value in [
+            None,
+            Some(""),
+            Some("invalid"),
+            Some("-64"),
+            Some("65"),
+            Some("8256"),
+        ] {
+            assert_eq!(parse_ahead_gap(value), AHEAD_GAP);
+        }
+    }
 
     #[test]
     fn kernel_pages_fold_into_guest_pages_without_losing_writes() {
