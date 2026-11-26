@@ -121,7 +121,7 @@ fn try_build_valu_cs(body: &[u32]) -> Result<HostShader, crate::ShaderError> {
             table_offset_dwords: 0,
             lower_bound: 0,
             stride: 0,
-            dwords: 32,
+            dwords: 4,
             user_data: 4,
             slot: 1,
         }],
@@ -222,7 +222,7 @@ fn run_cases(
                     &pso,
                     &Dispatch {
                         roots: vec![(0, Root::Constants(ud))],
-                        views: &[View::RawUav(32)],
+                        views: &[View::RawUav(1)],
                         samplers: &[],
                         groups: [1, 1, 1],
                     },
