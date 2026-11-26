@@ -305,12 +305,14 @@ fn handle(m: &HleModule) -> *mut c_void {
 /// mapped now.
 fn find_module(path: &str, load: bool) -> Option<*mut c_void> {
     let file = path.rsplit(['\\', '/']).next().unwrap_or(path);
-    // As the Windows loader does, a name without extension means a DLL; a
-    // trailing dot says it has none (and is not part of the name).
-    let file = match file.strip_suffix('.') {
-        Some(bare) => bare.to_owned(),
-        None if file.contains('.') => file.to_owned(),
-        None => format!("{file}.dll"),
+    // As the Windows loader does, a name without extension means a DLL;
+    // trailing dots say it has none (and are not part of the name).
+    let file = if file.ends_with('.') {
+        file.trim_end_matches('.').to_owned()
+    } else if file.contains('.') {
+        file.to_owned()
+    } else {
+        format!("{file}.dll")
     };
     // Loads go through the title DLL loader first: it waits for a DLL that
     // another thread is still initialising, as the Windows loader lock does.
@@ -744,7 +746,7 @@ mod tests {
         assert_eq!(GetModuleHandleW(w("XGameRuntime.dll").as_ptr()), runtime);
     }
 
-    /// A trailing dot means the name has no extension: no `.dll` is added.
+    /// Trailing dots mean the name has no extension: no `.dll` is added.
     #[test]
     fn a_module_name_with_a_trailing_dot_gets_no_dll_appended() {
         let (bare, dll) = (0x7400_0000_0000usize, 0x7500_0000_0000usize);
@@ -755,6 +757,8 @@ mod tests {
             GetModuleHandleA(c"sub\\PLAIN.".as_ptr().cast()) as usize,
             bare
         );
+        assert_eq!(GetModuleHandleW(w("plain..").as_ptr()) as usize, bare);
+        assert_eq!(GetModuleHandleW(w("plain.dll..").as_ptr()) as usize, dll);
         assert_eq!(GetModuleHandleW(w("plain").as_ptr()) as usize, dll);
         assert_eq!(GetModuleHandleW(w("plain.dll").as_ptr()) as usize, dll);
     }
