@@ -2453,6 +2453,9 @@ struct Line {
     /// The title memory the flights' shaders may write (address, end), in
     /// order and joined.
     written: Vec<(usize, usize)>,
+    /// Subset of `written` targeting in-place windows (which skip copy-back
+    /// and therefore cannot be checked by `fill_ahead::wrote`).
+    placed_written: Vec<(usize, usize)>,
     /// Host lists in the flights.
     lists: usize,
     /// The value signalled on the host's fence behind the last flight.
@@ -2479,6 +2482,7 @@ unsafe impl Send for Line {}
 static LINE: Mutex<Line> = Mutex::new(Line {
     line: Vec::new(),
     written: Vec::new(),
+    placed_written: Vec::new(),
     lists: 0,
     target: 0,
     settling: false,
@@ -2555,20 +2559,59 @@ fn flying() -> bool {
 /// runs steps of ours that may read or write it anywhere; what the
 /// flights' shaders write is not there yet.
 fn late_blocked(runs: &[&HostList]) -> Option<usize> {
-    let written = {
+    let (written, placed_written) = {
         let line = line();
         if line.written.is_empty() {
             return None;
         }
-        line.written.clone()
+        (line.written.clone(), line.placed_written.clone())
     };
-    blocked_by(&written, runs, true)
+    blocked_by(&written, &placed_written, runs, true)
+}
+
+/// Waits for any in-flight GPU writes to an in-place window overlapping
+/// `[from, to)` before the runtime unmaps or remaps those pages. Does not
+/// take `host.submitted` so it is safe while `xmem` holds `MAPPING`.
+pub(crate) fn settle_if_placed_written(from: usize, to: usize) {
+    if !late() || from >= to {
+        return;
+    }
+    let target = {
+        let line = line();
+        if !touches(&line.placed_written, from, to) {
+            return;
+        }
+        line.target
+    };
+    if relay() {
+        relay_wait(WHY_READ, |line| !touches(&line.placed_written, from, to));
+        return;
+    }
+    let Some(host) = host() else {
+        return;
+    };
+    // SAFETY: plain fence completion wait on a local event without holding `host.submitted`.
+    unsafe {
+        if host.fence.GetCompletedValue() < target {
+            if let Ok(event) = CreateEventW(None, false, false, None) {
+                if host.fence.SetEventOnCompletion(target, event).is_ok() {
+                    WaitForSingleObject(event, INFINITE);
+                }
+                let _ = windows::Win32::Foundation::CloseHandle(event);
+            }
+        }
+    }
 }
 
 /// [`late_blocked`] against `written`, the title memory flights' shaders
 /// may write (in order, joined); `count` whether the kind of read is
 /// counted for the frame line.
-fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Option<usize> {
+fn blocked_by(
+    written: &[(usize, usize)],
+    placed_written: &[(usize, usize)],
+    runs: &[&HostList],
+    count: bool,
+) -> Option<usize> {
     if written.is_empty() {
         return None;
     }
@@ -2583,8 +2626,12 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                         // (20,480 bytes out of the 174 MB buffer into a small
                         // buffer of its own, four a frame, 43 to 60 ms a
                         // frame) and neither side had other bytes after
-                        // one. A copy INTO such a range still waits.
-                        if !touches(written, dst, dst + len) && fill_ahead::on() {
+                        // one. A copy INTO such a range still waits, as does
+                        // any read of an in-place window written by a flight.
+                        if !touches(written, dst, dst + len)
+                            && !touches(placed_written, src, src + len)
+                            && fill_ahead::on()
+                        {
                             if count {
                                 fill_ahead::read(src, len);
                             }
@@ -2601,8 +2648,8 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                 &Step::Fill(_, src, len) => {
                     if touches(written, src, src + len) {
                         // Not waited for, and checked when the flights land
-                        // (`fill_ahead`).
-                        if fill_ahead::on() {
+                        // (`fill_ahead`), unless written through an in-place window.
+                        if !touches(placed_written, src, src + len) && fill_ahead::on() {
                             if count {
                                 fill_ahead::read(src, len);
                             }
@@ -3349,7 +3396,7 @@ fn relay_worker() {
 fn relay_hand_back(back: &[Declared]) {
     let mut work: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
     for (shadow, declared) in back {
-        if shadow.carded() {
+        if shadow.carded() || shadow.in_place() {
             continue;
         }
         let mut spans: Vec<(usize, usize)> = Vec::new();
@@ -3652,7 +3699,7 @@ fn hand_back(back: &[Declared]) {
         // threads), then the merges, in order, as below.
         let mut work: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
         for (shadow, declared) in back {
-            if shadow.carded() {
+            if shadow.carded() || shadow.in_place() {
                 continue;
             }
             let mut sorted = declared.clone();
@@ -3683,8 +3730,8 @@ fn hand_back(back: &[Declared]) {
         return;
     }
     for (shadow, declared) in back {
-        if shadow.carded() {
-            // Done before (`Host::card_back`).
+        if shadow.carded() || shadow.in_place() {
+            // Done before (`Host::card_back`), or in place (no copy-back).
             shadow.copy_back_done(declared);
             continue;
         }
@@ -4910,6 +4957,7 @@ impl Host {
             let Line {
                 line: items,
                 written,
+                placed_written,
                 lists,
                 settling,
                 poke,
@@ -4921,15 +4969,21 @@ impl Host {
             in_hand.clear();
             // What is still in the air, from the flights that are.
             written.clear();
+            placed_written.clear();
             *lists = 0;
             let mut ranges = Vec::new();
+            let mut placed_ranges = Vec::new();
             for item in items.iter() {
                 if let Late::Run(flight) = item {
                     *lists += flight.order.len().max(1);
                     ranges.extend(flight.back.iter().flat_map(|(_, r)| r.iter().copied()));
+                    placed_ranges.extend(
+                        flight.back.iter().filter(|(s, _)| s.in_place()).flat_map(|(_, r)| r.iter().copied()),
+                    );
                 }
             }
             join_ranges(written, ranges);
+            join_ranges(placed_written, placed_ranges);
             *settling = false;
             // The landed lists are reset, and what queues hold looked at,
             // by the helper thread (they take locks a waiter may hold).
@@ -5125,8 +5179,12 @@ impl Host {
         let told = !sent.writes.is_empty();
         let most = {
             let mut line = line();
-            let Line { line: items, written, lists: flying, target, .. } = &mut *line;
+            let Line { line: items, written, placed_written, lists: flying, target, .. } = &mut *line;
             join_ranges(written, sent.back.iter().flat_map(|(_, ranges)| ranges.iter().copied()));
+            join_ranges(
+                placed_written,
+                sent.back.iter().filter(|(s, _)| s.in_place()).flat_map(|(_, ranges)| ranges.iter().copied()),
+            );
             *flying += order.len();
             *target = *submitted;
             items.push(Late::Run(Flight {
@@ -5169,8 +5227,12 @@ impl Host {
         let number = sent.number;
         {
             let mut line = line();
-            let Line { line: items, written, lists: flying, target, .. } = &mut *line;
+            let Line { line: items, written, placed_written, lists: flying, target, .. } = &mut *line;
             join_ranges(written, sent.back.iter().flat_map(|(_, ranges)| ranges.iter().copied()));
+            join_ranges(
+                placed_written,
+                sent.back.iter().filter(|(s, _)| s.in_place()).flat_map(|(_, ranges)| ranges.iter().copied()),
+            );
             *flying += 1;
             *target = *submitted;
             items.push(Late::Run(Flight {
@@ -5227,6 +5289,7 @@ impl Host {
                 }
                 line.settling = true;
                 line.written.clear();
+                line.placed_written.clear();
                 line.lists = 0;
                 std::mem::take(&mut line.line)
             };
@@ -5368,7 +5431,7 @@ impl Host {
             if relay_exact() && why == WHY_READ {
                 // Only until the flights that may write what is read have
                 // landed: their copy-back's end, not the card's other work.
-                relay_wait(why, |line| blocked_by(&line.written, runs, false).is_none());
+                relay_wait(why, |line| blocked_by(&line.written, &line.placed_written, runs, false).is_none());
             } else {
                 self.settle(&mut submitted, why);
             }
