@@ -7764,6 +7764,27 @@ impl<'a> Lower<'a> {
                 let m = self.s.m.bin(c, Bin::Sub, m, one);
                 self.s.m.bin(c, Bin::Shl, m, b)
             }
+            "v_sat_pk_u8_i16" => {
+                let word = s(self, 0)?;
+                let shift = k(self, 16);
+                let zero = k(self, 0);
+                let limit = k(self, 255);
+                let low = self.s.m.bin(c, Bin::Shl, word, shift);
+                let low = self.s.m.bin(c, Bin::AShr, low, shift);
+                let high = self.s.m.bin(c, Bin::AShr, word, shift);
+                let m = &mut self.s.m;
+                let mut saturate = |half| {
+                    let positive = m.cmp(c, pred::SGT, half, zero);
+                    let nonnegative = m.select(c, positive, half, zero);
+                    let above = m.cmp(c, pred::SGT, nonnegative, limit);
+                    m.select(c, above, limit, nonnegative)
+                };
+                let low = saturate(low);
+                let high = saturate(high);
+                let byte = m.i32(8);
+                let high = m.bin(c, Bin::Shl, high, byte);
+                m.bin(c, Bin::Or, low, high)
+            }
             "v_cvt_pk_u8_f32" => {
                 // src0 rounded to nearest even and saturated to a byte, into
                 // byte src1[1:0] of src2.
