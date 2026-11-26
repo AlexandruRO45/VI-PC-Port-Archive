@@ -1,6 +1,6 @@
 // Minimal game launcher: pick the game's .exe once, pick a runtime, press PLAY. Side tabs: Launcher, Conversion
 // (the runtime), Settings. Slideshow of the pictures in backgrounds\ (drop more on the window), music from the game's own audio.
-// Runtimes: the archive top 3 (AnyXboxX left out, ztrx always 3rd) plus Hyphen (hyphenn, was victory-fork), cool_fox, CGBJ, VIctory
+// Runtimes: the archive top 3 in the site's order (AnyXboxX left out) plus ztrx, Hyphen (hyphenn, was victory-fork), cool_fox, CGBJ, VIctory
 // and xcl, each installed in runtimes\<key>\target\release: built there from source, or a ready-made build (CGBJ) unpacked there.
 // Build: build.bat (uses the C# compiler that ships with Windows, C# 5).
 using System;
@@ -24,8 +24,8 @@ using System.Xml;
 [assembly: AssemblyTitle("GTA VI Launcher")]
 [assembly: AssemblyDescription("Runs your game dump through the PC port runtimes")]
 [assembly: AssemblyProduct("GTA VI Launcher")]
-[assembly: AssemblyVersion("1.7.0.0")]
-[assembly: AssemblyFileVersion("1.7.0.0")]
+[assembly: AssemblyVersion("1.7.1.0")]
+[assembly: AssemblyFileVersion("1.7.1.0")]
 
 // One runtime project, as the archive's site describes it.
 class Runtime
@@ -128,7 +128,6 @@ static class Launcher
     {
         { "hyphenn", "Hyphen" }, { "victory-fork", "Hyphen" }, { "dexnom", "DexNom" }, { "belobug", "Belobug" }, { "victory-7900xtx", "7900XTX" },
     }; // cool_fox :CGBJ and NEWEST CGBJ private keep the site's names, as the user asked
-    const string Third = "ztrx"; // the user's pick for 3rd place, wherever the archive ranks it
 
     public static XmlDocument Manifest(string dir)
     {
@@ -178,16 +177,15 @@ static class Launcher
         return list;
     }
 
-    // Top 3 in the site's own order (its pinned places, then how far each gets, then name), plus the user's picks.
-    // Projects gone from GitHub are skipped unless the user picked them: the archive still has their last copy.
+    // Top 3 exactly as the site ranks them (its pinned places, then how far each gets, then name), plus the user's picks.
+    // Projects gone from GitHub only count for the top 3 when the site pins them; otherwise they're listed only if the
+    // user picked them: the archive still has their last copy.
     public static List<Runtime> Choose(List<Runtime> all)
     {
-        var ranked = all.Where(r => !Excluded.Contains(r.Key) && (!r.Gone || Wanted.Contains(r.Key)))
+        var ranked = all.Where(r => !Excluded.Contains(r.Key) && (!r.Gone || r.Top > 0 || Wanted.Contains(r.Key)))
             .OrderBy(r => r.Top > 0 ? r.Top : int.MaxValue).ThenByDescending(r => r.Reached).ThenBy(r => r.Name, StringComparer.OrdinalIgnoreCase).ToList();
-        var top = ranked.Where(r => !r.Gone).Take(3).ToList();
+        var top = ranked.Where(r => !r.Gone || r.Top > 0).Take(3).ToList();
         var pick = top.Concat(ranked.Where(r => Wanted.Contains(r.Key) && !top.Contains(r))).ToList();
-        var third = pick.FirstOrDefault(r => r.Key == Third);
-        if (third != null && pick.Count > 2) { pick.Remove(third); pick.Insert(2, third); }
         for (int i = 0; i < pick.Count; i++) pick[i].Rank = i < 3 ? i + 1 : 0;
         foreach (var r in pick) { string n; if (Names.TryGetValue(r.Key, out n)) r.Name = n; }
         return pick;
@@ -275,7 +273,7 @@ static class Launcher
             "  tuxbox: { repo: \"brcly/TuxBox\", name: \"TuxBox\", branch: \"tuxbox\", reached: 2 },\n" +
             "  \"leonida-old\": { repo: \"x/L\", gone: \"23 Nov 2026\", name: \"Leonida\", reached: 9 },\n";
         var keys = string.Join(",", Choose(ParseArchive(site)).Select(r => r.Key + r.Rank).ToArray());
-        if (keys != "cgbj1,cool-fox2,ztrx3,victory-7900xtx0,hyphenn0,victory0,xcl0") return 5;
+        if (keys != "cgbj1,cool-fox2,victory-7900xtx3,hyphenn0,ztrx0,victory0,xcl0") return 5;
         // A release-only entry installs by download with its pinned checksum; source entries build.
         var all = ParseArchive(Builtin);
         var cgbj = all.First(r => r.Key == "cgbj");
