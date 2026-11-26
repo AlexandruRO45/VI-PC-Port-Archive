@@ -198,9 +198,13 @@
 mod bitcode;
 #[cfg(test)]
 mod translate_bench;
+#[cfg(test)]
+mod census_tests;
 #[cfg(all(test, windows))]
 mod bvh_tests;
 mod container;
+#[cfg(all(test, windows))]
+mod crosslane_tests;
 #[cfg(all(test, windows))]
 mod diff_tests;
 #[cfg(all(test, windows))]
