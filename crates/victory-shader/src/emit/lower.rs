@@ -20,7 +20,11 @@ use crate::native::{HwStage, NativeProgram, ResourceType, RootType, StageIo, Usa
 use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source, USER_DATA};
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
+mod buffers;
 mod bvh;
+use buffers::lds_sub_dword;
+#[cfg(test)]
+pub(super) use buffers::sub_dword;
 
 type Why = &'static str;
 
@@ -181,32 +185,6 @@ fn half_shift(width: u32) -> u32 {
 /// A descriptor load's address given by root parameters alone: root
 /// parameter and byte offset.
 type EntryAddress = (usize, u32);
-
-/// A byte or half LDS access (`ds_read_u8`..., `ds_write_b8`..., their
-/// `_d16` and `_d16_hi` forms), from the opcode name: its bits, and
-/// whether a read extends the sign.
-fn lds_sub_dword(name: &str) -> Option<(u32, bool)> {
-    if let Some(rest) = name.strip_prefix("ds_read") {
-        return match rest.trim_end_matches("_hi").trim_end_matches("_d16") {
-            "_u8" => Some((8, false)),
-            "_i8" => Some((8, true)),
-            "_u16" => Some((16, false)),
-            "_i16" => Some((16, true)),
-            _ => None,
-        };
-    }
-    match name.strip_prefix("ds_write")?.trim_end_matches("_d16_hi") {
-        "_b8" => Some((8, false)),
-        "_b16" => Some((16, false)),
-        _ => None,
-    }
-}
-
-/// Whether `name` is a byte or half LDS access.
-#[cfg(test)]
-pub(super) fn sub_dword(name: &str) -> bool {
-    lds_sub_dword(name).is_some()
-}
 
 struct Lower<'a> {
     s: Shader,
@@ -3413,12 +3391,9 @@ impl<'a> Lower<'a> {
             } else if matches!(rest, "_b32" | "_b64" | "_b96" | "_b128") {
                 vec![(offset, width(name))]
             } else {
-                // A byte or half (`_d16_hi`: the high half of the data) into
-                // its dword by a compare-exchange loop, so lanes writing the
-                // other parts of the dword keep theirs, and of lanes writing
-                // the same part one value wins, as on the console. (An
-                // atomic AND then OR would merge two lanes' values written
-                // to the same part, and show a cleared part between the two.)
+                // A byte or half (`_d16_hi`: the data's high half) by a
+                // compare-exchange loop: other parts keep their lanes' bytes,
+                // one lane's value wins a part (AND then OR merged two).
                 let (bits, _) = lds_sub_dword(name).ok_or("an LDS write of bytes or halves")?;
                 let x = self.vgprs(inst, data.first().ok_or("an LDS write")?, 1)?[0];
                 let x = if rest.ends_with("_d16_hi") {
@@ -9976,48 +9951,6 @@ impl<'a> Lower<'a> {
             return Err("a typed-format load by index of unknown stride");
         }
         Ok(stride)
-    }
-
-    /// The element of a typed view (`buffer_load_format_*`,
-    /// `buffer_store_format_*`) the console addresses at `index` (none:
-    /// 0) and byte offset `off` (`fixed` when constant): the console adds
-    /// `index * stride + off` to the base; the host's typed view numbers
-    /// elements of its format, and DXIL typed loads and stores take an
-    /// element, not a byte offset. So the offset must be whole elements:
-    /// `index + off / size`.
-    ///
-    /// shortcut: the element size is the used-resource entry's stride (the
-    /// console's typed descriptors have their format's size as stride);
-    /// without one, only offset 0 translates. A computed offset is taken
-    /// as whole elements (a part of an element is dropped); a constant one
-    /// that is not stops the translation.
-    fn typed_element(
-        &mut self,
-        index: Option<V>,
-        off: V,
-        fixed: Option<u32>,
-        used: Option<&UsedResource>,
-    ) -> Result<V, Why> {
-        let c = self.cur;
-        let index = index.unwrap_or_else(|| self.s.m.i32(0));
-        if fixed == Some(0) {
-            return Ok(index);
-        }
-        let size = used.map_or(0, |u| u.stride);
-        if size == 0 {
-            return Err("a typed buffer access at an offset, of unknown element size");
-        }
-        let elements = match fixed {
-            Some(f) if f % size != 0 => {
-                return Err("a typed buffer access at an offset inside an element");
-            }
-            Some(f) => self.s.m.i32(f / size),
-            None => {
-                let k = self.s.m.i32(size);
-                self.s.m.bin(c, Bin::UDiv, off, k)
-            }
-        };
-        Ok(self.s.m.bin(c, Bin::Add, index, elements))
     }
 
     fn export(&mut self, b: usize, i: usize) -> Result<(), Why> {
