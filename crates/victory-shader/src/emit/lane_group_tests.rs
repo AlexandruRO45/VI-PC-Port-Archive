@@ -134,10 +134,15 @@ fn program(reads: &[&Read], extra: &[u32]) -> Vec<u32> {
 }
 
 fn lowered(words: &[u32], wave64: bool) -> lower::Lowered {
-    lowered_with_lds(words, wave64, 0)
+    lowered_with(words, wave64, 0, [THREADS, 1, 1])
 }
 
-fn lowered_with_lds(words: &[u32], wave64: bool, lds_blocks: u32) -> lower::Lowered {
+fn lowered_with(
+    words: &[u32],
+    wave64: bool,
+    lds_blocks: u32,
+    threads: [u32; 3],
+) -> lower::Lowered {
     let native = NativeProgram {
         stage: HwStage::Cs,
         wave64,
@@ -162,7 +167,7 @@ fn lowered_with_lds(words: &[u32], wave64: bool, lds_blocks: u32) -> lower::Lowe
         }],
         io: StageIo::Cs(ComputeIo {
             rsrc2: 1 << 1 | lds_blocks << 15,
-            threads: [THREADS, 1, 1],
+            threads,
         }),
         code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
     };
@@ -336,6 +341,21 @@ fn lane_groups_set_the_fewest_host_lanes() {
     }
 }
 
+/// Hosts tile 2-D groups into waves, so lane-group reads there keep the
+/// console's wave size.
+#[test]
+fn lane_groups_of_2d_thread_groups_keep_the_wave_size() {
+    for threads in [[8, 16, 1], [16, 8, 1], [32, 2, 2], [64, 1, 2]] {
+        for (reads, wave64) in [(vec![quad_perm()], false), (vec![row_shr()], true)] {
+            let reads: Vec<&Read> = reads.iter().collect();
+            let l = lowered_with(&program(&reads, &[]), wave64, 0, threads);
+            let size = if wave64 { 64 } else { 32 };
+            assert_eq!(l.min_lanes, 0, "{threads:?} {}", reads[0].text);
+            assert_eq!(wave_size(&l.dxil), Some(size), "{threads:?} {}", reads[0].text);
+        }
+    }
+}
+
 #[test]
 fn reads_of_the_whole_wave_keep_its_size() {
     // Each with a quad read, into v15 (not stored).
@@ -408,7 +428,7 @@ fn lds_shared_within_the_wave_keeps_its_size() {
         assert!(texts.iter().any(|t| t == what), "{what} not in {texts:?}");
     }
     for (wave64, size) in [(false, 32), (true, 64)] {
-        let l = lowered_with_lds(&words, wave64, 1);
+        let l = lowered_with(&words, wave64, 1, [THREADS, 1, 1]);
         assert_eq!(l.min_lanes, 0);
         assert_eq!(wave_size(&l.dxil), Some(size));
     }

@@ -914,6 +914,7 @@ fn pops_wait_loop_exits_immediately_for_inactive_lanes() {
             heap: l.heap,
             heap_writes: l.heap_writes,
             view_marks: false,
+            min_lanes: l.min_lanes,
         }
     };
 
