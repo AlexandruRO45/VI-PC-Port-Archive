@@ -25,8 +25,8 @@ using System.Xml;
 [assembly: AssemblyTitle("GTA VI Launcher")]
 [assembly: AssemblyDescription("Runs your game dump through the PC port runtimes")]
 [assembly: AssemblyProduct("GTA VI Launcher")]
-[assembly: AssemblyVersion("1.9.0.0")]
-[assembly: AssemblyFileVersion("1.9.0.0")]
+[assembly: AssemblyVersion("1.10.0.0")]
+[assembly: AssemblyFileVersion("1.10.0.0")]
 
 // One runtime project, as the archive's site describes it.
 class Runtime
@@ -72,7 +72,7 @@ class Runtime
         get
         {
             var b = Known;
-            return Path.Combine(Dir, @"target\release\" + (b != null ? b[0] : Key == "xcl" ? "xcl.exe" : "victory.exe"));
+            return Path.Combine(Dir, @"target\release\" + (b != null ? b[0] : Key == "xcl" ? "xcl.exe" : Key == "kelvaroq" ? "kelvaroq.exe" : "victory.exe"));
         }
     }
     public bool Installed { get { return File.Exists(Exe); } }
@@ -114,7 +114,9 @@ class Runtime
             if (Key == "dexnom") // its BCPack tables are fetched and hash-checked first
                 return "powershell -NoProfile -ExecutionPolicy Bypass -File Initialize-FormatTables.ps1 && cargo build --locked --release -p victory --features diagnostics --bins";
             if (Key == "victory-7900xtx") return "cargo build --locked --release -p victory --features diagnostics"; // its play.ps1 -Build release
-            if (Key == "cool-fox") return "cargo build --release --locked -p victory";
+            if (Key == "cool-fox" || Key == "victory-nvidia") return "cargo build --release --locked -p victory";
+            // Its CLI, then its native engine (fetches its pinned VIctory, patches it, puts kelvaroq-engine.exe in target\release\native).
+            if (Key == "kelvaroq") return "cargo build --release --locked && python scripts\\build_native.py";
             return "cargo build --release -p victory";
         }
     }
@@ -134,6 +136,10 @@ class Runtime
             return "powershell -NoProfile -ExecutionPolicy Bypass -Command \"& '" + Path.Combine(Dir, @"scripts\play.ps1") + "' -Exe '" + game + "' -Build release; exit $LASTEXITCODE\"";
         // Its launcher sets the RTX-tested Series S settings and runs target\release\victory.exe on VICTORY_GAME_DIR's game_scarlett_master.exe.
         if (Key == "cool-fox") return "\"" + Path.Combine(Dir, "Play-VIctory.cmd") + "\" pareto-residency";
+        if (Key == "kelvaroq") return exe + "play \"" + game + "\"";
+        // Its play-nvidia.ps1: Series X, 1440p, DLSS Quality (when Get-NVIDIA-DLSS.cmd was run, else the game's own upscaling).
+        if (Key == "victory-nvidia")
+            return "powershell -NoProfile -ExecutionPolicy Bypass -Command \"& '" + Path.Combine(Dir, @"scripts\play-nvidia.ps1") + "' -Exe '" + game + "'; exit $LASTEXITCODE\"";
         return exe + "run \"" + game + "\" --execute";
     }
 }
@@ -145,7 +151,7 @@ static class Launcher
     public static readonly string Settings = Path.Combine(Here, "launcher.txt");
     public const string Archive = "https://github.com/Guernica4u/GTA6-PC-Port-Archive.git";
     const string ArchiveSite = "https://raw.githubusercontent.com/Guernica4u/GTA6-PC-Port-Archive/main/docs/index.html";
-    static readonly string[] Wanted = { "ztrx", "hyphenn", "victory-fork", "victory", "xcl", "cool-fox" }; // the user's picks: Zettrox, Hyphen (renamed), VIctory, xcl, cool_fox; kept even once gone or unpinned
+    static readonly string[] Wanted = { "ztrx", "hyphenn", "victory-fork", "victory", "xcl", "cool-fox", "kelvaroq", "victory-nvidia" }; // the user's picks: Zettrox, Hyphen (renamed), VIctory, xcl, cool_fox, Kelvaroq, VIctory-NVIDIA; kept even once gone or unpinned
     public const string Repo = "https://github.com/Guernica4u/GTA6-PC-Port-Archive"; // the site's ${REPO}
     static readonly string[] Excluded = { "anyxboxx" }; // the user doesn't want it, even when it ranks
     static readonly Dictionary<string, string> Names = new Dictionary<string, string>
@@ -236,9 +242,11 @@ static class Launcher
         "    note: \"Newest build: about 30 fps median on an RTX 4090, 60 fps cap, keyboard and mouse, memory peak about 27 GB.\" },\n" +
         "  \"victory-7900xtx\": { repo: \"avatarmanz/VIctory-7900XTX\", name: \"VIctory-7900XTX\", gpu: \"amd\", top: 3, branch: \"victory-7900xtx\", reached: 5, note: \"Prologue and first mission at 13-22 fps. Needs about 64 GB of RAM.\" },\n" +
         "  ztrx: { repo: \"Zettrox/ztrx\", gone: \"25 Nov 2026\", name: \"ztrx\", branch: \"ztrx\", reached: 5, note: \"The prologue is playable. NVIDIA only.\" },\n" +
-        "  hyphenn: { repo: \"fxceless/victory-fork\", name: \"hyphenn\", gpu: \"nvidia\", top: 5, branch: \"hyphenn\", reached: 4, note: \"First gameplay scene at 2-4 fps.\" },\n" +
-        "  dexnom: { repo: \"DexNom/VIctory\", name: \"DexNom Runtime\", gpu: \"amd\", top: 4, branch: \"dexnom\", reached: 4, note: \"VIctory fork tuned on Radeon, experimental ray tracing.\" },\n" +
+        "  hyphenn: { repo: \"fxceless/victory-fork\", name: \"hyphenn\", gpu: \"nvidia\", top: 6, branch: \"hyphenn\", reached: 4, note: \"First gameplay scene at 2-4 fps.\" },\n" +
+        "  dexnom: { repo: \"DexNom/VIctory\", name: \"DexNom Runtime\", gpu: \"amd\", top: 5, branch: \"dexnom\", reached: 4, note: \"VIctory fork tuned on Radeon, experimental ray tracing.\" },\n" +
         "  belobug: { repo: \"Belobug/VIctory-Belobug-AMD\", name: \"VIctory-Belobug-AMD\", gpu: \"amd\", top: 1, branch: \"belobug\", reached: 4, note: \"The world renders lit at 5-7 fps on an RX 9070 XT.\" },\n" +
+        "  kelvaroq: { repo: \"stellarr-studio/kelvaroq\", name: \"Kelvaroq\", gpu: \"nvidia\", top: 4, branch: \"kelvaroq\", reached: 5, note: \"Plays the prologue at about 10 fps at 4K on an RTX 5080.\" },\n" +
+        "  \"victory-nvidia\": { repo: \"trustno1-coder/VIctory-NVIDIA\", name: \"VIctory-NVIDIA\", gpu: \"nvidia\", branch: \"victory-nvidia\", reached: 5, note: \"Opening rooms at 26-30 fps on an RTX 5070 with DLSS. Needs 32 GB of RAM.\" },\n" +
         "  victory: { repo: \"Marvisak/VIctory\", name: \"VIctory\", branch: \"victory\", reached: 3, note: \"Menus and the world intro.\" },\n" +
         "  xcl: { repo: \"ivall/xcl\", name: \"xcl\", branch: \"xcl\", reached: 2, note: \"Its own code, not VIctory. Menus at 30 fps; gameplay not reached yet.\" },\n";
 
@@ -312,7 +320,7 @@ static class Launcher
             "  tuxbox: { repo: \"brcly/TuxBox\", name: \"TuxBox\", branch: \"tuxbox\", reached: 2 },\n" +
             "  \"leonida-old\": { repo: \"x/L\", gone: \"23 Nov 2026\", name: \"Leonida\", reached: 9 },\n";
         var keys = string.Join(",", Choose(ParseArchive(site)).Select(r => r.Key + r.Rank).ToArray());
-        if (keys != "belobug1,cool-fox2,victory-7900xtx3,hyphenn0,ztrx0,victory0,xcl0") return 5;
+        if (keys != "belobug1,cool-fox2,victory-7900xtx3,kelvaroq0,hyphenn0,victory-nvidia0,ztrx0,victory0,xcl0") return 5;
         // The download picker: ready-made builds install by download with their pinned checksum and start through their
         // own script; the last choice builds from source. A release-only entry is one build, no source.
         var all = ParseArchive(Builtin);
@@ -329,9 +337,12 @@ static class Launcher
         foreach (var r in Choose(ParseArchive(Builtin))) // every runtime installs into runtimes\<dir>\target\release
             if (!r.Exe.StartsWith(Path.Combine(r.Dir, @"target\release\")) || !r.Dir.StartsWith(Path.Combine(Here, "runtimes") + @"\")) return 9;
         if (Choose(ParseArchive(Builtin)).First(r => r.Key == "hyphenn").Name != "Hyphen") return 6;
+        var kel = all.First(r => r.Key == "kelvaroq");
+        if (!kel.Exe.EndsWith(@"runtimes\kelvaroq\target\release\kelvaroq.exe") || !kel.Run(@"C:\g\game.exe").EndsWith(@"kelvaroq.exe"" play ""C:\g\game.exe""") ||
+            !kel.Build.Contains("build_native.py") || !all.First(r => r.Key == "victory-nvidia").Run(@"C:\g\game.exe").Contains(@"scripts\play-nvidia.ps1' -Exe 'C:\g\game.exe'")) return 15;
         // Every runtime says which cards it's made for: the site's gpu, else the launcher's own list.
         if (string.Join(",", Choose(ParseArchive(Builtin)).Select(r => r.Key + ":" + r.Gpu).ToArray()) !=
-            "belobug:amd,cool-fox:amd,victory-7900xtx:amd,hyphenn:nvidia,ztrx:nvidia,victory:amd,xcl:amd") return 14;
+            "belobug:amd,cool-fox:amd,victory-7900xtx:amd,kelvaroq:nvidia,hyphenn:nvidia,victory-nvidia:nvidia,ztrx:nvidia,victory:amd,xcl:amd") return 14;
 
         // Opus packet lengths: 20 ms CELT, 2x10 ms SILK, 3x20 ms CELT (code 3, count in byte 2).
         if (OpusDecoder.Samples(new byte[] { 0xF8 }, 0, 1) != 960 || OpusDecoder.Samples(new byte[] { 0x01 }, 0, 1) != 960 ||
