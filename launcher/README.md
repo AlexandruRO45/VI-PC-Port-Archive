@@ -4,8 +4,8 @@ A small Windows launcher for the PC port runtimes in this archive. Point it at y
 
 Tabs on the left side:
 
-- **Launcher:** the slideshow, your game, the runtime in use, and PLAY.
-- **Conversion:** every runtime, with how far it gets and whether it's installed. Click one to use it.
+- **Launcher:** the slideshow, your game, the runtime in use (its name and whether it's made for NVIDIA or AMD cards), and PLAY.
+- **Conversion:** every runtime, with its rank, whether it's made for NVIDIA or AMD cards, how far it gets and whether it's installed. Click one to use it.
 - **Settings:** the game path, the song, mute, and the pictures folder.
 
 **[Download GTA-VI-Launcher.zip](https://github.com/Guernica4u/GTA6-PC-Port-Archive/releases/download/launcher/GTA-VI-Launcher.zip)** (Windows 10/11, about 50 KB)

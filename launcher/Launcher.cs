@@ -25,13 +25,13 @@ using System.Xml;
 [assembly: AssemblyTitle("GTA VI Launcher")]
 [assembly: AssemblyDescription("Runs your game dump through the PC port runtimes")]
 [assembly: AssemblyProduct("GTA VI Launcher")]
-[assembly: AssemblyVersion("1.8.0.0")]
-[assembly: AssemblyFileVersion("1.8.0.0")]
+[assembly: AssemblyVersion("1.9.0.0")]
+[assembly: AssemblyFileVersion("1.9.0.0")]
 
 // One runtime project, as the archive's site describes it.
 class Runtime
 {
-    public string Key, Name, Branch, Note;
+    public string Key, Name, Branch, Note, Gpu; // Gpu: "nvidia" or "amd", the cards it's made for
     public int Reached, Top, Rank; // Top: the archive's pinned place (0 = none); Rank: 1-3 in the launcher's top 3, else 0
     public bool Gone; // removed from GitHub (not just gone private); the archive keeps its last copy
 
@@ -152,6 +152,8 @@ static class Launcher
     {
         { "hyphenn", "Hyphen" }, { "victory-fork", "Hyphen" }, { "dexnom", "DexNom" }, { "belobug", "Belobug" }, { "victory-7900xtx", "7900XTX" },
     }; // cool_fox :CGBJ and NEWEST CGBJ private keep the site's names, as the user asked
+    // The cards each is made for, where the site doesn't say: from their READMEs (ztrx: NVIDIA RTX only; VIctory tested on an RX 6700 XT; xcl developed on RDNA4).
+    static readonly Dictionary<string, string> Gpus = new Dictionary<string, string> { { "ztrx", "nvidia" }, { "victory", "amd" }, { "xcl", "amd" } };
 
     public static XmlDocument Manifest(string dir)
     {
@@ -191,7 +193,7 @@ static class Launcher
             string key = starts[i].Groups[1].Value;
             var rt = new Runtime
             {
-                Key = key, Name = str("name") ?? key, Branch = str("branch") ?? key, Note = str("note") ?? "",
+                Key = key, Name = str("name") ?? key, Branch = str("branch") ?? key, Note = str("note") ?? "", Gpu = str("gpu"),
                 Reached = reached.Success ? int.Parse(reached.Groups[1].Value) : 0,
                 Top = top.Success ? int.Parse(top.Groups[1].Value) : 0,
                 // As the site: a repo gone private is still alive (work goes on there).
@@ -220,23 +222,23 @@ static class Launcher
         var top = ranked.Where(r => !r.Gone).Take(3).ToList();
         var pick = top.Concat(ranked.Where(r => Wanted.Contains(r.Key) && !top.Contains(r))).ToList();
         for (int i = 0; i < pick.Count; i++) pick[i].Rank = i < 3 ? i + 1 : 0;
-        foreach (var r in pick) { string n; if (Names.TryGetValue(r.Key, out n)) r.Name = n; }
+        foreach (var r in pick) { string n; if (Names.TryGetValue(r.Key, out n)) r.Name = n; if (r.Gpu == null && Gpus.TryGetValue(r.Key, out n)) r.Gpu = n; }
         return pick;
     }
 
     // Offline fallback: the archive on 27 Nov 2026: Belobug first, cool_fox :CGBJ (private, with two ready-made builds) second.
     const string Builtin =
-        "  \"cool-fox\": { repo: \"codec-d/cool_fox\", gone: \"26 Nov 2026\", private: true, name: \"cool_fox :CGBJ\", top: 2, branch: \"cool-fox\", reached: 5,\n" +
+        "  \"cool-fox\": { repo: \"codec-d/cool_fox\", gone: \"26 Nov 2026\", private: true, name: \"cool_fox :CGBJ\", gpu: \"amd\", top: 2, branch: \"cool-fox\", reached: 5,\n" +
         "    builds: [\n" +
         "      { label: \"willy build 30e54b4 (newest)\", url: `${REPO}/releases/download/cgbj-willy-30e54b4/victory-cool_fox-willy.zip` },\n" +
         "      { label: \"pareto-residency build (Defender flags it)\", url: `${REPO}/releases/download/cgbj-pareto-residency/cool_fox-pareto-residency-windows-x64.zip` },\n" +
         "    ],\n" +
         "    note: \"Newest build: about 30 fps median on an RTX 4090, 60 fps cap, keyboard and mouse, memory peak about 27 GB.\" },\n" +
-        "  \"victory-7900xtx\": { repo: \"avatarmanz/VIctory-7900XTX\", name: \"VIctory-7900XTX\", top: 3, branch: \"victory-7900xtx\", reached: 5, note: \"Prologue and first mission at 13-22 fps. Needs about 64 GB of RAM.\" },\n" +
+        "  \"victory-7900xtx\": { repo: \"avatarmanz/VIctory-7900XTX\", name: \"VIctory-7900XTX\", gpu: \"amd\", top: 3, branch: \"victory-7900xtx\", reached: 5, note: \"Prologue and first mission at 13-22 fps. Needs about 64 GB of RAM.\" },\n" +
         "  ztrx: { repo: \"Zettrox/ztrx\", gone: \"25 Nov 2026\", name: \"ztrx\", branch: \"ztrx\", reached: 5, note: \"The prologue is playable. NVIDIA only.\" },\n" +
-        "  hyphenn: { repo: \"fxceless/victory-fork\", name: \"hyphenn\", top: 5, branch: \"hyphenn\", reached: 4, note: \"First gameplay scene at 2-4 fps.\" },\n" +
-        "  dexnom: { repo: \"DexNom/VIctory\", name: \"DexNom Runtime\", top: 4, branch: \"dexnom\", reached: 4, note: \"VIctory fork tuned on Radeon, experimental ray tracing.\" },\n" +
-        "  belobug: { repo: \"Belobug/VIctory-Belobug-AMD\", name: \"VIctory-Belobug-AMD\", top: 1, branch: \"belobug\", reached: 4, note: \"The world renders lit at 5-7 fps on an RX 9070 XT.\" },\n" +
+        "  hyphenn: { repo: \"fxceless/victory-fork\", name: \"hyphenn\", gpu: \"nvidia\", top: 5, branch: \"hyphenn\", reached: 4, note: \"First gameplay scene at 2-4 fps.\" },\n" +
+        "  dexnom: { repo: \"DexNom/VIctory\", name: \"DexNom Runtime\", gpu: \"amd\", top: 4, branch: \"dexnom\", reached: 4, note: \"VIctory fork tuned on Radeon, experimental ray tracing.\" },\n" +
+        "  belobug: { repo: \"Belobug/VIctory-Belobug-AMD\", name: \"VIctory-Belobug-AMD\", gpu: \"amd\", top: 1, branch: \"belobug\", reached: 4, note: \"The world renders lit at 5-7 fps on an RX 9070 XT.\" },\n" +
         "  victory: { repo: \"Marvisak/VIctory\", name: \"VIctory\", branch: \"victory\", reached: 3, note: \"Menus and the world intro.\" },\n" +
         "  xcl: { repo: \"ivall/xcl\", name: \"xcl\", branch: \"xcl\", reached: 2, note: \"Its own code, not VIctory. Menus at 30 fps; gameplay not reached yet.\" },\n";
 
@@ -327,6 +329,9 @@ static class Launcher
         foreach (var r in Choose(ParseArchive(Builtin))) // every runtime installs into runtimes\<dir>\target\release
             if (!r.Exe.StartsWith(Path.Combine(r.Dir, @"target\release\")) || !r.Dir.StartsWith(Path.Combine(Here, "runtimes") + @"\")) return 9;
         if (Choose(ParseArchive(Builtin)).First(r => r.Key == "hyphenn").Name != "Hyphen") return 6;
+        // Every runtime says which cards it's made for: the site's gpu, else the launcher's own list.
+        if (string.Join(",", Choose(ParseArchive(Builtin)).Select(r => r.Key + ":" + r.Gpu).ToArray()) !=
+            "belobug:amd,cool-fox:amd,victory-7900xtx:amd,hyphenn:nvidia,ztrx:nvidia,victory:amd,xcl:amd") return 14;
 
         // Opus packet lengths: 20 ms CELT, 2x10 ms SILK, 3x20 ms CELT (code 3, count in byte 2).
         if (OpusDecoder.Samples(new byte[] { 0xF8 }, 0, 1) != 960 || OpusDecoder.Samples(new byte[] { 0x01 }, 0, 1) != 960 ||
@@ -544,8 +549,7 @@ class LauncherForm : Form
         hover = h;
         Cursor = h == null ? Cursors.Default : Cursors.Hand;
         tip.Hide(this);
-        if (h == "runtime" && Current.Note.Length > 0) tip.Show(Current.Note, this, hits[h].X, hits[h].Y - S(30), 6000);
-        else if (h != null && h.StartsWith("row") && runtimes[int.Parse(h.Substring(3))].Note.Length > 0) // the row cuts long notes short
+        if (h != null && h.StartsWith("row") && runtimes[int.Parse(h.Substring(3))].Note.Length > 0) // the row cuts long notes short
             tip.Show(runtimes[int.Parse(h.Substring(3))].Note, this, hits[h].X + S(60), hits[h].Bottom + S(2), 8000);
         else if (h != null && h.StartsWith("opt"))
         {
@@ -569,7 +573,6 @@ class LauncherForm : Form
             else if (h == "mute") { muted = !muted; Save(); PlayMusic(); Invalidate(); }
             else if (h == "change") Pick();
             else if (h == "play") { if (state == "" && (exe != null || Pick())) Play(); }
-            else if (h == "runtime") { tab = 1; Invalidate(); }
             else if (h == "song-" || h == "song+")
             {
                 song = (song + (h == "song+" ? 1 : GameMusic.Songs.Length - 1)) % GameMusic.Songs.Length;
@@ -1025,17 +1028,14 @@ class LauncherForm : Form
                         new Point(changeR.X, pathR.Y), hover == "change" ? Color.White : Accent, TextFormatFlags.NoPadding);
                 }
 
-                // The chosen conversion tool; the Conversion tab picks another.
-                string label = (cur.Rank > 0 ? "#" + cur.Rank + "  " : "") + cur.Name + (cur.Choices > 1 ? "  ·  " + cur.ChoiceLabel : "");
-                var r = new Rectangle(x, h - S(80), TextRenderer.MeasureText(label, pillF).Width + S(18), S(34));
+                // The chosen conversion tool: its name and the cards it's made for. The Conversion tab picks another.
+                int nw = TextRenderer.MeasureText(cur.Name, pillF).Width;
+                var r = new Rectangle(x, h - S(80), nw + S(18) + (cur.Gpu != null ? GpuW() + S(4) : 0), S(34));
                 using (var path = Rounded(r, r.Height / 2))
                 using (var b = new SolidBrush(Color.FromArgb(235, 255, 255, 255)))
                     g.FillPath(b, path);
-                TextRenderer.DrawText(g, label, pillF, r, Color.FromArgb(20, 16, 30), center);
-                string more = "Change conversion tool";
-                var mr = new Rectangle(r.Right + S(14), r.Y, TextRenderer.MeasureText(more, pathF).Width, r.Height);
-                TextRenderer.DrawText(g, more, hover == "runtime" ? linkF : pathF, mr, hover == "runtime" ? Color.White : Accent, TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine);
-                hits["runtime"] = Rectangle.Union(r, mr);
+                TextRenderer.DrawText(g, cur.Name, pillF, new Rectangle(r.X + S(9), r.Y, nw, r.Height), Color.FromArgb(20, 16, 30), center);
+                GpuBadge(g, cur.Gpu, r.X + S(9) + nw + S(6), r.Y + r.Height / 2);
             }
         }
 
@@ -1080,8 +1080,9 @@ class LauncherForm : Form
             Color fg = on ? Color.FromArgb(20, 16, 30) : Color.White, sub = on ? Color.FromArgb(90, 80, 110) : muted2;
             if (rt.Rank > 0) TextRenderer.DrawText(g, "#" + rt.Rank, pillF, new Rectangle(r.X + S(16), r.Y, S(40), r.Height), Accent, mid);
             TextRenderer.DrawText(g, rt.Name, pillF, new Rectangle(r.X + S(60), r.Y, nameW, r.Height), fg, mid);
-            int noteR = ob.IsEmpty ? r.Right - S(130) : ob.X - S(10);
-            TextRenderer.DrawText(g, rt.Note, pathF, new Rectangle(r.X + S(72) + nameW, r.Y, noteR - (r.X + S(72) + nameW), r.Height), sub, mid);
+            GpuBadge(g, rt.Gpu, r.X + S(68) + nameW, r.Y + r.Height / 2);
+            int noteL = r.X + S(80) + nameW + GpuW(), noteR = ob.IsEmpty ? r.Right - S(130) : ob.X - S(10);
+            TextRenderer.DrawText(g, rt.Note, pathF, new Rectangle(noteL, r.Y, noteR - noteL, r.Height), sub, mid);
             if (!ob.IsEmpty)
             {
                 using (var path = Rounded(ob, S(6)))
@@ -1092,6 +1093,19 @@ class LauncherForm : Form
             TextRenderer.DrawText(g, on ? "Selected" : rt.Installed ? "Installed" : "Not installed", smallF,
                 new Rectangle(r.Right - S(126), r.Y, S(110), r.Height), on ? Accent : sub, mid | TextFormatFlags.Right);
         }
+    }
+
+    // NVIDIA green or AMD red tag, left edge at x, centred on cy. Every tag is as wide as "NVIDIA", so the notes line up.
+    int GpuW() { return TextRenderer.MeasureText("NVIDIA", smallF).Width + S(12); }
+    void GpuBadge(Graphics g, string gpu, int x, int cy)
+    {
+        if (gpu == null) return;
+        bool nv = gpu == "nvidia";
+        var r = new Rectangle(x, cy - S(11), GpuW(), S(22));
+        using (var path = Rounded(r, S(5)))
+        using (var b = new SolidBrush(nv ? Color.FromArgb(118, 185, 0) : Color.FromArgb(237, 28, 36)))
+            g.FillPath(b, path);
+        TextRenderer.DrawText(g, nv ? "NVIDIA" : "AMD", smallF, r, Color.White, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine);
     }
 
     void SettingsPage(Graphics g, int x, int w, Color muted2)
