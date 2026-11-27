@@ -20,8 +20,6 @@ PROJECTS = {
     "hyphenn": ("fxceless/victory-fork", r"## Status of this fork"),  # the repo keeps its name; called hyphenn here
     "anyxboxx": ("LooperSalty/AnyXboxX", r"> \*\*Where we are"),
     "dexnom": ("DexNom/VIctory", r"## Changes in this snapshot"),
-    "belobug": ("Belobug/VIctory-Belobug-AMD", r"## State of this fork"),
-    "victory-7900xtx": ("avatarmanz/VIctory-7900XTX", r"## Where it stands"),
     "victory-nvidia": ("trustno1-coder/VIctory-NVIDIA", r"## Where it stands"),
     "kelvaroq": ("stellarr-studio/kelvaroq", r"## Status"),
     "portwatch": ("4lwayz/portwatch-vi", None),  # a tracker site, not a port: no progress steps, and docs/portwatch/ is a copy of it

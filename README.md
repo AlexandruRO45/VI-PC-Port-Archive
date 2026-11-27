@@ -24,8 +24,8 @@ ZERO of Rockstars game assets, files, or leaked info is on this repo, NOTHING HE
 | [`anyxboxx/`](anyxboxx) | AnyXboxX: an Xbox Series X emulator prototype, aimed at GTA VI for now | `LooperSalty/AnyXboxX` | GPL-3.0 |
 | [`ztrx/`](ztrx) | ztrx: runs the Xbox Series build natively on Windows with NVIDIA cards, based on VIctory and hyphenn | `Zettrox/ztrx` (removed from GitHub on 2026-11-25) | GPL-3.0 |
 | [`dexnom/`](dexnom) | DexNom Runtime: a VIctory fork for AMD Radeon cards | `DexNom/VIctory` | GPL-3.0 |
-| [`belobug/`](belobug) | VIctory-Belobug-AMD: a VIctory fork for AMD Radeon cards | `Belobug/VIctory-Belobug-AMD` | GPL-3.0 |
-| [`victory-7900xtx/`](victory-7900xtx) | VIctory-7900XTX: a VIctory fork tuned for speed on an AMD RX 7900 XTX | `avatarmanz/VIctory-7900XTX` | GPL-3.0 |
+| [`belobug/`](belobug) | VIctory-Belobug-AMD: a VIctory fork for AMD Radeon cards | `Belobug/VIctory-Belobug-AMD` (removed from GitHub on 2026-11-27) | GPL-3.0 |
+| [`victory-7900xtx/`](victory-7900xtx) | VIctory-7900XTX: a VIctory fork tuned for speed on an AMD RX 7900 XTX | `avatarmanz/VIctory-7900XTX` (removed from GitHub on 2026-11-27) | GPL-3.0 |
 | [`cool-fox/`](cool-fox) | cool_fox :CGBJ: VIctory-7900XTX with a ready-made Windows build and launcher | `codec-d/cool_fox` (private since 2026-11-26) | GPL-3.0 |
 | releases [`cgbj-willy-30e54b4`](https://github.com/Guernica4u/GTA6-PC-Port-Archive/releases/tag/cgbj-willy-30e54b4) (newest), [`cgbj-pareto-residency`](https://github.com/Guernica4u/GTA6-PC-Port-Archive/releases/tag/cgbj-pareto-residency) | cool_fox :CGBJ Windows builds by codec_d (unsigned; see the release notes) | private releases of `codec-d/cool_fox` | GPL-3.0 |
 | [`victory-nvidia/`](victory-nvidia) | VIctory-NVIDIA: a VIctory fork tuned for NVIDIA RTX cards, with DLSS and frame generation | `trustno1-coder/VIctory-NVIDIA` | GPL-3.0 |
