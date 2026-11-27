@@ -1,6 +1,6 @@
 # GTA6 PC Port Archive
 
-Archived copies of thirteen open-source projects that work on running GTA VI on PC, first saved on 2026-11-23 and updated on 2026-11-24.
+Archived copies of fifteen open-source projects that work on running GTA VI on PC, first saved on 2026-11-23 and updated on 2026-11-24.
 ZERO of Rockstars game assets, files, or leaked info is on this repo, NOTHING HERE IS BREAKING ANY LAW OR ANYONE'S TOS
 ## GTA VI Launcher
 
@@ -28,6 +28,8 @@ ZERO of Rockstars game assets, files, or leaked info is on this repo, NOTHING HE
 | [`victory-7900xtx/`](victory-7900xtx) | VIctory-7900XTX: a VIctory fork tuned for speed on an AMD RX 7900 XTX | `avatarmanz/VIctory-7900XTX` | GPL-3.0 |
 | [`cool-fox/`](cool-fox) | cool_fox :CGBJ: VIctory-7900XTX with a ready-made Windows build and launcher | `codec-d/cool_fox` (private since 2026-11-26) | GPL-3.0 |
 | releases [`cgbj-willy-30e54b4`](https://github.com/Guernica4u/GTA6-PC-Port-Archive/releases/tag/cgbj-willy-30e54b4) (newest), [`cgbj-pareto-residency`](https://github.com/Guernica4u/GTA6-PC-Port-Archive/releases/tag/cgbj-pareto-residency) | cool_fox :CGBJ Windows builds by codec_d (unsigned; see the release notes) | private releases of `codec-d/cool_fox` | GPL-3.0 |
+| [`victory-nvidia/`](victory-nvidia) | VIctory-NVIDIA: a VIctory fork tuned for NVIDIA RTX cards, with DLSS and frame generation | `trustno1-coder/VIctory-NVIDIA` | GPL-3.0 |
+| [`kelvaroq/`](kelvaroq) | Kelvaroq: an Xbox Series compatibility runtime for Windows written in Rust, built on VIctory and hyphenn | `stellarr-studio/kelvaroq` | GPL-3.0 |
 | [`portwatch/`](portwatch) | PortWatch VI: 4lwayz's tracker site for the PC efforts (not a port). A copy of the site runs at [`/portwatch/`](https://guernica4u.github.io/GTA6-PC-Port-Archive/portwatch/) | `4lwayz/portwatch-vi` | none given |
 | [`github-export/`](github-export) | each project's issues, pull requests and comments | | |
 
@@ -38,7 +40,7 @@ Each project folder keeps its own license file. Leonida's (old and new) `third_p
 
 The old Leonida's branches keep their original `leonida/` names.
 
-`main` is a single snapshot of all thirteen projects and PortWatch VI. Each project's original history, with its original commits, authors,
+`main` is a single snapshot of all fifteen projects and PortWatch VI. Each project's original history, with its original commits, authors,
 hashes and file paths, is on its own branches:
 
 | Project | Code | Pull requests | Issues and comments |
@@ -56,6 +58,8 @@ hashes and file paths, is on its own branches:
 | VIctory-Belobug-AMD | `belobug/main` | `belobug/pr/<number>` (146) | `belobug/github-export` |
 | VIctory-7900XTX | `victory-7900xtx/main` | `victory-7900xtx/pr/<number>` (0) | `victory-7900xtx/github-export` |
 | cool_fox :CGBJ | `cool-fox/main` | `cool-fox/pr/<number>` (4) | `cool-fox/github-export` |
+| VIctory-NVIDIA | `victory-nvidia/main` | `victory-nvidia/pr/<number>` (20) | `victory-nvidia/github-export` |
+| Kelvaroq | `kelvaroq/main` | `kelvaroq/pr/<number>` (0) | `kelvaroq/github-export` |
 | PortWatch VI | `portwatch/main` | `portwatch/pr/<number>` (56) | `portwatch/github-export` |
 
 Get one project on its own:
