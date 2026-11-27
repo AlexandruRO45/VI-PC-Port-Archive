@@ -25,8 +25,8 @@ using System.Xml;
 [assembly: AssemblyTitle("GTA VI Launcher")]
 [assembly: AssemblyDescription("Runs your game dump through the PC port runtimes")]
 [assembly: AssemblyProduct("GTA VI Launcher")]
-[assembly: AssemblyVersion("1.10.0.0")]
-[assembly: AssemblyFileVersion("1.10.0.0")]
+[assembly: AssemblyVersion("1.10.1.0")]
+[assembly: AssemblyFileVersion("1.10.1.0")]
 
 // One runtime project, as the archive's site describes it.
 class Runtime
@@ -681,6 +681,12 @@ class LauncherForm : Form
         string tmp = Path.Combine(Launcher.Data, "tmp");
         Directory.CreateDirectory(tmp);
         psi.EnvironmentVariables["TEMP"] = psi.EnvironmentVariables["TMP"] = tmp;
+        // Same for AppData and cargo's home: security software here (Malwarebytes, earlier Bitdefender) denies the launcher's
+        // whole process tree writes there, which broke cargo downloads and VIctory-NVIDIA's logs. Toolchains in ~/.rustup are only read.
+        psi.EnvironmentVariables["LOCALAPPDATA"] = Path.Combine(Launcher.Data, "appdata", "Local");
+        psi.EnvironmentVariables["APPDATA"] = Path.Combine(Launcher.Data, "appdata", "Roaming");
+        psi.EnvironmentVariables["CARGO_HOME"] = Path.Combine(Launcher.Data, "cargo");
+        foreach (var k in new[] { "LOCALAPPDATA", "APPDATA", "CARGO_HOME" }) Directory.CreateDirectory(psi.EnvironmentVariables[k]);
         if (env != null) env(psi);
         var p = Process.Start(psi);
         p.EnableRaisingEvents = true;
