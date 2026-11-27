@@ -8,14 +8,14 @@ Tabs on the left side:
 - **Conversion:** every runtime, with how far it gets and whether it's installed. Click one to use it.
 - **Settings:** the game path, the song, mute, and the pictures folder.
 
-**[Download GTA-VI-Launcher.zip](https://github.com/Guernica4u/GTA6-PC-Port-Archive/releases/latest/download/GTA-VI-Launcher.zip)** (Windows 10/11, about 50 KB)
+**[Download GTA-VI-Launcher.zip](https://github.com/Guernica4u/GTA6-PC-Port-Archive/releases/download/launcher/GTA-VI-Launcher.zip)** (Windows 10/11, about 50 KB)
 
 Unzip it into a folder of its own. The launcher keeps everything next to itself: your settings, the runtimes it builds, their caches and the slideshow pictures.
 
 ## What it does
 
-- **Runtimes:** the archive's top 3, read live from [the archive site](https://guernica4u.github.io/GTA6-PC-Port-Archive/), plus ztrx, Hyphen (hyphenn), cool_fox :CGBJ, NEWEST CGBJ private, VIctory and xcl, under the site's names. ztrx and cool_fox were taken off GitHub by their authors; the launcher installs the last copy this archive saved. Hover over a runtime to see how far it gets.
-- **Install & play:** the first PLAY on a runtime downloads its source from this archive into `runtimes\<name>` next to the launcher and builds it into that folder's `target\release`. That needs [git](https://git-scm.com/download/win) and [Rust](https://rustup.rs) with the MSVC build tools. NEWEST CGBJ private is a ready-made build instead: the launcher downloads its ZIP from the archive's release, unpacks it into `runtimes\cgbj\target\release` and runs it only if the exe matches the checksum in the release notes. Its exe isn't signed and Windows Defender flags the ZIP. A console window shows the progress and stays open if something fails.
+- **Runtimes:** the archive's top 3, read live from [the archive site](https://guernica4u.github.io/GTA6-PC-Port-Archive/), plus ztrx, Hyphen (hyphenn), cool_fox :CGBJ, VIctory and xcl, under the site's names. ztrx was taken off GitHub and cool_fox went private; the launcher installs the copies this archive saved. Hover over a runtime to see how far it gets.
+- **Install & play:** the first PLAY on a runtime downloads its source from this archive into `runtimes\<name>` next to the launcher and builds it into that folder's `target\release`. That needs [git](https://git-scm.com/download/win) and [Rust](https://rustup.rs) with the MSVC build tools. cool_fox :CGBJ has a build picker in the Conversion tab, like the site's download picker: its ready-made builds (the newest first) or its source. A ready-made build needs no git or Rust: the launcher downloads its ZIP from the archive's release, unpacks it into `runtimes\cool-fox-<release>\target\release` and runs it only if the exe matches the checksum in the release notes. The exes aren't signed, and Windows Defender flags the pareto-residency ZIP. A console window shows the progress and stays open if something fails.
 - **Slideshow:** shows every picture in the `backgrounds` folder next to the launcher. To add pictures, drag them onto the window. With no pictures, it shows the game's own splash screen.
 - **Music:** plays a song from your copy of the game's `audio.rpf`, using the Opus decoder built into Windows. Settings switches between 5 songs. The speaker button in the top bar mutes it. Music stops while the game runs. Only the v1.0.2.1 dump is supported: the songs are found by their position in its `audio.rpf`.
 - **Full screen:** the maximize button, F11, Alt+Enter, or double-click the window. Esc leaves full screen.
