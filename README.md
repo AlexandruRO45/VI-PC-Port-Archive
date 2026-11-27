@@ -27,7 +27,7 @@ ZERO of Rockstars game assets, files, or leaked info is on this repo, NOTHING HE
 | [`belobug/`](belobug) | VIctory-Belobug-AMD: a VIctory fork for AMD Radeon cards | `Belobug/VIctory-Belobug-AMD` | GPL-3.0 |
 | [`victory-7900xtx/`](victory-7900xtx) | VIctory-7900XTX: a VIctory fork tuned for speed on an AMD RX 7900 XTX | `avatarmanz/VIctory-7900XTX` | GPL-3.0 |
 | [`cool-fox/`](cool-fox) | cool_fox :CGBJ: VIctory-7900XTX with a ready-made Windows build and launcher | `codec-d/cool_fox` (private since 2026-11-26) | GPL-3.0 |
-| [release `cgbj-pareto-residency`](https://github.com/Guernica4u/GTA6-PC-Port-Archive/releases/tag/cgbj-pareto-residency) | NEWEST CGBJ private: codec_d's private Windows build of cool_fox :CGBJ (unsigned; see the release notes) | private release of `codec-d/cool_fox` | GPL-3.0 |
+| releases [`cgbj-willy-30e54b4`](https://github.com/Guernica4u/GTA6-PC-Port-Archive/releases/tag/cgbj-willy-30e54b4) (newest), [`cgbj-pareto-residency`](https://github.com/Guernica4u/GTA6-PC-Port-Archive/releases/tag/cgbj-pareto-residency) | cool_fox :CGBJ Windows builds by codec_d (unsigned; see the release notes) | private releases of `codec-d/cool_fox` | GPL-3.0 |
 | [`github-export/`](github-export) | each project's issues, pull requests and comments | | |
 
 Each project folder keeps its own license file. Leonida's (old and new) `third_party/rpf9-explorer` submodule

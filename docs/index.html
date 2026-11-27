@@ -104,6 +104,7 @@
 .filter { margin:-6px 0 18px; }
 .filter .btn[aria-pressed="true"] { background:var(--ink); color:var(--bg); border-color:var(--ink); }
 .gta-only [data-gta="0"] { display:none; }
+.pick select { min-height:36px; max-width:100%; font:500 14px/1 Inter, system-ui, sans-serif; padding:0 10px; border-radius:8px; border:1.5px solid var(--ink2); background:var(--panel); color:var(--ink); }
 .one { display:flex; flex-wrap:wrap; align-items:center; gap:8px; margin-top:14px; font-size:14px; color:var(--ink2); }
 
 /* important links */
@@ -189,7 +190,7 @@ const STEPS = ["Starts", "Menus", "Loads the world", "World on screen", "Playabl
 // gone = date it was removed from GitHub (listed in the graveyard); born and commits come from its archived history
 // private = its repo went private but work goes on there: listed in the graveyard (public copy gone) and in the archive
 // top = pinned to the top of the archive in this order (picked by hand), the rest sort by reached
-// release = a build kept as a release of this repo (no GitHub project of its own); its code is on the `branch` it names
+// builds = Windows builds kept as releases of this repo, newest first; the card lets you pick one or the code
 // gta = made only for GTA VI (the others run Xbox Series games in general); the "Only GTA VI projects" button keeps these
 const PROJECTS = {
   "leonida-new": { repo: "ubiquitarianism/leonida", saved: "24 Nov 2026", name: "Leonida", tag: "new", gta: true, lic: "GPL-3.0", branch: "leonida-new", up: "https://github.com/ubiquitarianism/leonida",
@@ -210,7 +211,7 @@ const PROJECTS = {
   tuxbox: { repo: "brcly/TuxBox", saved: "24 Nov 2026", name: "TuxBox", lic: "Apache-2.0", branch: "tuxbox", up: "https://github.com/brcly/TuxBox",
     desc: "Runs Xbox Series games on Linux (through Proton) and Windows.", reached: 2,
     note: "On Linux it starts and shows the player selection screen in 4K. What comes after that isn't checked yet.", src: "https://github.com/brcly/TuxBox/blob/main/docs/PROGRESS.md#games" },
-  hyphenn: { repo: "fxceless/victory-fork", saved: "24 Nov 2026", name: "hyphenn", gta: true, top: 6, lic: "GPL-3.0", branch: "hyphenn", up: "https://github.com/fxceless/victory-fork",
+  hyphenn: { repo: "fxceless/victory-fork", saved: "24 Nov 2026", name: "hyphenn", gta: true, top: 5, lic: "GPL-3.0", branch: "hyphenn", up: "https://github.com/fxceless/victory-fork",
     desc: "A fork of VIctory focused on getting GTA VI's world to render and run on a Windows PC.", reached: 4,
     note: "Plays the opening cutscene and renders the first gameplay scene with working input, but at 2-4 fps and with everything in shadow black.", src: "https://github.com/fxceless/victory-fork#status-of-this-fork-2026-11-25" },
   anyxboxx: { repo: "LooperSalty/AnyXboxX", saved: "24 Nov 2026", name: "AnyXboxX", gta: true, lic: "GPL-3.0", branch: "anyxboxx", up: "https://github.com/LooperSalty/AnyXboxX",
@@ -219,23 +220,22 @@ const PROJECTS = {
   ztrx: { repo: "Zettrox/ztrx", saved: "25 Nov 2026", gone: "25 Nov 2026", born: "25 Nov 2026", commits: 226, name: "ztrx", gta: true, lic: "GPL-3.0", branch: "ztrx", up: null, frozen: "Final copy, 25 Nov 2026",
     desc: "Ran GTA VI's Xbox Series build natively on Windows with NVIDIA cards, prologue playable at 1-3 fps. Built on VIctory and hyphenn. Its GitHub account was removed the day it was published.", reached: 5,
     note: "The prologue is playable from the cell to the boat chase, and it ran 1 h 30 min without a crash. Only 1-3 fps, shadows are black and there is no ray-traced lighting yet.", src: `${REPO}/tree/main/ztrx#status-2026-11-25` },
-  dexnom: { repo: "DexNom/VIctory", saved: "25 Nov 2026", name: "DexNom Runtime", gta: true, top: 4, lic: "GPL-3.0", branch: "dexnom", up: "https://github.com/DexNom/VIctory",
+  dexnom: { repo: "DexNom/VIctory", saved: "25 Nov 2026", name: "DexNom Runtime", gta: true, top: 3, lic: "GPL-3.0", branch: "dexnom", up: "https://github.com/DexNom/VIctory",
     desc: "A VIctory fork for AMD Radeon cards, with a one-click setup and experimental ray tracing.", reached: 4,
     note: "Plays in the city on an RX 7900 XTX, with experimental ray-traced lighting. Frames can still take seconds and some objects show black.", src: "https://github.com/DexNom/VIctory#changes-in-this-snapshot" },
-  belobug: { repo: "Belobug/VIctory-Belobug-AMD", saved: "25 Nov 2026", name: "VIctory-Belobug-AMD", gta: true, top: 5, lic: "GPL-3.0", branch: "belobug", up: "https://github.com/Belobug/VIctory-Belobug-AMD",
+  belobug: { repo: "Belobug/VIctory-Belobug-AMD", saved: "25 Nov 2026", name: "VIctory-Belobug-AMD", gta: true, top: 4, lic: "GPL-3.0", branch: "belobug", up: "https://github.com/Belobug/VIctory-Belobug-AMD",
     desc: "A VIctory fork for AMD Radeon cards that renders the world lit, with textures, people, vehicles and water.", reached: 4,
     note: "The world renders lit at 5-7 fps on an RX 9070 XT and saves work. Not playable yet: the phone turns the world black and there is no ray-traced light.", src: "https://github.com/Belobug/VIctory-Belobug-AMD#state-of-this-fork-2026-11-25" },
-  "victory-7900xtx": { repo: "avatarmanz/VIctory-7900XTX", saved: "25 Nov 2026", name: "VIctory-7900XTX", gta: true, top: 3, lic: "GPL-3.0", branch: "victory-7900xtx", up: "https://github.com/avatarmanz/VIctory-7900XTX",
+  "victory-7900xtx": { repo: "avatarmanz/VIctory-7900XTX", saved: "25 Nov 2026", name: "VIctory-7900XTX", gta: true, top: 2, lic: "GPL-3.0", branch: "victory-7900xtx", up: "https://github.com/avatarmanz/VIctory-7900XTX",
     desc: "A VIctory fork tuned for speed on an AMD RX 7900 XTX.", reached: 5,
     note: "Plays the prologue and the first mission at 13-22 fps, and 6-10 fps in busy street chases. Ran 41 minutes without a crash. Needs about 64 GB of RAM.", src: "https://github.com/avatarmanz/VIctory-7900XTX#where-it-stands-2026-11-25" },
-  "cool-fox": { repo: "codec-d/cool_fox", saved: "26 Nov 2026", gone: "26 Nov 2026", born: "26 Nov 2026", private: true, commits: 627, name: "cool_fox :CGBJ", gta: true, top: 2, lic: "GPL-3.0", branch: "cool-fox", up: null, frozen: "Last public copy, 26 Nov 2026",
-    desc: "VIctory-7900XTX with a ready-made Windows build and a one-command launcher tuned on NVIDIA RTX. Its repo went private a few hours after it was published; work goes on there.", reached: 5,
-    note: "Builds on VIctory-7900XTX: the prologue and first mission play at 13-22 fps on an RX 7900 XTX. Adds a Windows ZIP and Series S settings tested on RTX cards.", src: `${REPO}/tree/main/cool-fox#run-the-codec_d-windows-build` },
-  cgbj: { saved: "26 Nov 2026", name: "NEWEST CGBJ private", gta: true, top: 1, lic: "GPL-3.0", branch: "cool-fox", reached: 5,
-    release: "https://github.com/Guernica4u/GTA6-PC-Port-Archive/releases/download/cgbj-pareto-residency/cool_fox-pareto-residency-windows-x64.zip", notes: "https://github.com/Guernica4u/GTA6-PC-Port-Archive/releases/tag/cgbj-pareto-residency",
-    desc: "The Windows build codec_d released privately from cool_fox :CGBJ, kept here after the repo went private. Ready to run with your own dump.",
-    note: "cool_fox's build with the Series S profile and RTX-tested settings. Unsigned exe; Windows Defender flags the ZIP (Trojan:Script/Wacatac.H!ml, a machine-learning detection). Read the release notes first.",
-    src: "https://github.com/Guernica4u/GTA6-PC-Port-Archive/releases/tag/cgbj-pareto-residency" },
+  "cool-fox": { repo: "codec-d/cool_fox", saved: "26 Nov 2026", gone: "26 Nov 2026", born: "26 Nov 2026", private: true, commits: 627, name: "cool_fox :CGBJ", gta: true, top: 1, lic: "GPL-3.0", branch: "cool-fox", up: null, frozen: "Last public copy, 26 Nov 2026",
+    desc: "codec_d's VIctory fork with ready-made Windows builds. Its repo went private a few hours after it was published; work goes on there, and new builds are kept here.", reached: 5,
+    builds: [
+      { label: "willy build 30e54b4 (newest)", url: `${REPO}/releases/download/cgbj-willy-30e54b4/victory-cool_fox-willy.zip` },
+      { label: "pareto-residency build (Defender flags it)", url: `${REPO}/releases/download/cgbj-pareto-residency/cool_fox-pareto-residency-windows-x64.zip` },
+    ],
+    note: "Newest build: about 30 fps median on an RTX 4090, 60 fps cap, keyboard and mouse, fixed faces and skin, memory peak down to about 27 GB.", src: `${REPO}/releases/tag/cgbj-willy-30e54b4` },
 };
 const $ = id => document.getElementById(id);
 const esc = s => String(s).replace(/[&<>"']/g, c => ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;", "'":"&#39;" }[c]));
@@ -249,6 +249,7 @@ const pulse = `<svg width="34" height="14" viewBox="0 0 34 14" aria-hidden="true
 const date = t => new Date(t * 1000).toLocaleDateString("en-GB", { day:"numeric", month:"short", year:"numeric", timeZone:"UTC" });
 const reach = P => P.reached ? `Gets to: ${STEPS[P.reached - 1]}` : "Doesn't start yet";
 const zip = (P, what) => `${REPO}/archive/refs/heads/${P.branch}/${what}.zip`;
+const picker = P => `<label class="pick"><span class="sr">Choose a ${esc(plain(P))} download</span><select data-pick>${[...P.builds, { label: "Source code (last public copy)", url: zip(P, "main") }].map(b => `<option value="${b.url}">${esc(b.label)}</option>`).join("")}</select></label><a class="btn solid sm" href="${P.builds[0].url}">Download</a>`;
 
 function projects(st) {
   st = st || {};
@@ -256,19 +257,14 @@ function projects(st) {
   $("alive").innerHTML = ALIVE.map(k => {
     const P = PROJECTS[k], s = st[k] || {};
     return `<article class="life p-${k}" data-gta="${+!!P.gta}" aria-labelledby="h-${k}">
-      <div class="hd"><h3 id="h-${k}">${label(P)}</h3><span class="beat">${P.release ? "Build" : pulse + (P.private ? "Alive · private" : "Alive")}</span></div>
+      <div class="hd"><h3 id="h-${k}">${label(P)}</h3><span class="beat">${pulse}${P.private ? "Alive · private" : "Alive"}</span></div>
       <p>${esc(P.desc)}</p>
-      ${P.release ? `<div class="facts">Windows x64 build · unsigned<br>${esc(P.note)}<br>Saved ${P.saved} · ${P.lic} · Status: ${esc(reach(P))}</div>
+      <div class="facts">${s.updated ? `Last code change ${ago(s.updated)}<br>` : ""}${fmt(s.prs)} PRs · ${fmt(s.issues)} issues · ${fmt(s.comments)} comments<br>Saved since ${P.saved} · ${P.lic}${P.private ? `<br>Repo went private ${P.gone}; work goes on there. This is the last public copy` : ""}<br>Status: ${esc(reach(P))} (<a href="${P.src}" target="_blank" rel="noopener">source</a>)${P.builds ? `<br>${esc(P.note)} Builds are unsigned: read the <a href="${REPO}/releases" target="_blank" rel="noopener">release notes</a> first` : ""}</div>
       <div class="actions">
-        <a class="btn solid sm" href="${P.release}">Download build</a>
-        <a class="btn sm" href="${zip(P, "main")}">Source code</a>
-        <a class="btn sm" href="${P.notes}" target="_blank" rel="noopener">Release notes ↗</a>
-      </div>` : `<div class="facts">${s.updated ? `Last code change ${ago(s.updated)}<br>` : ""}${fmt(s.prs)} PRs · ${fmt(s.issues)} issues · ${fmt(s.comments)} comments<br>Saved since ${P.saved} · ${P.lic}${P.private ? `<br>Repo went private ${P.gone}; work goes on there. This is the last public copy` : ""}<br>Status: ${esc(reach(P))} (<a href="${P.src}" target="_blank" rel="noopener">source</a>)</div>
-      <div class="actions">
-        <a class="btn solid sm" href="${zip(P, "main")}">Download</a>
+        ${P.builds ? picker(P) : `<a class="btn solid sm" href="${zip(P, "main")}">Download</a>`}
         <a class="btn sm" href="browse.html#${k}">Issues</a>
         ${P.up ? `<a class="btn sm" href="${P.up}" target="_blank" rel="noopener">On GitHub ↗</a>` : ""}
-      </div>`}
+      </div>
     </article>`;
   }).join("");
   $("yard").innerHTML = DEAD.map(k => {
@@ -289,10 +285,10 @@ function downloads() {
     const P = PROJECTS[k];
     return `<div class="dlc p-${k}" data-gta="${+!!P.gta}">
       <h3><i class="dot"></i>${label(P)}</h3>
-      <p>${P.release ? "Windows build, unsigned · read the release notes first" : P.frozen || "Latest code, synced every hour"}</p>
+      <p>${P.builds ? "Windows builds (unsigned) or the code" : P.frozen || "Latest code, synced every hour"}</p>
       <div class="actions">
-        <a class="btn solid sm" href="${zip(P, "main")}" aria-label="Download ${esc(plain(P))} code (zip)">Code .zip</a>
-        ${P.release ? `<a class="btn sm" href="${P.release}" aria-label="Download ${esc(plain(P))} Windows build (zip)">Build .zip</a>` : `<a class="btn sm" href="${zip(P, "github-export")}" aria-label="Download ${esc(plain(P))} issues and comments (zip)">Issues .zip</a>`}
+        ${P.builds ? picker(P) : `<a class="btn solid sm" href="${zip(P, "main")}" aria-label="Download ${esc(plain(P))} code (zip)">Code .zip</a>`}
+        <a class="btn sm" href="${zip(P, "github-export")}" aria-label="Download ${esc(plain(P))} issues and comments (zip)">Issues .zip</a>
       </div>
     </div>`;
   }).join("") + `<div class="dlc all">
@@ -347,6 +343,8 @@ function spy() {
   downloads();
   cmds();
   gtaFilter();
+  // a build picker points its Download button at the chosen file
+  document.addEventListener("change", e => { const s = e.target.closest("[data-pick]"); if (s) s.parentElement.nextElementSibling.href = s.value; });
   spy();
   try { const r = await fetch("data/stats.json"); if (r.ok) projects(await r.json()); } catch {}
 })();
