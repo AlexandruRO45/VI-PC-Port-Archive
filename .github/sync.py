@@ -7,7 +7,7 @@ made private) is skipped and its archived copy stays as it is.
 --push also pushes each project's branches to origin (<p>/main, <p>/pr/<n>, <p>/branch/<name>, <p>/github-export)
 and opens an issue when the README part the site's progress steps come from has changed.
 Committing main is left to the caller (.github/workflows/sync.yml)."""
-import datetime, gzip, json, os, re, subprocess, sys, time
+import datetime, gzip, json, os, re, shutil, subprocess, sys, time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # folder: (GitHub repo, README line where its "how far it gets" part starts)
@@ -22,7 +22,9 @@ PROJECTS = {
     "dexnom": ("DexNom/VIctory", r"## Changes in this snapshot"),
     "belobug": ("Belobug/VIctory-Belobug-AMD", r"## State of this fork"),
     "victory-7900xtx": ("avatarmanz/VIctory-7900XTX", r"## Where it stands"),
+    "portwatch": ("4lwayz/portwatch-vi", None),  # a tracker site, not a port: no progress steps, and docs/portwatch/ is a copy of it
 }
+SITE_ONLY = {"portwatch"}  # archived and synced, but not a project card on our site
 PUSH_BUDGET = 300  # seconds of branch pushing per project per run; the rest waits for the next run
 TODAY = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
 
@@ -154,6 +156,44 @@ def flag(p, repo):
            "Check that the progress steps on the site still match it: `PROJECTS` in `docs/index.html`.")
 
 
+BANNER = ('<div style="position:sticky;top:0;z-index:9999;background:#14121f;color:#eceef3;font:14px/1.4 system-ui,sans-serif;'
+          'padding:8px 16px;text-align:center">Copy of <a href="https://portwatch-vi.xyz/" style="color:#ff8a3d">portwatch-vi.xyz</a>'
+          ' by 4lwayz, kept by the <a href="../" style="color:#ff8a3d">GTA6 PC Port Archive</a> and updated hourly.'
+          ' News articles open on the original.</div>')
+
+
+def portwatch_copy():
+    """Rebuild docs/portwatch/ from the archived portwatch/ folder: only the files 4lwayz's own site deploys, with a
+    banner naming the original, news linking to it, and its analytics switched off. Their scripts are never run here."""
+    src, out = os.path.join(ROOT, "portwatch"), os.path.join(ROOT, "docs", "portwatch")
+    tmp = out + ".new"
+    shutil.rmtree(tmp, ignore_errors=True)
+    os.makedirs(tmp)
+    for f in ("index.html", "assets", "data"):  # what their Pages workflow deploys, minus the Search Console file
+        (shutil.copytree if os.path.isdir(os.path.join(src, f)) else shutil.copy)(os.path.join(src, f), os.path.join(tmp, f))
+    def patch(rel, *pairs):
+        path = os.path.join(tmp, rel)
+        text = open(path, encoding="utf-8").read()
+        for pattern, repl in pairs:
+            text, n = re.subn(pattern, repl, text, count=1)
+            if not n:  # their page changed shape; keep the last copy rather than publish an unlabelled or tracking one
+                raise RuntimeError(f"portwatch copy: {pattern!r} not found in {rel}, kept the last copy")
+        open(path, "w", encoding="utf-8", newline="\n").write(text)
+    patch("index.html", (r"<body([^>]*)>", lambda m: f"<body{m.group(1)}>\n{BANNER}"),
+          (r"<head>", '<head>\n  <meta name="robots" content="noindex">'),
+          (r'href="news/"', 'href="https://portwatch-vi.xyz/news/"'))
+    patch("assets/js/news-shared.js", (r"`news/\$\{n\.id\}\.html`", "`https://portwatch-vi.xyz/news/${n.id}.html`"))
+    patch("assets/js/config.js", (r"SUPABASE_URL = '[^']*'", "SUPABASE_URL = ''"), (r"SUPABASE_KEY = '[^']*'", "SUPABASE_KEY = ''"),
+          (r"STATS_PAUSED = \w+", "STATS_PAUSED = true"))
+    for rel in ("data/tracker.json", "data/pinned.json"):  # links in their data point at article pages only the original has
+        path = os.path.join(tmp, rel)
+        if os.path.exists(path):
+            text = open(path, encoding="utf-8").read().replace('"news/', '"https://portwatch-vi.xyz/news/')
+            open(path, "w", encoding="utf-8", newline="\n").write(text)
+    shutil.rmtree(out, ignore_errors=True)
+    os.rename(tmp, out)
+
+
 def check_merge():
     import tempfile
     z = lambda *rows: gzip.compress("".join(json.dumps({"id": i, "v": v}) + "\n" for i, v in rows).encode())
@@ -191,13 +231,16 @@ if __name__ == "__main__":
                 # GitHub refuses branches that edit .github/workflows files (the workflow's token may not touch those)
                 # and sometimes times out; both are retried next run, so they're warnings, not failures
                 skipped += [f"{p}: GitHub refused {line}" for line in push(p, repo, default)]
-                if status_part(old, start) != status_part(new, start):
+                if start and status_part(old, start) != status_part(new, start):
                     flag(p, repo)
+            if p == "portwatch":
+                portwatch_copy()
             print(f"{p}: synced", flush=True)
         except Exception as e:
             problems.append(f"{p}: {e}")
-    if synced:
-        subprocess.run([sys.executable, "-I", os.path.join(ROOT, "docs", "build_site.py"), *synced], check=True)
+    cards = [p for p in synced if p not in SITE_ONLY]
+    if cards:
+        subprocess.run([sys.executable, "-I", os.path.join(ROOT, "docs", "build_site.py"), *cards], check=True)
     for line in skipped:
         print("::warning::" + line)
     for line in problems:
